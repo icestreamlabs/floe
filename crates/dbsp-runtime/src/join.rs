@@ -164,6 +164,7 @@ pub struct DbspJoin {
 }
 
 impl DbspJoin {
+    #[cfg(test)]
     pub async fn new<L, R, O, K, KL, KR, P, F>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,
@@ -229,6 +230,7 @@ impl DbspJoin {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn new_with_state_namespace<L, R, O, K, KL, KR, P, F>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,
@@ -415,6 +417,192 @@ impl DbspJoin {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn new_batch_with_state_namespace<L, R, O, K, KL, KR, P, F>(
+        left: &DeltaHandleStream,
+        right: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        left_key: KL,
+        right_key: KR,
+        predicate: P,
+        projector: F,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<Self>
+    where
+        L: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        O: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        KL: Fn(&[(L, i64)]) -> Vec<(K, L, i64)> + Send + Sync + Clone + 'static,
+        KR: Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync + Clone + 'static,
+        P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
+        F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
+    {
+        let table = left.table();
+        let frontier = left.current_time().max(right.current_time());
+        let horizon = left.semantic_horizon().max(right.semantic_horizon());
+        let join_id = state_namespace
+            .unwrap_or_else(|| NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
+
+        let left_state =
+            RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
+        let right_state =
+            RelationState::empty(table.clone(), format!("join_right_state_{join_id}")).await?;
+
+        let output_ns = format!("join_output_{join_id}");
+        let output_dict = Arc::new(
+            Dictionary::<O>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .context("create output dictionary for join")?,
+        );
+        let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
+            .await
+            .context("create output zset for join")?;
+        let left_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
+            table.clone(),
+            format!("join_left_index_{join_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
+        );
+        let right_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
+            table.clone(),
+            format!("join_right_index_{join_id}"),
+            DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
+        );
+        left_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed left join index")?;
+        right_index
+            .restore_committed_checkpoint()
+            .await
+            .context("restore committed right join index")?;
+
+        let join_op = Arc::new(AsyncMutex::new(JoinOp::new_batch(
+            left_state,
+            right_state,
+            left_index,
+            right_index,
+            Arc::new(left_key),
+            Arc::new(right_key),
+            Arc::new(predicate),
+            Arc::new(projector),
+            table.clone(),
+            output,
+            None,
+        )));
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
+            default: empty_handle.clone(),
+        });
+
+        let left_history = collect_values(left, horizon).await?;
+        let right_history = collect_values(right, horizon).await?;
+        let mut output_handles = Vec::with_capacity((horizon + 1) as usize);
+        for ts in 0..=horizon {
+            let handles = vec![
+                left_history[ts as usize].clone(),
+                right_history[ts as usize].clone(),
+            ];
+            let out_handle = {
+                let mut op_guard = join_op.lock().await;
+                op_guard.on_step(ts, &handles).await?
+            }
+            .unwrap_or_else(|| empty_handle.clone());
+            output_handles.push(out_handle);
+        }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "join_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
+        {
+            let mut op_guard = join_op.lock().await;
+            op_guard.enable_live_output_replayable();
+        }
+
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
+
+        let op = Arc::clone(&join_op);
+        let mut runtime =
+            HandleOperatorRuntime::new(vec![left.stream(), right.stream()], move |ts, handles| {
+                let op = Arc::clone(&op);
+                let writer = Arc::clone(&writer);
+                let empty_handle = empty_handle.clone();
+                let handles = handles.to_vec();
+                Box::pin(async move {
+                    if handles.len() != 2 {
+                        return Err(anyhow::anyhow!(
+                            "join runtime expected 2 handles, got {}",
+                            handles.len()
+                        ));
+                    }
+                    if ts <= horizon {
+                        let mut writer_guard = writer.lock().await;
+                        publish_scheduled_value(&mut writer_guard, ts).await?;
+                        return Ok(());
+                    }
+                    drive_join(&op, &writer, &empty_handle, ts, handles).await
+                })
+            });
+
+        let error_handler = error_handler.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = runtime.step().await {
+                    report_runtime_error(&error_handler, "join", err);
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            stream: DeltaHandleStream::new(stream),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_transient<L, R, O, K, KL, KR, P, F>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,
@@ -467,6 +655,18 @@ impl DbspJoin {
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
+        let left_key = move |deltas: &[(L, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        };
+        let right_key = move |deltas: &[(R, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        };
         Self::spawn_transient_with_inputs_and_retention(
             left,
             right,
@@ -543,6 +743,18 @@ impl DbspJoin {
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
+        let left_key = move |deltas: &[(L, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| left_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        };
+        let right_key = move |deltas: &[(R, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| right_key(row).map(|key| (key, row.clone(), *weight)))
+                .collect()
+        };
         Self::spawn_transient_with_inputs_and_retention(
             left,
             right,
@@ -616,8 +828,8 @@ impl DbspJoin {
             + 'static
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-        KL: Fn(&L) -> Option<K> + Send + Sync + Clone + 'static,
-        KR: Fn(&R) -> Option<K> + Send + Sync + Clone + 'static,
+        KL: Fn(&[(L, i64)]) -> Vec<(K, L, i64)> + Send + Sync + Clone + 'static,
+        KR: Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync + Clone + 'static,
         P: Fn(&L, &R) -> bool + Send + Sync + Clone + 'static,
         F: Fn(&L, &R) -> O + Send + Sync + Clone + 'static,
     {
@@ -679,22 +891,8 @@ impl DbspJoin {
                 right_index,
                 left_closed_index,
                 right_closed_index,
-                Arc::new(move |deltas: &[(L, i64)]| {
-                    deltas
-                        .iter()
-                        .filter_map(|(row, weight)| {
-                            left_key(row).map(|key| (key, row.clone(), *weight))
-                        })
-                        .collect()
-                }),
-                Arc::new(move |deltas: &[(R, i64)]| {
-                    deltas
-                        .iter()
-                        .filter_map(|(row, weight)| {
-                            right_key(row).map(|key| (key, row.clone(), *weight))
-                        })
-                        .collect()
-                }),
+                Arc::new(left_key),
+                Arc::new(right_key),
                 Arc::new(predicate),
                 Arc::new(projector),
                 table.clone(),

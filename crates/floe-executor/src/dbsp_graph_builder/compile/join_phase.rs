@@ -4,8 +4,9 @@ use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, PreparedJoinedEncodedRowProjection,
-    concat_encoded_rows, extract_encoded_row_columns, project_joined_encoded_rows_prepared,
+    concat_encoded_rows, project_joined_encoded_rows_prepared,
 };
+use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use std::collections::{BTreeSet, HashMap};
@@ -43,7 +44,12 @@ impl DbspGraphBuilder {
                 .context("build vectorized transient join precompute evaluator")?,
         );
         Ok(Arc::new(move |delta_values| {
-            evaluator.transform_delta("transient_join_precompute", delta_values)
+            let evaluator = Arc::clone(&evaluator);
+            Box::pin(async move {
+                evaluator
+                    .transform_delta_arrow("transient_join_precompute", delta_values)
+                    .await
+            })
         }))
     }
 
@@ -63,7 +69,7 @@ impl DbspGraphBuilder {
         let task_label = format!("transient-join-{side}-precompute:{graph_id}");
         tokio::spawn(async move {
             while let Some(batch) = input.recv().await {
-                let transformed = match transform(batch.deltas.as_ref()) {
+                let transformed = match transform(Arc::clone(&batch.deltas)).await {
                     Ok(transformed) => transformed,
                     Err(err) => {
                         report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -332,10 +338,22 @@ impl DbspGraphBuilder {
 
         let left_key_columns = Arc::new(left_key_columns_resolved);
         let right_key_columns = Arc::new(right_key_columns_resolved);
+        let left_key_extractor = Arc::new(
+            VectorizedEncodedKeyExtractor::new(
+                left_join_schema.to_arrow_schema(),
+                Arc::clone(&left_key_columns),
+            )
+            .context("build vectorized left join key extractor")?,
+        );
+        let right_key_extractor = Arc::new(
+            VectorizedEncodedKeyExtractor::new(
+                right_join_schema.to_arrow_schema(),
+                Arc::clone(&right_key_columns),
+            )
+            .context("build vectorized right join key extractor")?,
+        );
         let defer_residual_to_post_filter =
             matches!(join_type, DbspJoinType::Inner) && residual.is_some();
-        let left_key_columns_for_outer = left_key_columns.clone();
-        let right_key_columns_for_outer = right_key_columns.clone();
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
@@ -344,82 +362,93 @@ impl DbspGraphBuilder {
         let right_output_projection = (right_join_schema.len() != right_schema.len())
             .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
-        let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            match extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %left_graph_id,
-                        error = %err,
-                        "failed to extract join left key columns"
-                    );
-                    None
-                }
+        let left_key_extractor_for_join = Arc::clone(&left_key_extractor);
+        let left_key = move |delta_values: &[(Vec<u8>, i64)]| match left_key_extractor_for_join
+            .extract_keyed_deltas(delta_values)
+        {
+            Ok(keyed) => keyed,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %left_graph_id,
+                    error = %err,
+                    "failed to extract vectorized join left key columns"
+                );
+                Vec::new()
             }
         };
 
-        let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            match extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %right_graph_id,
-                        error = %err,
-                        "failed to extract join right key columns"
-                    );
-                    None
-                }
+        let right_key_extractor_for_join = Arc::clone(&right_key_extractor);
+        let right_key = move |delta_values: &[(Vec<u8>, i64)]| match right_key_extractor_for_join
+            .extract_keyed_deltas(delta_values)
+        {
+            Ok(keyed) => keyed,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %right_graph_id,
+                    error = %err,
+                    "failed to extract vectorized join right key columns"
+                );
+                Vec::new()
             }
         };
 
         let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
+        let prepared_output_projection =
+            if left_output_projection.is_some() || right_output_projection.is_some() {
+                let mut columns = Vec::new();
+                if let Some(indices) = left_output_projection.as_ref() {
+                    columns.extend(indices.iter().copied().map(|index| {
+                        EncodedRowProjectionColumn {
+                            source: EncodedRowProjectionSource::Left,
+                            index,
+                        }
+                    }));
+                } else {
+                    columns.extend((0..left_join_schema.len()).map(|index| {
+                        EncodedRowProjectionColumn {
+                            source: EncodedRowProjectionSource::Left,
+                            index,
+                        }
+                    }));
+                }
+                if let Some(indices) = right_output_projection.as_ref() {
+                    columns.extend(indices.iter().copied().map(|index| {
+                        EncodedRowProjectionColumn {
+                            source: EncodedRowProjectionSource::Right,
+                            index,
+                        }
+                    }));
+                } else {
+                    columns.extend((0..right_join_schema.len()).map(|index| {
+                        EncodedRowProjectionColumn {
+                            source: EncodedRowProjectionSource::Right,
+                            index,
+                        }
+                    }));
+                }
+                Some(
+                    PreparedJoinedEncodedRowProjection::try_new(&columns)
+                        .context("prepare join output projection")?,
+                )
+            } else {
+                None
+            };
 
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
-            let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
-                match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
-                    Ok(Some(encoded)) => encoded,
-                    Ok(None) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            "join left output projection unexpectedly returned null"
-                        );
-                        return Vec::new();
-                    }
+            if let Some(plan) = prepared_output_projection.as_ref() {
+                return match project_joined_encoded_rows_prepared(left_bytes, right_bytes, plan) {
+                    Ok(encoded) => encoded,
                     Err(err) => {
                         tracing::warn!(
                             graph_id = %projector_graph_id,
                             error = %err,
-                            "failed to project join left output columns"
+                            "failed to project join output columns directly"
                         );
-                        return Vec::new();
+                        Vec::new()
                     }
-                }
-            } else {
-                left_bytes.clone()
-            };
-            let right_encoded = if let Some(indices) = right_output_projection.as_ref() {
-                match extract_encoded_row_columns(right_bytes, indices.as_ref(), false) {
-                    Ok(Some(encoded)) => encoded,
-                    Ok(None) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            "join right output projection unexpectedly returned null"
-                        );
-                        return Vec::new();
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %projector_graph_id,
-                            error = %err,
-                            "failed to project join right output columns"
-                        );
-                        return Vec::new();
-                    }
-                }
-            } else {
-                right_bytes.clone()
-            };
-            match concat_encoded_rows(&left_encoded, &right_encoded) {
+                };
+            }
+            match concat_encoded_rows(left_bytes, right_bytes) {
                 Ok(encoded) => encoded,
                 Err(err) => {
                     tracing::warn!(
@@ -432,19 +461,27 @@ impl DbspGraphBuilder {
             }
         };
 
-        let join =
-            DbspJoin::new_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
-                &left_join_input,
-                &right_join_input,
-                Some(join_state_namespace.clone()),
-                left_key,
-                right_key,
-                predicate,
-                projector,
-                Some(join_error_handler),
-            )
-            .await
-            .context("initialize DBSP join")?;
+        let join = DbspJoin::new_batch_with_state_namespace::<
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &left_join_input,
+            &right_join_input,
+            Some(join_state_namespace.clone()),
+            left_key,
+            right_key,
+            predicate,
+            projector,
+            Some(join_error_handler),
+        )
+        .await
+        .context("initialize DBSP join")?;
         // Log the first output handles, if any, to verify join activity.
         let mut join_cursor = StreamCursor::new(join.stream().stream());
         if let Ok((ts, handle)) = join_cursor.snapshot().await {
@@ -532,11 +569,16 @@ impl DbspGraphBuilder {
                         err,
                     );
                 });
-                let residual_transform =
-                    move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-                        residual_evaluator.transform_delta(&residual_graph_id, delta_values)
-                    };
-                let residual_filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+                let residual_transform = move |delta_values: Arc<Vec<(Vec<u8>, i64)>>| {
+                    let residual_evaluator = Arc::clone(&residual_evaluator);
+                    let residual_graph_id = residual_graph_id.clone();
+                    async move {
+                        residual_evaluator
+                            .transform_delta_arrow(&residual_graph_id, delta_values)
+                            .await
+                    }
+                };
+                let residual_filter = DbspFilterMap::new_async_batch::<Vec<u8>, Vec<u8>, _, _>(
                     &join_stream,
                     residual_transform,
                     Some(residual_filter_error_handler),
@@ -551,54 +593,40 @@ impl DbspGraphBuilder {
         let mut union_inputs = vec![join_stream];
 
         if matches!(join_type, DbspJoinType::LeftOuter | DbspJoinType::FullOuter) {
-            let antijoin_left_key_columns = left_key_columns_for_outer.clone();
-            let antijoin_right_key_columns = right_key_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
+            let antijoin_left_extractor = Arc::clone(&left_key_extractor);
+            let antijoin_right_extractor = Arc::clone(&right_key_extractor);
 
-            let antijoin_left_key = move |delta_values: &[(Vec<u8>, i64)]| {
-                let mut keyed = Vec::with_capacity(delta_values.len());
-                for (left_bytes, weight) in delta_values {
-                    match extract_encoded_row_columns(
-                        left_bytes,
-                        antijoin_left_key_columns.as_ref(),
-                        true,
-                    ) {
-                        Ok(Some(key)) => keyed.push((key, left_bytes.clone(), *weight)),
-                        Ok(None) => {}
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_left_graph_id,
-                                error = %err,
-                                "failed to extract left outer join anti left key columns"
-                            );
-                        }
+            let antijoin_left_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match antijoin_left_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %antijoin_left_graph_id,
+                            error = %err,
+                            "failed to extract vectorized left outer join anti left key columns"
+                        );
+                        Vec::new()
                     }
-                }
-                keyed
-            };
+                };
 
-            let antijoin_right_key = move |delta_values: &[(Vec<u8>, i64)]| {
-                let mut keyed = Vec::with_capacity(delta_values.len());
-                for (right_bytes, weight) in delta_values {
-                    match extract_encoded_row_columns(
-                        right_bytes,
-                        antijoin_right_key_columns.as_ref(),
-                        true,
-                    ) {
-                        Ok(Some(key)) => keyed.push((key, right_bytes.clone(), *weight)),
-                        Ok(None) => {}
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_right_graph_id,
-                                error = %err,
-                                "failed to extract left outer join anti right key columns"
-                            );
-                        }
+            let antijoin_right_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match antijoin_right_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %antijoin_right_graph_id,
+                            error = %err,
+                            "failed to extract vectorized left outer join anti right key columns"
+                        );
+                        Vec::new()
                     }
-                }
-                keyed
-            };
+                };
 
             let antijoin_events = task_events.clone();
             let antijoin_graph_id = graph_id.clone();
@@ -674,54 +702,40 @@ impl DbspGraphBuilder {
             join_type,
             DbspJoinType::RightOuter | DbspJoinType::FullOuter
         ) {
-            let antijoin_left_key_columns = right_key_columns_for_outer.clone();
-            let antijoin_right_key_columns = left_key_columns_for_outer.clone();
             let antijoin_left_graph_id = graph_id.clone();
             let antijoin_right_graph_id = graph_id.clone();
+            let antijoin_left_extractor = Arc::clone(&right_key_extractor);
+            let antijoin_right_extractor = Arc::clone(&left_key_extractor);
 
-            let antijoin_left_key = move |delta_values: &[(Vec<u8>, i64)]| {
-                let mut keyed = Vec::with_capacity(delta_values.len());
-                for (right_bytes, weight) in delta_values {
-                    match extract_encoded_row_columns(
-                        right_bytes,
-                        antijoin_left_key_columns.as_ref(),
-                        true,
-                    ) {
-                        Ok(Some(key)) => keyed.push((key, right_bytes.clone(), *weight)),
-                        Ok(None) => {}
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_left_graph_id,
-                                error = %err,
-                                "failed to extract right outer join anti right key columns"
-                            );
-                        }
+            let antijoin_left_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match antijoin_left_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %antijoin_left_graph_id,
+                            error = %err,
+                            "failed to extract vectorized right outer join anti right key columns"
+                        );
+                        Vec::new()
                     }
-                }
-                keyed
-            };
+                };
 
-            let antijoin_right_key = move |delta_values: &[(Vec<u8>, i64)]| {
-                let mut keyed = Vec::with_capacity(delta_values.len());
-                for (left_bytes, weight) in delta_values {
-                    match extract_encoded_row_columns(
-                        left_bytes,
-                        antijoin_right_key_columns.as_ref(),
-                        true,
-                    ) {
-                        Ok(Some(key)) => keyed.push((key, left_bytes.clone(), *weight)),
-                        Ok(None) => {}
-                        Err(err) => {
-                            tracing::warn!(
-                                graph_id = %antijoin_right_graph_id,
-                                error = %err,
-                                "failed to extract right outer join anti left key columns"
-                            );
-                        }
+            let antijoin_right_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match antijoin_right_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %antijoin_right_graph_id,
+                            error = %err,
+                            "failed to extract vectorized right outer join anti left key columns"
+                        );
+                        Vec::new()
                     }
-                }
-                keyed
-            };
+                };
 
             let antijoin_events = task_events.clone();
             let antijoin_graph_id = graph_id.clone();
@@ -1189,27 +1203,54 @@ impl DbspGraphBuilder {
         let left_graph_id = graph_id.clone();
         let right_graph_id = graph_id.clone();
         let projector_graph_id = graph_id.clone();
-        let prepared_output_projection = output_projection
-            .as_ref()
-            .map(|columns| PreparedJoinedEncodedRowProjection::try_new(columns.as_ref()))
-            .transpose()
-            .context("prepare transient join output projection")?
-            .map(Arc::new);
-        let left_output_projection = (prepared_output_projection.is_none()
-            && left_join_schema.len() != left_schema.len())
-        .then(|| Arc::new((0..left_schema.len()).collect::<Vec<_>>()));
-        let right_output_projection = (prepared_output_projection.is_none()
-            && right_join_schema.len() != right_schema.len())
-        .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
+        let left_key_extractor = Arc::new(
+            VectorizedEncodedKeyExtractor::new(
+                left_join_schema.to_arrow_schema(),
+                Arc::clone(&left_key_columns),
+            )
+            .context("build vectorized transient left join key extractor")?,
+        );
+        let right_key_extractor = Arc::new(
+            VectorizedEncodedKeyExtractor::new(
+                right_join_schema.to_arrow_schema(),
+                Arc::clone(&right_key_columns),
+            )
+            .context("build vectorized transient right join key extractor")?,
+        );
+        let prepared_output_projection = if let Some(columns) = output_projection.as_ref() {
+            Some(
+                PreparedJoinedEncodedRowProjection::try_new(columns.as_ref())
+                    .context("prepare transient join output projection")?,
+            )
+        } else if left_join_schema.len() != left_schema.len()
+            || right_join_schema.len() != right_schema.len()
+        {
+            let mut columns = Vec::with_capacity(left_schema.len() + right_schema.len());
+            columns.extend(
+                (0..left_schema.len()).map(|index| EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Left,
+                    index,
+                }),
+            );
+            columns.extend(
+                (0..right_schema.len()).map(|index| EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Right,
+                    index,
+                }),
+            );
+            Some(
+                PreparedJoinedEncodedRowProjection::try_new(&columns)
+                    .context("prepare transient join trimmed output projection")?,
+            )
+        } else {
+            None
+        }
+        .map(Arc::new);
 
         let make_projector = {
-            let left_output_projection = left_output_projection.clone();
-            let right_output_projection = right_output_projection.clone();
             let prepared_output_projection = prepared_output_projection.clone();
             let projector_graph_id = projector_graph_id.clone();
             move || {
-                let left_output_projection = left_output_projection.clone();
-                let right_output_projection = right_output_projection.clone();
                 let prepared_output_projection = prepared_output_projection.clone();
                 let projector_graph_id = projector_graph_id.clone();
                 move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
@@ -1230,51 +1271,7 @@ impl DbspGraphBuilder {
                             }
                         };
                     }
-                    let left_encoded = if let Some(indices) = left_output_projection.as_ref() {
-                        match extract_encoded_row_columns(left_bytes, indices.as_ref(), false) {
-                            Ok(Some(encoded)) => encoded,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    graph_id = %projector_graph_id,
-                                    "transient join left output projection unexpectedly returned null"
-                                );
-                                return Vec::new();
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    graph_id = %projector_graph_id,
-                                    error = %err,
-                                    "failed to project transient join left output columns"
-                                );
-                                return Vec::new();
-                            }
-                        }
-                    } else {
-                        left_bytes.clone()
-                    };
-                    let right_encoded = if let Some(indices) = right_output_projection.as_ref() {
-                        match extract_encoded_row_columns(right_bytes, indices.as_ref(), false) {
-                            Ok(Some(encoded)) => encoded,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    graph_id = %projector_graph_id,
-                                    "transient join right output projection unexpectedly returned null"
-                                );
-                                return Vec::new();
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    graph_id = %projector_graph_id,
-                                    error = %err,
-                                    "failed to project transient join right output columns"
-                                );
-                                return Vec::new();
-                            }
-                        }
-                    } else {
-                        right_bytes.clone()
-                    };
-                    match concat_encoded_rows(&left_encoded, &right_encoded) {
+                    match concat_encoded_rows(left_bytes, right_bytes) {
                         Ok(encoded) => encoded,
                         Err(err) => {
                             tracing::warn!(
@@ -1292,63 +1289,78 @@ impl DbspGraphBuilder {
         let observer_graph_id = graph_id.clone();
         let observer_events = task_events.clone();
         let observer_label = format!("transient-join-post-filter:{graph_id}");
-        let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
-            let filtered = if let Some(evaluator) = deferred_residual_evaluator.as_ref() {
-                match evaluator.transform_delta(&observer_graph_id, deltas.as_ref()) {
-                    Ok(filtered) => filtered,
-                    Err(err) => {
-                        report_graph_task_error(
-                            &observer_events,
-                            &observer_graph_id,
-                            observer_label.clone(),
-                            err,
-                        );
-                        Vec::new()
+        let (observer_filter_tx, mut observer_filter_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>();
+        let observer_output_tx = output_tx.clone();
+        let observer_filter_graph_id = observer_graph_id.clone();
+        let observer_filter_events = observer_events.clone();
+        let observer_filter_label = observer_label.clone();
+        let observer_filter_evaluator = deferred_residual_evaluator.clone();
+        tokio::spawn(async move {
+            while let Some((version, deltas)) = observer_filter_rx.recv().await {
+                let filtered = if let Some(evaluator) = observer_filter_evaluator.as_ref() {
+                    match evaluator
+                        .transform_delta_arrow(&observer_filter_graph_id, deltas)
+                        .await
+                    {
+                        Ok(filtered) => filtered,
+                        Err(err) => {
+                            report_graph_task_error(
+                                &observer_filter_events,
+                                &observer_filter_graph_id,
+                                observer_filter_label.clone(),
+                                err,
+                            );
+                            Vec::new()
+                        }
                     }
+                } else {
+                    deltas.as_ref().clone()
+                };
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    eprintln!(
+                        "transient-join-output graph_id={} version={} rows={}",
+                        observer_filter_graph_id,
+                        version,
+                        filtered.len()
+                    );
                 }
-            } else {
-                deltas.as_ref().clone()
-            };
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                eprintln!(
-                    "transient-join-output graph_id={} version={} rows={}",
-                    observer_graph_id,
+                let _ = observer_output_tx.send(TransientMaterializeBatch {
                     version,
-                    filtered.len()
-                );
+                    deltas: Arc::new(filtered),
+                    deltas_consolidated: false,
+                });
             }
-            let _ = output_tx.send(TransientMaterializeBatch {
-                version,
-                deltas: Arc::new(filtered),
-                deltas_consolidated: false,
-            });
+        });
+        let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
+            let _ = observer_filter_tx.send((version, deltas));
         });
 
-        let left_key = move |left_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            match extract_encoded_row_columns(left_bytes, left_key_columns.as_ref(), true) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %left_graph_id,
-                        error = %err,
-                        "failed to extract join left key columns"
-                    );
-                    None
-                }
+        let left_key = move |delta_values: &[(Vec<u8>, i64)]| match left_key_extractor
+            .extract_keyed_deltas(delta_values)
+        {
+            Ok(keyed) => keyed,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %left_graph_id,
+                    error = %err,
+                    "failed to extract vectorized transient join left key columns"
+                );
+                Vec::new()
             }
         };
 
-        let right_key = move |right_bytes: &Vec<u8>| -> Option<Vec<u8>> {
-            match extract_encoded_row_columns(right_bytes, right_key_columns.as_ref(), true) {
-                Ok(selected) => selected,
-                Err(err) => {
-                    tracing::warn!(
-                        graph_id = %right_graph_id,
-                        error = %err,
-                        "failed to extract join right key columns"
-                    );
-                    None
-                }
+        let right_key = move |delta_values: &[(Vec<u8>, i64)]| match right_key_extractor
+            .extract_keyed_deltas(delta_values)
+        {
+            Ok(keyed) => keyed,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %right_graph_id,
+                    error = %err,
+                    "failed to extract vectorized transient join right key columns"
+                );
+                Vec::new()
             }
         };
 

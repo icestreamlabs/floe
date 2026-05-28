@@ -12,6 +12,7 @@ use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
 use dbsp::stream::util::DeltaZSetHandleReader;
 use dbsp::stream::{DeltaHandleStream, StreamCursor};
+use futures::future::BoxFuture;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -38,7 +39,7 @@ const MV_OPTIMIZATION_LOG_SAMPLE_EVERY: u64 = 64;
 const MV_OPTIMIZATION_LOG_MIN_TOTAL_MS: u64 = 250;
 
 pub(super) type DeltaTransformFn =
-    dyn Fn(&[(Vec<u8>, i64)]) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync;
+    dyn Fn(EncodedDeltaBatch) -> BoxFuture<'static, Result<Vec<(Vec<u8>, i64)>>> + Send + Sync;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TransientMaterializeBatch {
@@ -1693,8 +1694,9 @@ impl DbspGraphBuilder {
         let raw_delta_rows = deltas.len();
         let transform_start = Instant::now();
         if let Some(transform) = delta_transform {
-            deltas =
-                transform(&deltas).context("apply transient transform before materialized view")?;
+            deltas = transform(Arc::new(deltas))
+                .await
+                .context("apply transient transform before materialized view")?;
         }
         let transform_ms = transform_start.elapsed().as_millis() as u64;
 
@@ -1779,7 +1781,8 @@ impl DbspGraphBuilder {
             .sum();
         let (merged, transform_ms) = if let Some(transform) = delta_transform {
             let transform_start = Instant::now();
-            let merged = transform(batch.deltas.as_ref())
+            let merged = transform(Arc::clone(&batch.deltas))
+                .await
                 .context("apply transient transform before materialized view")?;
             (
                 Arc::new(merged),

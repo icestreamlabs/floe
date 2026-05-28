@@ -141,7 +141,27 @@ where
     where
         I: IntoIterator<Item = (K, i64)>,
     {
+        let mut coalesced: HashMap<K, i64> = HashMap::new();
         for (key, weight) in deltas {
+            if weight == 0 {
+                continue;
+            }
+            match coalesced.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let next = entry.get().saturating_add(weight);
+                    if next == 0 {
+                        entry.remove();
+                    } else {
+                        *entry.get_mut() = next;
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(weight);
+                }
+            }
+        }
+
+        for (key, weight) in coalesced {
             self.add_delta(key, weight);
         }
     }

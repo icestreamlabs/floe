@@ -20,8 +20,11 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{compute_delta, delta_zset_handle_batch, publish_transient_zset_batch};
 
+#[cfg(test)]
 type PartitionKeyFn<K, P> = Arc<dyn Fn(&K) -> Option<P> + Send + Sync>;
+#[cfg(test)]
 type OrderKeyFn<K, O> = Arc<dyn Fn(&K) -> Option<O> + Send + Sync>;
+#[cfg(test)]
 type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
 type BatchKeyPartsFn<K, P, O> =
     Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
@@ -75,6 +78,7 @@ where
     P: Ord + Clone + Send + Sync + 'static,
     O: Ord + Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
     pub fn new(
         state: RelationState<K>,
         table: Arc<dyn KeyValueTable>,
@@ -88,6 +92,7 @@ where
         Self::new_with_key_extractor(state, table, output, key_parts, limit, offset)
     }
 
+    #[cfg(test)]
     pub fn new_with_key_extractor(
         state: RelationState<K>,
         table: Arc<dyn KeyValueTable>,

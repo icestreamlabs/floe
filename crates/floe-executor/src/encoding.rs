@@ -129,11 +129,23 @@ pub(crate) fn extract_encoded_row_scalars(
     bytes: &[u8],
     indices: &[usize],
 ) -> Result<Vec<Option<EncodedRowScalar>>> {
-    if indices.is_empty() {
-        return Ok(Vec::new());
-    }
+    let mut decoded = Vec::new();
+    decode_encoded_row_scalars_into(bytes, indices, &mut decoded)?;
+    Ok(decoded)
+}
+
+pub(crate) fn decode_encoded_row_scalars_into(
+    bytes: &[u8],
+    indices: &[usize],
+    decoded: &mut Vec<Option<EncodedRowScalar>>,
+) -> Result<()> {
+    decoded.clear();
+    decoded.resize(indices.len(), None);
 
     let count = encoded_row_column_count(bytes)?;
+    if indices.is_empty() {
+        return Ok(());
+    }
     if indices.iter().any(|index| *index >= count) {
         return Err(anyhow!(
             "encoded row has {count} columns but a requested index was out of bounds"
@@ -147,7 +159,6 @@ pub(crate) fn extract_encoded_row_scalars(
         .collect::<Vec<_>>();
     requested.sort_unstable_by_key(|(index, _)| *index);
 
-    let mut decoded = vec![None; indices.len()];
     let mut request_idx = 0usize;
     let mut cursor = 4usize;
 
@@ -167,7 +178,7 @@ pub(crate) fn extract_encoded_row_scalars(
         cursor = end;
     }
 
-    Ok(decoded)
+    Ok(())
 }
 
 pub fn decode_all_encoded_row_scalars(bytes: &[u8]) -> Result<Vec<Option<EncodedRowScalar>>> {
@@ -310,7 +321,7 @@ pub(crate) fn project_joined_encoded_rows(
     project_joined_encoded_rows_prepared(left, right, &plan)
 }
 
-fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
+pub(crate) fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < 4 {
         return Err(anyhow!("encoded key too short"));
     }

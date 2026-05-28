@@ -22,7 +22,7 @@ pub(super) fn build_transient_source_receiver(
                     let Some(batch) = maybe_batch else {
                         break;
                     };
-                    let input_deltas = match input_transform(batch.deltas.as_ref()) {
+                    let input_deltas = match input_transform(Arc::clone(&batch.deltas)).await {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -65,7 +65,7 @@ pub(super) fn build_transient_transform_receiver(
                     let Some(batch) = maybe_batch else {
                         break;
                     };
-                    let output_deltas = match transform(batch.deltas.as_ref()) {
+                    let output_deltas = match transform(Arc::clone(&batch.deltas)).await {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);

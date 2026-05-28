@@ -90,6 +90,7 @@ pub struct TransientIncrementalAggregateSnapshot<K, V> {
 }
 
 impl DbspIncrementalAggregate {
+    #[cfg(test)]
     pub async fn new<K, V, FRow>(
         input: &DeltaHandleStream,
         row_evaluator: FRow,
@@ -328,6 +329,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[cfg(test)]
     pub async fn new<FRow>(
         row_evaluator: FRow,
         slot_kinds: Vec<IncrementalAggregateSlotKind>,

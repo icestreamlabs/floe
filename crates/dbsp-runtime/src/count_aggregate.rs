@@ -103,6 +103,7 @@ pub struct TransientCountAggregateSnapshot<K, D> {
 }
 
 impl DbspCountAggregate {
+    #[cfg(test)]
     pub async fn new<K, V, D, FRow>(
         input: &DeltaHandleStream,
         row_evaluator: FRow,
@@ -396,6 +397,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[cfg(test)]
     pub async fn new<FRow>(
         row_evaluator: FRow,
         slot_kinds: Vec<CountAggregateSlotKind>,

@@ -18,7 +18,9 @@ use crate::storage::KeyValueTable;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 
+#[cfg(test)]
 type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
+type BatchKeyExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
 /// Aggregate specification used by `AggregateOp`.
@@ -278,6 +280,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[cfg(test)]
     pub fn new(
         state: RelationState<(K, A)>,
         index: IndexedBatchZSet<K, V>,
@@ -286,8 +289,27 @@ where
         spec: AggregateSpec<K, V, A>,
         output: crate::collections::zset::VersionedZSet<(K, A)>,
     ) -> Self {
+        let key_extractor = Arc::new(move |deltas: &[(V, i64)]| {
+            deltas
+                .iter()
+                .filter_map(|(row, weight)| {
+                    key_extractor(row).map(|key| (key, row.clone(), *weight))
+                })
+                .collect()
+        });
+        Self::new_batch(state, index, table, key_extractor, spec, output)
+    }
+
+    pub fn new_batch(
+        state: RelationState<(K, A)>,
+        index: IndexedBatchZSet<K, V>,
+        table: Arc<dyn KeyValueTable>,
+        key_extractor: BatchKeyExtractor<V, K>,
+        spec: AggregateSpec<K, V, A>,
+        output: crate::collections::zset::VersionedZSet<(K, A)>,
+    ) -> Self {
         let aggregator = spec.aggregator.clone();
-        let inner = GroupByOp::new(state, index, table, key_extractor, aggregator, output);
+        let inner = GroupByOp::new_batch(state, index, table, key_extractor, aggregator, output);
         Self { spec, inner }
     }
 

@@ -26,6 +26,9 @@ use crate::stream::util::{
     build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
+type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
+type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
+
 /// Window aggregate wrapper that drives WindowAggregateOp over handle streams.
 pub struct DbspWindowAggregate {
     stream: DeltaHandleStream,
@@ -33,6 +36,7 @@ pub struct DbspWindowAggregate {
 
 impl DbspWindowAggregate {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn new<K, V, A, FKey, FAgg, FTime>(
         input: &DeltaHandleStream,
         key_extractor: FKey,
@@ -76,6 +80,70 @@ impl DbspWindowAggregate {
         FAgg: Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync + 'static,
         FTime: Fn(&V) -> Option<i64> + Send + Sync + 'static,
     {
+        Self::new_with_batch_extractor(
+            input,
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(row, weight)| {
+                        let event_ts = time_extractor(row)?;
+                        let key = key_extractor(row)?;
+                        Some((row.clone(), *weight, key, event_ts))
+                    })
+                    .collect()
+            },
+            aggregator,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_batch_extractor<K, V, A, FWindow, FAgg>(
+        input: &DeltaHandleStream,
+        window_extractor: FWindow,
+        aggregator: FAgg,
+        window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        A: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FWindow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
+        FAgg: Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -102,19 +170,20 @@ impl DbspWindowAggregate {
             DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
 
-        let window_op = Arc::new(AsyncMutex::new(WindowAggregateOp::new(
-            state,
-            index,
-            table.clone(),
-            Arc::new(key_extractor),
-            Arc::new(time_extractor),
-            Arc::new(aggregator),
-            output,
-            window_size,
-            window_slide,
-            allowed_lateness_ms,
-            watermark,
-        )?));
+        let window_op = Arc::new(AsyncMutex::new(
+            WindowAggregateOp::new_with_batch_extractor(
+                state,
+                index,
+                table.clone(),
+                Arc::new(window_extractor) as BatchWindowExtractor<V, K>,
+                Arc::new(aggregator) as Aggregator<K, V, A>,
+                output,
+                window_size,
+                window_slide,
+                allowed_lateness_ms,
+                watermark,
+            )?,
+        ));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
             default: empty_handle.clone(),

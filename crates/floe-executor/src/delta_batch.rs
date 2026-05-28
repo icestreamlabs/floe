@@ -2,13 +2,18 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use datafusion::arrow::array::ArrayRef;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 
 use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 
-use crate::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars_into};
+use crate::encoding::{
+    EncodedRowScalar, decode_all_encoded_row_scalars_into, decode_encoded_row_scalars_into,
+};
 use crate::metrics;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::stream_types::Diff;
@@ -39,6 +44,8 @@ pub struct DeltaBatchBuffer {
     base_schema: SchemaRef,
     delta_schema: SchemaRef,
     config: DeltaBatchConfig,
+    input_columns: Option<Arc<[usize]>>,
+    computed_key_columns: Option<Arc<[usize]>>,
     columns: Vec<ScalarColumnBuilder>,
     row_count: usize,
     weights: Vec<Diff>,
@@ -51,6 +58,57 @@ impl DeltaBatchBuffer {
     pub fn new(
         base_schema: SchemaRef,
         include_key: bool,
+        config: DeltaBatchConfig,
+    ) -> Result<Self> {
+        Self::new_with_input_columns(base_schema, None, include_key, None, false, config)
+    }
+
+    pub fn new_keyed(
+        base_schema: SchemaRef,
+        key_columns: Arc<[usize]>,
+        config: DeltaBatchConfig,
+    ) -> Result<Self> {
+        for column in key_columns.iter().copied() {
+            if column >= base_schema.fields().len() {
+                bail!(
+                    "key column {} is outside schema width {}",
+                    column,
+                    base_schema.fields().len()
+                );
+            }
+        }
+        Self::new_with_input_columns(base_schema, None, true, Some(key_columns), false, config)
+    }
+
+    pub fn new_projected(
+        base_schema: SchemaRef,
+        input_columns: Arc<[usize]>,
+        include_key: bool,
+        config: DeltaBatchConfig,
+    ) -> Result<Self> {
+        if base_schema.fields().len() != input_columns.len() {
+            bail!(
+                "projected delta buffer schema has {} fields but {} input columns were requested",
+                base_schema.fields().len(),
+                input_columns.len()
+            );
+        }
+        Self::new_with_input_columns(
+            base_schema,
+            Some(input_columns),
+            include_key,
+            None,
+            true,
+            config,
+        )
+    }
+
+    fn new_with_input_columns(
+        base_schema: SchemaRef,
+        input_columns: Option<Arc<[usize]>>,
+        include_key: bool,
+        computed_key_columns: Option<Arc<[usize]>>,
+        payload_nullable: bool,
         config: DeltaBatchConfig,
     ) -> Result<Self> {
         if base_schema.index_of(WEIGHT_COLUMN_NAME).is_ok()
@@ -66,7 +124,14 @@ impl DeltaBatchBuffer {
         let mut fields: Vec<Field> = base_schema
             .fields()
             .iter()
-            .map(|field| (**field).clone())
+            .map(|field| {
+                let field = (**field).clone();
+                if payload_nullable {
+                    field.with_nullable(true)
+                } else {
+                    field
+                }
+            })
             .collect();
         if include_key {
             fields.push(Field::new(KEY_COLUMN_NAME, DataType::Binary, false));
@@ -84,6 +149,8 @@ impl DeltaBatchBuffer {
             base_schema,
             delta_schema,
             config,
+            input_columns,
+            computed_key_columns,
             columns,
             row_count: 0,
             weights: Vec::new(),
@@ -102,7 +169,11 @@ impl DeltaBatchBuffer {
         if weight == 0 {
             return Ok(None);
         }
-        decode_all_encoded_row_scalars_into(&row, &mut self.decode_scratch)?;
+        if let Some(input_columns) = self.input_columns.as_ref() {
+            decode_encoded_row_scalars_into(&row, input_columns, &mut self.decode_scratch)?;
+        } else {
+            decode_all_encoded_row_scalars_into(&row, &mut self.decode_scratch)?;
+        }
         if self.decode_scratch.len() != self.base_schema.fields().len() {
             return Err(anyhow!(
                 "encoded row has {} columns but schema has {}",
@@ -111,14 +182,16 @@ impl DeltaBatchBuffer {
             ));
         }
 
-        match (&mut self.keys, key) {
-            (Some(keys), Some(key)) => {
+        match (&mut self.keys, key, self.computed_key_columns.is_some()) {
+            (Some(_), Some(_), true) => bail!("delta buffer computes key bytes from Arrow columns"),
+            (Some(keys), Some(key), false) => {
                 self.estimated_bytes += key.len();
                 keys.push(key);
             }
-            (Some(_), None) => bail!("delta buffer expects key bytes"),
-            (None, Some(_)) => bail!("delta buffer does not accept keys"),
-            (None, None) => {}
+            (Some(_), None, false) => bail!("delta buffer expects key bytes"),
+            (Some(_), None, true) => {}
+            (None, Some(_), _) => bail!("delta buffer does not accept keys"),
+            (None, None, _) => {}
         }
 
         self.estimated_bytes += estimate_encoded_row_bytes(&row);
@@ -161,6 +234,7 @@ impl DeltaBatchBuffer {
             return Ok(None);
         }
 
+        let rows = self.row_count;
         let mut arrays: Vec<ArrayRef> = self
             .columns
             .iter_mut()
@@ -169,9 +243,17 @@ impl DeltaBatchBuffer {
             .collect::<Result<_>>()?;
 
         if let Some(keys) = self.keys.as_mut() {
-            let mut key_builder = ScalarColumnBuilder::new(&DataType::Binary, keys.len())?;
-            for key in keys.drain(..) {
-                key_builder.append_binary_value(&key)?;
+            let mut key_builder = ScalarColumnBuilder::new(&DataType::Binary, rows)?;
+            if let Some(key_columns) = self.computed_key_columns.as_ref() {
+                for row_idx in 0..rows {
+                    let key = encode_arrow_key_columns(&arrays, key_columns, row_idx)?;
+                    self.estimated_bytes += key.len();
+                    key_builder.append_binary_value(&key)?;
+                }
+            } else {
+                for key in keys.drain(..) {
+                    key_builder.append_binary_value(&key)?;
+                }
             }
             arrays.push(key_builder.finish_array());
         }
@@ -195,6 +277,84 @@ impl DeltaBatchBuffer {
 
         Ok(Some(batch))
     }
+}
+
+fn encode_arrow_key_columns(
+    arrays: &[ArrayRef],
+    key_columns: &[usize],
+    row_idx: usize,
+) -> Result<Vec<u8>> {
+    let count = u32::try_from(key_columns.len()).map_err(|_| anyhow!("too many key columns"))?;
+    let mut encoded = Vec::with_capacity(4 + key_columns.len().saturating_mul(16));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for column in key_columns {
+        let array = arrays
+            .get(*column)
+            .ok_or_else(|| anyhow!("key column {column} is outside materialized batch"))?;
+        if array.is_null(row_idx) {
+            bail!("key column {column} evaluated to NULL");
+        }
+        append_arrow_key_value(array.as_ref(), row_idx, &mut encoded)?;
+    }
+    Ok(encoded)
+}
+
+fn append_arrow_key_value(array: &dyn Array, row_idx: usize, encoded: &mut Vec<u8>) -> Result<()> {
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 key array"))?;
+            encoded.push(0x01);
+            encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected Utf8 key array"))?;
+            encoded.push(0x02);
+            let bytes = values.value(row_idx).as_bytes();
+            let len = u32::try_from(bytes.len()).map_err(|_| anyhow!("utf8 key too large"))?;
+            encoded.extend_from_slice(&len.to_le_bytes());
+            encoded.extend_from_slice(bytes);
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow!("expected TimestampMillisecond key array"))?;
+            encoded.push(0x03);
+            encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("expected Boolean key array"))?;
+            encoded.push(0x04);
+            encoded.push(u8::from(values.value(row_idx)));
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| anyhow!("expected Date32 key array"))?;
+            encoded.push(0x09);
+            encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+        }
+        DataType::Decimal128(_, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| anyhow!("expected Decimal128 key array"))?;
+            encoded.push(0x0B);
+            encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+        }
+        other => bail!("unsupported Arrow key type: {other:?}"),
+    }
+    Ok(())
 }
 
 fn initial_column_capacity(config: &DeltaBatchConfig) -> usize {

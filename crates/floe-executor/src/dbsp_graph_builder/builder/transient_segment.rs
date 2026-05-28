@@ -58,7 +58,11 @@ fn build_transient_segment_optimization_from_spec(
     let evaluators = Arc::new(evaluators);
     let graph_id = graph_id.to_string();
     let transform: Arc<DeltaTransformFn> = Arc::new(move |deltas| {
-        apply_transient_segment_vectorized(&graph_id, evaluators.as_ref(), deltas)
+        let graph_id = graph_id.clone();
+        let evaluators = Arc::clone(&evaluators);
+        Box::pin(async move {
+            apply_transient_segment_vectorized(&graph_id, evaluators.as_ref(), deltas).await
+        })
     });
 
     Ok(TransientSegmentOptimization {
@@ -70,20 +74,24 @@ fn build_transient_segment_optimization_from_spec(
     })
 }
 
-fn apply_transient_segment_vectorized(
+async fn apply_transient_segment_vectorized(
     graph_id: &str,
     evaluators: &[VectorizedFilterProjectEvaluator],
-    deltas: &[(Vec<u8>, i64)],
+    deltas: Arc<Vec<(Vec<u8>, i64)>>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
     if evaluators.is_empty() {
-        return Ok(deltas.to_vec());
+        return Ok(deltas.as_ref().clone());
     }
-    let mut deltas = evaluators[0].transform_delta(graph_id, deltas)?;
+    let mut deltas = evaluators[0]
+        .transform_delta_arrow(graph_id, Arc::clone(&deltas))
+        .await?;
     for evaluator in &evaluators[1..] {
         if deltas.is_empty() {
             break;
         }
-        deltas = evaluator.transform_delta(graph_id, &deltas)?;
+        deltas = evaluator
+            .transform_delta_arrow(graph_id, Arc::new(deltas))
+            .await?;
     }
     Ok(deltas)
 }

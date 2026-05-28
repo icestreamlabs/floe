@@ -128,8 +128,10 @@ fn append_only_direct_top1_retains_only_partition_winner() {
     let row_30 = encode_event(&decoder, bid_event_payload(1, 101, 30), "nexmark_bid");
     let row_20 = encode_event(&decoder, bid_event_payload(1, 102, 20), "nexmark_bid");
     let row_40 = encode_event(&decoder, bid_event_payload(1, 103, 40), "nexmark_bid");
+    let topn = test_topn_node(1, 0);
     let mut processor = TransientDirectTop1Processor::new(
         "test-graph",
+        &topn,
         TransientDirectTop1Config {
             partition_layout: TransientDirectTop1PartitionLayout::One(0),
             order_idx: 2,
@@ -949,7 +951,8 @@ fn transient_filter_map_transform_accepts_rows_when_project_schema_is_stale() {
 
     let decoder = SourceRowDecoder::new(nexmark_bid_source_definition());
     let encoded = encode_event(&decoder, bid_event_payload(9, 101, 1000), "nexmark_bid");
-    let transformed = transform(&[(encoded, 1)]).expect("transform rows");
+    let transformed = futures::executor::block_on(transform(Arc::new(vec![(encoded, 1)])))
+        .expect("transform rows");
     assert_eq!(transformed.len(), 1);
 
     let mut decoded = Vec::new();
@@ -1164,8 +1167,11 @@ async fn q20_filtered_unique_auction_side_emits_closed_join_keys() {
         auction_event_payload(2, 200, 5),
         "nexmark_auction",
     );
-    let closed_keys =
-        closed_key_transform(&[(matching, 1), (nonmatching.clone(), 1)]).expect("closed keys");
+    let closed_keys = futures::executor::block_on(closed_key_transform(Arc::new(vec![
+        (matching, 1),
+        (nonmatching.clone(), 1),
+    ])))
+    .expect("closed keys");
     let expected_key = extract_encoded_row_columns(&nonmatching, right_key_columns.as_ref(), true)
         .expect("extract nonmatching auction key")
         .expect("nonmatching auction key");
@@ -1224,9 +1230,12 @@ async fn q16_transient_aggregate_precompute_accepts_pruned_bid_rows() {
         Some(Arc::clone(&bid_mask)),
     );
     let encoded = encode_event(&bid_decoder, bid_event_payload(7, 42, 9_999), "nexmark_bid");
-    let source_deltas = (shape.source_root.transform)(&[(encoded, 1)]).expect("source transform");
+    let source_deltas = (shape.source_root.transform)(Arc::new(vec![(encoded, 1)]))
+        .await
+        .expect("source transform");
     let precomputed = precompute_evaluator
-        .transform_delta("benchmark_result", &source_deltas)
+        .transform_delta_arrow("benchmark_result", Arc::new(source_deltas))
+        .await
         .expect("precompute q16 pruned bid row");
     assert_eq!(precomputed.len(), 1);
 
@@ -1294,13 +1303,16 @@ async fn q16_transient_incremental_aggregate_emits_utf8_group_keys() {
         "nexmark_bid",
     );
 
-    let source_deltas = (shape.source_root.transform)(&[(encoded_one, 1), (encoded_two, 1)])
-        .expect("source transform");
+    let source_deltas =
+        (shape.source_root.transform)(Arc::new(vec![(encoded_one, 1), (encoded_two, 1)]))
+            .await
+            .expect("source transform");
     let precomputed = precompute_evaluator
-        .transform_delta("benchmark_result", &source_deltas)
+        .transform_delta_arrow("benchmark_result", Arc::new(source_deltas))
+        .await
         .expect("precompute q16 rows");
 
-    let row_evaluator = build_incremental_aggregate_row_evaluator(
+    let row_evaluator = build_incremental_aggregate_batch_row_evaluator(
         Arc::clone(&aggregate_input_schema),
         shape.aggregate.group_keys().to_vec(),
         shape.aggregate.aggregates().to_vec(),
@@ -1308,7 +1320,7 @@ async fn q16_transient_incremental_aggregate_emits_utf8_group_keys() {
         "benchmark_result".to_string(),
         "transient_aggregate",
     );
-    let aggregate = dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new(
+    let aggregate = dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new_batch(
         row_evaluator,
         build_incremental_aggregate_slot_kinds(shape.aggregate.aggregates())
             .expect("incremental aggregate slot kinds"),
@@ -2068,17 +2080,39 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         crate::encoding::concat_encoded_rows(left_bytes, right_bytes).unwrap_or_default()
     };
 
-    let canonical_join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
-        &left_stream,
-        &right_stream,
-        left_key.clone(),
-        right_key.clone(),
-        predicate,
-        projector,
-        None,
-    )
-    .await
-    .expect("canonical join");
+    let canonical_join =
+        DbspJoin::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
+            &left_stream,
+            &right_stream,
+            None,
+            {
+                let left_key = left_key.clone();
+                move |deltas: &[(Vec<u8>, i64)]| {
+                    deltas
+                        .iter()
+                        .filter_map(|(row, weight)| {
+                            left_key(row).map(|key| (key, row.clone(), *weight))
+                        })
+                        .collect()
+                }
+            },
+            {
+                let right_key = right_key.clone();
+                move |deltas: &[(Vec<u8>, i64)]| {
+                    deltas
+                        .iter()
+                        .filter_map(|(row, weight)| {
+                            right_key(row).map(|key| (key, row.clone(), *weight))
+                        })
+                        .collect()
+                }
+            },
+            predicate,
+            projector,
+            None,
+        )
+        .await
+        .expect("canonical join");
     let mut canonical_cursor = StreamCursor::new(canonical_join.stream().stream());
     let _ = canonical_cursor
         .snapshot()
@@ -2131,8 +2165,9 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
             1,
         ),
     ];
-    let transformed_right_tick1 =
-        (right_transient.transform)(&auction_batch).expect("transform auction batch");
+    let transformed_right_tick1 = (right_transient.transform)(Arc::new(auction_batch.clone()))
+        .await
+        .expect("transform auction batch");
     right_transient_tx
         .send(TransientJoinInputBatch {
             ts: 1,
@@ -2169,10 +2204,11 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
     let build_tick_delta = if let Some(evaluator) = residual_evaluator.as_ref() {
         consolidate_encoded_deltas(
             evaluator
-                .transform_delta(
+                .transform_delta_arrow(
                     "benchmark_join_build_tick_residual",
-                    &build_tick_delta.into_iter().collect::<Vec<_>>(),
+                    Arc::new(build_tick_delta.into_iter().collect::<Vec<_>>()),
                 )
+                .await
                 .expect("apply benchmark join build tick residual filter"),
         )
     } else {
@@ -2211,7 +2247,9 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
                 1,
             ),
         ];
-        let transformed_left = (left_transient.transform)(&bid_batch).expect("transform bid batch");
+        let transformed_left = (left_transient.transform)(Arc::new(bid_batch.clone()))
+            .await
+            .expect("transform bid batch");
         if tick != 16 {
             left_transient_tx
                 .send(TransientJoinInputBatch {
@@ -2252,10 +2290,11 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
             consolidate_encoded_deltas(
                 evaluator
-                    .transform_delta(
+                    .transform_delta_arrow(
                         "benchmark_join_tick_residual",
-                        &actual.into_iter().collect::<Vec<_>>(),
+                        Arc::new(actual.into_iter().collect::<Vec<_>>()),
                     )
+                    .await
                     .expect("apply benchmark join residual filter"),
             )
         } else {
@@ -2280,7 +2319,8 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         };
         let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
             evaluator
-                .transform_delta("benchmark_join_tick_residual", &transient_raw)
+                .transform_delta_arrow("benchmark_join_tick_residual", Arc::new(transient_raw))
+                .await
                 .expect("apply benchmark transient join residual filter")
         } else {
             transient_raw
@@ -2481,19 +2521,41 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
     };
     let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
 
-    let canonical_join = DbspJoin::new::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
-        &left_stream,
-        &right_stream,
-        left_key.clone(),
-        right_key.clone(),
-        predicate,
-        |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
-            crate::encoding::concat_encoded_rows(left_bytes, right_bytes).unwrap_or_default()
-        },
-        None,
-    )
-    .await
-    .expect("canonical join");
+    let canonical_join =
+        DbspJoin::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
+            &left_stream,
+            &right_stream,
+            None,
+            {
+                let left_key = left_key.clone();
+                move |deltas: &[(Vec<u8>, i64)]| {
+                    deltas
+                        .iter()
+                        .filter_map(|(row, weight)| {
+                            left_key(row).map(|key| (key, row.clone(), *weight))
+                        })
+                        .collect()
+                }
+            },
+            {
+                let right_key = right_key.clone();
+                move |deltas: &[(Vec<u8>, i64)]| {
+                    deltas
+                        .iter()
+                        .filter_map(|(row, weight)| {
+                            right_key(row).map(|key| (key, row.clone(), *weight))
+                        })
+                        .collect()
+                }
+            },
+            predicate,
+            |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+                crate::encoding::concat_encoded_rows(left_bytes, right_bytes).unwrap_or_default()
+            },
+            None,
+        )
+        .await
+        .expect("canonical join");
     let mut canonical_cursor = StreamCursor::new(canonical_join.stream().stream());
     let _ = canonical_cursor
         .snapshot()
@@ -2571,10 +2633,11 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
     let build_tick_delta = if let Some(evaluator) = residual_evaluator.as_ref() {
         consolidate_encoded_deltas(
             evaluator
-                .transform_delta(
+                .transform_delta_arrow(
                     "benchmark_join_source_task_build_tick_residual",
-                    &build_tick_delta.into_iter().collect::<Vec<_>>(),
+                    Arc::new(build_tick_delta.into_iter().collect::<Vec<_>>()),
                 )
+                .await
                 .expect("apply benchmark source-task join build tick residual filter"),
         )
     } else {
@@ -2636,10 +2699,11 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         let actual = if let Some(evaluator) = residual_evaluator.as_ref() {
             consolidate_encoded_deltas(
                 evaluator
-                    .transform_delta(
+                    .transform_delta_arrow(
                         "benchmark_join_source_task_tick_residual",
-                        &actual.into_iter().collect::<Vec<_>>(),
+                        Arc::new(actual.into_iter().collect::<Vec<_>>()),
                     )
+                    .await
                     .expect("apply benchmark source-task join residual filter"),
             )
         } else {
@@ -2663,7 +2727,11 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         };
         let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
             evaluator
-                .transform_delta("benchmark_join_source_task_tick_residual", &transient_raw)
+                .transform_delta_arrow(
+                    "benchmark_join_source_task_tick_residual",
+                    Arc::new(transient_raw),
+                )
+                .await
                 .expect("apply benchmark source-task transient join residual filter")
         } else {
             transient_raw
@@ -3089,7 +3157,8 @@ async fn assert_tick_matches_transform(
     let actual = materialize_zset_handle::<Vec<u8>>(Arc::clone(table), &mut cache, &handle)
         .await
         .expect("materialize child handle");
-    let expected = consolidate_encoded_deltas(transform(&source_batch).expect("transform"));
+    let expected =
+        consolidate_encoded_deltas(transform(Arc::new(source_batch)).await.expect("transform"));
     assert_eq!(actual, expected, "{label}");
 }
 
@@ -3132,6 +3201,7 @@ fn encode_event(decoder: &SourceRowDecoder, payload: Value, source: &str) -> Vec
 
 fn test_topn_key_layout() -> TransientTopNKeyLayout {
     TransientTopNKeyLayout {
+        input_schema: nexmark_bid_table().schema().clone(),
         partition_columns: Arc::new(vec![0]),
         order_columns: Arc::new(vec![2]),
         order_types: Arc::new(vec![DbspScalarType::Int64]),

@@ -444,6 +444,7 @@ where
 
 impl DbspWindowCountStarAggregate {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn new<K, V, FRow>(
         input: &DeltaHandleStream,
         row_extractor: FRow,

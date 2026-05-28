@@ -19,6 +19,7 @@ use dbsp::{
     CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
     DbspNodeKind, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
 };
+use futures::future::BoxFuture;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -28,17 +29,20 @@ use crate::dbsp_plan::{
 };
 use crate::delta_consolidation::ConsolidationMode;
 use crate::encoding::{
-    EncodedRowProjectionColumn, EncodedRowProjectionSource, EncodedRowScalar, concat_encoded_rows,
-    extract_encoded_row_columns, extract_encoded_row_columns_and_i64_like_column,
-    extract_encoded_row_scalar,
+    EncodedRowProjectionColumn, EncodedRowProjectionSource, concat_encoded_rows,
+    extract_encoded_row_columns,
 };
 use crate::materialized_view::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
+use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
 
+#[cfg(test)]
+use super::compile::build_incremental_aggregate_row_evaluator;
 use super::compile::{
-    build_count_aggregate_slot_kinds, build_count_row_evaluator,
-    build_incremental_aggregate_row_evaluator, build_incremental_aggregate_slot_kinds,
+    build_count_aggregate_slot_kinds, build_count_batch_row_evaluator,
+    build_incremental_aggregate_batch_row_evaluator, build_incremental_aggregate_slot_kinds,
+    build_prekeyed_incremental_aggregate_batch_row_evaluator,
 };
 use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
 use super::persistence_policy::{
@@ -48,8 +52,10 @@ use super::vectorized_filter_project::{
     VectorizedFilterProjectEvaluator, required_encoded_input_columns,
 };
 
-type ClosedJoinKeyTransformFn =
-    dyn Fn(&[(Vec<u8>, i64)]) -> Result<Vec<(Vec<u8>, i64)>> + Send + Sync + 'static;
+type ClosedJoinKeyTransformFn = dyn Fn(Arc<Vec<(Vec<u8>, i64)>>) -> BoxFuture<'static, Result<Vec<(Vec<u8>, i64)>>>
+    + Send
+    + Sync
+    + 'static;
 
 /// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
 pub struct DbspGraphBuilder {
@@ -786,8 +792,7 @@ impl DbspGraphBuilder {
         )
         .await?;
 
-        let identity_transform: Arc<DeltaTransformFn> =
-            Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()));
+        let identity_transform = identity_delta_transform();
         let mut current_output_append_only = false;
         for (step_idx, step) in root.steps.iter().enumerate() {
             receiver = match step {
@@ -1600,7 +1605,7 @@ fn try_build_transient_join_input_optimization(
                     let Some(batch) = maybe_batch else {
                         break;
                     };
-                    let transformed = match transform(batch.deltas.as_ref()) {
+                    let transformed = match transform(Arc::clone(&batch.deltas)).await {
                         Ok(transformed) => transformed,
                         Err(err) => {
                             tracing::warn!(
@@ -1616,7 +1621,7 @@ fn try_build_transient_join_input_optimization(
                     };
                         let join_ts = batch.version.saturating_add(1);
                         let closed_keys = match closed_key_transform.as_ref() {
-                            Some(transform) => match transform(batch.deltas.as_ref()) {
+                            Some(transform) => match transform(Arc::clone(&batch.deltas)).await {
                                 Ok(closed_keys) => closed_keys,
                                 Err(err) => {
                                     tracing::warn!(
@@ -1696,34 +1701,38 @@ fn try_build_transient_join_closed_key_transform(
         }
     };
     let filter_transform = build_filter_transform(&select)?;
-    Ok(Some(Arc::new(move |delta_values: &[(Vec<u8>, i64)]| {
-        let selected = filter_transform(delta_values)?;
-        let mut selected_keys = BTreeSet::new();
-        for (row, weight) in selected.iter() {
-            if *weight <= 0 {
-                continue;
-            }
-            if let Some(key) = extract_encoded_row_columns(row, closed_key_columns.as_ref(), true)?
-            {
+    let key_extractor = Arc::new(
+        VectorizedEncodedKeyExtractor::new(
+            select.output_schema().to_arrow_schema(),
+            Arc::clone(&closed_key_columns),
+        )
+        .context("build vectorized transient closed-key extractor")?,
+    );
+    Ok(Some(Arc::new(move |delta_values| {
+        let filter_transform = Arc::clone(&filter_transform);
+        let key_extractor = Arc::clone(&key_extractor);
+        Box::pin(async move {
+            let selected = filter_transform(Arc::clone(&delta_values)).await?;
+            let mut selected_keys = BTreeSet::new();
+            for (key, _row, weight) in key_extractor.extract_keyed_deltas(&selected)? {
+                if weight <= 0 {
+                    continue;
+                }
                 selected_keys.insert(key);
             }
-        }
 
-        let mut closed = BTreeMap::new();
-        for (row, weight) in delta_values {
-            if *weight <= 0 {
-                continue;
+            let mut closed = BTreeMap::new();
+            for (key, _row, weight) in key_extractor.extract_keyed_deltas(delta_values.as_ref())? {
+                if weight <= 0 {
+                    continue;
+                }
+                if selected_keys.contains(&key) {
+                    continue;
+                }
+                *closed.entry(key).or_insert(0_i64) += weight;
             }
-            let Some(key) = extract_encoded_row_columns(row, closed_key_columns.as_ref(), true)?
-            else {
-                continue;
-            };
-            if selected_keys.contains(&key) {
-                continue;
-            }
-            *closed.entry(key).or_insert(0_i64) += *weight;
-        }
-        Ok(closed.into_iter().collect())
+            Ok(closed.into_iter().collect())
+        })
     })))
 }
 
@@ -1748,10 +1757,7 @@ fn try_build_transient_source_root_materialization(
             } => optimized_nodes.clone(),
         };
         let transform = match match shape {
-            TransientSourceRootShape::Source { .. } => {
-                Ok(Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec()))
-                    as Arc<DeltaTransformFn>)
-            }
+            TransientSourceRootShape::Source { .. } => Ok(identity_delta_transform()),
             TransientSourceRootShape::Select { select, .. } => build_filter_transform(&select),
             TransientSourceRootShape::Project { project, .. } => build_map_transform(&project),
             TransientSourceRootShape::FilterMap {
@@ -1933,7 +1939,10 @@ fn try_build_transient_source_topn_root_shape(
                 } else {
                     shape.transform = compose_optional_delta_transform(
                         shape.transform.take(),
-                        transient_topn::build_direct_projection_transform(columns),
+                        transient_topn::build_direct_projection_transform(
+                            columns,
+                            Arc::clone(project.input_schema()),
+                        ),
                     );
                 }
             } else {
@@ -1974,7 +1983,7 @@ fn try_build_transient_source_aggregate_root_shape(
                 source_root,
                 aggregate: aggregate.clone(),
                 optimized_nodes,
-                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
+                transform: identity_delta_transform(),
             }))
         }
         DbspNodeKind::Passthrough => {
@@ -2082,7 +2091,7 @@ fn try_build_transient_source_window_count_star_root_shape(
             else {
                 return Ok(None);
             };
-            fold_window_count_star_output_projection(&mut shape);
+            fold_window_count_star_output_projection(&mut shape)?;
             shape.transform = compose_optional_delta_transform(
                 shape.transform.take(),
                 build_filter_transform(select)?,
@@ -2106,7 +2115,7 @@ fn try_build_transient_source_window_count_star_root_shape(
                 else {
                     return Ok(None);
                 };
-                fold_window_count_star_output_projection(&mut shape);
+                fold_window_count_star_output_projection(&mut shape)?;
                 shape.transform = compose_optional_delta_transform(
                     shape.transform.take(),
                     build_filter_map_transform(select, project)?,
@@ -2133,7 +2142,7 @@ fn try_build_transient_source_window_count_star_root_shape(
                 shape.output_projection =
                     Some(TransientWindowCountOutputProjection::GroupKeyAndCount);
             } else {
-                fold_window_count_star_output_projection(&mut shape);
+                fold_window_count_star_output_projection(&mut shape)?;
                 shape.transform = compose_optional_delta_transform(
                     shape.transform.take(),
                     build_map_transform(project)?,
@@ -2187,15 +2196,39 @@ async fn try_build_transient_source_window_count_star_root_materialization(
     }))
 }
 
-fn fold_window_count_star_output_projection(shape: &mut TransientSourceWindowCountStarRootShape) {
+fn fold_window_count_star_output_projection(
+    shape: &mut TransientSourceWindowCountStarRootShape,
+) -> Result<()> {
     if let Some(output_projection) = shape.output_projection.take() {
         let transform = match output_projection {
             TransientWindowCountOutputProjection::GroupKeyAndCount => {
-                build_window_count_group_key_count_projection_transform()
+                let input_schema = transient_window_count_full_output_schema(&shape.window)?;
+                let aggregate_width = shape.window.aggregate.output_schema().len();
+                let columns = Arc::new((2..2 + aggregate_width).collect::<Vec<_>>());
+                transient_topn::build_direct_projection_transform(columns, input_schema)
             }
         };
         shape.transform = compose_optional_delta_transform(shape.transform.take(), transform);
     }
+    Ok(())
+}
+
+fn transient_window_count_full_output_schema(
+    window: &dbsp::DbspWindowAggregateNode,
+) -> Result<Arc<RowSchema>> {
+    let mut fields = Vec::with_capacity(window.aggregate.output_schema().len() + 2);
+    fields.push(dbsp::Field::new(
+        "__floe_window_start",
+        DbspScalarType::TimestampMillis,
+        false,
+    ));
+    fields.push(dbsp::Field::new(
+        "__floe_window_end",
+        DbspScalarType::TimestampMillis,
+        false,
+    ));
+    fields.extend(window.aggregate.output_schema().fields().iter().cloned());
+    RowSchema::try_new(fields)
 }
 
 fn try_build_window_count_group_key_count_projection(
@@ -2217,26 +2250,6 @@ fn try_build_window_count_group_key_count_projection(
     } else {
         None
     }
-}
-
-fn build_window_count_group_key_count_projection_transform() -> Arc<DeltaTransformFn> {
-    Arc::new(move |deltas: &[(Vec<u8>, i64)]| {
-        let mut projected = AHashMap::<Vec<u8>, i64>::with_capacity(deltas.len());
-        for (encoded, diff) in deltas {
-            if *diff == 0 {
-                continue;
-            }
-            let full_count = transient_encoded_row_declared_column_count(encoded)?;
-            if full_count < 3 {
-                bail!("transient window count output row has too few columns");
-            }
-            let columns = (2..full_count).collect::<Vec<_>>();
-            let projected_row = extract_encoded_row_columns(encoded, &columns, false)?
-                .ok_or_else(|| anyhow!("direct encoded projection unexpectedly returned null"))?;
-            merge_encoded_delta(&mut projected, projected_row, *diff);
-        }
-        Ok(projected.into_iter().collect())
-    })
 }
 
 fn try_build_transient_source_window_aggregate_root_shape(
@@ -2263,7 +2276,7 @@ fn try_build_transient_source_window_aggregate_root_shape(
                 source_root,
                 window: window.clone(),
                 optimized_nodes,
-                transform: Arc::new(|deltas: &[(Vec<u8>, i64)]| Ok(deltas.to_vec())),
+                transform: identity_delta_transform(),
             }))
         }
         DbspNodeKind::Passthrough => {
@@ -2480,7 +2493,7 @@ async fn build_transient_aggregate_receiver_from_batches(
         .all(|agg| agg.function() == &dbsp::DbspAggregateFunction::Count)
     {
         let slot_kinds = build_count_aggregate_slot_kinds(aggregate.aggregates());
-        let row_evaluator = build_count_row_evaluator(
+        let row_evaluator = build_count_batch_row_evaluator(
             Arc::clone(&aggregate_input_schema),
             aggregate.group_keys().to_vec(),
             aggregate.aggregates().to_vec(),
@@ -2489,7 +2502,7 @@ async fn build_transient_aggregate_receiver_from_batches(
             "transient_count_aggregate",
         );
         let aggregate_processor = Arc::new(
-            dbsp::DbspTransientCountAggregate::<Vec<u8>, Vec<u8>, Vec<u8>>::new(
+            dbsp::DbspTransientCountAggregate::<Vec<u8>, Vec<u8>, Vec<u8>>::new_batch(
                 row_evaluator,
                 slot_kinds,
             )
@@ -2529,7 +2542,10 @@ async fn build_transient_aggregate_receiver_from_batches(
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            match evaluator
+                                .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                                .await
+                            {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2573,7 +2589,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                                 break;
                             }
                         };
-                        let final_deltas = match output_transform(&encoded_output) {
+                        let final_deltas = match output_transform(Arc::new(encoded_output)).await {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2604,7 +2620,7 @@ async fn build_transient_aggregate_receiver_from_batches(
             .ok_or_else(|| {
                 anyhow!("aggregate is not eligible for transient incremental aggregation")
             })?;
-        let row_evaluator = build_incremental_aggregate_row_evaluator(
+        let row_evaluator = build_incremental_aggregate_batch_row_evaluator(
             Arc::clone(&aggregate_input_schema),
             aggregate.group_keys().to_vec(),
             aggregate.aggregates().to_vec(),
@@ -2613,7 +2629,7 @@ async fn build_transient_aggregate_receiver_from_batches(
             "transient_aggregate",
         );
         let aggregate_processor = Arc::new(
-            dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new(
+            dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, Vec<u8>>::new_batch(
                 row_evaluator,
                 slot_kinds,
             )
@@ -2662,7 +2678,10 @@ async fn build_transient_aggregate_receiver_from_batches(
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            match evaluator
+                                .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                                .await
+                            {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2710,7 +2729,7 @@ async fn build_transient_aggregate_receiver_from_batches(
                                 break;
                             }
                         };
-                        let final_deltas = match output_transform(&encoded_output) {
+                        let final_deltas = match output_transform(Arc::new(encoded_output)).await {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2827,6 +2846,13 @@ async fn build_transient_window_count_star_receiver_from_batches(
     let allowed_lateness_ms = window.window.allowed_lateness_ms;
     let track_evictions = allowed_lateness_ms != i64::MAX;
     let group_key_columns = Arc::new(group_key_columns);
+    let window_key_extractor = Arc::new(
+        VectorizedEncodedKeyExtractor::new(
+            eval_schema.to_arrow_schema(),
+            Arc::clone(&group_key_columns),
+        )
+        .context("build vectorized transient window count-star key extractor")?,
+    );
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-window-count-star:{graph_id}");
     let task_events = task_events.clone();
@@ -2853,7 +2879,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
         } else {
             apply_transient_window_count_star_deltas(
                 restored_deltas,
-                group_key_columns.as_ref(),
+                window_key_extractor.as_ref(),
                 time_column,
                 window_size,
                 window_slide,
@@ -2878,7 +2904,10 @@ async fn build_transient_window_count_star_receiver_from_batches(
                     };
                     let input_deltas = batch.deltas.as_ref().clone();
                     let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                        match evaluator.transform_delta(&graph_id, &input_deltas) {
+                        match evaluator
+                            .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                            .await
+                        {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2896,7 +2925,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                     }
                     let updates = match apply_transient_window_count_star_deltas(
                         input_deltas,
-                        group_key_columns.as_ref(),
+                        window_key_extractor.as_ref(),
                         time_column,
                         window_size,
                         window_slide,
@@ -2934,7 +2963,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                         }
                     };
                     let final_deltas = if let Some(output_transform) = output_transform.as_ref() {
-                        match output_transform(&encoded_output) {
+                        match output_transform(Arc::new(encoded_output)).await {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3043,9 +3072,16 @@ async fn build_transient_window_incremental_receiver_from_batches(
         .ok_or_else(|| {
             anyhow!("window aggregate is not eligible for transient incremental aggregation")
         })?;
-    let row_evaluator = build_incremental_aggregate_row_evaluator(
+    let group_key_columns = Arc::new(group_key_columns);
+    let window_key_extractor = Arc::new(
+        VectorizedEncodedKeyExtractor::new(
+            eval_schema.to_arrow_schema(),
+            Arc::clone(&group_key_columns),
+        )
+        .context("build vectorized transient window key extractor")?,
+    );
+    let row_evaluator = build_prekeyed_incremental_aggregate_batch_row_evaluator(
         Arc::clone(&eval_schema),
-        window.aggregate.group_keys().to_vec(),
         window.aggregate.aggregates().to_vec(),
         Arc::clone(&expression_columns),
         graph_id.to_string(),
@@ -3053,22 +3089,16 @@ async fn build_transient_window_incremental_receiver_from_batches(
     );
     let row_evaluator = Arc::new(row_evaluator);
     let aggregate_processor = Arc::new(
-        dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, (Vec<u8>, Vec<u8>)>::new(
+        dbsp::DbspTransientIncrementalAggregate::<Vec<u8>, (Vec<u8>, Vec<u8>)>::new_batch(
             {
                 let row_evaluator = Arc::clone(&row_evaluator);
-                move |pair: &(Vec<u8>, Vec<u8>)| {
-                    row_evaluator(&pair.1).map(|mut row| {
-                        row.key = pair.0.clone();
-                        row
-                    })
-                }
+                move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]| row_evaluator(delta_values)
             },
             slot_kinds,
         )
         .await
         .context("initialize transient window incremental aggregate")?,
     );
-    let group_key_columns = Arc::new(group_key_columns);
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-window-aggregate:{graph_id}");
     let task_events = task_events.clone();
@@ -3123,7 +3153,10 @@ async fn build_transient_window_incremental_receiver_from_batches(
                     };
                     let input_deltas = batch.deltas.as_ref().clone();
                     let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                        match evaluator.transform_delta(&graph_id, &input_deltas) {
+                        match evaluator
+                            .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                            .await
+                        {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3136,44 +3169,25 @@ async fn build_transient_window_incremental_receiver_from_batches(
                     let cutoff = transient_window_watermark_cutoff(&watermark, allowed_lateness_ms);
                     let mut windowed_deltas = Vec::new();
                     let mut encoded_window_cache: HashMap<(i64, i64), Vec<u8>> = HashMap::new();
-                    for (row, weight) in input_deltas {
+                    let keyed_time_deltas = match window_key_extractor
+                        .extract_keyed_time_deltas(&input_deltas, time_column)
+                    {
+                        Ok(deltas) => deltas,
+                        Err(err) => {
+                            report_graph_task_error(
+                                &task_events,
+                                &graph_id,
+                                task_label.clone(),
+                                err.context("extract vectorized transient window aggregate keys"),
+                            );
+                            break;
+                        }
+                    };
+                    for (row, weight, group_key, event_ts) in keyed_time_deltas {
                         if weight == 0 {
                             continue;
                         }
-                        let (group_key, event_ts) = if group_key_columns.is_empty() {
-                            match extract_encoded_row_i64_like_column(&row, time_column) {
-                                Ok(Some(event_ts)) => (None, event_ts),
-                                Ok(None) => continue,
-                                Err(err) => {
-                                    report_graph_task_error(
-                                        &task_events,
-                                        &graph_id,
-                                        task_label.clone(),
-                                        err.context("extract transient window aggregate timestamp"),
-                                    );
-                                    return;
-                                }
-                            }
-                        } else {
-                            match extract_encoded_row_columns_and_i64_like_column(
-                                &row,
-                                group_key_columns.as_ref(),
-                                time_column,
-                                false,
-                            ) {
-                                Ok(Some((group_key, event_ts))) => (Some(group_key), event_ts),
-                                Ok(None) => continue,
-                                Err(err) => {
-                                    report_graph_task_error(
-                                        &task_events,
-                                        &graph_id,
-                                        task_label.clone(),
-                                        err.context("extract transient window aggregate row"),
-                                    );
-                                    return;
-                                }
-                            }
-                        };
+                        let group_key = (!group_key_columns.is_empty()).then_some(group_key);
                         if event_ts < 0 {
                             continue;
                         }
@@ -3342,7 +3356,7 @@ async fn build_transient_window_incremental_receiver_from_batches(
                             break;
                         }
                     };
-                    let final_deltas = match output_transform(&encoded_output) {
+                    let final_deltas = match output_transform(Arc::new(encoded_output)).await {
                         Ok(deltas) => deltas,
                         Err(err) => {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3760,7 +3774,7 @@ fn transient_window_evict_expired_counts(
 
 fn apply_transient_window_count_star_deltas(
     input_deltas: Vec<(Vec<u8>, i64)>,
-    group_key_columns: &[usize],
+    key_extractor: &VectorizedEncodedKeyExtractor,
     time_column: usize,
     window_size: i64,
     window_slide: i64,
@@ -3772,20 +3786,12 @@ fn apply_transient_window_count_star_deltas(
 ) -> Result<TransientWindowCountUpdates> {
     let mut grouped_deltas: AHashMap<TransientWindowCountKey, i64> = AHashMap::new();
     let mut batch_group_key_intern: AHashMap<Vec<u8>, Arc<[u8]>> = AHashMap::new();
-    for (row, weight) in input_deltas {
+    for (_row, weight, raw_key, event_ts) in
+        key_extractor.extract_keyed_time_deltas(&input_deltas, time_column)?
+    {
         if weight == 0 {
             continue;
         }
-        let Some((raw_key, event_ts)) = extract_encoded_row_columns_and_i64_like_column(
-            &row,
-            group_key_columns,
-            time_column,
-            false,
-        )
-        .context("extract transient window count-star row")?
-        else {
-            continue;
-        };
         if event_ts < 0 {
             continue;
         }
@@ -3928,28 +3934,6 @@ fn encode_transient_window_count_group_key_count_output_deltas(
         projected.push((row, diff));
     }
     Ok(projected)
-}
-
-fn merge_encoded_delta<S>(map: &mut HashMap<Vec<u8>, i64, S>, row: Vec<u8>, delta: i64)
-where
-    S: BuildHasher,
-{
-    if delta == 0 {
-        return;
-    }
-    match map.entry(row) {
-        std::collections::hash_map::Entry::Occupied(mut entry) => {
-            let merged = entry.get().saturating_add(delta);
-            if merged == 0 {
-                entry.remove();
-            } else {
-                *entry.get_mut() = merged;
-            }
-        }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(delta);
-        }
-    }
 }
 
 fn encode_transient_window_group_key_count_output_row(
@@ -4824,9 +4808,21 @@ fn compose_delta_transforms(
     second: Arc<DeltaTransformFn>,
 ) -> Arc<DeltaTransformFn> {
     Arc::new(move |deltas| {
-        let deltas = first(deltas)?;
-        second(&deltas)
+        let first = Arc::clone(&first);
+        let second = Arc::clone(&second);
+        Box::pin(async move {
+            let deltas = first(deltas).await?;
+            second(Arc::new(deltas)).await
+        })
     })
+}
+
+fn identity_delta_transform() -> Arc<DeltaTransformFn> {
+    Arc::new(
+        |deltas: Arc<Vec<(Vec<u8>, i64)>>| -> BoxFuture<'static, Result<Vec<(Vec<u8>, i64)>>> {
+            Box::pin(async move { Ok(deltas.as_ref().clone()) })
+        },
+    )
 }
 
 fn compose_optional_delta_transform(
@@ -4911,7 +4907,12 @@ fn build_filter_transform(node: &DbspSelectNode) -> Result<Arc<DeltaTransformFn>
             .context("build vectorized transient source filter evaluator")?,
     );
     Ok(Arc::new(move |delta_values| {
-        evaluator.transform_delta("source_batch_journal", &delta_values)
+        let evaluator = Arc::clone(&evaluator);
+        Box::pin(async move {
+            evaluator
+                .transform_delta_arrow("source_batch_journal", delta_values)
+                .await
+        })
     }))
 }
 
@@ -4923,7 +4924,12 @@ fn build_map_transform(node: &DbspProjectNode) -> Result<Arc<DeltaTransformFn>> 
             .context("build vectorized transient source map evaluator")?,
     );
     Ok(Arc::new(move |delta_values| {
-        evaluator.transform_delta("source_batch_journal", &delta_values)
+        let evaluator = Arc::clone(&evaluator);
+        Box::pin(async move {
+            evaluator
+                .transform_delta_arrow("source_batch_journal", delta_values)
+                .await
+        })
     }))
 }
 
@@ -4943,7 +4949,12 @@ fn build_filter_map_transform(
         .context("build vectorized transient source filter_map evaluator")?,
     );
     Ok(Arc::new(move |delta_values| {
-        evaluator.transform_delta("source_batch_journal", &delta_values)
+        let evaluator = Arc::clone(&evaluator);
+        Box::pin(async move {
+            evaluator
+                .transform_delta_arrow("source_batch_journal", delta_values)
+                .await
+        })
     }))
 }
 

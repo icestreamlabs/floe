@@ -1,4 +1,11 @@
 use super::*;
+use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
+use datafusion::arrow::array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
+};
+use datafusion::arrow::datatypes::{DataType, Field as ArrowField, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::record_batch::RecordBatch;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,26 +21,6 @@ enum TransientTopNValue {
     Timestamp(i64),
     Utf8(String),
     Bool(bool),
-}
-
-impl TransientTopNValue {
-    fn from_encoded_scalar(
-        scalar: Option<EncodedRowScalar>,
-        expected_type: &DbspScalarType,
-    ) -> Result<Self> {
-        match (scalar, expected_type) {
-            (None, _) => Ok(Self::Null),
-            (Some(EncodedRowScalar::Int64(value)), DbspScalarType::Int64) => Ok(Self::Int64(value)),
-            (Some(EncodedRowScalar::TimestampMillis(value)), DbspScalarType::TimestampMillis) => {
-                Ok(Self::Timestamp(value))
-            }
-            (Some(EncodedRowScalar::Utf8(value)), DbspScalarType::Utf8) => Ok(Self::Utf8(value)),
-            (Some(EncodedRowScalar::Bool(value)), DbspScalarType::Bool) => Ok(Self::Bool(value)),
-            (Some(other), expected) => Err(anyhow!(
-                "transient topn order key type mismatch: expected {expected:?}, decoded {other:?}"
-            )),
-        }
-    }
 }
 
 impl Ord for TransientTopNValue {
@@ -142,18 +129,573 @@ impl PartialOrd for TransientTopNKey {
 
 #[derive(Clone)]
 pub(super) struct TransientTopNKeyLayout {
+    pub(super) input_schema: Arc<RowSchema>,
     pub(super) partition_columns: Arc<Vec<usize>>,
     pub(super) order_columns: Arc<Vec<usize>>,
     pub(super) order_types: Arc<Vec<DbspScalarType>>,
     pub(super) precompute_evaluator: Option<Arc<VectorizedFilterProjectEvaluator>>,
 }
 
-pub(super) struct TransientTopNProcessor {
+#[derive(Clone)]
+struct TransientTopNKeyExtractor {
     graph_id: String,
-    partition_key_columns: Arc<Vec<usize>>,
-    order_key_columns: Arc<Vec<usize>>,
+    projected_schema: SchemaRef,
+    projected_columns: Arc<Vec<usize>>,
+    partition_positions: Arc<Vec<usize>>,
+    order_positions: Arc<Vec<usize>>,
     order_value_types: Arc<Vec<DbspScalarType>>,
     order_specs: Arc<Vec<TransientTopNSortSpec>>,
+}
+
+struct TransientTopNKeyedDelta {
+    row_key: Vec<u8>,
+    diff: i64,
+    partition_key: Option<Vec<u8>>,
+    order_key: Option<TransientTopNKey>,
+}
+
+struct TransientDirectPartitionTopNKeyedDelta {
+    diff: i64,
+    partition_value: i64,
+    order_key: TransientTopNKey,
+}
+
+struct TransientDirectInt64TopNKeyedDelta {
+    row_key: Vec<u8>,
+    diff: i64,
+    partition_value: i64,
+    order_value: i64,
+}
+
+struct TransientDirectTop1KeyedDelta {
+    row_key: Vec<u8>,
+    diff: i64,
+    partition_key: TransientDirectTop1PartitionKey,
+    order_value: i64,
+}
+
+impl TransientTopNKeyExtractor {
+    fn for_layout(
+        graph_id: impl Into<String>,
+        key_layout: &TransientTopNKeyLayout,
+        order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    ) -> Result<Self> {
+        Self::new(
+            graph_id,
+            Arc::clone(&key_layout.input_schema),
+            Arc::clone(&key_layout.partition_columns),
+            Arc::clone(&key_layout.order_columns),
+            Arc::clone(&key_layout.order_types),
+            order_specs,
+        )
+    }
+
+    fn new(
+        graph_id: impl Into<String>,
+        input_schema: Arc<RowSchema>,
+        partition_columns: Arc<Vec<usize>>,
+        order_columns: Arc<Vec<usize>>,
+        order_value_types: Arc<Vec<DbspScalarType>>,
+        order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    ) -> Result<Self> {
+        let arrow_schema = input_schema.to_arrow_schema();
+        let (projected_columns, partition_positions, order_positions) =
+            build_topn_projected_positions(partition_columns.as_ref(), order_columns.as_ref());
+        let projected_schema = projected_arrow_schema(&arrow_schema, &projected_columns)?;
+        Ok(Self {
+            graph_id: graph_id.into(),
+            projected_schema,
+            projected_columns: Arc::new(projected_columns),
+            partition_positions: Arc::new(partition_positions),
+            order_positions: Arc::new(order_positions),
+            order_value_types,
+            order_specs,
+        })
+    }
+
+    fn extract_topn(&self, deltas: &[(Vec<u8>, i64)]) -> Result<Vec<TransientTopNKeyedDelta>> {
+        let Some((batch, staged_rows)) = self.materialize_key_batch(deltas)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut output = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let (row_key, diff) = staged_rows
+                .get(row_idx)
+                .ok_or_else(|| anyhow!("transient topn key row index out of bounds"))?;
+            output.push(TransientTopNKeyedDelta {
+                row_key: row_key.clone(),
+                diff: *diff,
+                partition_key: Some(self.partition_key_from_batch(&batch, row_idx)?),
+                order_key: Some(self.order_key_from_batch(&batch, row_idx, row_key)?),
+            });
+        }
+        Ok(output)
+    }
+
+    fn extract_direct_partition_topn(
+        &self,
+        deltas: &[(Vec<u8>, i64)],
+        partition_idx: usize,
+    ) -> Result<Vec<TransientDirectPartitionTopNKeyedDelta>> {
+        let Some((batch, staged_rows)) = self.materialize_key_batch(deltas)? else {
+            return Ok(Vec::new());
+        };
+        let partition_position = self.position_for_input_column(partition_idx)?;
+
+        let mut output = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let Some(partition_value) =
+                arrow_int64_value(batch.column(partition_position).as_ref(), row_idx)?
+            else {
+                continue;
+            };
+            let (row_key, diff) = staged_rows
+                .get(row_idx)
+                .ok_or_else(|| anyhow!("transient topn key row index out of bounds"))?;
+            output.push(TransientDirectPartitionTopNKeyedDelta {
+                diff: *diff,
+                partition_value,
+                order_key: self.order_key_from_batch(&batch, row_idx, row_key)?,
+            });
+        }
+        Ok(output)
+    }
+
+    fn extract_direct_int64_topn(
+        &self,
+        deltas: &[(Vec<u8>, i64)],
+        partition_idx: usize,
+        order_idx: usize,
+    ) -> Result<Vec<TransientDirectInt64TopNKeyedDelta>> {
+        let Some((batch, staged_rows)) = self.materialize_key_batch(deltas)? else {
+            return Ok(Vec::new());
+        };
+        let partition_position = self.position_for_input_column(partition_idx)?;
+        let order_position = self.position_for_input_column(order_idx)?;
+
+        let mut output = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let Some(partition_value) =
+                arrow_int64_value(batch.column(partition_position).as_ref(), row_idx)?
+            else {
+                continue;
+            };
+            let Some(order_value) =
+                arrow_int64_value(batch.column(order_position).as_ref(), row_idx)?
+            else {
+                continue;
+            };
+            let (row_key, diff) = staged_rows
+                .get(row_idx)
+                .ok_or_else(|| anyhow!("transient topn key row index out of bounds"))?;
+            output.push(TransientDirectInt64TopNKeyedDelta {
+                row_key: row_key.clone(),
+                diff: *diff,
+                partition_value,
+                order_value,
+            });
+        }
+        Ok(output)
+    }
+
+    fn extract_direct_top1(
+        &self,
+        deltas: &[(Vec<u8>, i64)],
+        partition_layout: TransientDirectTop1PartitionLayout,
+        order_idx: usize,
+    ) -> Result<Vec<TransientDirectTop1KeyedDelta>> {
+        let Some((batch, staged_rows)) = self.materialize_key_batch(deltas)? else {
+            return Ok(Vec::new());
+        };
+        let order_position = self.position_for_input_column(order_idx)?;
+
+        let mut output = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let Some(partition_key) =
+                direct_top1_partition_key_from_batch(self, &batch, row_idx, partition_layout)?
+            else {
+                continue;
+            };
+            let Some(order_value) =
+                arrow_i64_like_value(batch.column(order_position).as_ref(), row_idx)?
+            else {
+                continue;
+            };
+            let (row_key, diff) = staged_rows
+                .get(row_idx)
+                .ok_or_else(|| anyhow!("transient topn key row index out of bounds"))?;
+            output.push(TransientDirectTop1KeyedDelta {
+                row_key: row_key.clone(),
+                diff: *diff,
+                partition_key,
+                order_value,
+            });
+        }
+        Ok(output)
+    }
+
+    fn materialize_key_batch(
+        &self,
+        deltas: &[(Vec<u8>, i64)],
+    ) -> Result<Option<(RecordBatch, Vec<(Vec<u8>, i64)>)>> {
+        if deltas.is_empty() {
+            return Ok(None);
+        }
+        let mut buffer = DeltaBatchBuffer::new_projected(
+            Arc::clone(&self.projected_schema),
+            Arc::<[usize]>::from(self.projected_columns.as_ref().clone()),
+            false,
+            DeltaBatchConfig {
+                max_rows: usize::MAX,
+                max_bytes: usize::MAX,
+            },
+        )
+        .context("create transient topn projected key batch")?;
+        let mut staged_rows = Vec::with_capacity(deltas.len());
+        for (row_key, diff) in deltas {
+            if *diff == 0 {
+                continue;
+            }
+            if buffer.push(row_key.clone(), *diff, None)?.is_some() {
+                bail!("unbounded transient topn key extractor flushed before manual flush");
+            }
+            staged_rows.push((row_key.clone(), *diff));
+        }
+
+        let Some(batch) = buffer.flush_manual()? else {
+            return Ok(None);
+        };
+        Ok(Some((batch, staged_rows)))
+    }
+
+    fn partition_key_from_batch(&self, batch: &RecordBatch, row_idx: usize) -> Result<Vec<u8>> {
+        if self.partition_positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        encode_arrow_columns(batch, self.partition_positions.as_ref(), row_idx)
+    }
+
+    fn order_key_from_batch(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        row_key: &[u8],
+    ) -> Result<TransientTopNKey> {
+        let mut values = Vec::with_capacity(self.order_positions.len());
+        for (position, expected_type) in self
+            .order_positions
+            .iter()
+            .zip(self.order_value_types.iter())
+        {
+            values.push(transient_topn_value_from_arrow(
+                batch.column(*position).as_ref(),
+                row_idx,
+                expected_type,
+            )?);
+        }
+        Ok(TransientTopNKey::new(
+            Arc::clone(&self.order_specs),
+            values,
+            row_key.to_vec(),
+        ))
+    }
+
+    fn position_for_input_column(&self, column_idx: usize) -> Result<usize> {
+        self.projected_columns
+            .iter()
+            .position(|column| *column == column_idx)
+            .ok_or_else(|| {
+                anyhow!(
+                    "transient topn key extractor missing projected column {column_idx} for graph {}",
+                    self.graph_id
+                )
+            })
+    }
+}
+
+fn transient_topn_order_specs(topn: &DbspTopNNode) -> Arc<Vec<TransientTopNSortSpec>> {
+    Arc::new(
+        topn.order_by()
+            .iter()
+            .map(|expr| TransientTopNSortSpec {
+                ascending: expr.ascending(),
+                nulls_first: expr.nulls_first(),
+            })
+            .collect(),
+    )
+}
+
+fn build_topn_projected_positions(
+    partition_columns: &[usize],
+    order_columns: &[usize],
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut projected_columns = Vec::<usize>::new();
+    let mut position_for = |column_idx: usize| {
+        if let Some(position) = projected_columns
+            .iter()
+            .position(|existing| *existing == column_idx)
+        {
+            position
+        } else {
+            projected_columns.push(column_idx);
+            projected_columns.len() - 1
+        }
+    };
+
+    let partition_positions = partition_columns
+        .iter()
+        .copied()
+        .map(&mut position_for)
+        .collect::<Vec<_>>();
+    let order_positions = order_columns
+        .iter()
+        .copied()
+        .map(&mut position_for)
+        .collect::<Vec<_>>();
+    (projected_columns, partition_positions, order_positions)
+}
+
+fn projected_arrow_schema(input_schema: &SchemaRef, columns: &[usize]) -> Result<SchemaRef> {
+    let fields = columns
+        .iter()
+        .map(|idx| {
+            input_schema
+                .fields()
+                .get(*idx)
+                .map(|field| (**field).clone())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "transient topn input column {idx} is out of bounds for schema width {}",
+                        input_schema.fields().len()
+                    )
+                })
+        })
+        .collect::<Result<Vec<ArrowField>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn encode_arrow_columns(
+    batch: &RecordBatch,
+    positions: &[usize],
+    row_idx: usize,
+) -> Result<Vec<u8>> {
+    let count = u32::try_from(positions.len()).context("too many transient topn key columns")?;
+    let mut encoded = Vec::with_capacity(4 + positions.len().saturating_mul(16));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for position in positions.iter().copied() {
+        append_arrow_encoded_value(batch.column(position).as_ref(), row_idx, &mut encoded)?;
+    }
+    Ok(encoded)
+}
+
+fn append_arrow_encoded_value(
+    array: &dyn Array,
+    row_idx: usize,
+    encoded: &mut Vec<u8>,
+) -> Result<()> {
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 transient topn key array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x05);
+            } else {
+                encoded.push(0x01);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected Utf8 transient topn key array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x06);
+            } else {
+                encoded.push(0x02);
+                let bytes = values.value(row_idx).as_bytes();
+                let len =
+                    u32::try_from(bytes.len()).context("transient topn utf8 key too large")?;
+                encoded.extend_from_slice(&len.to_le_bytes());
+                encoded.extend_from_slice(bytes);
+            }
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow!("expected TimestampMillisecond transient topn key array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x07);
+            } else {
+                encoded.push(0x03);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("expected Boolean transient topn key array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x08);
+            } else {
+                encoded.push(0x04);
+                encoded.push(u8::from(values.value(row_idx)));
+            }
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| anyhow!("expected Date32 transient topn key array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x0A);
+            } else {
+                encoded.push(0x09);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        DataType::Decimal128(_, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| anyhow!("expected Decimal128 transient topn key array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x0C);
+            } else {
+                encoded.push(0x0B);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        other => bail!("unsupported Arrow transient topn key type: {other:?}"),
+    }
+    Ok(())
+}
+
+fn transient_topn_value_from_arrow(
+    array: &dyn Array,
+    row_idx: usize,
+    expected_type: &DbspScalarType,
+) -> Result<TransientTopNValue> {
+    if array.is_null(row_idx) {
+        return Ok(TransientTopNValue::Null);
+    }
+    match (array.data_type(), expected_type) {
+        (DataType::Int64, DbspScalarType::Int64) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 transient topn order array"))?;
+            Ok(TransientTopNValue::Int64(values.value(row_idx)))
+        }
+        (DataType::Timestamp(TimeUnit::Millisecond, _), DbspScalarType::TimestampMillis) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected TimestampMillisecond transient topn order array")
+                })?;
+            Ok(TransientTopNValue::Timestamp(values.value(row_idx)))
+        }
+        (DataType::Utf8, DbspScalarType::Utf8) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected Utf8 transient topn order array"))?;
+            Ok(TransientTopNValue::Utf8(values.value(row_idx).to_string()))
+        }
+        (DataType::Boolean, DbspScalarType::Bool) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("expected Boolean transient topn order array"))?;
+            Ok(TransientTopNValue::Bool(values.value(row_idx)))
+        }
+        (actual, expected) => Err(anyhow!(
+            "transient topn order key type mismatch: expected {expected:?}, Arrow column is {actual:?}"
+        )),
+    }
+}
+
+fn arrow_int64_value(array: &dyn Array, row_idx: usize) -> Result<Option<i64>> {
+    let values = array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("expected Int64 transient topn direct key array"))?;
+    if values.is_null(row_idx) {
+        Ok(None)
+    } else {
+        Ok(Some(values.value(row_idx)))
+    }
+}
+
+fn arrow_i64_like_value(array: &dyn Array, row_idx: usize) -> Result<Option<i64>> {
+    if array.is_null(row_idx) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 transient topn direct order array"))?;
+            Ok(Some(values.value(row_idx)))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    anyhow!("expected TimestampMillisecond transient topn direct order array")
+                })?;
+            Ok(Some(values.value(row_idx)))
+        }
+        other => bail!("unsupported transient topn i64-like direct key type: {other:?}"),
+    }
+}
+
+fn direct_top1_partition_key_from_batch(
+    extractor: &TransientTopNKeyExtractor,
+    batch: &RecordBatch,
+    row_idx: usize,
+    partition_layout: TransientDirectTop1PartitionLayout,
+) -> Result<Option<TransientDirectTop1PartitionKey>> {
+    let key = match partition_layout {
+        TransientDirectTop1PartitionLayout::One(partition_idx) => {
+            let position = extractor.position_for_input_column(partition_idx)?;
+            let Some(partition_value) =
+                arrow_int64_value(batch.column(position).as_ref(), row_idx)?
+            else {
+                return Ok(None);
+            };
+            TransientDirectTop1PartitionKey::One(partition_value)
+        }
+        TransientDirectTop1PartitionLayout::Two(partition_indices) => {
+            let first_position = extractor.position_for_input_column(partition_indices[0])?;
+            let second_position = extractor.position_for_input_column(partition_indices[1])?;
+            let Some(first_partition_value) =
+                arrow_int64_value(batch.column(first_position).as_ref(), row_idx)?
+            else {
+                return Ok(None);
+            };
+            let Some(second_partition_value) =
+                arrow_int64_value(batch.column(second_position).as_ref(), row_idx)?
+            else {
+                return Ok(None);
+            };
+            TransientDirectTop1PartitionKey::Two(first_partition_value, second_partition_value)
+        }
+    };
+    Ok(Some(key))
+}
+
+pub(super) struct TransientTopNProcessor {
+    graph_id: String,
+    key_extractor: TransientTopNKeyExtractor,
     limit: usize,
     offset: usize,
     order_index: BTreeMap<Vec<u8>, BTreeMap<TransientTopNKey, i64>>,
@@ -163,11 +705,7 @@ pub(super) struct TransientTopNProcessor {
 }
 
 pub(super) struct TransientTop1Processor {
-    graph_id: String,
-    partition_key_columns: Arc<Vec<usize>>,
-    order_key_columns: Arc<Vec<usize>>,
-    order_value_types: Arc<Vec<DbspScalarType>>,
-    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    key_extractor: TransientTopNKeyExtractor,
     order_index: HashMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>,
     partition_output_cache: HashMap<Vec<u8>, Vec<u8>>,
 }
@@ -179,21 +717,14 @@ impl TransientTopNProcessor {
         key_layout: &TransientTopNKeyLayout,
         _append_only_input: bool,
     ) -> Self {
-        let order_specs = Arc::new(
-            topn.order_by()
-                .iter()
-                .map(|expr| TransientTopNSortSpec {
-                    ascending: expr.ascending(),
-                    nulls_first: expr.nulls_first(),
-                })
-                .collect(),
-        );
+        let graph_id = graph_id.into();
+        let order_specs = transient_topn_order_specs(topn);
+        let key_extractor =
+            TransientTopNKeyExtractor::for_layout(graph_id.clone(), key_layout, order_specs)
+                .expect("transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
-            partition_key_columns: Arc::clone(&key_layout.partition_columns),
-            order_key_columns: Arc::clone(&key_layout.order_columns),
-            order_value_types: Arc::clone(&key_layout.order_types),
-            order_specs,
+            graph_id,
+            key_extractor,
             limit: topn.limit(),
             offset: topn.offset(),
             order_index: BTreeMap::new(),
@@ -214,15 +745,18 @@ impl TransientTopNProcessor {
         let mut mutation_us = 0u128;
 
         let mut affected_partitions = BTreeSet::new();
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            let key_start = profile_this_batch.then(Instant::now);
-            let (partition_key, order_key) = self.keys_for(&row_key);
-            if let Some(key_start) = key_start {
-                key_eval_us += key_start.elapsed().as_micros();
-            }
+        let key_start = profile_this_batch.then(Instant::now);
+        let keyed_deltas = self.key_extractor.extract_topn(&deltas)?;
+        if let Some(key_start) = key_start {
+            key_eval_us += key_start.elapsed().as_micros();
+        }
+        for keyed in keyed_deltas {
+            let TransientTopNKeyedDelta {
+                diff,
+                partition_key,
+                order_key,
+                ..
+            } = keyed;
             let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
                 continue;
             };
@@ -372,21 +906,6 @@ impl TransientTopNProcessor {
             })
             .collect()
     }
-
-    fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        self.compute_key_parts(row_key)
-    }
-
-    fn compute_key_parts(&self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        compute_transient_topn_key_parts(
-            &self.graph_id,
-            Arc::clone(&self.order_specs),
-            self.partition_key_columns.as_ref(),
-            self.order_key_columns.as_ref(),
-            self.order_value_types.as_ref(),
-            row_key,
-        )
-    }
 }
 
 #[derive(Default)]
@@ -397,10 +916,7 @@ struct TransientAppendOnlyTopNPartitionState {
 
 struct TransientAppendOnlyTopNProcessor {
     graph_id: String,
-    partition_key_columns: Arc<Vec<usize>>,
-    order_key_columns: Arc<Vec<usize>>,
-    order_value_types: Arc<Vec<DbspScalarType>>,
-    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    key_extractor: TransientTopNKeyExtractor,
     limit: usize,
     profile_enabled: bool,
     profiled_batches: usize,
@@ -413,21 +929,14 @@ impl TransientAppendOnlyTopNProcessor {
         topn: &DbspTopNNode,
         key_layout: &TransientTopNKeyLayout,
     ) -> Self {
-        let order_specs = Arc::new(
-            topn.order_by()
-                .iter()
-                .map(|expr| TransientTopNSortSpec {
-                    ascending: expr.ascending(),
-                    nulls_first: expr.nulls_first(),
-                })
-                .collect(),
-        );
+        let graph_id = graph_id.into();
+        let order_specs = transient_topn_order_specs(topn);
+        let key_extractor =
+            TransientTopNKeyExtractor::for_layout(graph_id.clone(), key_layout, order_specs)
+                .expect("transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
-            partition_key_columns: Arc::clone(&key_layout.partition_columns),
-            order_key_columns: Arc::clone(&key_layout.order_columns),
-            order_value_types: Arc::clone(&key_layout.order_types),
-            order_specs,
+            graph_id,
+            key_extractor,
             limit: topn.limit(),
             profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
@@ -446,10 +955,18 @@ impl TransientAppendOnlyTopNProcessor {
         let mut affected_partitions = HashSet::new();
         let mut output_deltas = HashMap::new();
 
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
+        let key_start = profile_this_batch.then(Instant::now);
+        let keyed_deltas = self.key_extractor.extract_topn(&deltas)?;
+        if let Some(key_start) = key_start {
+            key_eval_us += key_start.elapsed().as_micros();
+        }
+        for keyed in keyed_deltas {
+            let TransientTopNKeyedDelta {
+                diff,
+                partition_key,
+                order_key,
+                ..
+            } = keyed;
             if diff < 0 {
                 bail!(
                     "append-only transient topn received negative diff for graph {}",
@@ -457,11 +974,6 @@ impl TransientAppendOnlyTopNProcessor {
                 );
             }
 
-            let key_start = profile_this_batch.then(Instant::now);
-            let (partition_key, order_key) = self.compute_key_parts(&row_key);
-            if let Some(key_start) = key_start {
-                key_eval_us += key_start.elapsed().as_micros();
-            }
             let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
                 continue;
             };
@@ -582,17 +1094,6 @@ impl TransientAppendOnlyTopNProcessor {
             );
         }
     }
-
-    fn compute_key_parts(&self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        compute_transient_topn_key_parts(
-            &self.graph_id,
-            Arc::clone(&self.order_specs),
-            self.partition_key_columns.as_ref(),
-            self.order_key_columns.as_ref(),
-            self.order_value_types.as_ref(),
-            row_key,
-        )
-    }
 }
 
 impl TransientTop1Processor {
@@ -601,21 +1102,13 @@ impl TransientTop1Processor {
         topn: &DbspTopNNode,
         key_layout: &TransientTopNKeyLayout,
     ) -> Self {
-        let order_specs = Arc::new(
-            topn.order_by()
-                .iter()
-                .map(|expr| TransientTopNSortSpec {
-                    ascending: expr.ascending(),
-                    nulls_first: expr.nulls_first(),
-                })
-                .collect(),
-        );
+        let graph_id = graph_id.into();
+        let order_specs = transient_topn_order_specs(topn);
+        let key_extractor =
+            TransientTopNKeyExtractor::for_layout(graph_id.clone(), key_layout, order_specs)
+                .expect("transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
-            partition_key_columns: Arc::clone(&key_layout.partition_columns),
-            order_key_columns: Arc::clone(&key_layout.order_columns),
-            order_value_types: Arc::clone(&key_layout.order_types),
-            order_specs,
+            key_extractor,
             order_index: HashMap::new(),
             partition_output_cache: HashMap::new(),
         }
@@ -626,11 +1119,13 @@ impl TransientTop1Processor {
         deltas: Vec<(Vec<u8>, i64)>,
     ) -> Result<Vec<(Vec<u8>, i64)>> {
         let mut output_deltas = HashMap::new();
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            let (partition_key, order_key) = self.keys_for(&row_key);
+        for keyed in self.key_extractor.extract_topn(&deltas)? {
+            let TransientTopNKeyedDelta {
+                row_key,
+                diff,
+                partition_key,
+                order_key,
+            } = keyed;
             let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
                 continue;
             };
@@ -691,34 +1186,16 @@ impl TransientTop1Processor {
     #[allow(dead_code)]
     pub(super) fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
         self.partition_output_cache
-            .values()
-            .filter_map(|row_key| {
-                let (partition_key, order_key) = self.compute_key_parts(row_key);
-                let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
-                    return None;
-                };
-                let weight = self
-                    .order_index
-                    .get(&partition_key)?
-                    .get(&(order_key, row_key.clone()))?;
+            .iter()
+            .filter_map(|(partition_key, row_key)| {
+                let weight = self.order_index.get(partition_key)?.iter().find_map(
+                    |((_order_key, candidate_row), weight)| {
+                        (candidate_row == row_key).then_some(weight)
+                    },
+                )?;
                 (*weight > 0).then_some((row_key.clone(), 1))
             })
             .collect()
-    }
-
-    fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        self.compute_key_parts(row_key)
-    }
-
-    fn compute_key_parts(&self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        compute_transient_topn_key_parts(
-            &self.graph_id,
-            Arc::clone(&self.order_specs),
-            self.partition_key_columns.as_ref(),
-            self.order_key_columns.as_ref(),
-            self.order_value_types.as_ref(),
-            row_key,
-        )
     }
 }
 
@@ -813,9 +1290,7 @@ struct TransientDirectPartitionTopNConfig {
 struct TransientDirectPartitionTopNProcessor {
     graph_id: String,
     partition_idx: usize,
-    order_key_columns: Arc<Vec<usize>>,
-    order_value_types: Arc<Vec<DbspScalarType>>,
-    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    key_extractor: TransientTopNKeyExtractor,
     limit: usize,
     offset: usize,
     order_index: HashMap<i64, BTreeMap<TransientTopNKey, i64>>,
@@ -830,7 +1305,7 @@ struct TransientDirectInt64TopNProcessor {
     order_idx: usize,
     ascending: bool,
     limit: usize,
-    row_key_cache: HashMap<Vec<u8>, Option<(i64, i64)>>,
+    key_extractor: TransientTopNKeyExtractor,
     partitions: HashMap<i64, TransientDirectInt64TopNPartitionState>,
     profile_enabled: bool,
     profiled_batches: usize,
@@ -842,7 +1317,7 @@ pub(super) struct TransientDirectTop1Processor {
     order_idx: usize,
     ascending: bool,
     compact_append_only_state: bool,
-    row_key_cache: HashMap<Vec<u8>, Option<(TransientDirectTop1PartitionKey, i64)>>,
+    key_extractor: TransientTopNKeyExtractor,
     pub(super) partitions:
         HashMap<TransientDirectTop1PartitionKey, TransientDirectTop1PartitionState>,
     profile_enabled: bool,
@@ -851,12 +1326,8 @@ pub(super) struct TransientDirectTop1Processor {
 
 struct TransientBatchTopNProcessor {
     graph_id: String,
-    partition_key_columns: Arc<Vec<usize>>,
-    order_key_columns: Arc<Vec<usize>>,
-    order_value_types: Arc<Vec<DbspScalarType>>,
-    order_specs: Arc<Vec<TransientTopNSortSpec>>,
+    key_extractor: TransientTopNKeyExtractor,
     limit: usize,
-    row_key_cache: Option<HashMap<Vec<u8>, (Option<Vec<u8>>, Option<TransientTopNKey>)>>,
     partitions: HashMap<Vec<u8>, TransientBatchTopNPartitionState>,
     profile_enabled: bool,
     profiled_batches: usize,
@@ -867,25 +1338,17 @@ impl TransientBatchTopNProcessor {
         graph_id: impl Into<String>,
         topn: &DbspTopNNode,
         key_layout: &TransientTopNKeyLayout,
-        append_only_input: bool,
+        _append_only_input: bool,
     ) -> Self {
-        let order_specs = Arc::new(
-            topn.order_by()
-                .iter()
-                .map(|expr| TransientTopNSortSpec {
-                    ascending: expr.ascending(),
-                    nulls_first: expr.nulls_first(),
-                })
-                .collect(),
-        );
+        let graph_id = graph_id.into();
+        let order_specs = transient_topn_order_specs(topn);
+        let key_extractor =
+            TransientTopNKeyExtractor::for_layout(graph_id.clone(), key_layout, order_specs)
+                .expect("transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
-            partition_key_columns: Arc::clone(&key_layout.partition_columns),
-            order_key_columns: Arc::clone(&key_layout.order_columns),
-            order_value_types: Arc::clone(&key_layout.order_types),
-            order_specs,
+            graph_id,
+            key_extractor,
             limit: topn.limit(),
-            row_key_cache: (!append_only_input).then(HashMap::new),
             partitions: HashMap::new(),
             profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
@@ -901,15 +1364,18 @@ impl TransientBatchTopNProcessor {
         let grouping_start = profile_this_batch.then(Instant::now);
         let mut partition_updates =
             HashMap::<Vec<u8>, Vec<TransientBatchTopNPartitionUpdate>>::new();
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            let key_start = profile_this_batch.then(Instant::now);
-            let (partition_key, order_key) = self.keys_for(&row_key);
-            if let Some(key_start) = key_start {
-                key_eval_us += key_start.elapsed().as_micros();
-            }
+        let key_start = profile_this_batch.then(Instant::now);
+        let keyed_deltas = self.key_extractor.extract_topn(&deltas)?;
+        if let Some(key_start) = key_start {
+            key_eval_us += key_start.elapsed().as_micros();
+        }
+        for keyed in keyed_deltas {
+            let TransientTopNKeyedDelta {
+                row_key,
+                diff,
+                partition_key,
+                order_key,
+            } = keyed;
             let (Some(partition_key), Some(order_key)) = (partition_key, order_key) else {
                 continue;
             };
@@ -1252,30 +1718,6 @@ impl TransientBatchTopNProcessor {
             }
         }
     }
-
-    fn keys_for(&mut self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        if let Some(cache) = self.row_key_cache.as_ref()
-            && let Some(cached) = cache.get(row_key)
-        {
-            return cached.clone();
-        }
-        let computed = self.compute_key_parts(row_key);
-        if let Some(cache) = self.row_key_cache.as_mut() {
-            cache.insert(row_key.clone(), computed.clone());
-        }
-        computed
-    }
-
-    fn compute_key_parts(&self, row_key: &Vec<u8>) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-        compute_transient_topn_key_parts(
-            &self.graph_id,
-            Arc::clone(&self.order_specs),
-            self.partition_key_columns.as_ref(),
-            self.order_key_columns.as_ref(),
-            self.order_value_types.as_ref(),
-            row_key,
-        )
-    }
 }
 
 impl TransientDirectPartitionTopNProcessor {
@@ -1285,21 +1727,15 @@ impl TransientDirectPartitionTopNProcessor {
         topn: &DbspTopNNode,
         key_layout: &TransientTopNKeyLayout,
     ) -> Self {
-        let order_specs = Arc::new(
-            topn.order_by()
-                .iter()
-                .map(|expr| TransientTopNSortSpec {
-                    ascending: expr.ascending(),
-                    nulls_first: expr.nulls_first(),
-                })
-                .collect(),
-        );
+        let graph_id = graph_id.into();
+        let order_specs = transient_topn_order_specs(topn);
+        let key_extractor =
+            TransientTopNKeyExtractor::for_layout(graph_id.clone(), key_layout, order_specs)
+                .expect("transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
+            graph_id,
             partition_idx: config.partition_idx,
-            order_key_columns: Arc::clone(&key_layout.order_columns),
-            order_value_types: Arc::clone(&key_layout.order_types),
-            order_specs,
+            key_extractor,
             limit: topn.limit(),
             offset: topn.offset(),
             order_index: HashMap::new(),
@@ -1317,28 +1753,29 @@ impl TransientDirectPartitionTopNProcessor {
         let mut mutation_us = 0u128;
 
         let mut affected_partitions = HashSet::new();
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            let key_start = profile_this_batch.then(Instant::now);
-            let maybe_keys = self.compute_key_parts(&row_key);
-            if let Some(key_start) = key_start {
-                key_eval_us += key_start.elapsed().as_micros();
-            }
-            let Some((partition_key, order_key)) = maybe_keys else {
-                continue;
-            };
-            affected_partitions.insert(partition_key);
+        let key_start = profile_this_batch.then(Instant::now);
+        let keyed_deltas = self
+            .key_extractor
+            .extract_direct_partition_topn(&deltas, self.partition_idx)?;
+        if let Some(key_start) = key_start {
+            key_eval_us += key_start.elapsed().as_micros();
+        }
+        for keyed in keyed_deltas {
+            let TransientDirectPartitionTopNKeyedDelta {
+                diff,
+                partition_value,
+                order_key,
+            } = keyed;
+            affected_partitions.insert(partition_value);
 
             let mutation_start = profile_this_batch.then(Instant::now);
-            let partition_index = self.order_index.entry(partition_key).or_default();
+            let partition_index = self.order_index.entry(partition_value).or_default();
             let previous_weight = partition_index.get(&order_key).copied().unwrap_or(0);
             let next_weight = previous_weight.saturating_add(diff);
             if next_weight <= 0 {
                 partition_index.remove(&order_key);
                 if partition_index.is_empty() {
-                    self.order_index.remove(&partition_key);
+                    self.order_index.remove(&partition_value);
                 }
             } else {
                 partition_index.insert(order_key, next_weight);
@@ -1444,29 +1881,6 @@ impl TransientDirectPartitionTopNProcessor {
         }
         output
     }
-
-    fn compute_key_parts(&self, row_key: &Vec<u8>) -> Option<(i64, TransientTopNKey)> {
-        let partition_key = match extract_encoded_row_int64_column(row_key, self.partition_idx) {
-            Ok(Some(value)) => value,
-            Ok(None) => return None,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %self.graph_id,
-                    error = %err,
-                    "failed to extract transient topn direct partition column"
-                );
-                return None;
-            }
-        };
-        let order_key = compute_transient_topn_order_key(
-            &self.graph_id,
-            Arc::clone(&self.order_specs),
-            self.order_key_columns.as_ref(),
-            self.order_value_types.as_ref(),
-            row_key,
-        )?;
-        Some((partition_key, order_key))
-    }
 }
 
 impl TransientDirectInt64TopNProcessor {
@@ -1475,13 +1889,30 @@ impl TransientDirectInt64TopNProcessor {
         config: TransientDirectInt64TopNConfig,
         topn: &DbspTopNNode,
     ) -> Self {
+        let graph_id = graph_id.into();
+        let order_specs = transient_topn_order_specs(topn);
+        let order_type = topn
+            .output_schema()
+            .field(config.order_idx)
+            .expect("direct int64 topn order index should be in bounds")
+            .data_type
+            .clone();
+        let key_extractor = TransientTopNKeyExtractor::new(
+            graph_id.clone(),
+            Arc::clone(topn.output_schema()),
+            Arc::new(vec![config.partition_idx]),
+            Arc::new(vec![config.order_idx]),
+            Arc::new(vec![order_type]),
+            order_specs,
+        )
+        .expect("direct int64 transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
+            graph_id,
             partition_idx: config.partition_idx,
             order_idx: config.order_idx,
             ascending: config.ascending,
             limit: topn.limit(),
-            row_key_cache: HashMap::new(),
+            key_extractor,
             partitions: HashMap::new(),
             profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
@@ -1497,18 +1928,22 @@ impl TransientDirectInt64TopNProcessor {
         let grouping_start = profile_this_batch.then(Instant::now);
         let mut partition_updates =
             HashMap::<i64, Vec<TransientDirectInt64TopNPartitionUpdate>>::new();
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            let key_start = profile_this_batch.then(Instant::now);
-            let maybe_keys = self.keys_for(&row_key)?;
-            if let Some(key_start) = key_start {
-                key_eval_us += key_start.elapsed().as_micros();
-            }
-            let Some((partition_value, order_value)) = maybe_keys else {
-                continue;
-            };
+        let key_start = profile_this_batch.then(Instant::now);
+        let keyed_deltas = self.key_extractor.extract_direct_int64_topn(
+            &deltas,
+            self.partition_idx,
+            self.order_idx,
+        )?;
+        if let Some(key_start) = key_start {
+            key_eval_us += key_start.elapsed().as_micros();
+        }
+        for keyed in keyed_deltas {
+            let TransientDirectInt64TopNKeyedDelta {
+                row_key,
+                diff,
+                partition_value,
+                order_value,
+            } = keyed;
             partition_updates.entry(partition_value).or_default().push(
                 TransientDirectInt64TopNPartitionUpdate {
                     row_key,
@@ -1847,40 +2282,44 @@ impl TransientDirectInt64TopNProcessor {
         }
         left_row_key.cmp(right_row_key)
     }
-
-    fn keys_for(&mut self, row_key: &Vec<u8>) -> Result<Option<(i64, i64)>> {
-        if let Some(cached) = self.row_key_cache.get(row_key) {
-            return Ok(*cached);
-        }
-        let computed = self.compute_key_parts(row_key)?;
-        self.row_key_cache.insert(row_key.clone(), computed);
-        Ok(computed)
-    }
-
-    fn compute_key_parts(&self, row_key: &Vec<u8>) -> Result<Option<(i64, i64)>> {
-        let Some(partition_value) = extract_encoded_row_int64_column(row_key, self.partition_idx)?
-        else {
-            return Ok(None);
-        };
-        let Some(order_value) = extract_encoded_row_int64_column(row_key, self.order_idx)? else {
-            return Ok(None);
-        };
-        Ok(Some((partition_value, order_value)))
-    }
 }
 impl TransientDirectTop1Processor {
     pub(super) fn new(
         graph_id: impl Into<String>,
+        topn: &DbspTopNNode,
         config: TransientDirectTop1Config,
         compact_append_only_state: bool,
     ) -> Self {
+        let graph_id = graph_id.into();
+        let partition_columns = match config.partition_layout {
+            TransientDirectTop1PartitionLayout::One(partition_idx) => vec![partition_idx],
+            TransientDirectTop1PartitionLayout::Two(partition_indices) => {
+                partition_indices.to_vec()
+            }
+        };
+        let order_specs = transient_topn_order_specs(topn);
+        let order_type = topn
+            .output_schema()
+            .field(config.order_idx)
+            .expect("direct top1 order index should be in bounds")
+            .data_type
+            .clone();
+        let key_extractor = TransientTopNKeyExtractor::new(
+            graph_id.clone(),
+            Arc::clone(topn.output_schema()),
+            Arc::new(partition_columns),
+            Arc::new(vec![config.order_idx]),
+            Arc::new(vec![order_type]),
+            order_specs,
+        )
+        .expect("direct top1 transient topn key layout should be valid");
         Self {
-            graph_id: graph_id.into(),
+            graph_id,
             partition_layout: config.partition_layout,
             order_idx: config.order_idx,
             ascending: config.ascending,
             compact_append_only_state,
-            row_key_cache: HashMap::new(),
+            key_extractor,
             partitions: HashMap::new(),
             profile_enabled: tracing::enabled!(tracing::Level::DEBUG),
             profiled_batches: 0,
@@ -1901,18 +2340,22 @@ impl TransientDirectTop1Processor {
             TransientDirectTop1PartitionKey,
             Vec<TransientDirectTop1PartitionUpdate>,
         >::new();
-        for (row_key, diff) in deltas {
-            if diff == 0 {
-                continue;
-            }
-            let key_start = profile_this_batch.then(Instant::now);
-            let maybe_keys = self.keys_for(&row_key)?;
-            if let Some(key_start) = key_start {
-                key_eval_us += key_start.elapsed().as_micros();
-            }
-            let Some((partition_key, order_value)) = maybe_keys else {
-                continue;
-            };
+        let key_start = profile_this_batch.then(Instant::now);
+        let keyed_deltas = self.key_extractor.extract_direct_top1(
+            &deltas,
+            self.partition_layout,
+            self.order_idx,
+        )?;
+        if let Some(key_start) = key_start {
+            key_eval_us += key_start.elapsed().as_micros();
+        }
+        for keyed in keyed_deltas {
+            let TransientDirectTop1KeyedDelta {
+                row_key,
+                diff,
+                partition_key,
+                order_value,
+            } = keyed;
             partition_updates.entry(partition_key).or_default().push(
                 TransientDirectTop1PartitionUpdate {
                     row_key,
@@ -2144,105 +2587,6 @@ impl TransientDirectTop1Processor {
         }
         left_row_key.cmp(right_row_key)
     }
-
-    fn keys_for(
-        &mut self,
-        row_key: &Vec<u8>,
-    ) -> Result<Option<(TransientDirectTop1PartitionKey, i64)>> {
-        if let Some(cached) = self.row_key_cache.get(row_key) {
-            return Ok(cached.clone());
-        }
-        let computed = self.compute_key_parts(row_key)?;
-        self.row_key_cache.insert(row_key.clone(), computed.clone());
-        Ok(computed)
-    }
-
-    fn compute_key_parts(
-        &self,
-        row_key: &Vec<u8>,
-    ) -> Result<Option<(TransientDirectTop1PartitionKey, i64)>> {
-        let Some(partition_key) =
-            extract_direct_top1_partition_key(row_key, self.partition_layout)?
-        else {
-            return Ok(None);
-        };
-        let Some(order_value) = extract_encoded_row_i64_like_column(row_key, self.order_idx)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((partition_key, order_value)))
-    }
-}
-
-fn compute_transient_topn_key_parts(
-    graph_id: &str,
-    order_specs: Arc<Vec<TransientTopNSortSpec>>,
-    partition_key_columns: &[usize],
-    order_key_columns: &[usize],
-    order_value_types: &[DbspScalarType],
-    row_key: &Vec<u8>,
-) -> (Option<Vec<u8>>, Option<TransientTopNKey>) {
-    let partition_key = if partition_key_columns.is_empty() {
-        Some(Vec::new())
-    } else {
-        match extract_encoded_row_columns(row_key, partition_key_columns, false) {
-            Ok(selected) => selected,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to extract transient topn partition key columns"
-                );
-                return (None, None);
-            }
-        }
-    };
-
-    let order_key = compute_transient_topn_order_key(
-        graph_id,
-        order_specs,
-        order_key_columns,
-        order_value_types,
-        row_key,
-    );
-
-    (partition_key, order_key)
-}
-
-fn compute_transient_topn_order_key(
-    graph_id: &str,
-    order_specs: Arc<Vec<TransientTopNSortSpec>>,
-    order_key_columns: &[usize],
-    order_value_types: &[DbspScalarType],
-    row_key: &Vec<u8>,
-) -> Option<TransientTopNKey> {
-    let mut values = Vec::with_capacity(order_key_columns.len());
-    for (column_idx, expected_type) in order_key_columns.iter().zip(order_value_types.iter()) {
-        let scalar = match extract_encoded_row_scalar(row_key, *column_idx) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to extract transient topn order key column"
-                );
-                return None;
-            }
-        };
-        match TransientTopNValue::from_encoded_scalar(scalar, expected_type) {
-            Ok(value) => values.push(value),
-            Err(err) => {
-                tracing::warn!(
-                    graph_id = %graph_id,
-                    error = %err,
-                    "failed to map transient topn order value"
-                );
-                return None;
-            }
-        }
-    }
-
-    Some(TransientTopNKey::new(order_specs, values, row_key.clone()))
 }
 
 fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNKeyLayout> {
@@ -2267,6 +2611,7 @@ fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNK
         && direct_order_columns.iter().all(Option::is_some)
     {
         return Ok(TransientTopNKeyLayout {
+            input_schema: Arc::clone(&input_schema),
             partition_columns: Arc::new(
                 direct_partition_columns
                     .into_iter()
@@ -2378,6 +2723,7 @@ fn build_transient_topn_key_layout(topn: &DbspTopNNode) -> Result<TransientTopNK
         .collect::<Result<Vec<_>>>()?;
 
     Ok(TransientTopNKeyLayout {
+        input_schema: Arc::clone(projected_schema),
         partition_columns: Arc::new(partition_columns),
         order_columns: Arc::new(order_columns),
         order_types: Arc::new(order_types),
@@ -2551,44 +2897,28 @@ fn try_build_direct_int64_partitioned_topn_config(
     })
 }
 
-fn extract_direct_top1_partition_key(
-    row_key: &[u8],
-    partition_layout: TransientDirectTop1PartitionLayout,
-) -> Result<Option<TransientDirectTop1PartitionKey>> {
-    let partition_key = match partition_layout {
-        TransientDirectTop1PartitionLayout::One(partition_idx) => {
-            let Some(partition_value) = extract_encoded_row_int64_column(row_key, partition_idx)?
-            else {
-                return Ok(None);
-            };
-            TransientDirectTop1PartitionKey::One(partition_value)
-        }
-        TransientDirectTop1PartitionLayout::Two(partition_indices) => {
-            let Some(first_partition_value) =
-                extract_encoded_row_int64_column(row_key, partition_indices[0])?
-            else {
-                return Ok(None);
-            };
-            let Some(second_partition_value) =
-                extract_encoded_row_int64_column(row_key, partition_indices[1])?
-            else {
-                return Ok(None);
-            };
-            TransientDirectTop1PartitionKey::Two(first_partition_value, second_partition_value)
-        }
-    };
-    Ok(Some(partition_key))
-}
-
-pub(super) fn build_direct_projection_transform(columns: Arc<Vec<usize>>) -> Arc<DeltaTransformFn> {
-    Arc::new(move |deltas: &[(Vec<u8>, i64)]| project_encoded_deltas(deltas, columns.as_ref()))
+pub(super) fn build_direct_projection_transform(
+    columns: Arc<Vec<usize>>,
+    input_schema: Arc<RowSchema>,
+) -> Arc<DeltaTransformFn> {
+    let input_arrow_schema = input_schema.to_arrow_schema();
+    Arc::new(move |deltas| {
+        let columns = Arc::clone(&columns);
+        let input_arrow_schema = Arc::clone(&input_arrow_schema);
+        Box::pin(async move {
+            project_encoded_deltas(deltas.as_ref(), columns.as_ref(), input_arrow_schema)
+        })
+    })
 }
 
 pub(super) fn fold_topn_root_output_projection(shape: &mut TransientSourceTopNRootShape) {
     if let Some(output_projection) = shape.output_projection.take() {
         shape.transform = compose_optional_delta_transform(
             shape.transform.take(),
-            build_direct_projection_transform(output_projection),
+            build_direct_projection_transform(
+                output_projection,
+                Arc::clone(shape.topn.output_schema()),
+            ),
         );
     }
 }
@@ -2596,15 +2926,46 @@ pub(super) fn fold_topn_root_output_projection(shape: &mut TransientSourceTopNRo
 fn project_encoded_deltas(
     deltas: &[(Vec<u8>, i64)],
     columns: &[usize],
+    input_schema: SchemaRef,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
-    deltas
-        .iter()
-        .map(|(encoded, weight)| {
-            let projected = extract_encoded_row_columns(encoded, columns, false)?
-                .ok_or_else(|| anyhow!("direct encoded projection unexpectedly returned null"))?;
-            Ok((projected, *weight))
-        })
-        .collect()
+    if deltas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let projected_schema = projected_arrow_schema(&input_schema, columns)?;
+    let mut buffer = DeltaBatchBuffer::new_projected(
+        projected_schema,
+        Arc::<[usize]>::from(columns.to_vec()),
+        false,
+        DeltaBatchConfig {
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+        },
+    )
+    .context("create transient topn projected output batch")?;
+    let mut staged_weights = Vec::with_capacity(deltas.len());
+    for (encoded, weight) in deltas {
+        if *weight == 0 {
+            continue;
+        }
+        if buffer.push(encoded.clone(), *weight, None)?.is_some() {
+            bail!("unbounded transient topn projection flushed before manual flush");
+        }
+        staged_weights.push(*weight);
+    }
+    let Some(batch) = buffer.flush_manual()? else {
+        return Ok(Vec::new());
+    };
+    let projected_positions = (0..columns.len()).collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        let weight = staged_weights
+            .get(row_idx)
+            .copied()
+            .ok_or_else(|| anyhow!("transient topn projection row index out of bounds"))?;
+        let projected = encode_arrow_columns(&batch, &projected_positions, row_idx)?;
+        output.push((projected, weight));
+    }
+    Ok(output)
 }
 
 pub(super) fn build_transient_topn_receiver(
@@ -2665,10 +3026,16 @@ pub(super) fn build_transient_topn_receiver_from_batches(
     let cancel = cancel.clone();
     let state_label = state_label.into();
     let debug_transient_join = tracing::enabled!(tracing::Level::DEBUG);
+    let topn_output_schema = topn.output_schema().to_arrow_schema();
     if let Some(config) = try_build_direct_partitioned_top1_config(topn) {
-        let mut processor =
-            TransientDirectTop1Processor::new(graph_id.clone(), config, compact_append_only_state);
+        let mut processor = TransientDirectTop1Processor::new(
+            graph_id.clone(),
+            topn,
+            config,
+            compact_append_only_state,
+        );
         let output_projection = output_projection.clone();
+        let output_projection_schema = Arc::clone(&topn_output_schema);
         let state_table = state_table.clone();
         let state_label = state_label.clone();
         tokio::spawn(async move {
@@ -2714,7 +3081,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             }
                         }
                         let output_deltas = match output_projection.as_ref() {
-                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2751,6 +3118,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
             let mut processor =
                 TransientDirectInt64TopNProcessor::new(graph_id.clone(), config, topn);
             let output_projection = output_projection.clone();
+            let output_projection_schema = Arc::clone(&topn_output_schema);
             let state_table = state_table.clone();
             let state_label = state_label.clone();
             tokio::spawn(async move {
@@ -2793,7 +3161,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                                 }
                             };
                             let output_deltas = match output_projection.as_ref() {
-                                Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                                Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                     Ok(deltas) => deltas,
                                     Err(err) => {
                                         report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2839,6 +3207,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
         let mut processor = TransientTop1Processor::new(graph_id.clone(), topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let output_projection_schema = Arc::clone(&topn_output_schema);
         let state_table = state_table.clone();
         let state_label = state_label.clone();
         tokio::spawn(async move {
@@ -2865,7 +3234,10 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            match evaluator
+                                .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                                .await
+                            {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2895,7 +3267,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             break;
                         }
                         let output_deltas = match output_projection.as_ref() {
-                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2931,6 +3303,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
             TransientDirectPartitionTopNProcessor::new(graph_id.clone(), config, topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let output_projection_schema = Arc::clone(&topn_output_schema);
         let state_table = state_table.clone();
         let state_label = state_label.clone();
         tokio::spawn(async move {
@@ -2957,7 +3330,10 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            match evaluator
+                                .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                                .await
+                            {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -2987,7 +3363,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             }
                         }
                         let output_deltas = match output_projection.as_ref() {
-                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3028,6 +3404,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
             TransientAppendOnlyTopNProcessor::new(graph_id.clone(), topn, &key_layout);
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let output_projection_schema = Arc::clone(&topn_output_schema);
         let state_table = state_table.clone();
         let state_label = state_label.clone();
         tokio::spawn(async move {
@@ -3054,7 +3431,10 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            match evaluator
+                                .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                                .await
+                            {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3084,7 +3464,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             }
                         }
                         let output_deltas = match output_projection.as_ref() {
-                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3130,6 +3510,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
         );
         let precompute_evaluator = key_layout.precompute_evaluator.clone();
         let output_projection = output_projection.clone();
+        let output_projection_schema = Arc::clone(&topn_output_schema);
         let state_table = state_table.clone();
         let state_label = state_label.clone();
         tokio::spawn(async move {
@@ -3156,7 +3537,10 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
                         let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                            match evaluator.transform_delta(&graph_id, &input_deltas) {
+                            match evaluator
+                                .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                                .await
+                            {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3178,7 +3562,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             }
                         };
                         let output_deltas = match output_projection.as_ref() {
-                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                            Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
                                 Err(err) => {
                                     report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3213,6 +3597,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
         TransientTopNProcessor::new(graph_id.clone(), topn, &key_layout, append_only_input);
     let precompute_evaluator = key_layout.precompute_evaluator.clone();
     let output_projection = output_projection.clone();
+    let output_projection_schema = Arc::clone(&topn_output_schema);
     let state_table = state_table.clone();
     let state_label = state_label.clone();
 
@@ -3238,7 +3623,10 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                     };
                     let input_deltas = batch.deltas.as_ref().clone();
                     let input_deltas = if let Some(evaluator) = precompute_evaluator.as_ref() {
-                        match evaluator.transform_delta(&graph_id, &input_deltas) {
+                        match evaluator
+                            .transform_delta_arrow(&graph_id, Arc::new(input_deltas))
+                            .await
+                        {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
@@ -3268,7 +3656,7 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         break;
                     }
                     let output_deltas = match output_projection.as_ref() {
-                        Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref()) {
+                        Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                             Ok(deltas) => deltas,
                             Err(err) => {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);

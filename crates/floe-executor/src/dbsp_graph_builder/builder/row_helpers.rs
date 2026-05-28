@@ -75,45 +75,6 @@ pub(super) fn projection_resolve_direct_column(
         .or_else(|| schema.field_index(&column.name))
 }
 
-pub(super) fn extract_encoded_row_int64_column(
-    bytes: &[u8],
-    target_index: usize,
-) -> Result<Option<i64>> {
-    if bytes.len() < 4 {
-        bail!("encoded key too short");
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    if target_index >= count {
-        bail!("encoded row missing int64 column at index {target_index}");
-    }
-
-    let mut cursor = 4usize;
-    for column_idx in 0..count {
-        let tag = *bytes
-            .get(cursor)
-            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
-        cursor += 1;
-        if column_idx == target_index {
-            return match tag {
-                0x01 => {
-                    let end = cursor + 8;
-                    let chunk = bytes
-                        .get(cursor..end)
-                        .ok_or_else(|| anyhow!("truncated int64"))?;
-                    Ok(Some(i64::from_le_bytes(chunk.try_into().unwrap())))
-                }
-                0x05 | 0x00 => Ok(None),
-                other => Err(anyhow!(
-                    "expected int64 encoded field at index {target_index}, found tag {other:#x}"
-                )),
-            };
-        }
-        cursor = skip_encoded_row_field(bytes, cursor, tag)?;
-    }
-
-    bail!("encoded row missing int64 column at index {target_index}")
-}
-
 pub(super) fn extract_encoded_row_i64_like_column(
     bytes: &[u8],
     target_index: usize,

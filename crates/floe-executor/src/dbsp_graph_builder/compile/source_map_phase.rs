@@ -46,11 +46,16 @@ impl DbspGraphBuilder {
             "using vectorized filter execution path"
         );
         let vectorized_graph_id = graph_id.clone();
-        let transform =
-            move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-                evaluator.transform_delta(&vectorized_graph_id, delta_values)
-            };
-        let filter = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+        let transform = move |delta_values: Arc<Vec<(Vec<u8>, i64)>>| {
+            let evaluator = Arc::clone(&evaluator);
+            let graph_id = vectorized_graph_id.clone();
+            async move {
+                evaluator
+                    .transform_delta_arrow(&graph_id, delta_values)
+                    .await
+            }
+        };
+        let filter = DbspFilterMap::new_async_batch::<Vec<u8>, Vec<u8>, _, _>(
             &upstream,
             transform,
             Some(error_handler),
@@ -87,11 +92,16 @@ impl DbspGraphBuilder {
             "using vectorized map execution path"
         );
         let vectorized_graph_id = graph_id.clone();
-        let transform =
-            move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-                evaluator.transform_delta(&vectorized_graph_id, delta_values)
-            };
-        let map = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+        let transform = move |delta_values: Arc<Vec<(Vec<u8>, i64)>>| {
+            let evaluator = Arc::clone(&evaluator);
+            let graph_id = vectorized_graph_id.clone();
+            async move {
+                evaluator
+                    .transform_delta_arrow(&graph_id, delta_values)
+                    .await
+            }
+        };
+        let map = DbspFilterMap::new_async_batch::<Vec<u8>, Vec<u8>, _, _>(
             &upstream,
             transform,
             Some(error_handler),
@@ -135,12 +145,17 @@ impl DbspGraphBuilder {
             "using vectorized filter_map execution path"
         );
         let vectorized_graph_id = graph_id.clone();
-        let transform =
-            move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-                evaluator.transform_delta(&vectorized_graph_id, delta_values)
-            };
+        let transform = move |delta_values: Arc<Vec<(Vec<u8>, i64)>>| {
+            let evaluator = Arc::clone(&evaluator);
+            let graph_id = vectorized_graph_id.clone();
+            async move {
+                evaluator
+                    .transform_delta_arrow(&graph_id, delta_values)
+                    .await
+            }
+        };
 
-        let filter_map = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+        let filter_map = DbspFilterMap::new_async_batch::<Vec<u8>, Vec<u8>, _, _>(
             &upstream,
             transform,
             Some(error_handler),

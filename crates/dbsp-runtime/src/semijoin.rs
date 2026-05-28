@@ -31,6 +31,7 @@ pub struct DbspSemiJoin {
 }
 
 impl DbspSemiJoin {
+    #[cfg(test)]
     pub async fn new<L, R, K, KL, KR>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,

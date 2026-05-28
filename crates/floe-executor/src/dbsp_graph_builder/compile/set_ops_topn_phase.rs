@@ -1,5 +1,12 @@
 use super::*;
-use crate::encoding::{EncodedRowScalar, extract_encoded_row_columns, extract_encoded_row_scalar};
+use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
+use anyhow::bail;
+use datafusion::arrow::array::{
+    Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
+};
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
@@ -198,77 +205,26 @@ impl DbspGraphBuilder {
         );
         let needs_trim_projection = needs_precompute;
 
-        let log_graph_id = graph_id.clone();
-        let order_key_columns_for_log = Arc::clone(&order_key_columns);
-        let order_value_types_for_log = Arc::clone(&order_value_types);
-        let partition_key_columns_for_log = Arc::clone(&partition_key_columns);
-        let key_parts = move |bytes: &Vec<u8>| -> (Option<Vec<u8>>, Option<TopNKey>) {
-            let partition_key = if partition_exprs.is_empty() {
-                Some(Vec::new())
-            } else {
-                match extract_encoded_row_columns(
-                    bytes,
-                    partition_key_columns_for_log.as_ref(),
-                    false,
-                ) {
-                    Ok(selected) => selected,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %log_graph_id,
-                            error = %err,
-                            "failed to extract topn partition key columns"
-                        );
-                        return (None, None);
-                    }
-                }
-            };
-
-            let mut values = Vec::with_capacity(order_exprs.len());
-            for (column_idx, expected_type) in order_key_columns_for_log
-                .iter()
-                .zip(order_value_types_for_log.iter())
-            {
-                let scalar = match extract_encoded_row_scalar(bytes, *column_idx) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %log_graph_id,
-                            error = %err,
-                            "failed to extract topn order key column"
-                        );
-                        return (partition_key, None);
-                    }
-                };
-                match topn_value_from_encoded_scalar(scalar, expected_type) {
-                    Ok(value) => values.push(value),
-                    Err(err) => {
-                        tracing::warn!(
-                            graph_id = %log_graph_id,
-                            error = %err,
-                            "failed to map topn order value"
-                        );
-                        return (partition_key, None);
-                    }
-                }
-            }
-
-            (
-                partition_key,
-                Some(TopNKey::new(
-                    Arc::clone(&order_specs),
-                    values,
-                    bytes.clone(),
-                )),
-            )
-        };
+        let key_parts = Arc::new(VectorizedTopNKeyParts::new(
+            Arc::clone(&key_schema),
+            partition_key_columns,
+            order_key_columns,
+            order_value_types,
+            Arc::clone(&order_specs),
+            graph_id.clone(),
+            partitioned,
+        ));
 
         if limit == 1 && offset == 0 && partitioned {
-            let top1 = dbsp::DbspPartitionedTop1::new_with_key_extractor::<
+            let key_parts_for_top1 = Arc::clone(&key_parts);
+            let key_parts_batch =
+                move |delta_values: &[(Vec<u8>, i64)]| key_parts_for_top1.extract(delta_values);
+            let top1 = dbsp::DbspPartitionedTop1::new_with_batch_key_extractor::<
                 Vec<u8>,
                 Vec<u8>,
                 TopNKey,
                 _,
-            >(&upstream, key_parts, Some(error_handler))
+            >(&upstream, key_parts_batch, Some(error_handler))
             .await
             .context("initialize DBSP partitioned top1")?;
             let top1_stream = top1.stream();
@@ -337,9 +293,12 @@ impl DbspGraphBuilder {
                 .context("initialize topn trim projection map");
         }
 
-        let topn = DbspTopN::new_with_key_extractor::<Vec<u8>, Vec<u8>, TopNKey, _>(
+        let key_parts_for_topn = Arc::clone(&key_parts);
+        let key_parts_batch =
+            move |delta_values: &[(Vec<u8>, i64)]| key_parts_for_topn.extract(delta_values);
+        let topn = DbspTopN::new_with_batch_key_extractor::<Vec<u8>, Vec<u8>, TopNKey, _>(
             &upstream,
-            key_parts,
+            key_parts_batch,
             limit,
             offset,
             Some(error_handler),
@@ -397,22 +356,257 @@ fn build_trim_projection_node(
     dbsp::DbspProjectNode::try_new(topn_schema, items)
 }
 
-fn topn_value_from_encoded_scalar(
-    scalar: Option<EncodedRowScalar>,
+struct VectorizedTopNKeyParts {
+    schema: Arc<RowSchema>,
+    partition_key_columns: Arc<Vec<usize>>,
+    order_key_columns: Arc<Vec<usize>>,
+    order_value_types: Arc<Vec<DbspScalarType>>,
+    order_specs: Arc<Vec<TopNSortSpec>>,
+    graph_id: String,
+    partitioned: bool,
+}
+
+impl VectorizedTopNKeyParts {
+    fn new(
+        schema: Arc<RowSchema>,
+        partition_key_columns: Arc<Vec<usize>>,
+        order_key_columns: Arc<Vec<usize>>,
+        order_value_types: Arc<Vec<DbspScalarType>>,
+        order_specs: Arc<Vec<TopNSortSpec>>,
+        graph_id: String,
+        partitioned: bool,
+    ) -> Self {
+        Self {
+            schema,
+            partition_key_columns,
+            order_key_columns,
+            order_value_types,
+            order_specs,
+            graph_id,
+            partitioned,
+        }
+    }
+
+    fn extract(
+        &self,
+        delta_values: &[(Vec<u8>, i64)],
+    ) -> Vec<(Vec<u8>, i64, Option<Vec<u8>>, Option<TopNKey>)> {
+        match self.try_extract(delta_values) {
+            Ok(extracted) => extracted,
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %self.graph_id,
+                    error = %err,
+                    "failed to evaluate vectorized topn keys"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn try_extract(
+        &self,
+        delta_values: &[(Vec<u8>, i64)],
+    ) -> Result<Vec<(Vec<u8>, i64, Option<Vec<u8>>, Option<TopNKey>)>> {
+        if delta_values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut buffer = DeltaBatchBuffer::new(
+            self.schema.to_arrow_schema(),
+            false,
+            DeltaBatchConfig {
+                max_rows: usize::MAX,
+                max_bytes: usize::MAX,
+            },
+        )
+        .context("create vectorized topn key input delta buffer")?;
+        let mut staged_rows = Vec::with_capacity(delta_values.len());
+        for (row, weight) in delta_values {
+            if *weight == 0 {
+                continue;
+            }
+            if buffer.push(row.clone(), *weight, None)?.is_some() {
+                bail!("unbounded vectorized topn key extractor flushed before manual flush");
+            }
+            staged_rows.push((row.clone(), *weight));
+        }
+        let Some(batch) = buffer.flush_manual()? else {
+            return Ok(Vec::new());
+        };
+
+        let mut output = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let (row, weight) = staged_rows
+                .get(row_idx)
+                .ok_or_else(|| anyhow!("vectorized topn key row index out of bounds"))?;
+            let partition_key = if self.partitioned {
+                Some(encode_arrow_columns(
+                    &batch,
+                    self.partition_key_columns.as_ref(),
+                    row_idx,
+                )?)
+            } else {
+                Some(Vec::new())
+            };
+            let mut order_values = Vec::with_capacity(self.order_key_columns.len());
+            for (column_idx, expected_type) in self
+                .order_key_columns
+                .iter()
+                .zip(self.order_value_types.iter())
+            {
+                order_values.push(topn_value_from_arrow(
+                    batch.column(*column_idx).as_ref(),
+                    row_idx,
+                    expected_type,
+                )?);
+            }
+            let order_key = Some(TopNKey::new(
+                Arc::clone(&self.order_specs),
+                order_values,
+                row.clone(),
+            ));
+            output.push((row.clone(), *weight, partition_key, order_key));
+        }
+        Ok(output)
+    }
+}
+
+fn encode_arrow_columns(batch: &RecordBatch, columns: &[usize], row_idx: usize) -> Result<Vec<u8>> {
+    let count = u32::try_from(columns.len()).context("too many topn partition columns")?;
+    let mut encoded = Vec::with_capacity(4 + columns.len().saturating_mul(16));
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for column_idx in columns.iter().copied() {
+        append_arrow_encoded_value(batch.column(column_idx).as_ref(), row_idx, &mut encoded)?;
+    }
+    Ok(encoded)
+}
+
+fn append_arrow_encoded_value(
+    array: &dyn Array,
+    row_idx: usize,
+    encoded: &mut Vec<u8>,
+) -> Result<()> {
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 partition array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x05);
+            } else {
+                encoded.push(0x01);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected Utf8 partition array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x06);
+            } else {
+                encoded.push(0x02);
+                let bytes = values.value(row_idx).as_bytes();
+                let len = u32::try_from(bytes.len()).context("topn utf8 partition too large")?;
+                encoded.extend_from_slice(&len.to_le_bytes());
+                encoded.extend_from_slice(bytes);
+            }
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow!("expected TimestampMillisecond partition array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x07);
+            } else {
+                encoded.push(0x03);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("expected Boolean partition array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x08);
+            } else {
+                encoded.push(0x04);
+                encoded.push(u8::from(values.value(row_idx)));
+            }
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| anyhow!("expected Date32 partition array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x0A);
+            } else {
+                encoded.push(0x09);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        DataType::Decimal128(_, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| anyhow!("expected Decimal128 partition array"))?;
+            if values.is_null(row_idx) {
+                encoded.push(0x0C);
+            } else {
+                encoded.push(0x0B);
+                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
+            }
+        }
+        other => bail!("unsupported Arrow topn partition key type: {other:?}"),
+    }
+    Ok(())
+}
+
+fn topn_value_from_arrow(
+    array: &dyn Array,
+    row_idx: usize,
     expected_type: &DbspScalarType,
 ) -> Result<TopNValue> {
-    match (scalar, expected_type) {
-        (None, _) => Ok(TopNValue::Null),
-        (Some(EncodedRowScalar::Int64(value)), DbspScalarType::Int64) => {
-            Ok(TopNValue::Int64(value))
+    if array.is_null(row_idx) {
+        return Ok(TopNValue::Null);
+    }
+    match (array.data_type(), expected_type) {
+        (DataType::Int64, DbspScalarType::Int64) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("expected Int64 order array"))?;
+            Ok(TopNValue::Int64(values.value(row_idx)))
         }
-        (Some(EncodedRowScalar::TimestampMillis(value)), DbspScalarType::TimestampMillis) => {
-            Ok(TopNValue::Timestamp(value))
+        (DataType::Timestamp(TimeUnit::Millisecond, _), DbspScalarType::TimestampMillis) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow!("expected TimestampMillisecond order array"))?;
+            Ok(TopNValue::Timestamp(values.value(row_idx)))
         }
-        (Some(EncodedRowScalar::Utf8(value)), DbspScalarType::Utf8) => Ok(TopNValue::Utf8(value)),
-        (Some(EncodedRowScalar::Bool(value)), DbspScalarType::Bool) => Ok(TopNValue::Bool(value)),
-        (Some(other), expected) => Err(anyhow!(
-            "topn order key type mismatch: expected {expected:?}, decoded {other:?}"
+        (DataType::Utf8, DbspScalarType::Utf8) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("expected Utf8 order array"))?;
+            Ok(TopNValue::Utf8(values.value(row_idx).to_string()))
+        }
+        (DataType::Boolean, DbspScalarType::Bool) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| anyhow!("expected Boolean order array"))?;
+            Ok(TopNValue::Bool(values.value(row_idx)))
+        }
+        (actual, expected) => Err(anyhow!(
+            "topn order key type mismatch: expected {expected:?}, Arrow column is {actual:?}"
         )),
     }
 }

@@ -20,6 +20,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
+#[cfg(test)]
 type KeyPartsFn<K, P, O> = Arc<dyn Fn(&K) -> (Option<P>, Option<O>) + Send + Sync>;
 type BatchKeyPartsFn<K, P, O> =
     Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
@@ -87,6 +88,7 @@ where
     P::Archived: RkyvDeserialize<P, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     O: Clone + Ord + Send + Sync + 'static,
 {
+    #[cfg(test)]
     pub fn new_with_key_extractor(
         input_index: IndexedBatchZSet<P, K>,
         table: Arc<dyn KeyValueTable>,

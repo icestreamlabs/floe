@@ -74,5 +74,5 @@ pub use tail::TailExecutionConfig;
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};
 pub use vectorized_exec::{VectorizedPlanExecutor, VectorizedTickOutput};
 pub use vectorized_keys::{
-    build_delta_batch, build_source_delta_batch, encode_primary_key, source_primary_key_columns,
+    build_delta_batch, build_source_delta_batch, source_primary_key_columns,
 };

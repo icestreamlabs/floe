@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::Context;
+use futures::future::BoxFuture;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -25,9 +27,13 @@ use crate::stream::util::{
     publish_scheduled_value, publish_transient_zset_batch, push_value_in_place,
 };
 
+#[cfg(test)]
 type FilterMapTransform<K, R> = Arc<dyn Fn(&K) -> Option<R> + Send + Sync>;
 type FilterMapBatchTransform<K, R> =
     Arc<dyn Fn(&[(K, i64)]) -> anyhow::Result<Vec<(R, i64)>> + Send + Sync>;
+type FilterMapAsyncBatchTransform<K, R> = Arc<
+    dyn Fn(Arc<Vec<(K, i64)>>) -> BoxFuture<'static, anyhow::Result<Vec<(R, i64)>>> + Send + Sync,
+>;
 
 /// Filter+map wrapper that evaluates a fused row transform over handle streams.
 /// The transform returns `None` to drop a row or `Some(mapped_key)` to emit it.
@@ -36,6 +42,7 @@ pub struct DbspFilterMap {
 }
 
 impl DbspFilterMap {
+    #[cfg(test)]
     pub async fn new<K, R, F>(
         input: &DeltaHandleStream,
         transform: F,
@@ -276,11 +283,138 @@ impl DbspFilterMap {
         })
     }
 
+    /// Async batch variant for transforms implemented by vectorized execution engines.
+    ///
+    /// Like [`Self::new_batch`], this consumes one logical delta batch per tick,
+    /// but the transform may await an Arrow/DataFusion physical plan instead of
+    /// forcing the runtime through a synchronous row closure.
+    pub async fn new_async_batch<K, R, F, Fut>(
+        input: &DeltaHandleStream,
+        transform: F,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        R: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        F: Fn(Arc<Vec<(K, i64)>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<Vec<(R, i64)>>> + Send + 'static,
+    {
+        let table = input.table();
+        let frontier = input.current_time();
+        let horizon = input.semantic_horizon();
+        let op_id = NEXT_FILTER_MAP_ID.fetch_add(1, Ordering::Relaxed);
+        let output_ns = format!("filter_map_output_{op_id}");
+        let empty_handle = ZSetHandle {
+            ns: output_ns.clone(),
+            version: 0,
+        };
+
+        let output_dict = Arc::new(
+            Dictionary::<R>::with_table(table.clone(), output_ns.clone(), None)
+                .await
+                .context("create output dictionary for async filter_map batch")?,
+        );
+        let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
+            .await
+            .context("create output zset for async filter_map batch")?;
+        let transform: FilterMapAsyncBatchTransform<K, R> =
+            Arc::new(move |delta| Box::pin(transform(delta)));
+        let state = Arc::new(AsyncMutex::new(FilterMapAsyncBatchState {
+            transform,
+            table: table.clone(),
+            output,
+            dict_cache: HashMap::new(),
+            logical_work: metrics::LogicalWorkCollector::default(),
+        }));
+
+        let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
+            default: empty_handle.clone(),
+        });
+        let history = collect_values(input, horizon).await?;
+        let mut output_handles = Vec::with_capacity(history.len());
+        for (ts, handle) in history.into_iter().enumerate() {
+            let out_handle = {
+                let mut guard = state.lock().await;
+                guard.on_step(ts as i64, &handle).await?
+            };
+            output_handles.push(out_handle);
+        }
+
+        let mut stream = build_exact_stream_from_values(
+            table.clone(),
+            handle_group,
+            "filter_map_output_stream/",
+            frontier,
+            horizon,
+            &output_handles,
+            empty_handle.clone(),
+        )
+        .await?;
+        stream.flush().await?;
+        let writer = Arc::new(AsyncMutex::new(stream.clone()));
+
+        let mut runtime = HandleOperatorRuntime::new(vec![input.stream()], move |ts, handles| {
+            let state = Arc::clone(&state);
+            let writer = Arc::clone(&writer);
+            let handles_vec = handles.to_vec();
+            Box::pin(async move {
+                if handles_vec.len() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "filter_map runtime expected 1 handle, got {}",
+                        handles_vec.len()
+                    ));
+                }
+                if ts <= horizon {
+                    let mut writer_guard = writer.lock().await;
+                    publish_scheduled_value(&mut writer_guard, ts).await?;
+                    return Ok(());
+                }
+                let mut state_guard = state.lock().await;
+                let out_handle = state_guard.on_step(ts, &handles_vec[0]).await?;
+                let mut writer_guard = writer.lock().await;
+                push_value_in_place(&mut writer_guard, out_handle);
+                writer_guard.flush().await?;
+                Ok(())
+            })
+        });
+
+        let error_handler = error_handler.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = runtime.step().await {
+                    report_runtime_error(&error_handler, "filter_map_async_batch", err);
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            stream: DeltaHandleStream::new(stream),
+        })
+    }
+
     pub fn stream(&self) -> DeltaHandleStream {
         self.stream.clone()
     }
 }
 
+#[cfg(test)]
 struct FilterMapState<K, R>
 where
     K: Archive
@@ -309,6 +443,7 @@ where
     logical_work: metrics::LogicalWorkCollector,
 }
 
+#[cfg(test)]
 impl<K, R> FilterMapState<K, R>
 where
     K: Archive
@@ -513,6 +648,116 @@ where
             output_apply_ms,
             total_ms = total_start.elapsed().as_millis() as u64,
             "filter_map_batch operator timing"
+        );
+        self.logical_work.finish_tick(work);
+        Ok(output_handle)
+    }
+}
+
+struct FilterMapAsyncBatchState<K, R>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    transform: FilterMapAsyncBatchTransform<K, R>,
+    table: Arc<dyn KeyValueTable>,
+    output: VersionedZSet<R>,
+    dict_cache: HashMap<String, Arc<Dictionary<K>>>,
+    logical_work: metrics::LogicalWorkCollector,
+}
+
+impl<K, R> FilterMapAsyncBatchState<K, R>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    async fn on_step(&mut self, ts: i64, input_handle: &ZSetHandle) -> anyhow::Result<ZSetHandle> {
+        let total_start = Instant::now();
+        let load_start = Instant::now();
+        let delta_values =
+            delta_zset_handle_batch::<K>(self.table.clone(), &mut self.dict_cache, input_handle)
+                .await
+                .context("load input delta for async filter_map batch")?;
+        let input_delta_rows = delta_values.len();
+        let mut work = metrics::LogicalWorkSnapshot::from_input_delta_rows(input_delta_rows);
+        let load_ms = load_start.elapsed().as_millis() as u64;
+
+        let transform_start = Instant::now();
+        let projected = (self.transform)(Arc::clone(&delta_values))
+            .await
+            .context("run async filter_map batch transform")?;
+        let transform_ms = transform_start.elapsed().as_millis() as u64;
+        let output_delta_rows = projected.len();
+
+        if projected.is_empty() {
+            tracing::debug!(
+                ts,
+                input_ns = %input_handle.ns,
+                input_version = input_handle.version,
+                input_delta_rows,
+                output_delta_rows,
+                load_ms,
+                transform_ms,
+                total_ms = total_start.elapsed().as_millis() as u64,
+                "filter_map_async_batch operator timing (no output)"
+            );
+            self.logical_work.finish_tick(work);
+            return Ok(self.output.handle_for_version(0));
+        }
+        work.record_output_delta_rows(output_delta_rows);
+        work.record_persisted_rows(output_delta_rows);
+
+        let output_apply_start = Instant::now();
+        let output_handle = apply_deltas_to_versioned(&mut self.output, &projected)
+            .await
+            .context("persist async filter_map batch delta output")?;
+        publish_transient_zset_batch(&output_handle, Arc::new(projected));
+        let output_apply_ms = output_apply_start.elapsed().as_millis() as u64;
+        tracing::debug!(
+            ts,
+            input_ns = %input_handle.ns,
+            input_version = input_handle.version,
+            input_delta_rows,
+            output_delta_rows,
+            output_ns = %self.output.namespace(),
+            output_version = output_handle.version,
+            load_ms,
+            transform_ms,
+            output_apply_ms,
+            total_ms = total_start.elapsed().as_millis() as u64,
+            "filter_map_async_batch operator timing"
         );
         self.logical_work.finish_tick(work);
         Ok(output_handle)

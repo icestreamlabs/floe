@@ -243,6 +243,7 @@ where
 
 impl DbspWindowCountAggregate {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub async fn new<K, V, D, FKey, FRow, FTime>(
         input: &DeltaHandleStream,
         key_extractor: FKey,

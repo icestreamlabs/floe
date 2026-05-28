@@ -25,6 +25,7 @@ use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch}
 
 type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
 type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
+#[cfg(test)]
 type JoinKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
 type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
@@ -161,6 +162,7 @@ where
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn new(
         left_state: RelationState<L>,
         right_state: RelationState<R>,
@@ -288,6 +290,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn new_without_output(
         left_state: RelationState<L>,
         right_state: RelationState<R>,

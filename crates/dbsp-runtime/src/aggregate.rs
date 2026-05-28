@@ -25,12 +25,15 @@ use crate::stream::util::{
     build_exact_stream_from_values, collect_values, publish_scheduled_value, push_value_in_place,
 };
 
+type BatchKeyExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync>;
+
 /// Aggregate wrapper that drives AggregateOp over handle streams.
 pub struct DbspAggregate {
     stream: DeltaHandleStream,
 }
 
 impl DbspAggregate {
+    #[cfg(test)]
     pub async fn new<K, V, A, FKey>(
         input: &DeltaHandleStream,
         key_extractor: FKey,
@@ -67,6 +70,58 @@ impl DbspAggregate {
         A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FKey: Fn(&V) -> Option<K> + Send + Sync + 'static,
     {
+        Self::new_batch(
+            input,
+            move |delta_values: &[(V, i64)]| {
+                delta_values
+                    .iter()
+                    .filter_map(|(value, weight)| {
+                        key_extractor(value).map(|key| (key, value.clone(), *weight))
+                    })
+                    .collect()
+            },
+            spec,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch<K, V, A, FKey>(
+        input: &DeltaHandleStream,
+        key_extractor: FKey,
+        spec: AggregateSpec<K, V, A>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        A: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FKey: Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -93,11 +148,11 @@ impl DbspAggregate {
             DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
         );
 
-        let aggregate_op = Arc::new(AsyncMutex::new(AggregateOp::new(
+        let aggregate_op = Arc::new(AsyncMutex::new(AggregateOp::new_batch(
             state,
             index,
             table.clone(),
-            Arc::new(key_extractor),
+            Arc::new(key_extractor) as BatchKeyExtractor<V, K>,
             spec,
             output,
         )));

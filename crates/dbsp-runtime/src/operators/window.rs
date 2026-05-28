@@ -24,7 +24,9 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::delta_zset_handle;
 
+#[cfg(test)]
 type KeyExtractor<V, K> = Arc<dyn Fn(&V) -> Option<K> + Send + Sync>;
+#[cfg(test)]
 type TimeExtractor<V> = Arc<dyn Fn(&V) -> Option<i64> + Send + Sync>;
 type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
@@ -143,6 +145,7 @@ where
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn new(
         state: RelationState<(WindowKey<K>, A)>,
         index: IndexedBatchZSet<WindowKey<K>, V>,
