@@ -3631,6 +3631,52 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
             drop(registry);
+
+            let mv_visibility_start = Instant::now();
+            let target_mv_version = i64::try_from(epoch).unwrap_or(i64::MAX);
+            match wait_for_materialized_views_visible(
+                &mv_for_task,
+                target_mv_version,
+                &executor_cancel,
+            )
+            .await
+            {
+                Ok(waited_views) => {
+                    let mv_visibility_latency_ms = mv_visibility_start.elapsed().as_millis() as u64;
+                    metrics::observe_tick_phase_latency_ms(
+                        "mv_visibility",
+                        mv_visibility_latency_ms,
+                    );
+                    if waited_views > 0 && (epoch <= 8 || epoch % 128 == 0) {
+                        tracing::info!(
+                            epoch,
+                            waited_views,
+                            mv_visibility_latency_ms,
+                            "tick materialized views visible"
+                        );
+                    }
+                }
+                Err(err) => {
+                    metrics::observe_tick_phase_latency_ms(
+                        "mv_visibility",
+                        mv_visibility_start.elapsed().as_millis() as u64,
+                    );
+                    tracing::error!(
+                        epoch,
+                        error = %err,
+                        "failed while waiting for materialized view visibility"
+                    );
+                    record_runtime_failure(
+                        &failure_for_executor,
+                        format!(
+                            "failed waiting for materialized view visibility at tick {epoch}: {err}"
+                        ),
+                    );
+                    executor_cancel.cancel();
+                    break 'executor;
+                }
+            }
+
             for (source_id, offsets) in tick_source_offsets.iter().enumerate() {
                 let Some(offsets) = offsets.as_ref() else {
                     continue;

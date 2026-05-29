@@ -412,6 +412,7 @@ impl DbspGraphBuilder {
         let view_namespace = crate::namespaces::materialized_view(view_name)
             .unwrap_or_else(|_| format!("materialized_view/{view_name}"));
         let flush_cfg = self.mv_flush_coalescing;
+        registry_handle.set_commit_visibility_barrier_enabled(flush_cfg.max_pending_deltas <= 1);
         tracing::info!(
             view = %view_name,
             enabled = flush_cfg.enabled,
@@ -646,6 +647,7 @@ impl DbspGraphBuilder {
         mv_registry: &Arc<MaterializedViewRegistry>,
     ) -> Result<()> {
         let registry_handle = mv_registry.register(view_name.to_string());
+        registry_handle.set_commit_visibility_barrier_enabled(true);
         let arrow_schema = schema.to_arrow_schema();
         mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
         {
@@ -868,6 +870,7 @@ impl DbspGraphBuilder {
         mv_registry: &Arc<MaterializedViewRegistry>,
     ) -> Result<()> {
         let registry_handle = mv_registry.register(view_name.to_string());
+        registry_handle.set_commit_visibility_barrier_enabled(true);
         let arrow_schema = schema.to_arrow_schema();
         mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
         {
@@ -1087,6 +1090,7 @@ impl DbspGraphBuilder {
         mv_registry: &Arc<MaterializedViewRegistry>,
     ) -> Result<()> {
         let registry_handle = mv_registry.register(view_name.to_string());
+        registry_handle.set_commit_visibility_barrier_enabled(true);
         let arrow_schema = schema.to_arrow_schema();
         mv_registry.set_schema(view_name.to_string(), Arc::clone(&arrow_schema));
         {

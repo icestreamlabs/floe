@@ -81,6 +81,59 @@ pub(super) fn record_mv_freshness_metrics(last_update_at_ms: &HashMap<String, u6
     }
 }
 
+pub(super) async fn wait_for_materialized_views_visible(
+    registry: &Arc<MaterializedViewRegistry>,
+    target_version: i64,
+    cancel: &CancellationToken,
+) -> anyhow::Result<usize> {
+    if target_version < 0 {
+        return Ok(0);
+    }
+
+    let mut waited_views = 0usize;
+    for view in registry.handles() {
+        if !view.commit_visibility_barrier_enabled() {
+            continue;
+        }
+        if view
+            .latest_version()
+            .is_some_and(|version| version >= target_version)
+        {
+            continue;
+        }
+
+        waited_views = waited_views.saturating_add(1);
+        let mut version_rx = view.version_watch();
+        loop {
+            if version_rx
+                .borrow()
+                .is_some_and(|version| version >= target_version)
+            {
+                break;
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(anyhow!(
+                        "runtime cancelled while waiting for materialized view '{}' to publish version {target_version}",
+                        view.name()
+                    ));
+                }
+                changed = version_rx.changed() => {
+                    changed.with_context(|| {
+                        format!(
+                            "wait for materialized view '{}' to publish version {target_version}",
+                            view.name()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+
+    Ok(waited_views)
+}
+
 pub(super) fn event_resume_offset(
     token: Option<&core_source::AppendIngestResumeToken>,
 ) -> Option<(u32, u64)> {

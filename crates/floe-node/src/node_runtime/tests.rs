@@ -323,6 +323,62 @@ fn collect_mv_versions_for_commit_uses_logical_overlay_versions() {
     );
 }
 
+#[tokio::test]
+async fn mv_visibility_wait_returns_immediately_for_visible_versions() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let handle = registry.register("mv_visible".to_string());
+    handle.publish_logical_version(4);
+    let cancel = CancellationToken::new();
+
+    let waited = wait_for_materialized_views_visible(&registry, 4, &cancel)
+        .await
+        .expect("visible version wait");
+
+    assert_eq!(waited, 0);
+}
+
+#[tokio::test]
+async fn mv_visibility_wait_blocks_until_target_version_is_published() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let handle = registry.register("mv_async".to_string());
+    let waiting_registry = Arc::clone(&registry);
+    let cancel = CancellationToken::new();
+    let waiting_cancel = cancel.clone();
+    let wait_task = tokio::spawn(async move {
+        wait_for_materialized_views_visible(&waiting_registry, 3, &waiting_cancel).await
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !wait_task.is_finished(),
+        "wait should remain pending before any version is published"
+    );
+
+    handle.publish_logical_version(2);
+    tokio::task::yield_now().await;
+    assert!(
+        !wait_task.is_finished(),
+        "wait should remain pending before target version is published"
+    );
+
+    handle.publish_logical_version(3);
+    assert_eq!(wait_task.await.expect("join visibility wait").unwrap(), 1);
+}
+
+#[tokio::test]
+async fn mv_visibility_wait_skips_views_with_disabled_barrier() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let handle = registry.register("mv_coalesced".to_string());
+    handle.set_commit_visibility_barrier_enabled(false);
+    let cancel = CancellationToken::new();
+
+    let waited = wait_for_materialized_views_visible(&registry, 10, &cancel)
+        .await
+        .expect("visibility wait should skip coalesced view");
+
+    assert_eq!(waited, 0);
+}
+
 #[test]
 fn kafka_offset_commit_state_preserves_idle_topic_offsets() {
     let mut committed = HashMap::new();

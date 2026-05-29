@@ -109,6 +109,7 @@ pub struct MaterializedViewHandle {
     logical_work: RwLock<BTreeMap<i64, LogicalWorkSnapshot>>,
     latest_version: RwLock<Option<i64>>,
     version_watch: watch::Sender<Option<i64>>,
+    commit_visibility_barrier: RwLock<bool>,
     retention_keep_last: Option<usize>,
 }
 
@@ -134,6 +135,7 @@ impl MaterializedViewHandle {
             logical_work: RwLock::new(BTreeMap::new()),
             latest_version: RwLock::new(None),
             version_watch: tx,
+            commit_visibility_barrier: RwLock::new(true),
             retention_keep_last,
         }
     }
@@ -618,6 +620,20 @@ impl MaterializedViewHandle {
 
     pub fn version_watch(&self) -> watch::Receiver<Option<i64>> {
         self.version_watch.subscribe()
+    }
+
+    pub fn set_commit_visibility_barrier_enabled(&self, enabled: bool) {
+        *self
+            .commit_visibility_barrier
+            .write()
+            .expect("materialized view visibility barrier lock poisoned") = enabled;
+    }
+
+    pub fn commit_visibility_barrier_enabled(&self) -> bool {
+        *self
+            .commit_visibility_barrier
+            .read()
+            .expect("materialized view visibility barrier lock poisoned")
     }
 
     pub fn handle_for_version(&self, version: i64) -> Option<ZSetHandle> {
