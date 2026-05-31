@@ -5609,6 +5609,36 @@ async fn tumbling_window_max_materializes_from_transient_source_journal() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn tumbling_window_avg_materializes_from_transient_source_journal() {
+    let plan = tumbling_window_avg_plan();
+    let rows = build_window_plan_rows(
+        "tumbling-avg-transient",
+        "mv_tumbling_avg_transient",
+        &plan,
+        &[
+            (1, 42, 10, 1_700_000_000_000),
+            (2, 7, 20, 1_700_000_001_000),
+            (3, 9, 30, 1_700_000_002_000),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        zset_from_rows(&rows),
+        ZSet::from_weights([(
+            row_key(&timestamp_int_row(
+                1_700_000_000_000,
+                1_700_000_010_000,
+                &[20]
+            )),
+            1,
+        )]),
+        "full tumbling avg window MV graph should match ZSet reference semantics"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn tumbling_window_max_recomputes_from_transient_source_journal_retraction() {
     let plan = tumbling_window_max_plan();
     let db = test_db("tumbling-max-retraction-transient").await;
@@ -5805,6 +5835,33 @@ fn tumbling_window_max_plan() -> dbsp::CircuitPlan {
         )],
     )
     .expect("build tumbling max aggregate");
+
+    let window = dbsp::DbspWindowSpec::try_new(
+        dbsp::DbspWindowPolicy::Tumbling { size_ms: 10_000 },
+        col("date_time"),
+        input_schema.clone(),
+        0,
+    )
+    .expect("build tumbling window");
+
+    build_window_plan(bid, input_schema, aggregate, window)
+}
+
+fn tumbling_window_avg_plan() -> dbsp::CircuitPlan {
+    let bid = nexmark_bid_table();
+    let input_schema = bid.schema().clone();
+    let aggregate = dbsp::DbspAggregateNode::try_new(
+        input_schema.clone(),
+        vec![],
+        vec![(
+            dbsp::DbspAggregateFunction::Avg,
+            Some(col("price")),
+            None,
+            false,
+            Some("avgprice".to_string()),
+        )],
+    )
+    .expect("build tumbling avg aggregate");
 
     let window = dbsp::DbspWindowSpec::try_new(
         dbsp::DbspWindowPolicy::Tumbling { size_ms: 10_000 },
