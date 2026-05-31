@@ -1379,6 +1379,95 @@ async fn sql_left_asof_join_null_extends_and_retracts_unmatched_rows() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn sql_asof_join_applies_residual_with_precomputed_key_and_timestamp_expressions() {
+    let db = test_db("sql-asof-residual-precompute").await;
+    let view_name = "mv_sql_asof_residual_precompute";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let logical = sql_plan(
+            "SELECT a.id, b.price \
+             FROM nexmark_auction a ASOF JOIN nexmark_bid b \
+             MATCH_CONDITION ((b.price + 1) <= (a.reserve + 1)) \
+             ON (a.id + 0) = (b.auction + 0) AND b.bidder > a.seller",
+        )
+        .await;
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(encoded_auction_row(20, 7), 1)
+        .expect("append auction");
+    auction_writer.flush().await.expect("flush auction");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row(20, 6, 18), 1)
+        .expect("append residual-filtered bid");
+    bid_writer
+        .append_encoded(encoded_bid_row(20, 8, 15), 1)
+        .expect("append matching bid");
+    bid_writer
+        .append_encoded(encoded_bid_row(20, 9, 21), 1)
+        .expect("append future bid");
+    bid_writer.flush().await.expect("flush bid");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("price", DataType::Int64, true),
+        ]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build SQL ASOF residual graph");
+
+    let rows = materialized_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_nullable_row(20, Some(15))]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn left_semi_join_materializes_retained_left_rows() {
     let db = test_db("left-semi-join").await;
     let view_name = "mv_left_semi_join";

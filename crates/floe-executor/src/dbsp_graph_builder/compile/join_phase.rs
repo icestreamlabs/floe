@@ -149,6 +149,37 @@ fn append_ordered_i64(value: i64, out: &mut Vec<u8>) {
     out.extend_from_slice(&shifted.to_be_bytes());
 }
 
+fn asof_candidate_residual_schema(
+    left_schema: &RowSchema,
+    left_join_schema: &RowSchema,
+    right_schema: &RowSchema,
+    right_join_schema: &RowSchema,
+    output_schema: &RowSchema,
+) -> Result<Arc<RowSchema>> {
+    let mut fields = Vec::with_capacity(left_join_schema.len() + right_join_schema.len());
+    fields.extend(output_schema.fields()[..left_schema.len()].iter().cloned());
+    fields.extend(
+        left_join_schema.fields()[left_schema.len()..]
+            .iter()
+            .cloned(),
+    );
+
+    let right_output_start = left_schema.len();
+    let right_output_end = right_output_start + right_schema.len();
+    fields.extend(
+        output_schema.fields()[right_output_start..right_output_end]
+            .iter()
+            .cloned(),
+    );
+    fields.extend(
+        right_join_schema.fields()[right_schema.len()..]
+            .iter()
+            .cloned(),
+    );
+
+    RowSchema::try_new(fields).context("build ASOF candidate residual schema")
+}
+
 impl DbspGraphBuilder {
     pub(crate) async fn compile_asof_join(
         &mut self,
@@ -302,15 +333,6 @@ impl DbspGraphBuilder {
             timestamp_column
         };
 
-        if node.residual.is_some()
-            && (left_join_schema.len() != left_schema.len()
-                || right_join_schema.len() != right_schema.len())
-        {
-            return Err(anyhow!(
-                "ASOF residual predicates with precomputed key/timestamp expressions are not yet supported"
-            ));
-        }
-
         let left_key_columns = Arc::new(left_key_columns);
         let right_key_columns = Arc::new(right_key_columns);
         let left_range_graph_id = graph_id.clone();
@@ -427,15 +449,19 @@ impl DbspGraphBuilder {
         let mut candidate_stream = candidates.stream();
         if let Some(residual) = &node.residual {
             let residual_expr = residual.expr().clone();
+            let residual_schema = asof_candidate_residual_schema(
+                left_schema.as_ref(),
+                left_join_schema.as_ref(),
+                right_schema.as_ref(),
+                right_join_schema.as_ref(),
+                output_schema.as_ref(),
+            )?;
             let residual_predicate =
-                dbsp::DbspPredicate::try_new(residual_expr, Arc::clone(&output_schema))
+                dbsp::DbspPredicate::try_new(residual_expr, Arc::clone(&residual_schema))
                     .context("analyze ASOF residual predicate")?;
             let residual_evaluator = Arc::new(
-                VectorizedFilterProjectEvaluator::for_filter(
-                    &residual_predicate,
-                    Arc::clone(&output_schema),
-                )
-                .context("build vectorized ASOF residual evaluator")?,
+                VectorizedFilterProjectEvaluator::for_filter(&residual_predicate, residual_schema)
+                    .context("build vectorized ASOF residual evaluator")?,
             );
             let residual_graph_id = graph_id.clone();
             let residual_filter_events = task_events.clone();
