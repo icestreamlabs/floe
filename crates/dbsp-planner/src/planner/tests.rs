@@ -18,7 +18,9 @@ use datafusion::prelude::SessionContext;
 use dbsp_circuit::circuit::plan::{
     DbspAggregateFunction, DbspJoinType, DbspNodeKind, DbspWindowPolicy,
 };
+use dbsp_circuit::circuit::schema::Field;
 use dbsp_circuit::circuit::tables::TableDescriptor;
+use dbsp_circuit::circuit::types::DbspScalarType;
 
 use super::expr::map_aggregate_expr;
 use super::{CircuitPlanner, PlannerConfig};
@@ -35,6 +37,10 @@ fn planner_config() -> PlannerConfig {
 }
 
 fn table_source(table: &'static TableDescriptor) -> Arc<dyn TableSource> {
+    Arc::new(LogicalTableSource::new(table.schema().to_arrow_schema()))
+}
+
+fn table_source_owned(table: &TableDescriptor) -> Arc<dyn TableSource> {
     Arc::new(LogicalTableSource::new(table.schema().to_arrow_schema()))
 }
 
@@ -564,6 +570,70 @@ fn plans_inner_join() {
             assert_eq!(join.keys.len(), 1);
         }
         other => panic!("expected join node, found {other:?}"),
+    }
+}
+
+#[test]
+fn plans_half_open_range_join_without_equi_keys() {
+    let windows = TableDescriptor::try_new_dynamic(
+        "range_windows",
+        vec![
+            Field::new("window_id", DbspScalarType::Int64, false),
+            Field::new("start_ts", DbspScalarType::TimestampMillis, false),
+            Field::new("end_ts", DbspScalarType::TimestampMillis, false),
+        ],
+        &[String::from("window_id")],
+    )
+    .expect("windows descriptor");
+    let events = TableDescriptor::try_new_dynamic(
+        "range_events",
+        vec![
+            Field::new("event_id", DbspScalarType::Int64, false),
+            Field::new("event_ts", DbspScalarType::TimestampMillis, false),
+        ],
+        &[String::from("event_id")],
+    )
+    .expect("events descriptor");
+
+    let left = LogicalPlanBuilder::scan(windows.name, table_source_owned(&windows), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(events.name, table_source_owned(&events), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let filter = col("event_ts")
+        .gt_eq(col("start_ts"))
+        .and(col("event_ts").lt(col("end_ts")));
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Inner,
+            (
+                Vec::<datafusion::common::Column>::new(),
+                Vec::<datafusion::common::Column>::new(),
+            ),
+            Some(filter),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut config = planner_config();
+    config.register_owned_table(windows);
+    config.register_owned_table(events);
+    let planner = CircuitPlanner::new(config);
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    match &root.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(join.keys.is_empty());
+            assert!(join.range.is_some());
+            assert!(join.residual.is_none());
+        }
+        other => panic!("expected range join node, found {other:?}"),
     }
 }
 

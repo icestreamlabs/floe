@@ -23,8 +23,8 @@ use super::circuit::{CircuitNode, CircuitPlan};
 use super::config::PlannerConfig;
 use super::error::PlannerError;
 use super::expr::{
-    combine_filters, extract_alias, extract_join_keys_and_residual, map_aggregate_expr,
-    normalize_expr,
+    combine_filters, extract_alias, extract_join_keys_and_residual,
+    extract_range_join_and_residual, map_aggregate_expr, normalize_expr,
 };
 use super::logical_optimizer::{OptimizerDiagnostics, optimize_logical_plan};
 
@@ -480,6 +480,23 @@ impl<'cfg> PlannerContext<'cfg> {
                 &mut right_required,
             )?;
         }
+        if let Some(range) = &join.range {
+            add_required_expression_columns(
+                range.left_lower_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                range.left_upper_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                range.right_key_expression().expr(),
+                join.right_schema.as_ref(),
+                &mut right_required,
+            )?;
+        }
         if let Some(residual) = &join.residual {
             let mut residual_columns = BTreeSet::new();
             add_required_expression_columns(
@@ -528,25 +545,38 @@ impl<'cfg> PlannerContext<'cfg> {
         let left = self.build_optional_select(left, left_pushdown)?;
         let right = self.build_optional_select(right, right_pushdown)?;
 
-        let key_pairs = join
-            .keys
-            .iter()
-            .map(|key| {
-                (
-                    key.left_expression().expr().clone(),
-                    key.right_expression().expr().clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let rebuilt_join = DbspJoinNode::try_new(
-            DbspJoinType::Inner,
-            left.schema.clone(),
-            right.schema.clone(),
-            key_pairs,
-            join.residual
-                .as_ref()
-                .map(|residual| residual.expr().clone()),
-        )?;
+        let residual = join
+            .residual
+            .as_ref()
+            .map(|residual| residual.expr().clone());
+        let rebuilt_join = if let Some(range) = &join.range {
+            DbspJoinNode::try_new_range(
+                left.schema.clone(),
+                right.schema.clone(),
+                range.right_key_expression().expr().clone(),
+                range.left_lower_expression().expr().clone(),
+                range.left_upper_expression().expr().clone(),
+                residual,
+            )
+        } else {
+            let key_pairs = join
+                .keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.left_expression().expr().clone(),
+                        key.right_expression().expr().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            DbspJoinNode::try_new(
+                DbspJoinType::Inner,
+                left.schema.clone(),
+                right.schema.clone(),
+                key_pairs,
+                residual,
+            )
+        }?;
         let rebuilt_join_schema = rebuilt_join.output_schema.clone();
         let rebuilt_join_id = self.add_node(
             vec![left.id, right.id],
@@ -767,8 +797,38 @@ impl<'cfg> PlannerContext<'cfg> {
         }
 
         if key_pairs.is_empty() {
+            if let Some(filter_expr) = &join.filter
+                && matches!(join_type, DbspJoinType::Inner)
+            {
+                let (range, range_residual) = extract_range_join_and_residual(
+                    filter_expr,
+                    left.schema.as_ref(),
+                    right.schema.as_ref(),
+                )?;
+                if let Some(range) = range {
+                    let range_join_node = DbspJoinNode::try_new_range(
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        range.right_key,
+                        range.left_lower,
+                        range.left_upper,
+                        range_residual,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+                    let output_schema = range_join_node.output_schema.clone();
+                    let id = self.add_node(
+                        vec![left.id, right.id],
+                        DbspNodeKind::Join(range_join_node),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
+            }
             return Err(PlannerError::UnsupportedJoin(
-                "joins must have at least one equi-key".to_string(),
+                "joins must have at least one equi-key or a half-open range predicate".to_string(),
             ));
         }
         let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;

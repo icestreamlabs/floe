@@ -9,9 +9,9 @@ pub use arrow_batch::{
 };
 pub use plan::{
     DbspAggregateFunction, DbspAggregateNode, DbspDistinctNode, DbspExpression, DbspJoinNode,
-    DbspJoinType, DbspNodeKind, DbspPredicate, DbspProjectNode, DbspSelectNode, DbspSinkNode,
-    DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
-    DbspWindowSpec, OrderExpr, ProjectItem,
+    DbspJoinType, DbspNodeKind, DbspPredicate, DbspProjectNode, DbspRangeJoinSpec, DbspSelectNode,
+    DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
+    DbspWindowPolicy, DbspWindowSpec, OrderExpr, ProjectItem,
 };
 pub use schema::{Field, FieldRef, PrimaryKey, RowSchema};
 pub use tables::{

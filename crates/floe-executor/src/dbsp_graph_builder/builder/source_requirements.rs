@@ -212,6 +212,23 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                         &mut right_columns,
                     )?;
                 }
+                if let Some(range) = &join.range {
+                    add_required_expression_columns(
+                        range.left_lower_expression(),
+                        join.left_schema.as_ref(),
+                        &mut left_columns,
+                    )?;
+                    add_required_expression_columns(
+                        range.left_upper_expression(),
+                        join.left_schema.as_ref(),
+                        &mut left_columns,
+                    )?;
+                    add_required_expression_columns(
+                        range.right_key_expression(),
+                        join.right_schema.as_ref(),
+                        &mut right_columns,
+                    )?;
+                }
                 if let Some(residual) = &join.residual {
                     let mut residual_columns = BTreeSet::new();
                     add_required_expression_columns(

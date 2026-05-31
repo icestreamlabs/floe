@@ -5,7 +5,7 @@ pub use expression::DbspExpression;
 pub use nodes::{
     DbspAggregateExpr, DbspAggregateFunction, DbspAggregateNode, DbspDistinctNode, DbspJoinKey,
     DbspJoinNode, DbspJoinType, DbspNodeKind, DbspPredicate, DbspProjectExpr, DbspProjectNode,
-    DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
+    DbspRangeJoinSpec, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
     DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, GroupKeyExpr, OrderExpr,
     ProjectItem,
 };

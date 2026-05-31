@@ -207,6 +207,66 @@ impl DbspJoinKey {
 }
 
 #[derive(Clone, Debug)]
+pub struct DbspRangeJoinSpec {
+    right_key: DbspExpression,
+    left_lower: DbspExpression,
+    left_upper: DbspExpression,
+}
+
+impl DbspRangeJoinSpec {
+    fn try_new(
+        right_key_expr: Expr,
+        right_schema: Arc<RowSchema>,
+        left_lower_expr: Expr,
+        left_upper_expr: Expr,
+        left_schema: Arc<RowSchema>,
+    ) -> Result<Self> {
+        let right_key = DbspExpression::analyze(right_key_expr, right_schema)?;
+        let left_lower = DbspExpression::analyze(left_lower_expr, left_schema.clone())?;
+        let left_upper = DbspExpression::analyze(left_upper_expr, left_schema)?;
+
+        if left_lower.data_type() != right_key.data_type()
+            || left_upper.data_type() != right_key.data_type()
+        {
+            bail!(
+                "range join bound type mismatch: right key {}, lower {}, upper {}",
+                right_key.data_type().name(),
+                left_lower.data_type().name(),
+                left_upper.data_type().name()
+            );
+        }
+
+        if !matches!(
+            right_key.data_type(),
+            DbspScalarType::Int64 | DbspScalarType::TimestampMillis
+        ) {
+            bail!(
+                "range joins currently require Int64 or TimestampMillis bounds, found {}",
+                right_key.data_type().name()
+            );
+        }
+
+        Ok(Self {
+            right_key,
+            left_lower,
+            left_upper,
+        })
+    }
+
+    pub fn right_key_expression(&self) -> &DbspExpression {
+        &self.right_key
+    }
+
+    pub fn left_lower_expression(&self) -> &DbspExpression {
+        &self.left_lower
+    }
+
+    pub fn left_upper_expression(&self) -> &DbspExpression {
+        &self.left_upper
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DbspJoinNode {
     pub join_type: DbspJoinType,
     pub left_schema: Arc<RowSchema>,
@@ -214,6 +274,7 @@ pub struct DbspJoinNode {
     pub output_schema: Arc<RowSchema>,
     pub keys: Vec<DbspJoinKey>,
     pub residual: Option<DbspExpression>,
+    pub range: Option<DbspRangeJoinSpec>,
 }
 
 impl DbspJoinNode {
@@ -255,6 +316,45 @@ impl DbspJoinNode {
             output_schema,
             keys,
             residual,
+            range: None,
+        })
+    }
+
+    pub fn try_new_range(
+        left_schema: Arc<RowSchema>,
+        right_schema: Arc<RowSchema>,
+        right_key_expr: Expr,
+        left_lower_expr: Expr,
+        left_upper_expr: Expr,
+        residual: Option<Expr>,
+    ) -> Result<Self> {
+        let range = DbspRangeJoinSpec::try_new(
+            right_key_expr,
+            right_schema.clone(),
+            left_lower_expr,
+            left_upper_expr,
+            left_schema.clone(),
+        )?;
+        let residual = if let Some(expr) = residual {
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
+            Some(DbspExpression::analyze(expr, combined_schema)?)
+        } else {
+            None
+        };
+        let output_schema = Self::combined_schema(
+            left_schema.clone(),
+            right_schema.clone(),
+            &DbspJoinType::Inner,
+        )?;
+
+        Ok(Self {
+            join_type: DbspJoinType::Inner,
+            left_schema,
+            right_schema,
+            output_schema,
+            keys: Vec::new(),
+            residual,
+            range: Some(range),
         })
     }
 

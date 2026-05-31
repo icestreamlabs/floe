@@ -4,11 +4,17 @@ use datafusion_common::{
     tree_node::{Transformed, TreeNode},
 };
 
+use dbsp_circuit::RowSchema;
 use dbsp_circuit::circuit::plan::DbspAggregateFunction;
 
 use super::error::PlannerError;
 
 type JoinKeysAndResidual = (Vec<(Expr, Expr)>, Option<Expr>);
+pub(super) struct RangeJoinExpressions {
+    pub right_key: Expr,
+    pub left_lower: Expr,
+    pub left_upper: Expr,
+}
 pub(super) type AggregateExprSpec = (
     DbspAggregateFunction,
     Option<Expr>,
@@ -52,6 +58,77 @@ pub(super) fn extract_join_keys_and_residual(
     Ok((key_pairs, combine_filters(residuals)))
 }
 
+pub(super) fn extract_range_join_and_residual(
+    expr: &Expr,
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
+) -> Result<(Option<RangeJoinExpressions>, Option<Expr>), PlannerError> {
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(expr, &mut conjuncts)?;
+
+    let mut lower_bounds = Vec::new();
+    let mut upper_bounds = Vec::new();
+    let mut residuals = Vec::new();
+    for conjunct in conjuncts {
+        if let Some(bound) = range_bound_candidate(&conjunct, left_schema, right_schema)? {
+            match bound.kind {
+                RangeBoundKind::LowerInclusive => lower_bounds.push(bound),
+                RangeBoundKind::UpperExclusive => upper_bounds.push(bound),
+            }
+        } else {
+            residuals.push(conjunct);
+        }
+    }
+
+    let mut selected: Option<(usize, usize)> = None;
+    for (lower_idx, lower) in lower_bounds.iter().enumerate() {
+        for (upper_idx, upper) in upper_bounds.iter().enumerate() {
+            if lower.right_key == upper.right_key {
+                if selected.is_some() {
+                    return Err(PlannerError::UnsupportedJoin(
+                        "range joins require exactly one matching lower/upper bound pair"
+                            .to_string(),
+                    ));
+                }
+                selected = Some((lower_idx, upper_idx));
+            }
+        }
+    }
+
+    let Some((lower_idx, upper_idx)) = selected else {
+        residuals.extend(lower_bounds.into_iter().map(|bound| bound.original));
+        residuals.extend(upper_bounds.into_iter().map(|bound| bound.original));
+        return Ok((None, combine_filters(residuals)));
+    };
+
+    for (idx, bound) in lower_bounds.iter().enumerate() {
+        if idx != lower_idx {
+            residuals.push(bound.original.clone());
+        }
+    }
+    for (idx, bound) in upper_bounds.iter().enumerate() {
+        if idx != upper_idx {
+            residuals.push(bound.original.clone());
+        }
+    }
+
+    let lower = lower_bounds
+        .get(lower_idx)
+        .expect("selected lower bound should exist");
+    let upper = upper_bounds
+        .get(upper_idx)
+        .expect("selected upper bound should exist");
+
+    Ok((
+        Some(RangeJoinExpressions {
+            right_key: lower.right_key.clone(),
+            left_lower: lower.left_bound.clone(),
+            left_upper: upper.left_bound.clone(),
+        }),
+        combine_filters(residuals),
+    ))
+}
+
 fn accumulate_conjuncts(
     expr: &Expr,
     key_pairs: &mut Vec<(Expr, Expr)>,
@@ -74,6 +151,110 @@ fn accumulate_conjuncts(
         _ => residuals.push(normalized),
     }
     Ok(())
+}
+
+fn flatten_conjuncts(expr: &Expr, conjuncts: &mut Vec<Expr>) -> Result<(), PlannerError> {
+    let normalized = normalize_expr(expr.clone())?;
+    match &normalized {
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            flatten_conjuncts(&binary.left, conjuncts)?;
+            flatten_conjuncts(&binary.right, conjuncts)?;
+        }
+        _ => conjuncts.push(normalized),
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExpressionSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+enum RangeBoundKind {
+    LowerInclusive,
+    UpperExclusive,
+}
+
+struct RangeBoundCandidate {
+    kind: RangeBoundKind,
+    right_key: Expr,
+    left_bound: Expr,
+    original: Expr,
+}
+
+fn range_bound_candidate(
+    expr: &Expr,
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
+) -> Result<Option<RangeBoundCandidate>, PlannerError> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return Ok(None);
+    };
+
+    let left_side = expression_side(binary.left.as_ref(), left_schema, right_schema)?;
+    let right_side = expression_side(binary.right.as_ref(), left_schema, right_schema)?;
+    let Some((left_side, right_side)) = left_side.zip(right_side) else {
+        return Ok(None);
+    };
+
+    let candidate = match (left_side, binary.op, right_side) {
+        (ExpressionSide::Right, Operator::GtEq, ExpressionSide::Left) => {
+            Some(RangeBoundCandidate {
+                kind: RangeBoundKind::LowerInclusive,
+                right_key: (*binary.left).clone(),
+                left_bound: (*binary.right).clone(),
+                original: expr.clone(),
+            })
+        }
+        (ExpressionSide::Left, Operator::LtEq, ExpressionSide::Right) => {
+            Some(RangeBoundCandidate {
+                kind: RangeBoundKind::LowerInclusive,
+                right_key: (*binary.right).clone(),
+                left_bound: (*binary.left).clone(),
+                original: expr.clone(),
+            })
+        }
+        (ExpressionSide::Right, Operator::Lt, ExpressionSide::Left) => Some(RangeBoundCandidate {
+            kind: RangeBoundKind::UpperExclusive,
+            right_key: (*binary.left).clone(),
+            left_bound: (*binary.right).clone(),
+            original: expr.clone(),
+        }),
+        (ExpressionSide::Left, Operator::Gt, ExpressionSide::Right) => Some(RangeBoundCandidate {
+            kind: RangeBoundKind::UpperExclusive,
+            right_key: (*binary.right).clone(),
+            left_bound: (*binary.left).clone(),
+            original: expr.clone(),
+        }),
+        _ => None,
+    };
+    Ok(candidate)
+}
+
+fn expression_side(
+    expr: &Expr,
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
+) -> Result<Option<ExpressionSide>, PlannerError> {
+    let normalized = normalize_expr(expr.clone())?;
+    let mut side = None;
+    for column in normalized.column_refs() {
+        let in_left = left_schema.field_index(column.name.as_str()).is_some();
+        let in_right = right_schema.field_index(column.name.as_str()).is_some();
+        let column_side = match (in_left, in_right) {
+            (true, false) => ExpressionSide::Left,
+            (false, true) => ExpressionSide::Right,
+            _ => return Ok(None),
+        };
+        match side {
+            Some(existing) if existing != column_side => return Ok(None),
+            Some(_) => {}
+            None => side = Some(column_side),
+        }
+    }
+    Ok(side)
 }
 
 pub(super) fn extract_alias(expr: Expr) -> Result<(Expr, Option<String>), PlannerError> {
