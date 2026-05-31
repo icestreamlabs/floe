@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% if page.title %}{{ page.title }} | {% endif %}{{ site.title }}</title>
+    <meta name="description" content="{{ page.description | default: site.description }}">
+    <link rel="stylesheet" href="{{ site.baseurl }}/assets/styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="{{ site.baseurl }}/">Floe</a>
+      <nav aria-label="Main navigation">
+        <a href="{{ site.baseurl }}/quickstart/">Quickstart</a>
+        <a href="{{ site.baseurl }}/alpha-support/">Alpha Support</a>
+        <a href="{{ site.baseurl }}/sql/">SQL</a>
+        <a href="{{ site.baseurl }}/connectors/">Connectors</a>
+        <a href="{{ site.baseurl }}/operations/">Operations</a>
+        <a href="{{ site.baseurl }}/roadmap/">Roadmap</a>
+      </nav>
+    </header>
+
+    <main class="content">
+      {{ content }}
+    </main>
+
+    <footer class="site-footer">
+      <span>Single-node vectorized streaming SQL.</span>
+      <a href="https://github.com/icestreamlabs/floe">GitHub</a>
+    </footer>
+  </body>
+</html>

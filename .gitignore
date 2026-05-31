@@ -2,7 +2,14 @@
 .floe/
 out
 *merged_output*.txt
-docs/
+docs/arrow_batch_contract.md
+docs/codebase_cleanup_roadmap.md
+docs/datafusion_plan_reuse.md
+docs/dbsp_paper_semantics_audit.md
+docs/dbsp_runtime_semantics.md
+docs/delta_consolidation.md
+docs/incremental_state_semantics.md
+docs/postgres_cdc_conformance.md
 
 # ide
 .idea

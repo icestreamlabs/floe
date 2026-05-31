@@ -1,0 +1,16 @@
+title: Floe
+description: Single-node vectorized streaming SQL.
+url: "https://icestreamlabs.github.io"
+baseurl: "/floe"
+markdown: kramdown
+highlighter: rouge
+
+exclude:
+  - arrow_batch_contract.md
+  - codebase_cleanup_roadmap.md
+  - datafusion_plan_reuse.md
+  - dbsp_paper_semantics_audit.md
+  - dbsp_runtime_semantics.md
+  - delta_consolidation.md
+  - incremental_state_semantics.md
+  - postgres_cdc_conformance.md

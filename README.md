@@ -290,6 +290,18 @@ Useful validation entry points:
 - `crates/dbsp-runtime`: runtime operators, streams, and state mechanics.
 - `crates/dbsp-storage`: DBSP storage utilities.
 
+## Documentation
+
+The project docs are published with GitHub Pages from the tracked `docs/`
+directory. The site is intentionally lightweight: Markdown pages, a tiny Jekyll
+layout, and a GitHub Actions workflow that deploys static output.
+
+Local entry point:
+
+```bash
+open docs/index.md
+```
+
 ## Development
 
 Common commands:
@@ -312,7 +324,3 @@ Canonical full validation sequence:
 ```bash
 bash scripts/validate_workspace.sh
 ```
-
-This repository currently tracks README and scripts as the committed operational
-surface. The `docs/` directory is ignored by `.gitignore`, so local files there
-are not part of the published repository unless that policy changes.
