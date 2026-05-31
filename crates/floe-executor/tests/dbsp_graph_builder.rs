@@ -900,6 +900,146 @@ async fn inner_join_materializes_mv() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn three_way_join_materializes_through_binary_composition() {
+    let db = test_db("three-way-join").await;
+    let view_name = "mv_three_way_join";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let person_schema = nexmark_person_schema();
+        let auction_schema = nexmark_auction_schema();
+        let bid_schema = nexmark_bid_schema();
+        let auction = table_scan(Some("nexmark_auction"), &auction_schema, None)
+            .expect("auction scan")
+            .project(vec![col("id").alias("auction_id"), col("seller")])
+            .expect("auction project")
+            .build()
+            .expect("auction plan");
+        let bid = table_scan(Some("nexmark_bid"), &bid_schema, None)
+            .expect("bid scan")
+            .project(vec![col("auction").alias("bid_auction"), col("price")])
+            .expect("bid project")
+            .build()
+            .expect("bid plan");
+        let logical = table_scan(Some("nexmark_person"), &person_schema, None)
+            .expect("person scan")
+            .project(vec![col("id").alias("person_id")])
+            .expect("person project")
+            .join(
+                auction,
+                JoinType::Inner,
+                (
+                    vec![Column::from_name("person_id")],
+                    vec![Column::from_name("seller")],
+                ),
+                None,
+            )
+            .expect("person auction join")
+            .join(
+                bid,
+                JoinType::Inner,
+                (
+                    vec![Column::from_name("auction_id")],
+                    vec![Column::from_name("bid_auction")],
+                ),
+                None,
+            )
+            .expect("auction bid join")
+            .project(vec![col("person_id"), col("price")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_person", "nexmark_auction", "nexmark_bid"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    registry
+        .writer_mut("nexmark_person")
+        .expect("person writer")
+        .append_encoded(encoded_person_row(100, "alice"), 1)
+        .expect("append person");
+    registry
+        .writer_mut("nexmark_person")
+        .expect("person writer")
+        .flush()
+        .await
+        .expect("flush person");
+
+    registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer")
+        .append_encoded(encoded_auction_row(10, 100), 1)
+        .expect("append auction");
+    registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer")
+        .flush()
+        .await
+        .expect("flush auction");
+
+    registry
+        .writer_mut("nexmark_bid")
+        .expect("bid writer")
+        .append_encoded(encoded_bid_row_with_ts(10, 7, 99, 1_700_000_000_000), 1)
+        .expect("append bid");
+    registry
+        .writer_mut("nexmark_bid")
+        .expect("bid writer")
+        .flush()
+        .await
+        .expect("flush bid");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![
+        Field::new("person_id", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+    ]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    let outputs = builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build three-way join graph");
+
+    assert_eq!(outputs.required_sources, required_sources);
+    let rows = materialized_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_row(&[100, 99])]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn range_join_materializes_half_open_matches() {
     let db = test_db("range-join").await;
     let view_name = "mv_range_join";

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, TimestampMillisecondArray};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::Result as DataFusionResult;
+use datafusion::common::{Column, Result as DataFusionResult};
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
 use datafusion::logical_expr::expr::WildcardOptions;
@@ -1104,6 +1104,68 @@ fn plans_multi_column_join() {
         }
         other => panic!("expected join node, found {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn plans_three_way_join_as_binary_join_composition() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let auction_plan = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(auction, "id")).alias("auction_id"),
+            col(qualified(auction, "seller")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+    let bid_plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .project(vec![
+            col(qualified(bid, "auction")).alias("bid_auction"),
+            col(qualified(bid, "price")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+    let plan = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .project(vec![col(qualified(person, "id")).alias("person_id")])
+        .unwrap()
+        .join(
+            auction_plan,
+            JoinType::Inner,
+            (
+                vec![Column::from_name("person_id")],
+                vec![Column::from_name("seller")],
+            ),
+            None,
+        )
+        .unwrap()
+        .join(
+            bid_plan,
+            JoinType::Inner,
+            (
+                vec![Column::from_name("auction_id")],
+                vec![Column::from_name("bid_auction")],
+            ),
+            None,
+        )
+        .unwrap()
+        .project(vec![col("person_id"), col("price")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let join_count = circuit_plan
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.kind, DbspNodeKind::Join(_)))
+        .count();
+    assert_eq!(join_count, 2);
 }
 
 #[test]
