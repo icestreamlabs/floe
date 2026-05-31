@@ -1212,10 +1212,16 @@ async fn load_json<T: for<'de> Deserialize<'de>>(
 }
 
 async fn write_batch(db: &Db, batch: WriteBatch, await_durable: bool) -> Result<()> {
-    db.write_with_options(batch, &WriteOptions { await_durable })
-        .await
-        .map(|_| ())
-        .map_err(map_slate_err)
+    db.write_with_options(
+        batch,
+        &WriteOptions {
+            await_durable,
+            ..WriteOptions::default()
+        },
+    )
+    .await
+    .map(|_| ())
+    .map_err(map_slate_err)
 }
 
 async fn scan_prefix(db: &Db, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

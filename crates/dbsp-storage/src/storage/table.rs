@@ -108,6 +108,7 @@ impl SlateTable {
     fn write_options(&self) -> WriteOptions {
         WriteOptions {
             await_durable: self.await_durable,
+            ..WriteOptions::default()
         }
     }
 }

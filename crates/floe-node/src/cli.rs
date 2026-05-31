@@ -120,6 +120,24 @@ pub struct RunArgs {
     #[arg(long = "slatedb-l0-sst-bytes", value_parser = parse_positive_usize)]
     pub slatedb_l0_sst_size_bytes: Option<usize>,
 
+    /// Max WAL flushes before forcing the active memtable to L0.
+    #[arg(
+        long = "slatedb-max-wal-flushes-before-l0-flush",
+        value_parser = parse_positive_u64
+    )]
+    pub slatedb_max_wal_flushes_before_l0_flush: Option<u64>,
+
+    /// Max total SlateDB L0 SSTs before write backpressure.
+    #[arg(long = "slatedb-l0-max-ssts", value_parser = parse_positive_usize)]
+    pub slatedb_l0_max_ssts: Option<usize>,
+
+    /// Max SlateDB L0 SSTs covering any single key before write backpressure.
+    #[arg(
+        long = "slatedb-l0-max-ssts-per-key",
+        value_parser = parse_positive_usize
+    )]
+    pub slatedb_l0_max_ssts_per_key: Option<usize>,
+
     /// Max unflushed bytes before SlateDB applies backpressure.
     #[arg(long = "slatedb-max-unflushed-bytes", value_parser = parse_positive_usize)]
     pub slatedb_max_unflushed_bytes: Option<usize>,
@@ -157,6 +175,13 @@ pub struct RunArgs {
     /// Cache SlateDB PUT operations to disk (requires --slatedb-cache-dir).
     #[arg(long = "slatedb-cache-puts")]
     pub slatedb_cache_puts: bool,
+
+    /// Max open file handles retained by the SlateDB disk-cache file-handle cache.
+    #[arg(
+        long = "slatedb-cache-max-open-file-handles",
+        value_parser = parse_positive_usize
+    )]
+    pub slatedb_cache_max_open_file_handles: Option<usize>,
 
     /// Timeout for closing SlateDB during shutdown.
     #[arg(long = "slatedb-close-timeout-ms", value_parser = parse_positive_u64)]

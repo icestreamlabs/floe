@@ -271,6 +271,9 @@ pub(super) fn env_has_prefix(prefix: &str) -> bool {
 pub(super) fn slatedb_overrides_present(args: &cli::RunArgs) -> bool {
     args.slatedb_flush_interval_ms.is_some()
         || args.slatedb_l0_sst_size_bytes.is_some()
+        || args.slatedb_max_wal_flushes_before_l0_flush.is_some()
+        || args.slatedb_l0_max_ssts.is_some()
+        || args.slatedb_l0_max_ssts_per_key.is_some()
         || args.slatedb_max_unflushed_bytes.is_some()
         || args.slatedb_compaction_max_sst_bytes.is_some()
         || args.slatedb_compaction_max_concurrent.is_some()
@@ -278,6 +281,7 @@ pub(super) fn slatedb_overrides_present(args: &cli::RunArgs) -> bool {
         || args.slatedb_cache_max_bytes.is_some()
         || args.slatedb_cache_part_bytes.is_some()
         || args.slatedb_cache_puts
+        || args.slatedb_cache_max_open_file_handles.is_some()
 }
 
 pub(super) fn apply_slatedb_overrides(settings: &mut Settings, args: &cli::RunArgs) {
@@ -290,6 +294,15 @@ pub(super) fn apply_slatedb_overrides(settings: &mut Settings, args: &cli::RunAr
     }
     if let Some(bytes) = args.slatedb_l0_sst_size_bytes {
         settings.l0_sst_size_bytes = bytes;
+    }
+    if let Some(flushes) = args.slatedb_max_wal_flushes_before_l0_flush {
+        settings.max_wal_flushes_before_l0_flush = flushes;
+    }
+    if let Some(max_ssts) = args.slatedb_l0_max_ssts {
+        settings.l0_max_ssts = max_ssts;
+    }
+    if let Some(max_ssts_per_key) = args.slatedb_l0_max_ssts_per_key {
+        settings.l0_max_ssts_per_key = max_ssts_per_key;
     }
     if let Some(bytes) = args.slatedb_max_unflushed_bytes {
         settings.max_unflushed_bytes = bytes;
@@ -317,6 +330,9 @@ pub(super) fn apply_slatedb_overrides(settings: &mut Settings, args: &cli::RunAr
     }
     if args.slatedb_cache_puts {
         settings.object_store_cache_options.cache_puts = true;
+    }
+    if let Some(max_open_file_handles) = args.slatedb_cache_max_open_file_handles {
+        settings.object_store_cache_options.max_open_file_handles = max_open_file_handles;
     }
 }
 

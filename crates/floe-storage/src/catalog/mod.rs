@@ -748,7 +748,13 @@ impl SlateCatalog {
         let mut batch = WriteBatch::new();
         batch.put(&key, encoded);
         self.db
-            .write_with_options(batch, &WriteOptions { await_durable })
+            .write_with_options(
+                batch,
+                &WriteOptions {
+                    await_durable,
+                    ..WriteOptions::default()
+                },
+            )
             .await
             .map(|_| ())
             .map_err(map_slate_err)
@@ -796,6 +802,7 @@ impl SlateCatalog {
                 batch,
                 &WriteOptions {
                     await_durable: true,
+                    ..WriteOptions::default()
                 },
             )
             .await
