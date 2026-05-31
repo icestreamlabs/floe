@@ -1,40 +1,40 @@
 ---
 layout: default
 title: Connectors and Sinks
-description: Floe connector and sink contracts.
+description: Floe connectors, sink behavior, and delivery settings.
 permalink: /connectors/
 ---
 
-# Connector Contracts
+# Connectors and Sinks
 
-This document describes the expectations for connector implementations used by Floe.
+This page describes the connector and sink behavior Floe exposes today.
 
 ## Lifecycle
 
-Connectors implement a simple lifecycle:
+Connectors follow a simple lifecycle:
 
 - init: allocate resources and validate configuration.
-- tick: emit zero or more `SourceEvent` records for one logical cycle.
+- tick: emit zero or more source events for one logical cycle.
 - shutdown: release resources and finish gracefully.
 
 The runtime drives `tick` at the connector's declared interval and stops when the
 connector reports `Finished` or the runtime is cancelled.
 
-Internal lifecycle hooks used by the runtime:
+Connector lifecycle behavior:
 
-- pre-tick commit notification: connectors can receive barrier commit decisions
+- pre-tick commit notification: connectors can receive commit decisions
   before polling (for example, Kafka offsets and Postgres CDC LSN advancement).
 - post-checkpoint barrier: commit notifications are sent only after tick state
   and checkpoint writes are durable.
 
 ## Event Emission
 
-- Connectors send events through the shared `SourceEventSender`.
+- Connectors send events through the shared source-event channel.
 - Events are expected to be self-contained JSON objects with fields matching the
   corresponding `SourceDefinition`.
 - A connector should skip emitting events with missing required fields rather
   than sending partial records.
-- Connectors should attach resume metadata in `SourceResumeToken` whenever
+- Connectors should attach resume metadata whenever
   available (partition/offset/LSN/cursor) and may attach `event_time_ms` when
   source-native event time is known.
 
@@ -117,8 +117,8 @@ Floe can load connector and sink definitions from a config file:
 
 - `--config path/to/connectors.toml`
 - Supported formats: TOML, YAML, JSON
-- Full schema reference (including `materialized_views`, `runtime`, `storage`,
-  and `maintenance`): `docs/runtime_config.md`
+- Configuration can also include `materialized_views`, `runtime`, `storage`,
+  and `maintenance` sections.
 
 Example (TOML):
 
@@ -165,8 +165,8 @@ Operational notes:
 - Runtime/storage knobs (for example `--slatedb-*`, `--zset-*`,
   `--mv-retain-last`) still apply when `--config` is used.
 
-Connector config fields are mapped into `SourceDefinition` properties for
-introspection (e.g., `connector.kafka.brokers`, `connector.generator.events_per_second`).
+Connector config fields are exposed for introspection (for example,
+`connector.kafka.brokers` and `connector.generator.events_per_second`).
 
 Validation rules:
 
@@ -197,9 +197,8 @@ event payload.
 The Postgres CDC connector uses native logical replication with the built-in
 `pgoutput` plugin. It reads from an existing logical replication slot and
 publication, and reports the applied LSN only after Floe's durable tick-commit
-barrier. In the current `SourceEvent` bridge, insert and update rows are emitted
-to the normal Floe ingest path; delete and truncate correctness will be handled
-by the CDC table runtime.
+barrier. CDC-backed tables use the native CDC table runtime so inserts, updates,
+and deletes can be reflected in materialized views and replication pipelines.
 
 Example (TOML):
 
@@ -260,4 +259,5 @@ Execution semantics:
   - `floe_sink_failures_total{sink=...,transport=...}`
   - `floe_sink_retries_total{sink=...,transport=...}`
 
-For explicit GA delivery guarantees and limitations, see `docs/ga_contract.md`.
+See the [operations page]({{ site.baseurl }}/operations/) for health checks,
+metrics, and CDC operator endpoints.

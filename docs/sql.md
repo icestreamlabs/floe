@@ -108,7 +108,7 @@ Sink execution behavior:
 - Rows with event-time earlier than `(watermark - allowed_lateness)` are
   dropped. The SQL planner currently defaults `allowed_lateness` to `0`.
 - SQL `ASOF JOIN` is supported for latest-prior lookup joins over Int64 or
-  timestamp keys. `FOR SYSTEM_TIME AS OF` compatibility syntax is not yet
+  timestamp keys. `FOR SYSTEM_TIME AS OF` compatibility syntax is not currently
   supported.
 
 ## Nexmark Support Matrix
@@ -120,16 +120,16 @@ Current status:
 - All canonical queries pass logical planning, circuit planning, and runtime
   graph validation in the coverage harness.
 - SQL `ASOF JOIN` is available in Floe. RisingWave-compatible
-  `FOR SYSTEM_TIME AS OF` syntax remains documented as unsupported below.
+  `FOR SYSTEM_TIME AS OF` syntax is listed below.
 
-## Nexmark-Specific Limitations
+## Nexmark-Specific Limits
 
-Unsupported constructs with concrete errors:
+Current limits with concrete errors:
 
 - Temporal joins using `FOR SYSTEM_TIME AS OF` syntax
   - Example parser error:
     - `failed to parse materialized view statement: sql parser error: Expected: one of UPDATE or SHARE, found: SYSTEM_TIME`
-- Full `DATE_FORMAT` token parity is not yet guaranteed beyond tokens required
+- `DATE_FORMAT` currently covers the tokens required
   by the Nexmark suite (`yyyy`, `MM`, `dd`, `HH`, `mm`, `ss`).
 - `REGEXP_EXTRACT` returns `NULL` for invalid patterns (some systems raise
   errors instead).

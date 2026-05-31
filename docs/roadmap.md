@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Roadmap
-description: Floe release milestones.
+description: Floe release roadmap.
 permalink: /roadmap/
 ---
 
@@ -11,7 +11,7 @@ Floe will remain a single-node streaming SQL engine. The roadmap intentionally e
 
 ## Alpha
 
-- Publish the single-node support matrix and release checklist.
+- Publish the single-node support matrix and validation checklist.
 - Add automated psql `COPY (SUBSCRIBE ...) TO STDOUT` regression coverage.
 
 Milestone: [Alpha](https://github.com/icestreamlabs/floe/milestone/1)
@@ -30,14 +30,14 @@ Milestone: [Beta](https://github.com/icestreamlabs/floe/milestone/2)
 - pgwire authentication, TLS, and production credential handling.
 - Single-node backup, restore, and upgrade validation.
 - Online schema and catalog evolution contracts.
-- Release gates for freshness, throughput, recovery, and vectorization.
+- Release validation for freshness, throughput, recovery, and vectorization.
 
 Milestone: [1.0 GA](https://github.com/icestreamlabs/floe/milestone/3)
 
 ## 2.0
 
 - `FOR SYSTEM_TIME AS OF` compatibility syntax and advanced window semantics.
-- Remaining deferred data types and productized Arrow IPC format decisions.
+- Broader data type coverage and stable Arrow IPC format support.
 - Single-node resource governance and admission control.
 
 Milestone: [2.0](https://github.com/icestreamlabs/floe/milestone/4)

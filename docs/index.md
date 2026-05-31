@@ -10,7 +10,7 @@ description: Documentation for Floe, a single-node vectorized streaming SQL data
 
 <div class="actions">
   <a class="button" href="{{ site.baseurl }}/quickstart/">Start with the quickstart</a>
-  <a class="button secondary" href="{{ site.baseurl }}/alpha-support/">Read the alpha support matrix</a>
+  <a class="button secondary" href="{{ site.baseurl }}/support/">Read the support matrix</a>
 </div>
 
 <div class="grid">
@@ -35,7 +35,7 @@ description: Documentation for Floe, a single-node vectorized streaming SQL data
 ## Core pages
 
 - [Quickstart]({{ site.baseurl }}/quickstart/)
-- [Alpha support matrix]({{ site.baseurl }}/alpha-support/)
+- [Support matrix]({{ site.baseurl }}/support/)
 - [SQL reference]({{ site.baseurl }}/sql/)
 - [Connectors and sinks]({{ site.baseurl }}/connectors/)
 - [Operations]({{ site.baseurl }}/operations/)

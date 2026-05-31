@@ -77,4 +77,5 @@ Postgres CDC operator endpoints report:
 - target state
 - DLQ entry counts and retry/discard state
 
-The current Alpha API is HTTP-first. A `floe-node ops` CLI wrapper is tracked for Beta.
+Administrative operations are currently exposed over HTTP. A `floe-node ops`
+CLI wrapper is planned.

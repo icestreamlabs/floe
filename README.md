@@ -91,10 +91,11 @@ cache settings via:
   - `--slatedb-cache-dir /tmp/floe-slate-cache --slatedb-cache-max-bytes 1073741824`
 - A settings file: `--slatedb-config /path/to/SlateDb.toml` or
   `storage.slatedb_config = "/path/to/SlateDb.toml"`
-- Environment variables can still be used for SlateDB internals when explicitly
-  requested with `--slatedb-env-prefix` or `storage.slatedb_env_prefix`.
+- Environment variables can still be used for SlateDB-specific settings when
+  explicitly requested with `--slatedb-env-prefix` or
+  `storage.slatedb_env_prefix`.
 
-Defaults (SlateDB 0.8.2):
+Default SlateDB behavior:
 
 - Flush interval: 100ms
 - L0 SST size: 64 MiB; max unflushed bytes: 1 GiB
@@ -124,9 +125,9 @@ Tradeoffs:
 5. Materialized views are managed in the executor and exposed via pgwire SUBSCRIBE.
 6. State is stored in SlateDB (in-memory by default, filesystem when configured).
 
-## Postgres CDC Alpha Surface
+## Postgres CDC Support
 
-Postgres CDC is an alpha feature for single-node deployments. It supports:
+Postgres CDC is available for single-node deployments. It supports:
 
 - `CREATE SOURCE ... WITH (connector = 'postgres-cdc', connection = ...,
   slot.name = ..., publication.name = ...)` using native `pgoutput` logical
@@ -136,16 +137,16 @@ Postgres CDC is an alpha feature for single-node deployments. It supports:
 - Materialized views over CDC-backed tables, including snapshot backfill, WAL
   handoff, inserts, updates, deletes, joins, and aggregates.
 - `CREATE REPLICATION PIPELINE ... INTO KAFKA` with `floe-json`,
-  `debezium-json`, or experimental `arrow-ipc` payloads.
+  `debezium-json`, or `arrow-ipc` payloads for evaluation.
 - `CREATE REPLICATION PIPELINE ... INTO POSTGRES` with `floe-json` payloads.
 - Optional durable replication buffers with bounded pending bytes, records,
   transactions, and age limits.
 - Postgres materialized-view sinks in `upsert` and `append_only` modes.
 - Operator inspection under `/ops/cdc/replication` and DLQ list, inspect,
   retry, batch retry, and discard endpoints under `/ops/cdc/replication/dlq`.
-  The older `/debug/cdc/replication` paths remain engineering aliases.
+  The older `/debug/cdc/replication` paths remain accepted for compatibility.
 
-Current requirements and limitations:
+Current requirements and limits:
 
 - The Postgres publication and logical replication slot are auto-created by
   default when possible. Use `publication.create = false` or
@@ -156,7 +157,7 @@ Current requirements and limitations:
   fail-fast behavior.
 - CDC tables need primary-key metadata for update/delete and target upsert
   semantics.
-- Schema evolution has an explicit alpha contract:
+- Schema evolution supports the following behavior:
   - `schema_evolution = 'fail_fast'` rejects any observed schema change.
   - `ignore_compatible` and `apply_compatible_additions` allow nullable,
     non-key columns appended to the upstream table and continue projecting rows
@@ -169,15 +170,15 @@ Current requirements and limitations:
     types/nullability, extra required target columns, and a unique index matching
     the CDC primary key before rows are applied.
 - Common scalar types are covered; arrays, enums/domains, intervals, and range
-  types remain deferred.
-- Richer operator CLI UX is follow-up product work.
-- Full HA discovery is not implemented in alpha: source failover requires the
-  configured connection string to resolve to the new writer, and the promoted
-  Postgres instance must retain a compatible logical slot/publication. Target
-  Postgres sinks and replication pipelines retry the configured endpoint; use a
-  stable proxy/DNS name for writer changes.
-- Arrow IPC Kafka output is internal/experimental and should not be used for
-  public apples-to-apples format claims without calling that out.
+  types are not currently supported.
+- A CLI wrapper for operator workflows is planned.
+- Automatic failover discovery is not currently available: source failover
+  requires the configured connection string to resolve to the new writer, and
+  the promoted Postgres instance must retain a compatible logical
+  slot/publication. Target Postgres sinks and replication pipelines retry the
+  configured endpoint; use a stable proxy/DNS name for writer changes.
+- Arrow IPC Kafka output is available for evaluation. Encoding details and
+  performance characteristics may change before stable support.
 
 Postgres CDC operator endpoints:
 
@@ -226,9 +227,9 @@ Postgres CDC performance baselines:
   include `summary.json`, `summary.csv`, `summary.md`, per-run `summary.json`,
   `reproduce.sh`, Floe Prometheus metrics, CDC replication state, Postgres slot
   state, Docker stats, and system/build metadata.
-- Compare the same profile on the feature branch on the same host. The alpha
-  performance boundary is the current `main` result for the same profile and
-  hardware, not a checked-in numeric SLA.
+- Compare the same profile on the feature branch on the same host. The
+  performance comparison boundary is the current `main` result for the same
+  profile and hardware, not a checked-in numeric SLA.
 - Timing fields have distinct meanings:
   - `end_to_end_source_rows_per_second`: node startup through target
     observation.
@@ -261,9 +262,9 @@ Postgres CDC type compatibility:
 | `numeric(p,s)` with `p <= 38` | `Decimal128` | supported | decimal string | supported |
 | unconstrained `numeric` / larger precision | `Numeric` string | supported | string | supported |
 | `float4`, `float8` | none | rejected | n/a | n/a |
-| arrays, ranges, multiranges | none | rejected/deferred | n/a | n/a |
-| enums/domains | none | rejected/deferred | n/a | n/a |
-| `time`, `timetz`, `interval` | none | rejected/deferred | n/a | n/a |
+| arrays, ranges, multiranges | none | not supported | n/a | n/a |
+| enums/domains | none | not supported | n/a | n/a |
+| `time`, `timetz`, `interval` | none | not supported | n/a | n/a |
 
 Useful validation entry points:
 
@@ -295,6 +296,12 @@ Useful validation entry points:
 The project docs are published with GitHub Pages from the tracked `docs/`
 directory. The site is intentionally lightweight: Markdown pages, a tiny Jekyll
 layout, and a GitHub Actions workflow that deploys static output.
+
+Published docs:
+
+```text
+https://icestreamlabs.github.io/floe/
+```
 
 Local entry point:
 
