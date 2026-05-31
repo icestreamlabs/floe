@@ -59,12 +59,12 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
         "runtime.watermark_idle_source_ms",
     )?;
     ensure_optional_positive_usize(
-        runtime.tail_channel_capacity,
-        "runtime.tail_channel_capacity",
+        runtime.subscribe_channel_capacity,
+        "runtime.subscribe_channel_capacity",
     )?;
     ensure_optional_positive_i64(
-        runtime.tail_max_catchup_versions,
-        "runtime.tail_max_catchup_versions",
+        runtime.subscribe_max_catchup_versions,
+        "runtime.subscribe_max_catchup_versions",
     )?;
     ensure_optional_positive_usize(
         runtime.transient_segment_max_nodes,

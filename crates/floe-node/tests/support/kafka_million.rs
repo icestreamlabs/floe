@@ -120,13 +120,13 @@ struct NoSinkVerificationTiming {
     total: Duration,
 }
 
-struct TailVerification {
+struct SubscribeVerification {
     pg_port: u16,
     mv_name: &'static str,
     output_fields: &'static [FieldSpec],
     sample_match_field: &'static str,
     expected: ExpectedDataset,
-    verify_mode: TailVerifyMode,
+    verify_mode: SubscribeVerifyMode,
     timeout: Duration,
     ready_tx: oneshot::Sender<()>,
 }
@@ -252,7 +252,7 @@ enum SinkMode {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum TailVerifyMode {
+enum SubscribeVerifyMode {
     SamplesOnly,
 }
 
@@ -621,13 +621,13 @@ async fn run_redpanda_kafka_million_test_impl(
                 let (pgwire_ready_tx, pgwire_ready_rx) = oneshot::channel();
                 let expected_for_pgwire = expected.clone();
                 let pgwire_task = tokio::spawn(async move {
-                    verify_pgwire_tail(TailVerification {
+                    verify_pgwire_subscribe(SubscribeVerification {
                         pg_port,
                         mv_name: spec.mv_name,
                         output_fields: spec.output_fields,
                         sample_match_field: spec.sample_match_field,
                         expected: expected_for_pgwire,
-                        verify_mode: TailVerifyMode::SamplesOnly,
+                        verify_mode: SubscribeVerifyMode::SamplesOnly,
                         timeout: Duration::from_secs(1800),
                         ready_tx: pgwire_ready_tx,
                     })
@@ -635,7 +635,7 @@ async fn run_redpanda_kafka_million_test_impl(
                 });
                 pgwire_ready_rx
                     .await
-                    .context("wait for pgwire tail consumer readiness")?;
+                    .context("wait for pgwire subscribe consumer readiness")?;
 
                 let produce_started = Instant::now();
                 {
@@ -687,7 +687,7 @@ async fn run_redpanda_kafka_million_test_impl(
 
                 pgwire_task
                     .await
-                    .context("join pgwire tail consumer task")??;
+                    .context("join pgwire subscribe consumer task")??;
             }
             SinkMode::NoSink => {
                 let produce_started = Instant::now();
@@ -1136,8 +1136,8 @@ fn consume_sink_metrics(
     Ok(metrics)
 }
 
-async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
-    let TailVerification {
+async fn verify_pgwire_subscribe(config: SubscribeVerification) -> Result<()> {
+    let SubscribeVerification {
         pg_port,
         mv_name,
         output_fields,
@@ -1157,12 +1157,12 @@ async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
         let _ = connection.await;
     });
 
-    let tail_sql = format!("TAIL {mv_name}");
+    let subscribe_sql = format!("SUBSCRIBE {mv_name}");
     let mut stream = Box::pin(
         client
-            .simple_query_raw(&tail_sql)
+            .simple_query_raw(&subscribe_sql)
             .await
-            .context("start pgwire tail")?,
+            .context("start pgwire subscribe")?,
     );
     let _ = ready_tx.send(());
 
@@ -1170,18 +1170,20 @@ async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
     let pgwire_value_idx = sample_field_idx + 3;
     let mut observed_samples: BTreeMap<String, ExpectedRow> = BTreeMap::new();
     let start = Instant::now();
-    let mut tail_rows_seen: usize = 0;
+    let mut subscribe_rows_seen: usize = 0;
     while start.elapsed() < timeout {
         match tokio::time::timeout(Duration::from_millis(250), stream.try_next()).await {
             Ok(Ok(Some(SimpleQueryMessage::Row(row)))) => {
                 let Some(op_raw) = row.get(1) else {
                     continue;
                 };
-                let op: i16 = op_raw.parse().context("parse pgwire __op as i16")?;
+                let op: i64 = op_raw.parse().context("parse pgwire floe_diff as i64")?;
                 if op != 1 {
-                    bail!("unexpected pgwire tail __op={op}; expected insert-only output");
+                    bail!(
+                        "unexpected pgwire subscribe floe_diff={op}; expected insert-only output"
+                    );
                 }
-                tail_rows_seen += 1;
+                subscribe_rows_seen += 1;
 
                 let Some(sample_key) = row.get(pgwire_value_idx) else {
                     continue;
@@ -1201,10 +1203,12 @@ async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
                         break;
                     }
                 }
-                if tail_rows_seen.is_multiple_of(100_000) {
-                    eprintln!("consumed {tail_rows_seen} pgwire tail rows from mv={mv_name}");
+                if subscribe_rows_seen.is_multiple_of(100_000) {
+                    eprintln!(
+                        "consumed {subscribe_rows_seen} pgwire subscribe rows from mv={mv_name}"
+                    );
                 }
-                if matches!(verify_mode, TailVerifyMode::SamplesOnly)
+                if matches!(verify_mode, SubscribeVerifyMode::SamplesOnly)
                     && observed_samples.len() == expected.sample_rows_by_key.len()
                 {
                     break;
@@ -1214,7 +1218,7 @@ async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
             | Ok(Ok(Some(SimpleQueryMessage::CommandComplete(_)))) => {}
             Ok(Ok(Some(_))) => {}
             Ok(Ok(None)) => break,
-            Ok(Err(err)) => return Err(err).context("read pgwire tail row"),
+            Ok(Err(err)) => return Err(err).context("read pgwire subscribe row"),
             Err(_) => {}
         }
     }
@@ -1227,19 +1231,19 @@ async fn verify_pgwire_tail(config: TailVerification) -> Result<()> {
             .cloned()
             .collect();
         bail!(
-            "pgwire tail sample row count mismatch: observed={}, expected={}, tail_rows_seen={}, missing_keys={missing:?}",
+            "pgwire subscribe sample row count mismatch: observed={}, expected={}, subscribe_rows_seen={}, missing_keys={missing:?}",
             observed_samples.len(),
             expected.sample_rows_by_key.len(),
-            tail_rows_seen
+            subscribe_rows_seen
         );
     }
     for (key, expected_row) in &expected.sample_rows_by_key {
         let actual = observed_samples
             .get(key)
-            .with_context(|| format!("missing pgwire tail sample for key={key}"))?;
+            .with_context(|| format!("missing pgwire subscribe sample for key={key}"))?;
         if actual != expected_row {
             bail!(
-                "pgwire tail sample mismatch for key={}: actual={actual:?}, expected={expected_row:?}",
+                "pgwire subscribe sample mismatch for key={}: actual={actual:?}, expected={expected_row:?}",
                 key
             );
         }
@@ -1585,7 +1589,7 @@ fn row_from_query_row_at_offset(
         let value_idx = idx + base_offset;
         let raw = row
             .get(value_idx)
-            .with_context(|| format!("pgwire tail row missing {}", field.name))?;
+            .with_context(|| format!("pgwire subscribe row missing {}", field.name))?;
         let value = match field.kind {
             FieldKind::Int64 => ExpectedValue::Int64(
                 raw.parse()

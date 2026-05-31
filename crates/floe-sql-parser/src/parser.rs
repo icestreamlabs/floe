@@ -54,10 +54,6 @@ pub fn parse_floe_program(sql: &str) -> Result<Vec<FloeStatement>> {
             statements.push(FloeStatement::CreateMaterializedView(definition));
             continue;
         }
-        if starts_with_keyword(normalized, "TAIL") {
-            statements.push(parse_tail_statement(normalized)?);
-            continue;
-        }
         if starts_with_keyword(normalized, "SUBSCRIBE") {
             statements.push(parse_subscribe_statement(normalized)?);
             continue;
@@ -894,15 +890,6 @@ fn postgres_schema_evolution_policy_from_options(
             "unsupported Postgres CDC schema evolution policy '{other}'; expected fail_fast, ignore_compatible, or apply_compatible_additions"
         )),
     }
-}
-
-fn parse_tail_statement(sql: &str) -> Result<FloeStatement> {
-    let (mv_name, with_snapshot, as_of) = parse_stream_statement_parts(sql, "TAIL")?;
-    Ok(FloeStatement::Tail {
-        mv_name,
-        with_snapshot,
-        as_of,
-    })
 }
 
 fn parse_subscribe_statement(sql: &str) -> Result<FloeStatement> {

@@ -18,10 +18,10 @@ Run the node with the built-in Nexmark generator and a single materialized view:
 cargo run -- run --mv-query "CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid"
 ```
 
-Tail the view over pgwire (defaults to 127.0.0.1:6432):
+Subscribe to the view changelog over pgwire (defaults to 127.0.0.1:6432):
 
 ```bash
-cargo run -- tail --mv mv
+psql -h 127.0.0.1 -p 6432 -U postgres -c "COPY (SUBSCRIBE mv WITH SNAPSHOT) TO STDOUT"
 ```
 
 Optional inputs:
@@ -61,7 +61,7 @@ Observability:
   - `ingest_decode`: `epoch`, `raw_batch_size`, `decoded_rows`, `latency_ms`
   - `connector_tick`: `epoch`, `watermark`, `tick_latency_ms`
   - `dbsp_write`: `graph_id`, `view`, `namespace`, `version`, `latency_ms`
-  - `tail_emit`: `mv`, `version`, `mode`, `rows`
+  - `mv_changelog_emit`: `mv`, `version`, `mode`, `rows`
   Correlation: `connector_tick.epoch` aligns with `dbsp_write.version` for MV
   updates produced by that ingest tick.
 - Key Prometheus counters:
@@ -121,7 +121,7 @@ Tradeoffs:
 3. Events and CDC changes are decoded into typed rows via planner/runtime
    source definitions.
 4. Outer streams feed the DBSP runtime built from DataFusion logical plans.
-5. Materialized views are managed in the executor and exposed via pgwire TAIL.
+5. Materialized views are managed in the executor and exposed via pgwire SUBSCRIBE.
 6. State is stored in SlateDB (in-memory by default, filesystem when configured).
 
 ## Postgres CDC Alpha Surface
@@ -280,10 +280,10 @@ Useful validation entry points:
 - `crates/floe-node`: CLI entrypoint and orchestration for connectors + execution.
 - `crates/floe-node-core`: connector implementations, MV planner, and generator.
 - `crates/floe-executor`: DataFusion plan validation, DBSP graph building, and MV runtime.
-- `crates/floe-server`: pgwire protocol server and TAIL query execution.
+- `crates/floe-server`: pgwire protocol server and SUBSCRIBE query execution.
 - `crates/floe-storage`: SlateDB catalog integration and persistence glue.
 - `crates/floe-core`: shared types (catalog, source definitions, row values).
-- `crates/floe-sql-parser`: SQL parsing for Floe-specific statements (MV/SINK/TAIL).
+- `crates/floe-sql-parser`: SQL parsing for Floe-specific statements (MV/SINK/SUBSCRIBE).
 - `crates/dbsp`: core DBSP APIs and types (align semantics with Feldera).
 - `crates/dbsp-circuit`: circuit representation and planning utilities.
 - `crates/dbsp-planner`: DataFusion to DBSP plan translation.

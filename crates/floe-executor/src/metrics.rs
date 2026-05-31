@@ -21,12 +21,12 @@ static MV_UPDATES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register floe_mv_updates_total")
 });
 
-static TAIL_THROUGHPUT_ROWS: LazyLock<IntCounter> = LazyLock::new(|| {
+static SUBSCRIBE_THROUGHPUT_ROWS: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
-        "floe_tail_rows_total",
-        "Total number of rows emitted by tail streams"
+        "floe_subscribe_rows_total",
+        "Total number of rows emitted by SUBSCRIBE streams"
     )
-    .expect("register floe_tail_rows_total")
+    .expect("register floe_subscribe_rows_total")
 });
 
 static DELTA_BATCH_ROWS: LazyLock<Histogram> = LazyLock::new(|| {
@@ -101,9 +101,9 @@ pub(crate) fn inc_mv_updates() {
     MV_UPDATES_TOTAL.inc();
 }
 
-pub(crate) fn inc_tail_rows(count: usize) {
+pub(crate) fn inc_subscribe_rows(count: usize) {
     if count > 0 {
-        TAIL_THROUGHPUT_ROWS.inc_by(count as u64);
+        SUBSCRIBE_THROUGHPUT_ROWS.inc_by(count as u64);
     }
 }
 
@@ -127,7 +127,7 @@ pub(crate) fn observe_mv_optimization_hotspot(
 pub(crate) fn init() {
     let _ = &*MV_UPDATE_LATENCY_MS;
     let _ = &*MV_UPDATES_TOTAL;
-    let _ = &*TAIL_THROUGHPUT_ROWS;
+    let _ = &*SUBSCRIBE_THROUGHPUT_ROWS;
     let _ = &*DELTA_BATCH_ROWS;
     let _ = &*DELTA_BATCH_BYTES;
     let _ = &*DELTA_BATCH_FLUSHES;

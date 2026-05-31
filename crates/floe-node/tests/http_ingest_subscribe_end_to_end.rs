@@ -16,8 +16,8 @@ const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_http_ingest AS \
      SELECT auction, bidder, price FROM nexmark_bid";
 
 #[tokio::test]
-#[ignore = "requires TCP sockets and HTTP; run with cargo test -p floe-node --test http_ingest_tail_end_to_end -- --ignored"]
-async fn http_ingest_tail_streams_rows() -> Result<()> {
+#[ignore = "requires TCP sockets and HTTP; run with cargo test -p floe-node --test http_ingest_subscribe_end_to_end -- --ignored"]
+async fn http_ingest_subscribe_streams_rows() -> Result<()> {
     let pg_port = find_unused_port()?;
     let http_port = find_unused_port()?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
@@ -26,8 +26,8 @@ async fn http_ingest_tail_streams_rows() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let config_path = temp_path(&format!("floe-http-tail-{run_id}.json"));
-    let sink_path = temp_path(&format!("floe-http-tail-{run_id}.jsonl"));
+    let config_path = temp_path(&format!("floe-http-subscribe-{run_id}.json"));
+    let sink_path = temp_path(&format!("floe-http-subscribe-{run_id}.jsonl"));
 
     let config = json!({
         "connectors": [
@@ -94,10 +94,10 @@ async fn http_ingest_tail_streams_rows() -> Result<()> {
             );
         }
 
-        let rows = wait_for_tail_rows(Path::new(&sink_path)).await?;
+        let rows = wait_for_subscribe_rows(Path::new(&sink_path)).await?;
 
         if rows.is_empty() {
-            bail!("expected tail to stream at least one row");
+            bail!("expected subscribe stream to emit at least one row");
         }
         let mut matched = false;
         for row in rows {
@@ -113,7 +113,7 @@ async fn http_ingest_tail_streams_rows() -> Result<()> {
             }
         }
         if !matched {
-            bail!("tail rows did not include expected auction/bidder/price payload");
+            bail!("subscribe rows did not include expected auction/bidder/price payload");
         }
 
         Ok(())
@@ -141,7 +141,7 @@ async fn wait_for_healthz(addr: &str) -> Result<()> {
     unreachable!("loop either returns success or bail");
 }
 
-async fn wait_for_tail_rows(path: &Path) -> Result<Vec<Value>> {
+async fn wait_for_subscribe_rows(path: &Path) -> Result<Vec<Value>> {
     for attempt in 0..60 {
         match tokio::fs::read_to_string(path).await {
             Ok(contents) => {
@@ -151,7 +151,8 @@ async fn wait_for_tail_rows(path: &Path) -> Result<Vec<Value>> {
                     if line.is_empty() {
                         continue;
                     }
-                    let value: Value = serde_json::from_str(line).context("parse tail row json")?;
+                    let value: Value =
+                        serde_json::from_str(line).context("parse subscribe row json")?;
                     rows.push(value);
                 }
                 if !rows.is_empty() {
@@ -162,12 +163,12 @@ async fn wait_for_tail_rows(path: &Path) -> Result<Vec<Value>> {
             Err(err) => return Err(err.into()),
         }
         if attempt == 30 {
-            tracing::warn!("waiting for tail sink output");
+            tracing::warn!("waiting for subscribe sink output");
         }
         sleep(Duration::from_millis(100)).await;
     }
     bail!(
-        "tail sink output never appeared in {}",
+        "subscribe sink output never appeared in {}",
         path.to_string_lossy()
     )
 }

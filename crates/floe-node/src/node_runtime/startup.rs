@@ -36,11 +36,11 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.watermark_idle_source_ms.is_none() {
         args.watermark_idle_source_ms = runtime.watermark_idle_source_ms;
     }
-    if args.tail_channel_capacity.is_none() {
-        args.tail_channel_capacity = runtime.tail_channel_capacity;
+    if args.subscribe_channel_capacity.is_none() {
+        args.subscribe_channel_capacity = runtime.subscribe_channel_capacity;
     }
-    if args.tail_max_catchup_versions.is_none() {
-        args.tail_max_catchup_versions = runtime.tail_max_catchup_versions;
+    if args.subscribe_max_catchup_versions.is_none() {
+        args.subscribe_max_catchup_versions = runtime.subscribe_max_catchup_versions;
     }
     if args.transient_segment_max_nodes.is_none() {
         args.transient_segment_max_nodes = runtime.transient_segment_max_nodes;
@@ -518,10 +518,9 @@ pub(super) fn log_operator_hints(
     for mv_name in mv_names {
         tracing::info!(
             mv = %mv_name,
-            tail_mv = %format!("cargo run -p floe-node -- tail --mv {mv_name}"),
-            tail_sql = %format!("cargo run -p floe-node -- tail --sql \"TAIL {mv_name} WITH (SNAPSHOT)\""),
+            subscribe_sql = %format!("psql postgresql://postgres@{pgwire_addr}/postgres -c \"COPY (SUBSCRIBE {mv_name} WITH SNAPSHOT) TO STDOUT\""),
             pgwire_addr = %pgwire_addr,
-            "tail hint"
+            "subscribe hint"
         );
     }
 }

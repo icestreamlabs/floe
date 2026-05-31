@@ -4,15 +4,14 @@ mod management;
 mod protocol;
 mod sql;
 mod subscribe;
-mod tail;
 mod types;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use floe_executor::SubscribeExecutionConfig;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::tail::TailExecutionConfig;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry};
 use floe_storage::SlateCatalog;
 use pgwire::error::{ErrorInfo, PgWireError};
@@ -30,7 +29,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:6432";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerRuntimeConfig {
-    pub tail: TailExecutionConfig,
+    pub subscribe: SubscribeExecutionConfig,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -50,7 +50,7 @@ use floe_executor::{
     BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
     MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
     OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig, SourceRowDecoder,
-    SourceTableProvider, TailExecutionConfig, ValidatedPlan, plan_source_requirements,
+    SourceTableProvider, SubscribeExecutionConfig, ValidatedPlan, plan_source_requirements,
     source_batch_journal_root_sources_with_config, validate_dbsp_plan,
 };
 use floe_node_core::cdc_delta_encoder::encode_cdc_table_deltas;
@@ -68,7 +68,6 @@ use floe_node_core::postgres_cdc::{
     PostgresCdcCommit, PostgresCdcSourceConfig, PostgresSlotCommit, default_postgres_publication,
     replication_config_from_connection_string, stored_slot_start_lsn,
 };
-use floe_node_core::tail_client;
 use floe_server as server;
 use floe_sql_parser::{
     CreateSourceDefinition, CreateTableDefinition, FloeStatement, MaterializedViewDefinition,

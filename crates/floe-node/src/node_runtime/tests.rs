@@ -23,8 +23,8 @@ fn default_run_args() -> cli::RunArgs {
         admin_port: None,
         pre_tick_commit_delay_ms: None,
         watermark_idle_source_ms: None,
-        tail_channel_capacity: None,
-        tail_max_catchup_versions: None,
+        subscribe_channel_capacity: None,
+        subscribe_max_catchup_versions: None,
         transient_segment_max_nodes: None,
         transient_segment_min_score: None,
         slatedb_config: None,
@@ -531,8 +531,8 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             kafka_max_messages: Some(1024),
             watermark_idle_source_ms: Some(45_000),
             pre_tick_commit_delay_ms: Some(5),
-            tail_channel_capacity: Some(512),
-            tail_max_catchup_versions: Some(64),
+            subscribe_channel_capacity: Some(512),
+            subscribe_max_catchup_versions: Some(64),
             transient_segment_max_nodes: Some(48),
             transient_segment_min_score: Some(0),
             admin_port: Some(9090),
@@ -584,8 +584,8 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
     assert_eq!(args.admin_port, Some(9090));
     assert_eq!(args.pre_tick_commit_delay_ms, Some(5));
     assert_eq!(args.watermark_idle_source_ms, Some(45_000));
-    assert_eq!(args.tail_channel_capacity, Some(512));
-    assert_eq!(args.tail_max_catchup_versions, Some(64));
+    assert_eq!(args.subscribe_channel_capacity, Some(512));
+    assert_eq!(args.subscribe_max_catchup_versions, Some(64));
     assert_eq!(args.transient_segment_max_nodes, Some(48));
     assert_eq!(args.transient_segment_min_score, Some(0));
     assert_eq!(args.slatedb_await_durable, Some(true));

@@ -1,14 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 
-use floe_node_core::tail_client::{TailConfig, build_subscribe_sql, build_tail_sql};
-
 #[derive(Debug, Parser)]
 #[command(
     author,
     version,
     about = "Floe node entrypoint",
-    long_about = "Run and tail a single-node streaming SQL runtime.",
-    after_long_help = "Examples:\n  floe-node run --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n  floe-node run --config ./floe.toml\n  floe-node tail --mv mv\n  floe-node subscribe --mv mv --with-snapshot\n  floe-node tail --sql \"TAIL mv WITH SNAPSHOT\""
+    long_about = "Run a single-node streaming SQL runtime.",
+    after_long_help = "Examples:\n  floe-node run --mv-query \"CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid\"\n  floe-node run --config ./floe.toml\n  psql -h 127.0.0.1 -p 6432 -U postgres -c \"COPY (SUBSCRIBE mv WITH SNAPSHOT) TO STDOUT\""
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -19,8 +17,6 @@ pub struct Cli {
 #[allow(clippy::large_enum_variant)]
 pub enum Command {
     Run(RunArgs),
-    Tail(TailArgs),
-    Subscribe(SubscribeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -88,13 +84,13 @@ pub struct RunArgs {
     #[arg(long = "watermark-idle-source-ms", value_parser = parse_positive_u64)]
     pub watermark_idle_source_ms: Option<u64>,
 
-    /// Channel capacity for pgwire TAIL streams.
-    #[arg(long = "tail-channel-capacity", value_parser = parse_positive_usize)]
-    pub tail_channel_capacity: Option<usize>,
+    /// Channel capacity for pgwire SUBSCRIBE streams.
+    #[arg(long = "subscribe-channel-capacity", value_parser = parse_positive_usize)]
+    pub subscribe_channel_capacity: Option<usize>,
 
-    /// Maximum materialized-view versions a TAIL stream catches up per scheduler pass.
-    #[arg(long = "tail-max-catchup-versions", value_parser = parse_positive_i64)]
-    pub tail_max_catchup_versions: Option<i64>,
+    /// Maximum materialized-view versions a SUBSCRIBE stream catches up per scheduler pass.
+    #[arg(long = "subscribe-max-catchup-versions", value_parser = parse_positive_i64)]
+    pub subscribe_max_catchup_versions: Option<i64>,
 
     /// Maximum number of transient operators folded into one materialization segment.
     #[arg(long = "transient-segment-max-nodes", value_parser = parse_positive_usize)]
@@ -324,108 +320,6 @@ pub struct RunArgs {
     pub http_source: Option<String>,
 }
 
-#[derive(Debug, Args)]
-#[command(
-    after_long_help = "Examples:\n  # Tail by materialized view name\n  floe-node tail --mv mv_bid\n\n  # Tail by explicit SQL\n  floe-node tail --sql \"TAIL mv_bid WITH (SNAPSHOT)\"\n\n  # Tail from a specific version\n  floe-node tail --mv mv_bid --as-of 42 --with-snapshot"
-)]
-pub struct TailArgs {
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
-    #[arg(long, default_value_t = 6432)]
-    pub port: u16,
-    #[arg(long, default_value = "postgres")]
-    pub user: String,
-    #[arg(long, default_value = "postgres")]
-    pub database: String,
-    #[arg(long, required_unless_present = "sql", conflicts_with = "sql")]
-    pub mv: Option<String>,
-    #[arg(long, required_unless_present = "mv", conflicts_with = "mv")]
-    pub sql: Option<String>,
-    #[arg(long)]
-    pub with_snapshot: bool,
-    #[arg(long)]
-    pub as_of: Option<i64>,
-    #[arg(long)]
-    pub max_rows: Option<usize>,
-    #[arg(long)]
-    pub no_header: bool,
-}
-
-#[derive(Debug, Args)]
-#[command(
-    after_long_help = "Examples:\n  # Subscribe by materialized view name\n  floe-node subscribe --mv mv_bid\n\n  # Subscribe with an initial snapshot\n  floe-node subscribe --mv mv_bid --with-snapshot\n\n  # Subscribe by explicit SQL\n  floe-node subscribe --sql \"SUBSCRIBE mv_bid WITH SNAPSHOT\""
-)]
-pub struct SubscribeArgs {
-    #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
-    #[arg(long, default_value_t = 6432)]
-    pub port: u16,
-    #[arg(long, default_value = "postgres")]
-    pub user: String,
-    #[arg(long, default_value = "postgres")]
-    pub database: String,
-    #[arg(long, required_unless_present = "sql", conflicts_with = "sql")]
-    pub mv: Option<String>,
-    #[arg(long, required_unless_present = "mv", conflicts_with = "mv")]
-    pub sql: Option<String>,
-    #[arg(long)]
-    pub with_snapshot: bool,
-    #[arg(long)]
-    pub as_of: Option<i64>,
-    #[arg(long)]
-    pub max_rows: Option<usize>,
-    #[arg(long)]
-    pub no_header: bool,
-}
-
-impl TailArgs {
-    pub fn to_config(&self) -> anyhow::Result<TailConfig> {
-        let sql = match self.sql.as_ref() {
-            Some(sql) => sql.to_string(),
-            None => {
-                let mv = self
-                    .mv
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("--mv is required when --sql is not set"))?;
-                build_tail_sql(mv, self.with_snapshot, self.as_of)
-            }
-        };
-        Ok(TailConfig {
-            host: self.host.clone(),
-            port: self.port,
-            user: self.user.clone(),
-            database: self.database.clone(),
-            sql,
-            max_rows: self.max_rows,
-            no_header: self.no_header,
-        })
-    }
-}
-
-impl SubscribeArgs {
-    pub fn to_config(&self) -> anyhow::Result<TailConfig> {
-        let sql = match self.sql.as_ref() {
-            Some(sql) => sql.to_string(),
-            None => {
-                let mv = self
-                    .mv
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("--mv is required when --sql is not set"))?;
-                build_subscribe_sql(mv, self.with_snapshot, self.as_of)
-            }
-        };
-        Ok(TailConfig {
-            host: self.host.clone(),
-            port: self.port,
-            user: self.user.clone(),
-            database: self.database.clone(),
-            sql,
-            max_rows: self.max_rows,
-            no_header: self.no_header,
-        })
-    }
-}
-
 fn parse_positive_rate(value: &str) -> Result<f64, String> {
     let parsed: f64 = value
         .parse()
@@ -511,25 +405,8 @@ mod tests {
     }
 
     #[test]
-    fn tail_help_includes_examples() {
-        let mut cmd = Cli::command();
-        let tail = cmd
-            .find_subcommand_mut("tail")
-            .expect("tail subcommand should exist");
-        let help = tail.render_long_help().to_string();
-        assert!(help.contains("Tail by materialized view name"));
-        assert!(help.contains("Tail by explicit SQL"));
-        assert!(help.contains("--as-of 42 --with-snapshot"));
-    }
-
-    #[test]
-    fn subscribe_help_includes_examples() {
-        let mut cmd = Cli::command();
-        let subscribe = cmd
-            .find_subcommand_mut("subscribe")
-            .expect("subscribe subcommand should exist");
-        let help = subscribe.render_long_help().to_string();
-        assert!(help.contains("Subscribe by materialized view name"));
-        assert!(help.contains("SUBSCRIBE mv_bid WITH SNAPSHOT"));
+    fn root_help_includes_psql_subscribe_example() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("COPY (SUBSCRIBE mv WITH SNAPSHOT) TO STDOUT"));
     }
 }

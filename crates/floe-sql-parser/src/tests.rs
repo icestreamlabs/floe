@@ -498,7 +498,7 @@ fn parse_floe_program_preserves_statement_order() {
     let program = r#"
         CREATE MATERIALIZED VIEW mv_bid AS SELECT auction FROM bid;
         CREATE SINK sink_bid FROM mv_bid WITH (connector = 'file', path = '/tmp/out.jsonl', append = true);
-        TAIL mv_bid WITH SNAPSHOT;
+        SUBSCRIBE mv_bid WITH SNAPSHOT;
     "#;
     let statements = parse_floe_program(program).expect("parse program");
     assert_eq!(statements.len(), 3);
@@ -512,57 +512,22 @@ fn parse_floe_program_preserves_statement_order() {
     ));
     assert!(matches!(
         statements.last(),
-        Some(FloeStatement::Tail { .. })
+        Some(FloeStatement::Subscribe { .. })
     ));
 }
 
 #[test]
 fn parse_floe_statement_rejects_multi_statement_input() {
-    let err = parse_floe_statement("TAIL mv; TAIL mv2").unwrap_err();
+    let err = parse_floe_statement("SUBSCRIBE mv; SUBSCRIBE mv2").unwrap_err();
     assert!(err.to_string().contains("exactly one statement"));
 }
 
 #[test]
-fn parse_tail_variants() {
-    let stmt = parse_floe_statement("TAIL mv_orders").expect("parse tail");
-    assert_eq!(
-        stmt,
-        FloeStatement::Tail {
-            mv_name: "mv_orders".to_string(),
-            with_snapshot: false,
-            as_of: None,
-        }
-    );
-
-    let stmt = parse_floe_statement("TAIL mv_orders WITH SNAPSHOT").expect("parse tail snapshot");
-    assert_eq!(
-        stmt,
-        FloeStatement::Tail {
-            mv_name: "mv_orders".to_string(),
-            with_snapshot: true,
-            as_of: None,
-        }
-    );
-
-    let stmt = parse_floe_statement("TAIL mv_orders AS OF 42").expect("parse tail as of");
-    assert_eq!(
-        stmt,
-        FloeStatement::Tail {
-            mv_name: "mv_orders".to_string(),
-            with_snapshot: false,
-            as_of: Some(42),
-        }
-    );
-
-    let stmt = parse_floe_statement("TAIL mv_orders WITH SNAPSHOT AS OF 42")
-        .expect("parse tail snapshot as of");
-    assert_eq!(
-        stmt,
-        FloeStatement::Tail {
-            mv_name: "mv_orders".to_string(),
-            with_snapshot: true,
-            as_of: Some(42),
-        }
+fn parse_floe_statement_rejects_tail() {
+    let err = parse_floe_statement("TAIL mv_orders").expect_err("tail should not parse");
+    assert!(
+        err.to_string()
+            .contains("unsupported SQL statement: TAIL mv_orders")
     );
 }
 

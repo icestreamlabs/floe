@@ -12,11 +12,6 @@ pub enum FloeStatement {
     CreateMaterializedView(MaterializedViewDefinition),
     CreateSink(SinkDefinition),
     CreateReplicationPipeline(ReplicationPipelineDefinition),
-    Tail {
-        mv_name: String,
-        with_snapshot: bool,
-        as_of: Option<i64>,
-    },
     Subscribe {
         mv_name: String,
         with_snapshot: bool,

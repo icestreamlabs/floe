@@ -37,7 +37,6 @@ pub mod source_journal;
 pub mod stream_types;
 pub mod subscribe;
 pub mod table_provider;
-pub mod tail;
 pub mod task_events;
 pub mod vectorized_keys;
 
@@ -60,8 +59,8 @@ pub use operator_state::OperatorStateHandle;
 pub use outer_stream::OuterStreamRegistry;
 pub use source_decoder::SourceRowDecoder;
 pub use stream_types::{Diff, Timestamp};
+pub use subscribe::SubscribeExecutionConfig;
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider, SourceTableProvider};
-pub use tail::TailExecutionConfig;
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};
 pub use vectorized_keys::{
     build_delta_batch, build_source_delta_batch, source_primary_key_columns,

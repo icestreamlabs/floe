@@ -1679,9 +1679,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         "--mv-query",
                     )?;
                 }
-                FloeStatement::Tail { .. } | FloeStatement::Subscribe { .. } => {
+                FloeStatement::Subscribe { .. } => {
                     return Err(anyhow!(
-                        "TAIL/SUBSCRIBE statements are not supported in --mv-query programs"
+                        "SUBSCRIBE statements are not supported in --mv-query programs"
                     ));
                 }
             }
@@ -1729,12 +1729,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let planned_materialized_views =
         plan_materialized_views(&source_registry, &materialized_views).await?;
-    let mut tail_execution_config = TailExecutionConfig::default();
-    if let Some(channel_capacity) = run_args.tail_channel_capacity {
-        tail_execution_config.channel_capacity = channel_capacity;
+    let mut subscribe_execution_config = SubscribeExecutionConfig::default();
+    if let Some(channel_capacity) = run_args.subscribe_channel_capacity {
+        subscribe_execution_config.channel_capacity = channel_capacity;
     }
-    if let Some(max_catchup_versions) = run_args.tail_max_catchup_versions {
-        tail_execution_config.max_catchup_versions = max_catchup_versions;
+    if let Some(max_catchup_versions) = run_args.subscribe_max_catchup_versions {
+        subscribe_execution_config.max_catchup_versions = max_catchup_versions;
     }
     let mut persistence_policy_config = PersistencePolicyConfig::default();
     if let Some(max_nodes) = run_args.transient_segment_max_nodes {
@@ -3978,7 +3978,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         !run_args.disable_pgwire,
         pgwire_addr,
         server::ServerRuntimeConfig {
-            tail: tail_execution_config,
+            subscribe: subscribe_execution_config,
         },
     );
 

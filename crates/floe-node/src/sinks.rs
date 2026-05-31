@@ -216,7 +216,7 @@ pub fn spawn_sinks(
     registry: Arc<MaterializedViewRegistry>,
     resume_cursors: HashMap<String, SinkCursor>,
     checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
-    tail_cancel: CancellationToken,
+    changelog_cancel: CancellationToken,
     runtime_cancel: CancellationToken,
     runtime_failure: Arc<StdMutex<Option<String>>>,
 ) -> Vec<JoinHandle<()>> {
@@ -225,7 +225,7 @@ pub fn spawn_sinks(
         let resume_cursor = resume_cursors.get(&sink.name).cloned();
         let checkpoint_tx = checkpoint_tx.clone();
         let registry = registry.clone();
-        let tail_cancel = tail_cancel.clone();
+        let changelog_cancel = changelog_cancel.clone();
         let runtime_cancel = runtime_cancel.clone();
         let runtime_failure = Arc::clone(&runtime_failure);
         handles.push(tokio::spawn(async move {
@@ -235,7 +235,7 @@ pub fn spawn_sinks(
                 registry,
                 resume_cursor,
                 checkpoint_tx,
-                tail_cancel.clone(),
+                changelog_cancel.clone(),
             )
             .await
             {

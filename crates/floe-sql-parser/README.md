@@ -5,7 +5,7 @@ parsing primitives needed by Floe runtime/CLI flows:
 
 - `CREATE MATERIALIZED VIEW`
 - `CREATE SINK`
-- `TAIL`
+- `SUBSCRIBE`
 - Multi-statement SQL program parsing with ordered statements
 
 The initial implementation references the grammar used by RisingWave's SQL

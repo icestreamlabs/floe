@@ -11,4 +11,3 @@ pub mod object_store_connector;
 pub mod planner;
 pub mod postgres_cdc;
 pub mod source;
-pub mod tail_client;

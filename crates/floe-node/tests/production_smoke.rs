@@ -18,7 +18,7 @@ const MV_SQL: &str = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_smoke AS \
      SELECT auction, bidder, price FROM nexmark_bid";
 
 #[tokio::test]
-async fn smoke_generator_mv_emits_tail_rows() -> Result<()> {
+async fn smoke_generator_mv_emits_sink_rows() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
     let pg_port = 0;
     let data_dir = temp_dir.path().join("data");
