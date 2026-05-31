@@ -1846,7 +1846,9 @@ dependencies = [
  "anyhow",
  "datafusion",
  "datafusion-common",
+ "datafusion-sql",
  "dbsp-circuit",
+ "sqlparser",
  "tokio",
  "tracing",
 ]
@@ -2293,6 +2295,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
+ "dbsp-planner",
  "floe-cdc",
  "floe-cdc-core",
  "floe-cdc-pg",

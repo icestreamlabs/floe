@@ -20,6 +20,7 @@ pub mod join;
 mod metrics;
 pub mod operator_state_registry;
 pub mod operators;
+pub mod range_join;
 pub mod relation_state;
 pub mod semijoin;
 pub mod session_window_aggregate;
@@ -66,11 +67,13 @@ pub use operators::incremental_aggregate::{
     IncrementalAggregateSlotUpdate,
 };
 pub use operators::join::{JoinInputRetention, JoinOp};
+pub use operators::range_join::RangeJoinOp;
 pub use operators::semijoin::{SemiJoinMode, SemiJoinOp};
 pub use operators::top1::PartitionedTop1Op;
 pub use operators::topn::TopNOp;
 pub use operators::union::UnionOp;
 pub use operators::window::{WindowAggregateOp, WindowKey};
+pub use range_join::DbspRangeJoin;
 pub use relation_state::RelationState;
 pub use semijoin::DbspSemiJoin;
 pub use session_window_aggregate::DbspSessionWindowAggregate;

@@ -158,6 +158,10 @@ pub enum DbspJoinType {
     LeftOuter,
     RightOuter,
     FullOuter,
+    LeftSemi,
+    RightSemi,
+    LeftAnti,
+    RightAnti,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +207,114 @@ impl DbspJoinKey {
 }
 
 #[derive(Clone, Debug)]
+pub struct DbspRangeJoinSpec {
+    right_key: DbspExpression,
+    left_lower: DbspExpression,
+    left_upper: DbspExpression,
+}
+
+impl DbspRangeJoinSpec {
+    fn try_new(
+        right_key_expr: Expr,
+        right_schema: Arc<RowSchema>,
+        left_lower_expr: Expr,
+        left_upper_expr: Expr,
+        left_schema: Arc<RowSchema>,
+    ) -> Result<Self> {
+        let right_key = DbspExpression::analyze(right_key_expr, right_schema)?;
+        let left_lower = DbspExpression::analyze(left_lower_expr, left_schema.clone())?;
+        let left_upper = DbspExpression::analyze(left_upper_expr, left_schema)?;
+
+        if left_lower.data_type() != right_key.data_type()
+            || left_upper.data_type() != right_key.data_type()
+        {
+            bail!(
+                "range join bound type mismatch: right key {}, lower {}, upper {}",
+                right_key.data_type().name(),
+                left_lower.data_type().name(),
+                left_upper.data_type().name()
+            );
+        }
+
+        if !matches!(
+            right_key.data_type(),
+            DbspScalarType::Int64 | DbspScalarType::TimestampMillis
+        ) {
+            bail!(
+                "range joins currently require Int64 or TimestampMillis bounds, found {}",
+                right_key.data_type().name()
+            );
+        }
+
+        Ok(Self {
+            right_key,
+            left_lower,
+            left_upper,
+        })
+    }
+
+    pub fn right_key_expression(&self) -> &DbspExpression {
+        &self.right_key
+    }
+
+    pub fn left_lower_expression(&self) -> &DbspExpression {
+        &self.left_lower
+    }
+
+    pub fn left_upper_expression(&self) -> &DbspExpression {
+        &self.left_upper
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DbspAsofJoinSpec {
+    left_timestamp: DbspExpression,
+    right_timestamp: DbspExpression,
+}
+
+impl DbspAsofJoinSpec {
+    fn try_new(
+        left_timestamp_expr: Expr,
+        left_schema: Arc<RowSchema>,
+        right_timestamp_expr: Expr,
+        right_schema: Arc<RowSchema>,
+    ) -> Result<Self> {
+        let left_timestamp = DbspExpression::analyze(left_timestamp_expr, left_schema)?;
+        let right_timestamp = DbspExpression::analyze(right_timestamp_expr, right_schema)?;
+
+        if left_timestamp.data_type() != right_timestamp.data_type() {
+            bail!(
+                "ASOF join timestamp type mismatch: left {}, right {}",
+                left_timestamp.data_type().name(),
+                right_timestamp.data_type().name()
+            );
+        }
+        if !matches!(
+            left_timestamp.data_type(),
+            DbspScalarType::Int64 | DbspScalarType::TimestampMillis
+        ) {
+            bail!(
+                "ASOF joins currently require Int64 or TimestampMillis timestamps, found {}",
+                left_timestamp.data_type().name()
+            );
+        }
+
+        Ok(Self {
+            left_timestamp,
+            right_timestamp,
+        })
+    }
+
+    pub fn left_timestamp_expression(&self) -> &DbspExpression {
+        &self.left_timestamp
+    }
+
+    pub fn right_timestamp_expression(&self) -> &DbspExpression {
+        &self.right_timestamp
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DbspJoinNode {
     pub join_type: DbspJoinType,
     pub left_schema: Arc<RowSchema>,
@@ -210,6 +322,8 @@ pub struct DbspJoinNode {
     pub output_schema: Arc<RowSchema>,
     pub keys: Vec<DbspJoinKey>,
     pub residual: Option<DbspExpression>,
+    pub range: Option<DbspRangeJoinSpec>,
+    pub asof: Option<DbspAsofJoinSpec>,
 }
 
 impl DbspJoinNode {
@@ -235,8 +349,7 @@ impl DbspJoinNode {
         }
 
         let residual = if let Some(expr) = residual {
-            let combined_schema =
-                Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
             Some(DbspExpression::analyze(expr, combined_schema)?)
         } else {
             None
@@ -252,6 +365,97 @@ impl DbspJoinNode {
             output_schema,
             keys,
             residual,
+            range: None,
+            asof: None,
+        })
+    }
+
+    pub fn try_new_range(
+        left_schema: Arc<RowSchema>,
+        right_schema: Arc<RowSchema>,
+        right_key_expr: Expr,
+        left_lower_expr: Expr,
+        left_upper_expr: Expr,
+        residual: Option<Expr>,
+    ) -> Result<Self> {
+        let range = DbspRangeJoinSpec::try_new(
+            right_key_expr,
+            right_schema.clone(),
+            left_lower_expr,
+            left_upper_expr,
+            left_schema.clone(),
+        )?;
+        let residual = if let Some(expr) = residual {
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
+            Some(DbspExpression::analyze(expr, combined_schema)?)
+        } else {
+            None
+        };
+        let output_schema = Self::combined_schema(
+            left_schema.clone(),
+            right_schema.clone(),
+            &DbspJoinType::Inner,
+        )?;
+
+        Ok(Self {
+            join_type: DbspJoinType::Inner,
+            left_schema,
+            right_schema,
+            output_schema,
+            keys: Vec::new(),
+            residual,
+            range: Some(range),
+            asof: None,
+        })
+    }
+
+    pub fn try_new_asof(
+        join_type: DbspJoinType,
+        left_schema: Arc<RowSchema>,
+        right_schema: Arc<RowSchema>,
+        key_pairs: Vec<(Expr, Expr)>,
+        left_timestamp_expr: Expr,
+        right_timestamp_expr: Expr,
+        residual: Option<Expr>,
+    ) -> Result<Self> {
+        if !matches!(join_type, DbspJoinType::Inner | DbspJoinType::LeftOuter) {
+            bail!("ASOF joins currently support INNER or LEFT OUTER semantics");
+        }
+
+        let mut keys = Vec::with_capacity(key_pairs.len());
+        for (left, right) in key_pairs {
+            keys.push(DbspJoinKey::try_new(
+                left,
+                left_schema.clone(),
+                right,
+                right_schema.clone(),
+            )?);
+        }
+
+        let asof = DbspAsofJoinSpec::try_new(
+            left_timestamp_expr,
+            left_schema.clone(),
+            right_timestamp_expr,
+            right_schema.clone(),
+        )?;
+        let residual = if let Some(expr) = residual {
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
+            Some(DbspExpression::analyze(expr, combined_schema)?)
+        } else {
+            None
+        };
+        let output_schema =
+            Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
+
+        Ok(Self {
+            join_type,
+            left_schema,
+            right_schema,
+            output_schema,
+            keys,
+            residual,
+            range: None,
+            asof: Some(asof),
         })
     }
 
@@ -260,6 +464,15 @@ impl DbspJoinNode {
         right: Arc<RowSchema>,
         join_type: &DbspJoinType,
     ) -> Result<Arc<RowSchema>> {
+        match join_type {
+            DbspJoinType::LeftSemi | DbspJoinType::LeftAnti => return Ok(left),
+            DbspJoinType::RightSemi | DbspJoinType::RightAnti => return Ok(right),
+            DbspJoinType::Inner
+            | DbspJoinType::LeftOuter
+            | DbspJoinType::RightOuter
+            | DbspJoinType::FullOuter => {}
+        }
+
         let mut fields = Vec::with_capacity(left.len() + right.len());
         let mut existing = HashSet::new();
 
@@ -268,6 +481,10 @@ impl DbspJoinNode {
             let nullable = match join_type {
                 DbspJoinType::Inner | DbspJoinType::LeftOuter => field.nullable,
                 DbspJoinType::RightOuter | DbspJoinType::FullOuter => true,
+                DbspJoinType::LeftSemi
+                | DbspJoinType::RightSemi
+                | DbspJoinType::LeftAnti
+                | DbspJoinType::RightAnti => unreachable!("semi/anti joins returned above"),
             };
             fields.push(Field::new(
                 field.name.clone(),
@@ -288,8 +505,36 @@ impl DbspJoinNode {
                 DbspJoinType::Inner => field.nullable,
                 DbspJoinType::LeftOuter | DbspJoinType::FullOuter => true,
                 DbspJoinType::RightOuter => field.nullable,
+                DbspJoinType::LeftSemi
+                | DbspJoinType::RightSemi
+                | DbspJoinType::LeftAnti
+                | DbspJoinType::RightAnti => unreachable!("semi/anti joins returned above"),
             };
             fields.push(Field::new(name, field.data_type.clone(), nullable));
+        }
+
+        RowSchema::try_new(fields)
+    }
+
+    fn matched_schema(left: Arc<RowSchema>, right: Arc<RowSchema>) -> Result<Arc<RowSchema>> {
+        let mut fields = Vec::with_capacity(left.len() + right.len());
+        let mut existing = HashSet::new();
+
+        for field in left.fields().iter() {
+            existing.insert(field.name.clone());
+            fields.push(field.clone());
+        }
+
+        for field in right.fields().iter() {
+            let mut field = field.clone();
+            let base_name = field.name.clone();
+            let mut suffix = 1;
+            while existing.contains(&field.name) {
+                field.name = format!("{base_name}_{suffix}");
+                suffix += 1;
+            }
+            existing.insert(field.name.clone());
+            fields.push(field);
         }
 
         RowSchema::try_new(fields)

@@ -16,6 +16,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
+use dbsp_planner::create_logical_plan_with_asof_preplanner;
 use floe_sql_parser::MaterializedViewDefinition;
 use regex::Regex;
 
@@ -52,9 +53,8 @@ pub async fn plan_materialized_views(
 
     let mut plans = Vec::with_capacity(definitions.len());
     for definition in definitions {
-        let plan = ctx
-            .state()
-            .create_logical_plan(definition.query())
+        let state = ctx.state();
+        let plan = create_logical_plan_with_asof_preplanner(&state, definition.query())
             .await
             .with_context(|| {
                 format!(
@@ -62,7 +62,7 @@ pub async fn plan_materialized_views(
                     definition.name()
                 )
             })?;
-        let optimized = ctx.state().optimize(&plan).with_context(|| {
+        let optimized = state.optimize(&plan).with_context(|| {
             format!(
                 "failed to optimize logical plan for materialized view {}",
                 definition.name()

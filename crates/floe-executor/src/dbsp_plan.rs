@@ -241,25 +241,58 @@ fn normalize_optimizer_source_projections(
                         continue;
                     }
 
-                    let key_pairs = join
-                        .keys
-                        .iter()
-                        .map(|key| {
-                            (
-                                key.left_expression().expr().clone(),
-                                key.right_expression().expr().clone(),
-                            )
-                        })
-                        .collect();
-                    let rebased = DbspJoinNode::try_new(
-                        join.join_type.clone(),
-                        left_schema,
-                        right_schema,
-                        key_pairs,
-                        join.residual
-                            .as_ref()
-                            .map(|residual| residual.expr().clone()),
-                    )
+                    let residual = join
+                        .residual
+                        .as_ref()
+                        .map(|residual| residual.expr().clone());
+                    let rebased = if let Some(asof) = join.asof.as_ref() {
+                        let key_pairs = join
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                (
+                                    key.left_expression().expr().clone(),
+                                    key.right_expression().expr().clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        DbspJoinNode::try_new_asof(
+                            join.join_type.clone(),
+                            left_schema,
+                            right_schema,
+                            key_pairs,
+                            asof.left_timestamp_expression().expr().clone(),
+                            asof.right_timestamp_expression().expr().clone(),
+                            residual,
+                        )
+                    } else if let Some(range) = join.range.as_ref() {
+                        DbspJoinNode::try_new_range(
+                            left_schema,
+                            right_schema,
+                            range.right_key_expression().expr().clone(),
+                            range.left_lower_expression().expr().clone(),
+                            range.left_upper_expression().expr().clone(),
+                            residual,
+                        )
+                    } else {
+                        let key_pairs = join
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                (
+                                    key.left_expression().expr().clone(),
+                                    key.right_expression().expr().clone(),
+                                )
+                            })
+                            .collect();
+                        DbspJoinNode::try_new(
+                            join.join_type.clone(),
+                            left_schema,
+                            right_schema,
+                            key_pairs,
+                            residual,
+                        )
+                    }
                     .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
                     let output_schema = Arc::clone(&rebased.output_schema);
                     (new_inputs, DbspNodeKind::Join(rebased), output_schema)
@@ -603,12 +636,17 @@ pub fn validate_dbsp_plan(
             let left_width = join.left_schema.len();
             let right_width = join.right_schema.len();
             let output_width = join.output_schema.len();
-            if left_width + right_width != output_width {
+            let expected_width = match join.join_type {
+                DbspJoinType::Inner
+                | DbspJoinType::LeftOuter
+                | DbspJoinType::RightOuter
+                | DbspJoinType::FullOuter => left_width + right_width,
+                DbspJoinType::LeftSemi | DbspJoinType::LeftAnti => left_width,
+                DbspJoinType::RightSemi | DbspJoinType::RightAnti => right_width,
+            };
+            if expected_width != output_width {
                 bail!(
-                    "node {node_id} (Join) output width mismatch: {} + {} ≠ {}",
-                    left_width,
-                    right_width,
-                    output_width
+                    "node {node_id} (Join) output width mismatch: expected {expected_width}, found {output_width}"
                 );
             }
         }

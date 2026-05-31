@@ -162,6 +162,43 @@ fn source_requirement_analysis_tracks_join_inputs() -> Result<()> {
 }
 
 #[test]
+fn source_requirement_analysis_tracks_right_anti_join_output_side() -> Result<()> {
+    let auction_scan = table_scan(
+        Some(nexmark_auction_table().name),
+        &schema_for(nexmark_auction_table()),
+        None,
+    )?
+    .build()?;
+    let logical_plan = table_scan(
+        Some(nexmark_person_table().name),
+        &schema_for(nexmark_person_table()),
+        None,
+    )?
+    .join(
+        auction_scan,
+        JoinType::RightAnti,
+        (
+            vec![Column::from_name("id")],
+            vec![Column::from_name("seller")],
+        ),
+        None,
+    )?
+    .project(vec![col("id")])?
+    .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let requirements = plan_source_requirements(&plan)?
+        .expect("right anti join plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].source_name, "nexmark_auction");
+    assert_eq!(requirements[0].required_columns, vec![0, 5]);
+    assert_eq!(requirements[1].source_name, "nexmark_person");
+    assert_eq!(requirements[1].required_columns, vec![0]);
+
+    Ok(())
+}
+
+#[test]
 fn join_filter_pushdown_prunes_join_inputs() -> Result<()> {
     let auction_scan = table_scan(
         Some(nexmark_auction_table().name),

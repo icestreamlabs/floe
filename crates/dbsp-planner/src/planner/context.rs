@@ -19,12 +19,15 @@ use dbsp_circuit::circuit::plan::{
 use dbsp_circuit::circuit::schema::{Field, RowSchema};
 use dbsp_circuit::circuit::types::DbspScalarType;
 
+use super::asof_extension::FloeAsofJoinNode;
 use super::circuit::{CircuitNode, CircuitPlan};
 use super::config::PlannerConfig;
 use super::error::PlannerError;
 use super::expr::{
-    combine_filters, extract_alias, extract_join_keys_and_residual, map_aggregate_expr,
-    normalize_expr,
+    combine_filters, extract_alias, extract_asof_join_and_residual,
+    extract_asof_join_and_residual_with_logical_schemas, extract_join_keys_and_residual,
+    extract_join_keys_and_residual_with_logical_schemas, extract_range_join_and_residual,
+    map_aggregate_expr, normalize_expr,
 };
 use super::logical_optimizer::{OptimizerDiagnostics, optimize_logical_plan};
 
@@ -295,12 +298,18 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::Statement(_) => Err(PlannerError::UnsupportedPlan(
                 "statement plans are not supported".to_string(),
             )),
-            LogicalPlan::Dml(_)
-            | LogicalPlan::Ddl(_)
-            | LogicalPlan::DescribeTable(_)
-            | LogicalPlan::Extension(_) => Err(PlannerError::UnsupportedPlan(
-                "plan type is not supported".to_string(),
-            )),
+            LogicalPlan::Extension(extension) => {
+                if let Some(asof) = extension.node.as_any().downcast_ref::<FloeAsofJoinNode>() {
+                    return self.plan_asof_extension(asof);
+                }
+                Err(PlannerError::UnsupportedPlan(format!(
+                    "logical extension node {} is not supported",
+                    extension.node.name()
+                )))
+            }
+            LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::DescribeTable(_) => Err(
+                PlannerError::UnsupportedPlan("plan type is not supported".to_string()),
+            ),
             LogicalPlan::Copy(_) | LogicalPlan::RecursiveQuery(_) | LogicalPlan::Unnest(_) => Err(
                 PlannerError::UnsupportedPlan("plan type is not supported".to_string()),
             ),
@@ -480,6 +489,35 @@ impl<'cfg> PlannerContext<'cfg> {
                 &mut right_required,
             )?;
         }
+        if let Some(range) = &join.range {
+            add_required_expression_columns(
+                range.left_lower_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                range.left_upper_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                range.right_key_expression().expr(),
+                join.right_schema.as_ref(),
+                &mut right_required,
+            )?;
+        }
+        if let Some(asof) = &join.asof {
+            add_required_expression_columns(
+                asof.left_timestamp_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                asof.right_timestamp_expression().expr(),
+                join.right_schema.as_ref(),
+                &mut right_required,
+            )?;
+        }
         if let Some(residual) = &join.residual {
             let mut residual_columns = BTreeSet::new();
             add_required_expression_columns(
@@ -528,25 +566,58 @@ impl<'cfg> PlannerContext<'cfg> {
         let left = self.build_optional_select(left, left_pushdown)?;
         let right = self.build_optional_select(right, right_pushdown)?;
 
-        let key_pairs = join
-            .keys
-            .iter()
-            .map(|key| {
-                (
-                    key.left_expression().expr().clone(),
-                    key.right_expression().expr().clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let rebuilt_join = DbspJoinNode::try_new(
-            DbspJoinType::Inner,
-            left.schema.clone(),
-            right.schema.clone(),
-            key_pairs,
-            join.residual
-                .as_ref()
-                .map(|residual| residual.expr().clone()),
-        )?;
+        let residual = join
+            .residual
+            .as_ref()
+            .map(|residual| residual.expr().clone());
+        let rebuilt_join = if let Some(asof) = &join.asof {
+            let key_pairs = join
+                .keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.left_expression().expr().clone(),
+                        key.right_expression().expr().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            DbspJoinNode::try_new_asof(
+                join.join_type.clone(),
+                left.schema.clone(),
+                right.schema.clone(),
+                key_pairs,
+                asof.left_timestamp_expression().expr().clone(),
+                asof.right_timestamp_expression().expr().clone(),
+                residual,
+            )
+        } else if let Some(range) = &join.range {
+            DbspJoinNode::try_new_range(
+                left.schema.clone(),
+                right.schema.clone(),
+                range.right_key_expression().expr().clone(),
+                range.left_lower_expression().expr().clone(),
+                range.left_upper_expression().expr().clone(),
+                residual,
+            )
+        } else {
+            let key_pairs = join
+                .keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.left_expression().expr().clone(),
+                        key.right_expression().expr().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            DbspJoinNode::try_new(
+                DbspJoinType::Inner,
+                left.schema.clone(),
+                right.schema.clone(),
+                key_pairs,
+                residual,
+            )
+        }?;
         let rebuilt_join_schema = rebuilt_join.output_schema.clone();
         let rebuilt_join_id = self.add_node(
             vec![left.id, right.id],
@@ -733,9 +804,13 @@ impl<'cfg> PlannerContext<'cfg> {
             JoinType::Left => DbspJoinType::LeftOuter,
             JoinType::Right => DbspJoinType::RightOuter,
             JoinType::Full => DbspJoinType::FullOuter,
+            JoinType::LeftSemi => DbspJoinType::LeftSemi,
+            JoinType::RightSemi => DbspJoinType::RightSemi,
+            JoinType::LeftAnti => DbspJoinType::LeftAnti,
+            JoinType::RightAnti => DbspJoinType::RightAnti,
             other => {
                 return Err(PlannerError::UnsupportedJoin(format!(
-                    "unsupported join type {other:?}; only INNER/LEFT/RIGHT/FULL OUTER joins are supported"
+                    "unsupported join type {other:?}; INNER/LEFT/RIGHT/FULL OUTER/SEMI/ANTI joins are supported"
                 )));
             }
         };
@@ -763,8 +838,65 @@ impl<'cfg> PlannerContext<'cfg> {
         }
 
         if key_pairs.is_empty() {
+            if let Some(filter_expr) = &join.filter
+                && matches!(join_type, DbspJoinType::Inner)
+            {
+                let (range, range_residual) = extract_range_join_and_residual(
+                    filter_expr,
+                    left.schema.as_ref(),
+                    right.schema.as_ref(),
+                )?;
+                if let Some(range) = range {
+                    let range_join_node = DbspJoinNode::try_new_range(
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        range.right_key,
+                        range.left_lower,
+                        range.left_upper,
+                        range_residual,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+                    let output_schema = range_join_node.output_schema.clone();
+                    let id = self.add_node(
+                        vec![left.id, right.id],
+                        DbspNodeKind::Join(range_join_node),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
+                let (asof, asof_residual) = extract_asof_join_and_residual(
+                    filter_expr,
+                    left.schema.as_ref(),
+                    right.schema.as_ref(),
+                )?;
+                if let Some(asof) = asof {
+                    let asof_join_node = DbspJoinNode::try_new_asof(
+                        DbspJoinType::Inner,
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        Vec::new(),
+                        asof.left_timestamp,
+                        asof.right_timestamp,
+                        asof_residual,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+                    let output_schema = asof_join_node.output_schema.clone();
+                    let id = self.add_node(
+                        vec![left.id, right.id],
+                        DbspNodeKind::Join(asof_join_node),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
+            }
             return Err(PlannerError::UnsupportedJoin(
-                "joins must have at least one equi-key".to_string(),
+                "joins must have at least one equi-key, a half-open range predicate, or an ASOF predicate".to_string(),
             ));
         }
         let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;
@@ -772,7 +904,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let residual = combine_filters(residuals);
         if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
             return Err(PlannerError::UnsupportedJoin(
-                "OUTER joins currently require pure equi-join predicates".to_string(),
+                "non-INNER joins currently require pure equi-join predicates".to_string(),
             ));
         }
 
@@ -787,6 +919,88 @@ impl<'cfg> PlannerContext<'cfg> {
         let id = self.add_node(
             vec![left.id, right.id],
             DbspNodeKind::Join(join_node),
+            output_schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: output_schema,
+        })
+    }
+
+    fn plan_asof_extension(
+        &mut self,
+        asof_node: &FloeAsofJoinNode,
+    ) -> Result<PlannedNode, PlannerError> {
+        let join_type = match asof_node.join_type() {
+            JoinType::Inner => DbspJoinType::Inner,
+            JoinType::Left => DbspJoinType::LeftOuter,
+            other => {
+                return Err(PlannerError::UnsupportedJoin(format!(
+                    "unsupported ASOF join type {other:?}; INNER and LEFT ASOF joins are supported"
+                )));
+            }
+        };
+
+        let left = self.plan_node(asof_node.left())?;
+        let right = self.plan_node(asof_node.right())?;
+        let mut key_pairs = asof_node
+            .on()
+            .iter()
+            .map(|(left_expr, right_expr)| {
+                let left = normalize_expr(left_expr.clone())?;
+                let right = normalize_expr(right_expr.clone())?;
+                Ok((left, right))
+            })
+            .collect::<Result<Vec<_>, PlannerError>>()?;
+
+        let filter = asof_node.filter().ok_or_else(|| {
+            PlannerError::UnsupportedJoin(
+                "ASOF joins require a MATCH_CONDITION predicate".to_string(),
+            )
+        })?;
+        let (asof, residual) = extract_asof_join_and_residual_with_logical_schemas(
+            filter,
+            left.schema.as_ref(),
+            right.schema.as_ref(),
+            asof_node.left().schema().as_ref(),
+            asof_node.right().schema().as_ref(),
+        )?;
+        let Some(asof) = asof else {
+            return Err(PlannerError::UnsupportedJoin(
+                "ASOF joins require exactly one right_timestamp <= left_timestamp predicate"
+                    .to_string(),
+            ));
+        };
+        let residual = if let Some(residual) = residual {
+            let (filter_keys, filter_residual) =
+                extract_join_keys_and_residual_with_logical_schemas(
+                    &residual,
+                    left.schema.as_ref(),
+                    right.schema.as_ref(),
+                    asof_node.left().schema().as_ref(),
+                    asof_node.right().schema().as_ref(),
+                )?;
+            key_pairs.extend(filter_keys);
+            filter_residual
+        } else {
+            None
+        };
+        let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;
+
+        let asof_join_node = DbspJoinNode::try_new_asof(
+            join_type,
+            left.schema.clone(),
+            right.schema.clone(),
+            key_pairs,
+            asof.left_timestamp,
+            asof.right_timestamp,
+            residual,
+        )
+        .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+        let output_schema = asof_join_node.output_schema.clone();
+        let id = self.add_node(
+            vec![left.id, right.id],
+            DbspNodeKind::Join(asof_join_node),
             output_schema.clone(),
         );
         Ok(PlannedNode {

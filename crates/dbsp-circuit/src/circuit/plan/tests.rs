@@ -133,6 +133,52 @@ fn full_outer_join_marks_both_sides_nullable() {
 }
 
 #[test]
+fn semi_and_anti_joins_keep_only_retained_side_schema() {
+    let left = base_schema();
+    let right = RowSchema::try_new(vec![
+        Field::new("rid", DbspScalarType::Int64, false),
+        Field::new("rname", DbspScalarType::Utf8, false),
+    ])
+    .expect("right");
+
+    let left_semi = DbspJoinNode::try_new(
+        DbspJoinType::LeftSemi,
+        left.clone(),
+        right.clone(),
+        vec![(col("id"), col("rid"))],
+        None,
+    )
+    .expect("left semi join");
+    assert_eq!(left_semi.output_schema.len(), left.len());
+    assert_eq!(
+        left_semi
+            .output_schema
+            .field(0)
+            .expect("left id field")
+            .name,
+        "id"
+    );
+
+    let right_anti = DbspJoinNode::try_new(
+        DbspJoinType::RightAnti,
+        left,
+        right.clone(),
+        vec![(col("id"), col("rid"))],
+        None,
+    )
+    .expect("right anti join");
+    assert_eq!(right_anti.output_schema.len(), right.len());
+    assert_eq!(
+        right_anti
+            .output_schema
+            .field(0)
+            .expect("right id field")
+            .name,
+        "rid"
+    );
+}
+
+#[test]
 fn aggregate_output_schema_combines_keys_and_aggs() {
     let schema = base_schema();
     let agg = DbspAggregateNode::try_new(
