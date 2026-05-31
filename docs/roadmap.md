@@ -7,11 +7,12 @@ permalink: /roadmap/
 
 # Roadmap
 
-Floe will remain a single-node streaming SQL engine. The roadmap intentionally excludes distributed runtime, cluster scheduling, and multi-node architecture.
+Floe will remain a single-node streaming SQL engine. The roadmap intentionally
+excludes distributed runtime, cluster scheduling, and multi-node architecture.
 
 ## Alpha
 
-- Publish the single-node support matrix and validation checklist.
+- Keep the public docs, quickstart, and validation checklist current.
 - Add automated psql `COPY (SUBSCRIBE ...) TO STDOUT` regression coverage.
 
 Milestone: [Alpha](https://github.com/icestreamlabs/floe/milestone/1)

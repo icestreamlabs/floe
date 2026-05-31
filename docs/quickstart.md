@@ -75,6 +75,6 @@ cargo run -- run --config /path/to/floe.toml --dry-run
 
 ## Next steps
 
-- Review the [support matrix]({{ site.baseurl }}/support/).
 - Read the [SQL reference]({{ site.baseurl }}/sql/).
 - Configure [connectors and sinks]({{ site.baseurl }}/connectors/).
+- Check the [roadmap]({{ site.baseurl }}/roadmap/).
