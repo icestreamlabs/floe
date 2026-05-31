@@ -23,7 +23,7 @@ use super::circuit::{CircuitNode, CircuitPlan};
 use super::config::PlannerConfig;
 use super::error::PlannerError;
 use super::expr::{
-    combine_filters, extract_alias, extract_join_keys_and_residual,
+    combine_filters, extract_alias, extract_asof_join_and_residual, extract_join_keys_and_residual,
     extract_range_join_and_residual, map_aggregate_expr, normalize_expr,
 };
 use super::logical_optimizer::{OptimizerDiagnostics, optimize_logical_plan};
@@ -497,6 +497,18 @@ impl<'cfg> PlannerContext<'cfg> {
                 &mut right_required,
             )?;
         }
+        if let Some(asof) = &join.asof {
+            add_required_expression_columns(
+                asof.left_timestamp_expression().expr(),
+                join.left_schema.as_ref(),
+                &mut left_required,
+            )?;
+            add_required_expression_columns(
+                asof.right_timestamp_expression().expr(),
+                join.right_schema.as_ref(),
+                &mut right_required,
+            )?;
+        }
         if let Some(residual) = &join.residual {
             let mut residual_columns = BTreeSet::new();
             add_required_expression_columns(
@@ -549,7 +561,15 @@ impl<'cfg> PlannerContext<'cfg> {
             .residual
             .as_ref()
             .map(|residual| residual.expr().clone());
-        let rebuilt_join = if let Some(range) = &join.range {
+        let rebuilt_join = if let Some(asof) = &join.asof {
+            DbspJoinNode::try_new_asof(
+                left.schema.clone(),
+                right.schema.clone(),
+                asof.left_timestamp_expression().expr().clone(),
+                asof.right_timestamp_expression().expr().clone(),
+                residual,
+            )
+        } else if let Some(range) = &join.range {
             DbspJoinNode::try_new_range(
                 left.schema.clone(),
                 right.schema.clone(),
@@ -826,9 +846,34 @@ impl<'cfg> PlannerContext<'cfg> {
                         schema: output_schema,
                     });
                 }
+                let (asof, asof_residual) = extract_asof_join_and_residual(
+                    filter_expr,
+                    left.schema.as_ref(),
+                    right.schema.as_ref(),
+                )?;
+                if let Some(asof) = asof {
+                    let asof_join_node = DbspJoinNode::try_new_asof(
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        asof.left_timestamp,
+                        asof.right_timestamp,
+                        asof_residual,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+                    let output_schema = asof_join_node.output_schema.clone();
+                    let id = self.add_node(
+                        vec![left.id, right.id],
+                        DbspNodeKind::Join(asof_join_node),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
             }
             return Err(PlannerError::UnsupportedJoin(
-                "joins must have at least one equi-key or a half-open range predicate".to_string(),
+                "joins must have at least one equi-key, a half-open range predicate, or an ASOF predicate".to_string(),
             ));
         }
         let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;

@@ -35,13 +35,14 @@ pub use aggregate::DbspAggregate;
 pub use algebra::AbelianGroup;
 pub use circuit::{
     CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
-    DbspDistinctNode, DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspPredicate,
-    DbspProjectNode, DbspRangeJoinSpec, DbspScalarType, DbspSelectNode, DbspSinkNode,
-    DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy,
-    DbspWindowSpec, Field, FieldRef, OptimizerDiagnostics, OptimizerRuleDiagnostics,
-    OptimizerStageDiagnostics, OrderExpr, PlannerConfig, PlannerError, PrimaryKey, ProjectItem,
-    RowSchema, TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table,
-    nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
+    DbspAsofJoinSpec, DbspDistinctNode, DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind,
+    DbspPredicate, DbspProjectNode, DbspRangeJoinSpec, DbspScalarType, DbspSelectNode,
+    DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
+    DbspWindowPolicy, DbspWindowSpec, Field, FieldRef, OptimizerDiagnostics,
+    OptimizerRuleDiagnostics, OptimizerStageDiagnostics, OrderExpr, PlannerConfig, PlannerError,
+    PrimaryKey, ProjectItem, RowSchema, TableDescriptor, nexmark_auction_alias_table,
+    nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table,
+    nexmark_person_table,
 };
 pub use collections::{ZSet, h};
 pub use count_aggregate::{

@@ -1003,6 +1003,106 @@ async fn range_join_materializes_half_open_matches() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn asof_join_materializes_latest_prior_match() {
+    let db = test_db("asof-join").await;
+    let view_name = "mv_asof_join";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let auction_schema = nexmark_auction_schema();
+        let bid_schema = nexmark_bid_schema();
+        let right = table_scan(Some("nexmark_bid"), &bid_schema, None)
+            .expect("bid scan")
+            .build()
+            .expect("bid plan");
+        let logical = table_scan(Some("nexmark_auction"), &auction_schema, None)
+            .expect("auction scan")
+            .join(
+                right,
+                JoinType::Inner,
+                (Vec::<Column>::new(), Vec::<Column>::new()),
+                Some(col("price").lt_eq(col("reserve"))),
+            )
+            .expect("asof join")
+            .project(vec![col("id"), col("price")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_bid", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(encoded_auction_row(10, 100), 1)
+        .expect("append auction");
+    auction_writer.flush().await.expect("flush auction");
+
+    let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 7, 15, 1_700_000_000_000), 1)
+        .expect("append earlier bid");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 7, 18, 1_700_000_000_000), 1)
+        .expect("append latest bid");
+    bid_writer
+        .append_encoded(encoded_bid_row_with_ts(1, 7, 21, 1_700_000_000_000), 1)
+        .expect("append future bid");
+    bid_writer.flush().await.expect("flush bid");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    let arrow_schema = arrow_schema(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+    ]);
+    mv_registry.set_schema(view_name, arrow_schema);
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    let outputs = builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build ASOF join graph");
+
+    assert_eq!(outputs.required_sources, required_sources);
+    let rows = materialized_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_row(&[10, 18])]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn left_semi_join_materializes_retained_left_rows() {
     let db = test_db("left-semi-join").await;
     let view_name = "mv_left_semi_join";

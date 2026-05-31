@@ -245,7 +245,15 @@ fn normalize_optimizer_source_projections(
                         .residual
                         .as_ref()
                         .map(|residual| residual.expr().clone());
-                    let rebased = if let Some(range) = join.range.as_ref() {
+                    let rebased = if let Some(asof) = join.asof.as_ref() {
+                        DbspJoinNode::try_new_asof(
+                            left_schema,
+                            right_schema,
+                            asof.left_timestamp_expression().expr().clone(),
+                            asof.right_timestamp_expression().expr().clone(),
+                            residual,
+                        )
+                    } else if let Some(range) = join.range.as_ref() {
                         DbspJoinNode::try_new_range(
                             left_schema,
                             right_schema,

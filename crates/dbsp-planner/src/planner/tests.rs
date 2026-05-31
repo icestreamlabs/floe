@@ -638,6 +638,48 @@ fn plans_half_open_range_join_without_equi_keys() {
 }
 
 #[test]
+fn plans_asof_join_without_equi_keys() {
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+
+    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let filter = col("price").lt_eq(col("reserve"));
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::Inner,
+            (
+                Vec::<datafusion::common::Column>::new(),
+                Vec::<datafusion::common::Column>::new(),
+            ),
+            Some(filter),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    match &root.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(join.keys.is_empty());
+            assert!(join.range.is_none());
+            assert!(join.asof.is_some());
+        }
+        other => panic!("expected ASOF join node, found {other:?}"),
+    }
+}
+
+#[test]
 fn infers_join_key_predicates_for_opposite_input() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();

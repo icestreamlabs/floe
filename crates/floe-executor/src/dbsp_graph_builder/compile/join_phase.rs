@@ -77,6 +77,259 @@ async fn strip_semijoin_precomputed_columns(
 }
 
 impl DbspGraphBuilder {
+    pub(crate) async fn compile_asof_join(
+        &mut self,
+        node_idx: usize,
+        node: &DbspJoinNode,
+        left: DeltaHandleStream,
+        right: DeltaHandleStream,
+        task_events: &GraphTaskSender,
+    ) -> Result<DeltaHandleStream> {
+        if node.residual.is_some() {
+            return Err(anyhow!(
+                "ASOF join residual predicates are not supported in the native ASOF lowering"
+            ));
+        }
+        let asof = node
+            .asof
+            .as_ref()
+            .context("ASOF join node is missing timestamp expressions")?;
+        let left_schema = Arc::clone(&node.left_schema);
+        let right_schema = Arc::clone(&node.right_schema);
+        let graph_id = self.graph_id().to_string();
+        let asof_state_namespace = format!("{graph_id}_asof_join_{node_idx}");
+
+        let mut left_join_input = left;
+        let right_join_input = right;
+        let mut left_join_schema = Arc::clone(&left_schema);
+
+        let left_timestamp_column =
+            direct_column_index(asof.left_timestamp_expression(), left_schema.as_ref());
+        let left_timestamp_column = if let Some(column_idx) = left_timestamp_column {
+            column_idx
+        } else {
+            let mut items = Vec::with_capacity(left_schema.len() + 1);
+            for field in left_schema.fields() {
+                items.push(dbsp::circuit::plan::ProjectItem {
+                    expr: Expr::Column(Column::new_unqualified(field.name.clone())),
+                    alias: Some(field.name.clone()),
+                });
+            }
+            let timestamp_column = left_schema.len();
+            items.push(dbsp::circuit::plan::ProjectItem {
+                expr: asof.left_timestamp_expression().expr().clone(),
+                alias: Some("__floe_asof_left_ts".to_string()),
+            });
+            let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&left_schema), items)
+                .context("build ASOF left timestamp precompute projection")?;
+            left_join_schema = Arc::clone(precompute.output_schema());
+            left_join_input = self
+                .compile_map(&precompute, left_join_input, task_events)
+                .await
+                .context("initialize ASOF left timestamp precompute map")?;
+            timestamp_column
+        };
+
+        let right_timestamp_column =
+            direct_column_index(asof.right_timestamp_expression(), right_schema.as_ref())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "ASOF join currently requires the right timestamp to be a direct column"
+                    )
+                })?;
+
+        let prepared_output_projection = if left_join_schema.len() != left_schema.len() {
+            let mut columns = Vec::with_capacity(left_schema.len() + right_schema.len());
+            columns.extend(
+                (0..left_schema.len()).map(|index| EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Left,
+                    index,
+                }),
+            );
+            columns.extend(
+                (0..right_schema.len()).map(|index| EncodedRowProjectionColumn {
+                    source: EncodedRowProjectionSource::Right,
+                    index,
+                }),
+            );
+            Some(
+                PreparedJoinedEncodedRowProjection::try_new(&columns)
+                    .context("prepare ASOF join output projection")?,
+            )
+        } else {
+            None
+        };
+
+        let left_range_graph_id = graph_id.clone();
+        let left_range = move |delta_values: &[(Vec<u8>, i64)]| {
+            let mut out = Vec::new();
+            for (row, weight) in delta_values {
+                if *weight == 0 {
+                    continue;
+                }
+                let Some(left_ts) =
+                    (match extract_encoded_row_i64_like_column(row, left_timestamp_column) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %left_range_graph_id,
+                                error = %err,
+                                "failed to extract ASOF left timestamp"
+                            );
+                            continue;
+                        }
+                    })
+                else {
+                    continue;
+                };
+                out.push((i64::MIN, left_ts.saturating_add(1), row.clone(), *weight));
+            }
+            out
+        };
+
+        let right_key_graph_id = graph_id.clone();
+        let right_key = move |delta_values: &[(Vec<u8>, i64)]| {
+            let mut out = Vec::new();
+            for (row, weight) in delta_values {
+                if *weight == 0 {
+                    continue;
+                }
+                match extract_encoded_row_i64_like_column(row, right_timestamp_column) {
+                    Ok(Some(key)) => out.push((key, row.clone(), *weight)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %right_key_graph_id,
+                            error = %err,
+                            "failed to extract ASOF right timestamp"
+                        );
+                    }
+                }
+            }
+            out
+        };
+
+        let projector_graph_id = graph_id.clone();
+        let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
+            if let Some(plan) = prepared_output_projection.as_ref() {
+                return match project_joined_encoded_rows_prepared(left_bytes, right_bytes, plan) {
+                    Ok(encoded) => encoded,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %projector_graph_id,
+                            error = %err,
+                            "failed to project ASOF candidate output columns directly"
+                        );
+                        Vec::new()
+                    }
+                };
+            }
+            match concat_encoded_rows(left_bytes, right_bytes) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    tracing::warn!(
+                        graph_id = %projector_graph_id,
+                        error = %err,
+                        "failed to concatenate ASOF candidate rows"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+
+        let predicate = |_left_bytes: &Vec<u8>, _right_bytes: &Vec<u8>| -> bool { true };
+        let range_events = task_events.clone();
+        let range_graph_id = graph_id.clone();
+        let range_label = format!("asof-candidates:{graph_id}");
+        let range_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&range_events, &range_graph_id, range_label.clone(), err);
+        });
+        let candidates = DbspRangeJoin::new_batch_with_state_namespace::<
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &left_join_input,
+            &right_join_input,
+            Some(format!("{asof_state_namespace}_candidates")),
+            left_range,
+            right_key,
+            predicate,
+            projector,
+            Some(range_error_handler),
+        )
+        .await
+        .context("initialize ASOF candidate range join")?;
+
+        let left_partition_columns = Arc::new((0..left_schema.len()).collect::<Vec<_>>());
+        let right_timestamp_output_column = left_schema.len() + right_timestamp_column;
+        let top1_graph_id = graph_id.clone();
+        let key_extractor = move |delta_values: &[(Vec<u8>, i64)]| {
+            let mut out = Vec::new();
+            for (row, weight) in delta_values {
+                if *weight == 0 {
+                    continue;
+                }
+                let partition = match extract_encoded_row_columns(
+                    row,
+                    left_partition_columns.as_ref(),
+                    false,
+                ) {
+                    Ok(Some(partition)) => partition,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %top1_graph_id,
+                            error = %err,
+                            "failed to extract ASOF top1 partition"
+                        );
+                        continue;
+                    }
+                };
+                let order =
+                    match extract_encoded_row_i64_like_column(row, right_timestamp_output_column) {
+                        Ok(Some(order)) => order,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            tracing::warn!(
+                                graph_id = %top1_graph_id,
+                                error = %err,
+                                "failed to extract ASOF top1 order"
+                            );
+                            continue;
+                        }
+                    };
+                out.push((
+                    row.clone(),
+                    *weight,
+                    Some(partition),
+                    Some(order.saturating_neg()),
+                ));
+            }
+            out
+        };
+
+        let top1_events = task_events.clone();
+        let top1_graph_id = graph_id.clone();
+        let top1_label = format!("asof-top1:{graph_id}");
+        let top1_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+            report_graph_task_error(&top1_events, &top1_graph_id, top1_label.clone(), err);
+        });
+        let top1 = DbspPartitionedTop1::new_with_batch_key_extractor::<Vec<u8>, Vec<u8>, i64, _>(
+            &candidates.stream(),
+            key_extractor,
+            Some(top1_error_handler),
+        )
+        .await
+        .context("initialize ASOF latest-row top1")?;
+        Ok(top1.stream())
+    }
+
     pub(crate) async fn compile_range_join(
         &mut self,
         node_idx: usize,
@@ -454,6 +707,11 @@ impl DbspGraphBuilder {
     ) -> Result<DeltaHandleStream> {
         let left_schema = Arc::clone(&node.left_schema);
         let right_schema = Arc::clone(&node.right_schema);
+        if node.asof.is_some() {
+            return self
+                .compile_asof_join(node_idx, node, left, right, task_events)
+                .await;
+        }
         if node.range.is_some() {
             return self
                 .compile_range_join(node_idx, node, left, right, task_events)

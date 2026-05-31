@@ -15,6 +15,10 @@ pub(super) struct RangeJoinExpressions {
     pub left_lower: Expr,
     pub left_upper: Expr,
 }
+pub(super) struct AsofJoinExpressions {
+    pub left_timestamp: Expr,
+    pub right_timestamp: Expr,
+}
 pub(super) type AggregateExprSpec = (
     DbspAggregateFunction,
     Option<Expr>,
@@ -129,6 +133,33 @@ pub(super) fn extract_range_join_and_residual(
     ))
 }
 
+pub(super) fn extract_asof_join_and_residual(
+    expr: &Expr,
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
+) -> Result<(Option<AsofJoinExpressions>, Option<Expr>), PlannerError> {
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(expr, &mut conjuncts)?;
+
+    let mut selected = None;
+    let mut residuals = Vec::new();
+    for conjunct in conjuncts {
+        if let Some(asof) = asof_candidate(&conjunct, left_schema, right_schema)? {
+            if selected.is_some() {
+                return Err(PlannerError::UnsupportedJoin(
+                    "ASOF joins require exactly one right_timestamp <= left_timestamp predicate"
+                        .to_string(),
+                ));
+            }
+            selected = Some(asof);
+        } else {
+            residuals.push(conjunct);
+        }
+    }
+
+    Ok((selected, combine_filters(residuals)))
+}
+
 fn accumulate_conjuncts(
     expr: &Expr,
     key_pairs: &mut Vec<(Expr, Expr)>,
@@ -151,6 +182,39 @@ fn accumulate_conjuncts(
         _ => residuals.push(normalized),
     }
     Ok(())
+}
+
+fn asof_candidate(
+    expr: &Expr,
+    left_schema: &RowSchema,
+    right_schema: &RowSchema,
+) -> Result<Option<AsofJoinExpressions>, PlannerError> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return Ok(None);
+    };
+
+    let left_side = expression_side(binary.left.as_ref(), left_schema, right_schema)?;
+    let right_side = expression_side(binary.right.as_ref(), left_schema, right_schema)?;
+    let Some((left_side, right_side)) = left_side.zip(right_side) else {
+        return Ok(None);
+    };
+
+    let candidate = match (left_side, binary.op, right_side) {
+        (ExpressionSide::Right, Operator::LtEq, ExpressionSide::Left) => {
+            Some(AsofJoinExpressions {
+                right_timestamp: (*binary.left).clone(),
+                left_timestamp: (*binary.right).clone(),
+            })
+        }
+        (ExpressionSide::Left, Operator::GtEq, ExpressionSide::Right) => {
+            Some(AsofJoinExpressions {
+                right_timestamp: (*binary.right).clone(),
+                left_timestamp: (*binary.left).clone(),
+            })
+        }
+        _ => None,
+    };
+    Ok(candidate)
 }
 
 fn flatten_conjuncts(expr: &Expr, conjuncts: &mut Vec<Expr>) -> Result<(), PlannerError> {
