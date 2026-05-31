@@ -7,14 +7,16 @@
 pub mod circuit {
     pub use dbsp_circuit::circuit::*;
     pub use dbsp_planner::{
-        CircuitNode, CircuitPlan, CircuitPlanner, OptimizerDiagnostics, OptimizerRuleDiagnostics,
-        OptimizerStageDiagnostics, PlannerConfig, PlannerError,
+        CircuitNode, CircuitPlan, CircuitPlanner, FloeAsofJoinNode, OptimizerDiagnostics,
+        OptimizerRuleDiagnostics, OptimizerStageDiagnostics, PlannerConfig, PlannerError,
+        create_logical_plan_with_asof_preplanner,
     };
 
     pub mod planner {
         pub use dbsp_planner::{
-            CircuitNode, CircuitPlan, CircuitPlanner, OptimizerDiagnostics,
+            CircuitNode, CircuitPlan, CircuitPlanner, FloeAsofJoinNode, OptimizerDiagnostics,
             OptimizerRuleDiagnostics, OptimizerStageDiagnostics, PlannerConfig, PlannerError,
+            create_logical_plan_with_asof_preplanner,
         };
     }
 }
@@ -38,11 +40,11 @@ pub use circuit::{
     DbspAsofJoinSpec, DbspDistinctNode, DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind,
     DbspPredicate, DbspProjectNode, DbspRangeJoinSpec, DbspScalarType, DbspSelectNode,
     DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
-    DbspWindowPolicy, DbspWindowSpec, Field, FieldRef, OptimizerDiagnostics,
+    DbspWindowPolicy, DbspWindowSpec, Field, FieldRef, FloeAsofJoinNode, OptimizerDiagnostics,
     OptimizerRuleDiagnostics, OptimizerStageDiagnostics, OrderExpr, PlannerConfig, PlannerError,
-    PrimaryKey, ProjectItem, RowSchema, TableDescriptor, nexmark_auction_alias_table,
-    nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table,
-    nexmark_person_table,
+    PrimaryKey, ProjectItem, RowSchema, TableDescriptor, create_logical_plan_with_asof_preplanner,
+    nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
+    nexmark_person_alias_table, nexmark_person_table,
 };
 pub use collections::{ZSet, h};
 pub use count_aggregate::{

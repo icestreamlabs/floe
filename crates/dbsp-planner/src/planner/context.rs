@@ -19,12 +19,15 @@ use dbsp_circuit::circuit::plan::{
 use dbsp_circuit::circuit::schema::{Field, RowSchema};
 use dbsp_circuit::circuit::types::DbspScalarType;
 
+use super::asof_extension::FloeAsofJoinNode;
 use super::circuit::{CircuitNode, CircuitPlan};
 use super::config::PlannerConfig;
 use super::error::PlannerError;
 use super::expr::{
-    combine_filters, extract_alias, extract_asof_join_and_residual, extract_join_keys_and_residual,
-    extract_range_join_and_residual, map_aggregate_expr, normalize_expr,
+    combine_filters, extract_alias, extract_asof_join_and_residual,
+    extract_asof_join_and_residual_with_logical_schemas, extract_join_keys_and_residual,
+    extract_join_keys_and_residual_with_logical_schemas, extract_range_join_and_residual,
+    map_aggregate_expr, normalize_expr,
 };
 use super::logical_optimizer::{OptimizerDiagnostics, optimize_logical_plan};
 
@@ -295,12 +298,18 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::Statement(_) => Err(PlannerError::UnsupportedPlan(
                 "statement plans are not supported".to_string(),
             )),
-            LogicalPlan::Dml(_)
-            | LogicalPlan::Ddl(_)
-            | LogicalPlan::DescribeTable(_)
-            | LogicalPlan::Extension(_) => Err(PlannerError::UnsupportedPlan(
-                "plan type is not supported".to_string(),
-            )),
+            LogicalPlan::Extension(extension) => {
+                if let Some(asof) = extension.node.as_any().downcast_ref::<FloeAsofJoinNode>() {
+                    return self.plan_asof_extension(asof);
+                }
+                Err(PlannerError::UnsupportedPlan(format!(
+                    "logical extension node {} is not supported",
+                    extension.node.name()
+                )))
+            }
+            LogicalPlan::Dml(_) | LogicalPlan::Ddl(_) | LogicalPlan::DescribeTable(_) => Err(
+                PlannerError::UnsupportedPlan("plan type is not supported".to_string()),
+            ),
             LogicalPlan::Copy(_) | LogicalPlan::RecursiveQuery(_) | LogicalPlan::Unnest(_) => Err(
                 PlannerError::UnsupportedPlan("plan type is not supported".to_string()),
             ),
@@ -562,9 +571,21 @@ impl<'cfg> PlannerContext<'cfg> {
             .as_ref()
             .map(|residual| residual.expr().clone());
         let rebuilt_join = if let Some(asof) = &join.asof {
+            let key_pairs = join
+                .keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.left_expression().expr().clone(),
+                        key.right_expression().expr().clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
             DbspJoinNode::try_new_asof(
+                join.join_type.clone(),
                 left.schema.clone(),
                 right.schema.clone(),
+                key_pairs,
                 asof.left_timestamp_expression().expr().clone(),
                 asof.right_timestamp_expression().expr().clone(),
                 residual,
@@ -853,8 +874,10 @@ impl<'cfg> PlannerContext<'cfg> {
                 )?;
                 if let Some(asof) = asof {
                     let asof_join_node = DbspJoinNode::try_new_asof(
+                        DbspJoinType::Inner,
                         left.schema.clone(),
                         right.schema.clone(),
+                        Vec::new(),
                         asof.left_timestamp,
                         asof.right_timestamp,
                         asof_residual,
@@ -896,6 +919,88 @@ impl<'cfg> PlannerContext<'cfg> {
         let id = self.add_node(
             vec![left.id, right.id],
             DbspNodeKind::Join(join_node),
+            output_schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: output_schema,
+        })
+    }
+
+    fn plan_asof_extension(
+        &mut self,
+        asof_node: &FloeAsofJoinNode,
+    ) -> Result<PlannedNode, PlannerError> {
+        let join_type = match asof_node.join_type() {
+            JoinType::Inner => DbspJoinType::Inner,
+            JoinType::Left => DbspJoinType::LeftOuter,
+            other => {
+                return Err(PlannerError::UnsupportedJoin(format!(
+                    "unsupported ASOF join type {other:?}; INNER and LEFT ASOF joins are supported"
+                )));
+            }
+        };
+
+        let left = self.plan_node(asof_node.left())?;
+        let right = self.plan_node(asof_node.right())?;
+        let mut key_pairs = asof_node
+            .on()
+            .iter()
+            .map(|(left_expr, right_expr)| {
+                let left = normalize_expr(left_expr.clone())?;
+                let right = normalize_expr(right_expr.clone())?;
+                Ok((left, right))
+            })
+            .collect::<Result<Vec<_>, PlannerError>>()?;
+
+        let filter = asof_node.filter().ok_or_else(|| {
+            PlannerError::UnsupportedJoin(
+                "ASOF joins require a MATCH_CONDITION predicate".to_string(),
+            )
+        })?;
+        let (asof, residual) = extract_asof_join_and_residual_with_logical_schemas(
+            filter,
+            left.schema.as_ref(),
+            right.schema.as_ref(),
+            asof_node.left().schema().as_ref(),
+            asof_node.right().schema().as_ref(),
+        )?;
+        let Some(asof) = asof else {
+            return Err(PlannerError::UnsupportedJoin(
+                "ASOF joins require exactly one right_timestamp <= left_timestamp predicate"
+                    .to_string(),
+            ));
+        };
+        let residual = if let Some(residual) = residual {
+            let (filter_keys, filter_residual) =
+                extract_join_keys_and_residual_with_logical_schemas(
+                    &residual,
+                    left.schema.as_ref(),
+                    right.schema.as_ref(),
+                    asof_node.left().schema().as_ref(),
+                    asof_node.right().schema().as_ref(),
+                )?;
+            key_pairs.extend(filter_keys);
+            filter_residual
+        } else {
+            None
+        };
+        let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;
+
+        let asof_join_node = DbspJoinNode::try_new_asof(
+            join_type,
+            left.schema.clone(),
+            right.schema.clone(),
+            key_pairs,
+            asof.left_timestamp,
+            asof.right_timestamp,
+            residual,
+        )
+        .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+        let output_schema = asof_join_node.output_schema.clone();
+        let id = self.add_node(
+            vec![left.id, right.id],
+            DbspNodeKind::Join(asof_join_node),
             output_schema.clone(),
         );
         Ok(PlannedNode {

@@ -410,12 +410,28 @@ impl DbspJoinNode {
     }
 
     pub fn try_new_asof(
+        join_type: DbspJoinType,
         left_schema: Arc<RowSchema>,
         right_schema: Arc<RowSchema>,
+        key_pairs: Vec<(Expr, Expr)>,
         left_timestamp_expr: Expr,
         right_timestamp_expr: Expr,
         residual: Option<Expr>,
     ) -> Result<Self> {
+        if !matches!(join_type, DbspJoinType::Inner | DbspJoinType::LeftOuter) {
+            bail!("ASOF joins currently support INNER or LEFT OUTER semantics");
+        }
+
+        let mut keys = Vec::with_capacity(key_pairs.len());
+        for (left, right) in key_pairs {
+            keys.push(DbspJoinKey::try_new(
+                left,
+                left_schema.clone(),
+                right,
+                right_schema.clone(),
+            )?);
+        }
+
         let asof = DbspAsofJoinSpec::try_new(
             left_timestamp_expr,
             left_schema.clone(),
@@ -428,18 +444,15 @@ impl DbspJoinNode {
         } else {
             None
         };
-        let output_schema = Self::combined_schema(
-            left_schema.clone(),
-            right_schema.clone(),
-            &DbspJoinType::Inner,
-        )?;
+        let output_schema =
+            Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
 
         Ok(Self {
-            join_type: DbspJoinType::Inner,
+            join_type,
             left_schema,
             right_schema,
             output_schema,
-            keys: Vec::new(),
+            keys,
             residual,
             range: None,
             asof: Some(asof),

@@ -6,7 +6,18 @@ pub trait RangeKey {
     fn encoded_len(encoded: &[u8]) -> Result<usize>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct OrderedBytes(pub Vec<u8>);
 
 impl OrderedBytes {

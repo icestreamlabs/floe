@@ -127,8 +127,8 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
         passthrough_ts,
     )));
 
-    ctx.state()
-        .create_logical_plan(sql)
+    let state = ctx.state();
+    super::create_logical_plan_with_asof_preplanner(&state, sql)
         .await
         .expect("build SQL logical plan")
 }
@@ -677,6 +677,38 @@ fn plans_asof_join_without_equi_keys() {
         }
         other => panic!("expected ASOF join node, found {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn preplans_sql_asof_join_as_left_asof_node() {
+    let plan = sql_plan(
+        "SELECT a.id, b.price \
+         FROM auction a ASOF JOIN bid b \
+         MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") \
+         ON a.id = b.auction",
+    )
+    .await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan ASOF SQL");
+    let join_nodes = circuit_plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            DbspNodeKind::Join(join) => Some(join),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(join_nodes.len(), 1, "expected exactly one ASOF join");
+    let join = join_nodes[0];
+    assert!(matches!(join.join_type, DbspJoinType::LeftOuter));
+    assert_eq!(join.keys.len(), 1);
+    assert!(join.asof.is_some());
+    assert!(join.range.is_none());
+    assert!(
+        join.output_schema.fields()[join.left_schema.len()].nullable,
+        "ASOF SQL should expose nullable RHS columns"
+    );
 }
 
 #[test]

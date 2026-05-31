@@ -246,9 +246,21 @@ fn normalize_optimizer_source_projections(
                         .as_ref()
                         .map(|residual| residual.expr().clone());
                     let rebased = if let Some(asof) = join.asof.as_ref() {
+                        let key_pairs = join
+                            .keys
+                            .iter()
+                            .map(|key| {
+                                (
+                                    key.left_expression().expr().clone(),
+                                    key.right_expression().expr().clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         DbspJoinNode::try_new_asof(
+                            join.join_type.clone(),
                             left_schema,
                             right_schema,
+                            key_pairs,
                             asof.left_timestamp_expression().expr().clone(),
                             asof.right_timestamp_expression().expr().clone(),
                             residual,
