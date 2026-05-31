@@ -603,12 +603,17 @@ pub fn validate_dbsp_plan(
             let left_width = join.left_schema.len();
             let right_width = join.right_schema.len();
             let output_width = join.output_schema.len();
-            if left_width + right_width != output_width {
+            let expected_width = match join.join_type {
+                DbspJoinType::Inner
+                | DbspJoinType::LeftOuter
+                | DbspJoinType::RightOuter
+                | DbspJoinType::FullOuter => left_width + right_width,
+                DbspJoinType::LeftSemi | DbspJoinType::LeftAnti => left_width,
+                DbspJoinType::RightSemi | DbspJoinType::RightAnti => right_width,
+            };
+            if expected_width != output_width {
                 bail!(
-                    "node {node_id} (Join) output width mismatch: {} + {} ≠ {}",
-                    left_width,
-                    right_width,
-                    output_width
+                    "node {node_id} (Join) output width mismatch: expected {expected_width}, found {output_width}"
                 );
             }
         }

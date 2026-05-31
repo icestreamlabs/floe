@@ -872,6 +872,90 @@ fn plans_full_outer_join_with_nullable_both_sides() {
 }
 
 #[test]
+fn plans_left_semi_join_with_left_schema_output() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::LeftSemi,
+            (
+                vec![qualified(person, "id")],
+                vec![qualified(auction, "seller")],
+            ),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    match &root.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(matches!(join.join_type, DbspJoinType::LeftSemi));
+            assert_eq!(join.output_schema.len(), join.left_schema.len());
+            assert!(join.output_schema.field_index("name").is_some());
+            assert!(join.output_schema.field_index("item_name").is_none());
+        }
+        other => panic!("expected join node, found {other:?}"),
+    }
+}
+
+#[test]
+fn plans_right_anti_join_with_right_schema_output() {
+    let person = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
+
+    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            right,
+            JoinType::RightAnti,
+            (
+                vec![qualified(person, "id")],
+                vec![qualified(auction, "seller")],
+            ),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    match &root.kind {
+        DbspNodeKind::Join(join) => {
+            assert!(matches!(join.join_type, DbspJoinType::RightAnti));
+            assert_eq!(join.output_schema.len(), join.right_schema.len());
+            assert!(join.output_schema.field_index("item_name").is_some());
+            assert!(join.output_schema.field_index("name").is_none());
+        }
+        other => panic!("expected join node, found {other:?}"),
+    }
+}
+
+#[test]
 fn plans_multi_column_join() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();

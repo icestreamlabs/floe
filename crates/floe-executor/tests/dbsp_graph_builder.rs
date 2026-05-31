@@ -900,6 +900,209 @@ async fn inner_join_materializes_mv() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn left_semi_join_materializes_retained_left_rows() {
+    let db = test_db("left-semi-join").await;
+    let view_name = "mv_left_semi_join";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let person_schema = nexmark_person_schema();
+        let auction_schema = nexmark_auction_schema();
+        let right = table_scan(Some("nexmark_auction"), &auction_schema, None)
+            .expect("auction scan")
+            .build()
+            .expect("auction plan");
+        let logical = table_scan(Some("nexmark_person"), &person_schema, None)
+            .expect("person scan")
+            .join(
+                right,
+                JoinType::LeftSemi,
+                (
+                    vec![Column::from_name("id")],
+                    vec![Column::from_name("seller")],
+                ),
+                None,
+            )
+            .expect("left semi join")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_person", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let person_writer = registry
+        .writer_mut("nexmark_person")
+        .expect("person writer");
+    person_writer
+        .append_encoded(encoded_person_row(100, "alice"), 1)
+        .expect("append alice");
+    person_writer
+        .append_encoded(encoded_person_row(200, "bob"), 1)
+        .expect("append bob");
+    person_writer.flush().await.expect("flush person");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(encoded_auction_row(10, 100), 1)
+        .expect("append matched auction");
+    auction_writer
+        .append_encoded(encoded_auction_row(11, 999), 1)
+        .expect("append unmatched auction");
+    auction_writer.flush().await.expect("flush auctions");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![Field::new("id", DataType::Int64, true)]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build left semi join graph");
+
+    let rows = materialized_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_row(&[100])]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn right_anti_join_materializes_retained_right_rows() {
+    let db = test_db("right-anti-join").await;
+    let view_name = "mv_right_anti_join";
+    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
+
+    let plan = {
+        let person_schema = nexmark_person_schema();
+        let auction_schema = nexmark_auction_schema();
+        let right = table_scan(Some("nexmark_auction"), &auction_schema, None)
+            .expect("auction scan")
+            .build()
+            .expect("auction plan");
+        let logical = table_scan(Some("nexmark_person"), &person_schema, None)
+            .expect("person scan")
+            .join(
+                right,
+                JoinType::RightAnti,
+                (
+                    vec![Column::from_name("id")],
+                    vec![Column::from_name("seller")],
+                ),
+                None,
+            )
+            .expect("right anti join")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build logical");
+        let planner = DbspPlanBuilder::new(nexmark_config());
+        planner.build(&logical).expect("circuit plan")
+    };
+
+    let available_sources = ["nexmark_person", "nexmark_auction"]
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
+        .expect("validate plan")
+        .required_sources;
+
+    let mut registry =
+        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
+            .await
+            .expect("outer streams");
+
+    let person_writer = registry
+        .writer_mut("nexmark_person")
+        .expect("person writer");
+    person_writer
+        .append_encoded(encoded_person_row(100, "alice"), 1)
+        .expect("append alice");
+    person_writer.flush().await.expect("flush person");
+
+    let auction_writer = registry
+        .writer_mut("nexmark_auction")
+        .expect("auction writer");
+    auction_writer
+        .append_encoded(encoded_auction_row(10, 100), 1)
+        .expect("append matched auction");
+    auction_writer
+        .append_encoded(encoded_auction_row(11, 999), 1)
+        .expect("append unmatched auction");
+    auction_writer.flush().await.expect("flush auctions");
+
+    let mv_registry = Arc::new(MaterializedViewRegistry::new());
+    mv_registry.register(view_name);
+    mv_registry.set_schema(
+        view_name,
+        arrow_schema(vec![Field::new("id", DataType::Int64, true)]),
+    );
+
+    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
+    let handle_streams = gather_handle_streams(&registry, &source_refs);
+    let transient_streams = gather_transient_streams(&registry, &source_refs);
+    builder
+        .build(BuildInputs {
+            graph_id: view_name,
+            view_name,
+            plan: &plan,
+            cancel: CancellationToken::new(),
+            task_events: task_tx,
+            mv_registry: Arc::clone(&mv_registry),
+            outer_handle_streams: &handle_streams,
+            outer_transient_streams: &transient_streams,
+            enable_source_batch_journal: false,
+            restore_transient_helper_state: false,
+            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
+            watermark: Arc::new(AtomicI64::new(-1)),
+        })
+        .await
+        .expect("build right anti join graph");
+
+    let rows = materialized_rows(&mv_registry, view_name).await;
+    assert_eq!(rows, vec![int_row(&[11])]);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
     let db = test_db("join-filter-pushdown-static-build").await;
     let view_name = "mv_join_filter_pushdown";

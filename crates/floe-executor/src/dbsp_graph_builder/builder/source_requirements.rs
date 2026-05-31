@@ -194,9 +194,9 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                 let right_idx = node.inputs[1];
                 let mut left_columns = BTreeSet::new();
                 let mut right_columns = BTreeSet::new();
-                split_join_required_columns(
+                split_join_output_required_columns(
+                    join,
                     &required_columns,
-                    join.left_schema.len(),
                     &mut left_columns,
                     &mut right_columns,
                 )?;
@@ -398,4 +398,47 @@ fn split_join_required_columns(
         right_columns.insert(right_idx);
     }
     Ok(())
+}
+
+fn split_join_output_required_columns(
+    join: &dbsp::DbspJoinNode,
+    columns: &BTreeSet<usize>,
+    left_columns: &mut BTreeSet<usize>,
+    right_columns: &mut BTreeSet<usize>,
+) -> Result<()> {
+    match join.join_type {
+        dbsp::DbspJoinType::Inner
+        | dbsp::DbspJoinType::LeftOuter
+        | dbsp::DbspJoinType::RightOuter
+        | dbsp::DbspJoinType::FullOuter => split_join_required_columns(
+            columns,
+            join.left_schema.len(),
+            left_columns,
+            right_columns,
+        ),
+        dbsp::DbspJoinType::LeftSemi | dbsp::DbspJoinType::LeftAnti => {
+            for column_idx in columns {
+                if *column_idx >= join.left_schema.len() {
+                    bail!(
+                        "left semi/anti join output column {column_idx} out of bounds for left width {}",
+                        join.left_schema.len()
+                    );
+                }
+                left_columns.insert(*column_idx);
+            }
+            Ok(())
+        }
+        dbsp::DbspJoinType::RightSemi | dbsp::DbspJoinType::RightAnti => {
+            for column_idx in columns {
+                if *column_idx >= join.right_schema.len() {
+                    bail!(
+                        "right semi/anti join output column {column_idx} out of bounds for right width {}",
+                        join.right_schema.len()
+                    );
+                }
+                right_columns.insert(*column_idx);
+            }
+            Ok(())
+        }
+    }
 }

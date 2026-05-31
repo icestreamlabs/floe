@@ -733,9 +733,13 @@ impl<'cfg> PlannerContext<'cfg> {
             JoinType::Left => DbspJoinType::LeftOuter,
             JoinType::Right => DbspJoinType::RightOuter,
             JoinType::Full => DbspJoinType::FullOuter,
+            JoinType::LeftSemi => DbspJoinType::LeftSemi,
+            JoinType::RightSemi => DbspJoinType::RightSemi,
+            JoinType::LeftAnti => DbspJoinType::LeftAnti,
+            JoinType::RightAnti => DbspJoinType::RightAnti,
             other => {
                 return Err(PlannerError::UnsupportedJoin(format!(
-                    "unsupported join type {other:?}; only INNER/LEFT/RIGHT/FULL OUTER joins are supported"
+                    "unsupported join type {other:?}; INNER/LEFT/RIGHT/FULL OUTER/SEMI/ANTI joins are supported"
                 )));
             }
         };
@@ -772,7 +776,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let residual = combine_filters(residuals);
         if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
             return Err(PlannerError::UnsupportedJoin(
-                "OUTER joins currently require pure equi-join predicates".to_string(),
+                "non-INNER joins currently require pure equi-join predicates".to_string(),
             ));
         }
 

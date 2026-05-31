@@ -158,6 +158,10 @@ pub enum DbspJoinType {
     LeftOuter,
     RightOuter,
     FullOuter,
+    LeftSemi,
+    RightSemi,
+    LeftAnti,
+    RightAnti,
 }
 
 #[derive(Clone, Debug)]
@@ -235,8 +239,7 @@ impl DbspJoinNode {
         }
 
         let residual = if let Some(expr) = residual {
-            let combined_schema =
-                Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
             Some(DbspExpression::analyze(expr, combined_schema)?)
         } else {
             None
@@ -260,6 +263,15 @@ impl DbspJoinNode {
         right: Arc<RowSchema>,
         join_type: &DbspJoinType,
     ) -> Result<Arc<RowSchema>> {
+        match join_type {
+            DbspJoinType::LeftSemi | DbspJoinType::LeftAnti => return Ok(left),
+            DbspJoinType::RightSemi | DbspJoinType::RightAnti => return Ok(right),
+            DbspJoinType::Inner
+            | DbspJoinType::LeftOuter
+            | DbspJoinType::RightOuter
+            | DbspJoinType::FullOuter => {}
+        }
+
         let mut fields = Vec::with_capacity(left.len() + right.len());
         let mut existing = HashSet::new();
 
@@ -268,6 +280,10 @@ impl DbspJoinNode {
             let nullable = match join_type {
                 DbspJoinType::Inner | DbspJoinType::LeftOuter => field.nullable,
                 DbspJoinType::RightOuter | DbspJoinType::FullOuter => true,
+                DbspJoinType::LeftSemi
+                | DbspJoinType::RightSemi
+                | DbspJoinType::LeftAnti
+                | DbspJoinType::RightAnti => unreachable!("semi/anti joins returned above"),
             };
             fields.push(Field::new(
                 field.name.clone(),
@@ -288,8 +304,36 @@ impl DbspJoinNode {
                 DbspJoinType::Inner => field.nullable,
                 DbspJoinType::LeftOuter | DbspJoinType::FullOuter => true,
                 DbspJoinType::RightOuter => field.nullable,
+                DbspJoinType::LeftSemi
+                | DbspJoinType::RightSemi
+                | DbspJoinType::LeftAnti
+                | DbspJoinType::RightAnti => unreachable!("semi/anti joins returned above"),
             };
             fields.push(Field::new(name, field.data_type.clone(), nullable));
+        }
+
+        RowSchema::try_new(fields)
+    }
+
+    fn matched_schema(left: Arc<RowSchema>, right: Arc<RowSchema>) -> Result<Arc<RowSchema>> {
+        let mut fields = Vec::with_capacity(left.len() + right.len());
+        let mut existing = HashSet::new();
+
+        for field in left.fields().iter() {
+            existing.insert(field.name.clone());
+            fields.push(field.clone());
+        }
+
+        for field in right.fields().iter() {
+            let mut field = field.clone();
+            let base_name = field.name.clone();
+            let mut suffix = 1;
+            while existing.contains(&field.name) {
+                field.name = format!("{base_name}_{suffix}");
+                suffix += 1;
+            }
+            existing.insert(field.name.clone());
+            fields.push(field);
         }
 
         RowSchema::try_new(fields)

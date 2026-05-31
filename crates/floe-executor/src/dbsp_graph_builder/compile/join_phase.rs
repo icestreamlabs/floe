@@ -4,7 +4,7 @@ use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, PreparedJoinedEncodedRowProjection,
-    concat_encoded_rows, project_joined_encoded_rows_prepared,
+    concat_encoded_rows, extract_encoded_row_columns, project_joined_encoded_rows_prepared,
 };
 use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
 use datafusion::common::Column;
@@ -31,6 +31,48 @@ fn project_encoded_delta_batch<K>(
         }
     }
     projected.into_iter().collect()
+}
+
+async fn strip_semijoin_precomputed_columns(
+    stream: DeltaHandleStream,
+    output_width: usize,
+    graph_id: &str,
+    label: String,
+    task_events: &GraphTaskSender,
+) -> Result<DeltaHandleStream> {
+    let columns = Arc::new((0..output_width).collect::<Vec<_>>());
+    let project_graph_id = graph_id.to_string();
+    let projector = move |row: &Vec<u8>| -> Vec<u8> {
+        match extract_encoded_row_columns(row, columns.as_ref(), false) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                tracing::warn!(
+                    graph_id = %project_graph_id,
+                    error = %err,
+                    "failed to strip semijoin precomputed key columns"
+                );
+                Vec::new()
+            }
+        }
+    };
+
+    let project_events = task_events.clone();
+    let project_error_graph_id = graph_id.to_string();
+    let project_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+        report_graph_task_error(&project_events, &project_error_graph_id, label.clone(), err);
+    });
+    let transform = move |delta_values: &[(Vec<u8>, i64)]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+        Ok(project_encoded_delta_batch(delta_values, &projector))
+    };
+    let projected = DbspFilterMap::new_batch::<Vec<u8>, Vec<u8>, _>(
+        &stream,
+        transform,
+        Some(project_error_handler),
+    )
+    .await
+    .context("initialize semijoin output projection")?;
+    Ok(projected.stream())
 }
 
 impl DbspGraphBuilder {
@@ -108,7 +150,7 @@ impl DbspGraphBuilder {
         let output_schema = Arc::clone(&node.output_schema);
         if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
             return Err(anyhow!(
-                "OUTER joins currently require pure equi-join predicates"
+                "non-INNER joins currently require pure equi-join predicates"
             ));
         }
         let graph_id = self.graph_id().to_string();
@@ -352,6 +394,157 @@ impl DbspGraphBuilder {
             )
             .context("build vectorized right join key extractor")?,
         );
+
+        if matches!(join_type, DbspJoinType::LeftSemi | DbspJoinType::LeftAnti) {
+            let mode = if matches!(join_type, DbspJoinType::LeftSemi) {
+                SemiJoinMode::Semi
+            } else {
+                SemiJoinMode::Anti
+            };
+            let semijoin_left_graph_id = graph_id.clone();
+            let semijoin_right_graph_id = graph_id.clone();
+            let semijoin_left_extractor = Arc::clone(&left_key_extractor);
+            let semijoin_right_extractor = Arc::clone(&right_key_extractor);
+            let semijoin_left_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match semijoin_left_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %semijoin_left_graph_id,
+                            error = %err,
+                            "failed to extract vectorized left semijoin key columns"
+                        );
+                        Vec::new()
+                    }
+                };
+            let semijoin_right_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match semijoin_right_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %semijoin_right_graph_id,
+                            error = %err,
+                            "failed to extract vectorized right semijoin key columns"
+                        );
+                        Vec::new()
+                    }
+                };
+            let semijoin_events = task_events.clone();
+            let semijoin_graph_id = graph_id.clone();
+            let semijoin_label = format!("semijoin:{graph_id}");
+            let semijoin_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+                report_graph_task_error(
+                    &semijoin_events,
+                    &semijoin_graph_id,
+                    semijoin_label.clone(),
+                    err,
+                );
+            });
+            let semijoin =
+                DbspSemiJoin::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+                    &left_join_input,
+                    &right_join_input,
+                    Some(format!("{join_state_namespace}_left_semijoin")),
+                    semijoin_left_key,
+                    semijoin_right_key,
+                    mode,
+                    Some(semijoin_error_handler),
+                )
+                .await
+                .context("initialize DBSP LEFT SEMI/ANTI join")?;
+            let semijoin_stream = semijoin.stream();
+            if left_join_schema.len() == output_schema.len() {
+                return Ok(semijoin_stream);
+            }
+            return strip_semijoin_precomputed_columns(
+                semijoin_stream,
+                output_schema.len(),
+                &graph_id,
+                format!("left-semijoin-output-project:{graph_id}"),
+                task_events,
+            )
+            .await;
+        }
+
+        if matches!(join_type, DbspJoinType::RightSemi | DbspJoinType::RightAnti) {
+            let mode = if matches!(join_type, DbspJoinType::RightSemi) {
+                SemiJoinMode::Semi
+            } else {
+                SemiJoinMode::Anti
+            };
+            let semijoin_left_graph_id = graph_id.clone();
+            let semijoin_right_graph_id = graph_id.clone();
+            let semijoin_left_extractor = Arc::clone(&right_key_extractor);
+            let semijoin_right_extractor = Arc::clone(&left_key_extractor);
+            let semijoin_left_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match semijoin_left_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %semijoin_left_graph_id,
+                            error = %err,
+                            "failed to extract vectorized right semijoin key columns"
+                        );
+                        Vec::new()
+                    }
+                };
+            let semijoin_right_key =
+                move |delta_values: &[(Vec<u8>, i64)]| match semijoin_right_extractor
+                    .extract_keyed_deltas(delta_values)
+                {
+                    Ok(keyed) => keyed,
+                    Err(err) => {
+                        tracing::warn!(
+                            graph_id = %semijoin_right_graph_id,
+                            error = %err,
+                            "failed to extract vectorized left semijoin key columns"
+                        );
+                        Vec::new()
+                    }
+                };
+            let semijoin_events = task_events.clone();
+            let semijoin_graph_id = graph_id.clone();
+            let semijoin_label = format!("right-semijoin:{graph_id}");
+            let semijoin_error_handler: RuntimeErrorHandler = Arc::new(move |err| {
+                report_graph_task_error(
+                    &semijoin_events,
+                    &semijoin_graph_id,
+                    semijoin_label.clone(),
+                    err,
+                );
+            });
+            let semijoin =
+                DbspSemiJoin::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+                    &right_join_input,
+                    &left_join_input,
+                    Some(format!("{join_state_namespace}_right_semijoin")),
+                    semijoin_left_key,
+                    semijoin_right_key,
+                    mode,
+                    Some(semijoin_error_handler),
+                )
+                .await
+                .context("initialize DBSP RIGHT SEMI/ANTI join")?;
+            let semijoin_stream = semijoin.stream();
+            if right_join_schema.len() == output_schema.len() {
+                return Ok(semijoin_stream);
+            }
+            return strip_semijoin_precomputed_columns(
+                semijoin_stream,
+                output_schema.len(),
+                &graph_id,
+                format!("right-semijoin-output-project:{graph_id}"),
+                task_events,
+            )
+            .await;
+        }
+
         let defer_residual_to_post_filter =
             matches!(join_type, DbspJoinType::Inner) && residual.is_some();
         let left_graph_id = graph_id.clone();
