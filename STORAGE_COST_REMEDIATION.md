@@ -117,7 +117,7 @@ Validation:
 
 ### 3. Native ASOF/Range Trace Access
 
-Status: partially implemented; one generic interval-stabbing gap remains.
+Status: implemented and validated in `codex/storage-cost-remediation`.
 
 Problem: current range/asof decomposition can use broad right-side range scans
 and scan the left in-memory range cache for right-side changes.
@@ -128,6 +128,10 @@ Implemented:
 - ASOF left deltas use `RangeLookupMode::First`, so a left row reads only the
   latest qualifying right row instead of materializing every prior right row in
   the range.
+- Right-side range/asof deltas now probe a lazily rebuilt interval tree over the
+  left range state instead of scanning the whole left cache. Left updates mark
+  the tree dirty; the next right-side probe rebuilds it from the already
+  materialized left range cache.
 - Generic range joins still use the original `RangeLookupMode::All` path.
   The mode branch is outside the hot loop so existing full-range joins keep the
   old tight scan path.
@@ -138,10 +142,16 @@ Proof target:
   left-side change can materialize all range postings for its interval.
 - After for ASOF left deltas: `O(first_live_right_key_posting_group + boundary)`
   range-index entries plus the output ties for that timestamp.
-- Remaining gap: right-side changes still use the existing left range cache
-  scan. A fully generic fix needs a second interval index for left ranges; a
-  lower-bound-only index is not enough to prove fewer operations for arbitrary
-  intervals because it can still scan all intervals with `lower <= point`.
+- After for right-side deltas: `O(log left_intervals + matching_intervals)` over
+  the in-memory left interval tree, plus the actual right rows for the changed
+  key. This adds no SlateDB writes; it replaces a full in-memory cache scan with
+  a maintained search structure over state Floe was already materializing.
+
+Validation:
+
+- `range_join_right_delta_uses_left_interval_index` seeds 100 left intervals,
+  probes one right key, and proves `left_state_rows_examined == 1` rather than
+  100.
 
 ### 4. Range Index Cursor/Filter Layout
 
@@ -218,12 +228,13 @@ Focused commands:
 - `cargo test -p dbsp-runtime operators::range_join::tests::`
 - `cargo test -p dbsp-planner asof`
 - `cargo test -p floe-executor --test dbsp_graph_builder asof`
+- `cargo test -p floe-executor --test dbsp_graph_builder range_join`
 
 Same-condition Nexmark regression checks versus `fc07b6b`:
 
 | Query | Baseline run | Baseline result-ready | Current run | Current result-ready | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| q4 | `1780303342783` | 14.056s | `1780304094303` | 13.988s | no regression |
+| q4 | `1780303342783` | 14.056s | `1780327638081` | 14.060s | no regression |
 | q6 | `1780303136932` | 7.171s | `1780304297449` | 7.170s | no regression |
 | q7 | `1780302385671` | 2.168s | `1780304279194` | 2.188s | within noise |
 | q9 | `1780303166404` | 6.819s | `1780304330458` | 6.846s | within noise |

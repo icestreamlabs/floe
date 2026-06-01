@@ -31,6 +31,139 @@ type LeftRangeDeltas<L, K> = HashMap<L, (K, K, i64)>;
 type RightKeyedDeltas<R, K> = HashMap<K, HashMap<R, i64>>;
 type LeftRangeCache<L, K> = HashMap<L, (K, K, i64)>;
 
+#[derive(Clone)]
+struct LeftInterval<L, K> {
+    row: L,
+    lower: K,
+    upper: K,
+    weight: i64,
+}
+
+struct LeftIntervalNode<L, K> {
+    center: K,
+    by_lower: Vec<LeftInterval<L, K>>,
+    by_upper_desc: Vec<LeftInterval<L, K>>,
+    left: Option<Box<LeftIntervalNode<L, K>>>,
+    right: Option<Box<LeftIntervalNode<L, K>>>,
+}
+
+struct LeftIntervalIndex<L, K> {
+    root: Option<Box<LeftIntervalNode<L, K>>>,
+}
+
+impl<L, K> LeftIntervalIndex<L, K>
+where
+    L: Clone,
+    K: Clone + Ord,
+{
+    fn from_cache(cache: &LeftRangeCache<L, K>) -> Self {
+        let intervals = cache
+            .iter()
+            .filter_map(|(row, (lower, upper, weight))| {
+                (*weight != 0 && lower < upper).then(|| LeftInterval {
+                    row: row.clone(),
+                    lower: lower.clone(),
+                    upper: upper.clone(),
+                    weight: *weight,
+                })
+            })
+            .collect::<Vec<_>>();
+        Self {
+            root: Self::build_node(intervals),
+        }
+    }
+
+    fn build_node(intervals: Vec<LeftInterval<L, K>>) -> Option<Box<LeftIntervalNode<L, K>>> {
+        if intervals.is_empty() {
+            return None;
+        }
+
+        let mut lowers = intervals
+            .iter()
+            .map(|interval| interval.lower.clone())
+            .collect::<Vec<_>>();
+        lowers.sort();
+        let center = lowers[lowers.len() / 2].clone();
+
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut center_intervals = Vec::new();
+        for interval in intervals {
+            if interval.upper <= center {
+                left.push(interval);
+            } else if interval.lower > center {
+                right.push(interval);
+            } else {
+                center_intervals.push(interval);
+            }
+        }
+
+        let mut by_lower = center_intervals;
+        by_lower.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.upper.cmp(&b.upper)));
+        let mut by_upper_desc = by_lower.clone();
+        by_upper_desc.sort_by(|a, b| b.upper.cmp(&a.upper).then_with(|| a.lower.cmp(&b.lower)));
+
+        Some(Box::new(LeftIntervalNode {
+            center,
+            by_lower,
+            by_upper_desc,
+            left: Self::build_node(left),
+            right: Self::build_node(right),
+        }))
+    }
+
+    fn visit_point<F>(&self, point: &K, visitor: &mut F)
+    where
+        F: FnMut(&L, &K, &K, i64),
+    {
+        if let Some(root) = self.root.as_ref() {
+            root.visit_point(point, visitor);
+        }
+    }
+}
+
+impl<L, K> LeftIntervalNode<L, K>
+where
+    K: Ord,
+{
+    fn visit_point<F>(&self, point: &K, visitor: &mut F)
+    where
+        F: FnMut(&L, &K, &K, i64),
+    {
+        if point < &self.center {
+            for interval in &self.by_lower {
+                if &interval.lower > point {
+                    break;
+                }
+                visitor(
+                    &interval.row,
+                    &interval.lower,
+                    &interval.upper,
+                    interval.weight,
+                );
+            }
+            if let Some(left) = self.left.as_ref() {
+                left.visit_point(point, visitor);
+            }
+        } else {
+            for interval in &self.by_upper_desc {
+                if &interval.upper <= point {
+                    break;
+                }
+                visitor(
+                    &interval.row,
+                    &interval.lower,
+                    &interval.upper,
+                    interval.weight,
+                );
+            }
+            if let Some(right) = self.right.as_ref() {
+                right.visit_point(point, visitor);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RangeLookupMode {
     All,
@@ -96,6 +229,8 @@ where
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
     left_cache: Option<LeftRangeCache<L, K>>,
+    left_interval_index: Option<LeftIntervalIndex<L, K>>,
+    left_interval_index_dirty: bool,
     range_lookup_mode: RangeLookupMode,
     logical_work: metrics::LogicalWorkCollector,
 }
@@ -198,6 +333,8 @@ where
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
             left_cache: None,
+            left_interval_index: None,
+            left_interval_index_dirty: true,
             range_lookup_mode,
             logical_work: metrics::LogicalWorkCollector::default(),
         }
@@ -227,8 +364,23 @@ where
                 }
                 cache.insert(row, (lower, upper, weight));
             }
+            self.left_interval_index = Some(LeftIntervalIndex::from_cache(&cache));
+            self.left_interval_index_dirty = false;
             self.left_cache = Some(cache);
         }
+        Ok(())
+    }
+
+    fn ensure_left_interval_index(&mut self) -> Result<()> {
+        if !self.left_interval_index_dirty && self.left_interval_index.is_some() {
+            return Ok(());
+        }
+        let cache = self
+            .left_cache
+            .as_ref()
+            .context("range join left cache missing while rebuilding interval index")?;
+        self.left_interval_index = Some(LeftIntervalIndex::from_cache(cache));
+        self.left_interval_index_dirty = false;
         Ok(())
     }
 
@@ -411,27 +563,27 @@ where
         Ok(())
     }
 
-    fn join_right_delta_with_left_cache(
-        left_cache: &LeftRangeCache<L, K>,
+    fn join_right_delta_with_left_index(
+        left_index: &LeftIntervalIndex<L, K>,
         right_keyed: &RightKeyedDeltas<R, K>,
         predicate: &RangeJoinPredicate<L, R>,
         projector: &RangeJoinProjector<L, R, O>,
         output_deltas: &mut HashMap<O, i64>,
         work: &mut metrics::LogicalWorkSnapshot,
     ) {
+        work.state_lookup_keys = work
+            .state_lookup_keys
+            .saturating_add(right_keyed.len() as u64);
         for (right_key, right_rows) in right_keyed {
-            for (left, (lower, upper, left_weight)) in left_cache {
+            left_index.visit_point(right_key, &mut |left, _lower, _upper, left_weight| {
                 work.left_state_rows_examined = work.left_state_rows_examined.saturating_add(1);
                 work.state_scan_rows = work.state_scan_rows.saturating_add(1);
-                if right_key < lower || right_key >= upper {
-                    continue;
-                }
                 for (right, right_weight) in right_rows {
                     if let Some((out, weight)) = Self::join_pair(
                         predicate,
                         projector,
                         left,
-                        *left_weight,
+                        left_weight,
                         right,
                         *right_weight,
                     ) {
@@ -439,7 +591,7 @@ where
                         work.join_output_rows = work.join_output_rows.saturating_add(1);
                     }
                 }
-            }
+            });
         }
     }
 
@@ -477,24 +629,29 @@ where
     fn apply_left_ranges_to_cache(
         cache: &mut LeftRangeCache<L, K>,
         left_ranges: &LeftRangeDeltas<L, K>,
-    ) {
+    ) -> bool {
+        let mut changed = false;
         for (left, (lower, upper, weight)) in left_ranges {
             match cache.entry(left.clone()) {
                 Entry::Occupied(mut entry) => {
                     let next = entry.get().2.saturating_add(*weight);
                     if next == 0 {
                         entry.remove();
+                        changed = true;
                     } else {
                         entry.get_mut().0 = lower.clone();
                         entry.get_mut().1 = upper.clone();
                         entry.get_mut().2 = next;
+                        changed = true;
                     }
                 }
                 Entry::Vacant(entry) => {
                     entry.insert((lower.clone(), upper.clone(), *weight));
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
     async fn apply_deltas_to_versioned<T>(
@@ -693,9 +850,12 @@ where
 
         self.join_left_delta_with_right_state(&left_ranges, &mut output_deltas, &mut work)
             .await?;
-        if let Some(left_cache) = self.left_cache.as_ref() {
-            Self::join_right_delta_with_left_cache(
-                left_cache,
+        if !right_keyed.is_empty() {
+            self.ensure_left_interval_index()?;
+        }
+        if let Some(left_index) = self.left_interval_index.as_ref() {
+            Self::join_right_delta_with_left_index(
+                left_index,
                 &right_keyed,
                 &self.predicate,
                 &self.projector,
@@ -745,7 +905,9 @@ where
         }
 
         if let Some(cache) = self.left_cache.as_mut() {
-            Self::apply_left_ranges_to_cache(cache, &left_ranges);
+            if Self::apply_left_ranges_to_cache(cache, &left_ranges) {
+                self.left_interval_index_dirty = true;
+            }
         }
 
         if output_deltas.is_empty() {
@@ -1082,5 +1244,57 @@ mod tests {
             HashMap::from([((1, 101), -1), ((2, 101), -1)])
         );
         assert_eq!(op.last_logical_work().output_delta_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn range_join_right_delta_uses_left_interval_index() {
+        let suffix = next_test_suffix();
+        let (mut op, left_dict, right_dict, table) = build_op(suffix).await;
+        let mut cache = HashMap::new();
+
+        let left_rows = (0..100)
+            .map(|id| ((id, id * 10, id * 10 + 5), 1))
+            .collect::<Vec<_>>();
+        let left_t1 = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "range_index_left_stream_t1",
+            &left_rows,
+        )
+        .await;
+        let right_t1 = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "range_index_right_stream_t1",
+            &[],
+        )
+        .await;
+        op.on_step(1, &[left_t1, right_t1])
+            .await
+            .expect("seed left ranges");
+
+        let left_t2 =
+            stage_version(left_dict, table.clone(), "range_index_left_stream_t2", &[]).await;
+        let right_t2 = stage_version(
+            right_dict,
+            table.clone(),
+            "range_index_right_stream_t2",
+            &[((502, 900), 1)],
+        )
+        .await;
+        let out_t2 = op
+            .on_step(2, &[left_t2, right_t2])
+            .await
+            .expect("probe right delta")
+            .expect("output t2");
+        let materialized_t2 = materialize_zset_handle::<OutRow>(table.clone(), &mut cache, &out_t2)
+            .await
+            .expect("materialize t2");
+        assert_eq!(materialized_t2, HashMap::from([((50, 900), 1)]));
+        assert_eq!(
+            op.last_logical_work().left_state_rows_examined,
+            1,
+            "right-delta probing should visit matching left intervals, not the whole left cache",
+        );
     }
 }
