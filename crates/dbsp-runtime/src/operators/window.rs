@@ -95,9 +95,9 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub state: RelationState<(WindowKey<K>, A)>,
+    pub(crate) state: RelationState<(WindowKey<K>, A)>,
     pub index: IndexedBatchZSet<WindowKey<K>, V>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     pub window_extractor: BatchWindowExtractor<V, K>,
     pub aggregator: Aggregator<K, V, A>,
     pub watermark: Arc<AtomicI64>,

@@ -95,18 +95,20 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub left_state: RelationState<L>,
-    pub right_state: RelationState<R>,
-    pub left_index: IndexedBatchZSet<K, L>,
-    pub right_index: IndexedBatchZSet<K, R>,
-    pub left_closed_index: IndexedBatchZSet<K, ()>,
-    pub right_closed_index: IndexedBatchZSet<K, ()>,
-    pub left_key: BatchJoinKeyExtractor<L, K>,
-    pub right_key: BatchJoinKeyExtractor<R, K>,
-    pub predicate: JoinPredicate<L, R>,
-    pub projector: JoinProjector<L, R, O>,
-    pub table: Arc<dyn KeyValueTable>,
-    pub integrated: Option<RelationState<O>>,
+    #[cfg(test)]
+    pub(crate) left_state: RelationState<L>,
+    #[cfg(test)]
+    pub(crate) right_state: RelationState<R>,
+    pub(crate) left_index: IndexedBatchZSet<K, L>,
+    pub(crate) right_index: IndexedBatchZSet<K, R>,
+    pub(crate) left_closed_index: IndexedBatchZSet<K, ()>,
+    pub(crate) right_closed_index: IndexedBatchZSet<K, ()>,
+    pub(crate) left_key: BatchJoinKeyExtractor<L, K>,
+    pub(crate) right_key: BatchJoinKeyExtractor<R, K>,
+    pub(crate) predicate: JoinPredicate<L, R>,
+    pub(crate) projector: JoinProjector<L, R, O>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
+    pub(crate) integrated: Option<RelationState<O>>,
     output: Option<VersionedZSet<O>>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
@@ -161,8 +163,8 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new_batch(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
+        _left_state: RelationState<L>,
+        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_key: BatchJoinKeyExtractor<L, K>,
@@ -175,8 +177,8 @@ where
     ) -> Self {
         let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
         Self::new_batch_with_closed_indexes(
-            left_state,
-            right_state,
+            _left_state,
+            _right_state,
             left_index,
             right_index,
             IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
@@ -196,8 +198,8 @@ where
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_batch_with_closed_indexes(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
+        _left_state: RelationState<L>,
+        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_closed_index: IndexedBatchZSet<K, ()>,
@@ -213,8 +215,10 @@ where
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
-            left_state,
-            right_state,
+            #[cfg(test)]
+            left_state: _left_state,
+            #[cfg(test)]
+            right_state: _right_state,
             left_index,
             right_index,
             left_closed_index,
@@ -247,8 +251,8 @@ where
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_without_output_batch(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
+        _left_state: RelationState<L>,
+        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_key: BatchJoinKeyExtractor<L, K>,
@@ -260,8 +264,8 @@ where
     ) -> Self {
         let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
         Self::new_without_output_batch_with_closed_indexes(
-            left_state,
-            right_state,
+            _left_state,
+            _right_state,
             left_index,
             right_index,
             IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
@@ -280,8 +284,8 @@ where
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_without_output_batch_with_closed_indexes(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
+        _left_state: RelationState<L>,
+        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_closed_index: IndexedBatchZSet<K, ()>,
@@ -296,8 +300,10 @@ where
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
-            left_state,
-            right_state,
+            #[cfg(test)]
+            left_state: _left_state,
+            #[cfg(test)]
+            right_state: _right_state,
             left_index,
             right_index,
             left_closed_index,

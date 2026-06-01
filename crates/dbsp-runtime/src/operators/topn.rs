@@ -41,8 +41,8 @@ where
     P: Ord + Clone + Send + Sync + 'static,
     O: Ord + Clone + Send + Sync + 'static,
 {
-    pub state: RelationState<K>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) state: RelationState<K>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     input_cache: Option<HashMap<K, i64>>,
@@ -110,7 +110,7 @@ where
         self.logical_work.last_tick()
     }
 
-    async fn ensure_input_cache(&mut self) -> Result<usize> {
+    async fn ensure_input_cache_loaded_from_state(&mut self) -> Result<usize> {
         if self.input_cache.is_some() {
             return Ok(0);
         }
@@ -164,7 +164,7 @@ where
         output
     }
 
-    async fn ensure_order_index(&mut self) -> Result<usize> {
+    async fn ensure_order_index_built_from_input_cache(&mut self) -> Result<usize> {
         if self.order_index.is_some() {
             return Ok(0);
         }
@@ -193,6 +193,17 @@ where
         }
         self.order_index = Some(index);
         Ok(rebuild_rows)
+    }
+
+    fn record_cold_cache_rebuild(work: &mut metrics::LogicalWorkSnapshot, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+
+        let rows = rows as u64;
+        work.cache_rebuild_rows = work.cache_rebuild_rows.saturating_add(rows);
+        work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
+        work.state_scan_rows = work.state_scan_rows.saturating_add(rows);
     }
 
     fn keys_for(&mut self, key: &K) -> (Option<P>, Option<O>) {
@@ -353,18 +364,10 @@ where
         }
 
         let input_cache_rebuild_rows = self
-            .ensure_input_cache()
+            .ensure_input_cache_loaded_from_state()
             .await
             .context("load topn input cache")?;
-        if input_cache_rebuild_rows != 0 {
-            work.cache_rebuild_rows = work
-                .cache_rebuild_rows
-                .saturating_add(input_cache_rebuild_rows as u64);
-            work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
-            work.state_scan_rows = work
-                .state_scan_rows
-                .saturating_add(input_cache_rebuild_rows as u64);
-        }
+        Self::record_cold_cache_rebuild(&mut work, input_cache_rebuild_rows);
 
         let mut delta_map = HashMap::new();
         for (key, diff_weight) in delta_values.iter() {
@@ -381,18 +384,10 @@ where
         }
 
         let order_index_rebuild_rows = self
-            .ensure_order_index()
+            .ensure_order_index_built_from_input_cache()
             .await
             .context("build topn order index")?;
-        if order_index_rebuild_rows != 0 {
-            work.cache_rebuild_rows = work
-                .cache_rebuild_rows
-                .saturating_add(order_index_rebuild_rows as u64);
-            work.state_full_scan_count = work.state_full_scan_count.saturating_add(1);
-            work.state_scan_rows = work
-                .state_scan_rows
-                .saturating_add(order_index_rebuild_rows as u64);
-        }
+        Self::record_cold_cache_rebuild(&mut work, order_index_rebuild_rows);
 
         let mut cache_updates = Vec::new();
         for (key, diff_weight, partition_key, order_key) in self.keys_for_delta_map(&delta_map) {
@@ -582,9 +577,11 @@ mod tests {
         (id >> 48) as u16
     }
 
+    type ScalarTopNKeyFn<T> = Arc<dyn Fn(&i64) -> Option<T> + Send + Sync>;
+
     fn scalar_topn_key_parts<P, O>(
-        partition_key: Arc<dyn Fn(&i64) -> Option<P> + Send + Sync>,
-        order_key: Arc<dyn Fn(&i64) -> Option<O> + Send + Sync>,
+        partition_key: ScalarTopNKeyFn<P>,
+        order_key: ScalarTopNKeyFn<O>,
     ) -> BatchKeyPartsFn<i64, P, O>
     where
         P: Ord + Clone + Send + Sync + 'static,
@@ -730,9 +727,8 @@ mod tests {
         .await
         .expect("output");
 
-        let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
-        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value));
+        let partition_key: ScalarTopNKeyFn<()> = Arc::new(|_| Some(()));
+        let order_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value));
         let mut op = TopNOp::new_with_batch_key_extractor(
             state,
             table.clone(),
@@ -821,9 +817,8 @@ mod tests {
         .await
         .expect("output");
 
-        let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
-        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value));
+        let partition_key: ScalarTopNKeyFn<()> = Arc::new(|_| Some(()));
+        let order_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value));
         let mut op = TopNOp::new_with_batch_key_extractor(
             state,
             table.clone(),
@@ -922,10 +917,8 @@ mod tests {
         .expect("output");
 
         // Key encoding: partition = key / 100, order = key % 100.
-        let partition_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value / 100));
-        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value % 100));
+        let partition_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value / 100));
+        let order_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value % 100));
         let mut op = TopNOp::new_with_batch_key_extractor(
             state,
             table.clone(),
@@ -997,10 +990,8 @@ mod tests {
         .await
         .expect("output");
 
-        let partition_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value / 100));
-        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value % 100));
+        let partition_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value / 100));
+        let order_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value % 100));
         let mut op = TopNOp::new_with_batch_key_extractor(
             state,
             table.clone(),
@@ -1087,10 +1078,9 @@ mod tests {
         .await
         .expect("output");
 
-        let partition_key: Arc<dyn Fn(&i64) -> Option<()> + Send + Sync> = Arc::new(|_| Some(()));
+        let partition_key: ScalarTopNKeyFn<()> = Arc::new(|_| Some(()));
         // All inserted rows tie on this key (value % 10 == 1).
-        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value % 10));
+        let order_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value % 10));
         let mut op = TopNOp::new_with_batch_key_extractor(
             state,
             table.clone(),
@@ -1172,10 +1162,8 @@ mod tests {
         let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
             .await
             .expect("output");
-        let partition_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value / 100));
-        let order_key: Arc<dyn Fn(&i64) -> Option<i64> + Send + Sync> =
-            Arc::new(|value| Some(*value % 100));
+        let partition_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value / 100));
+        let order_key: ScalarTopNKeyFn<i64> = Arc::new(|value| Some(*value % 100));
         let mut op = TopNOp::new_with_batch_key_extractor(
             state,
             table.clone(),

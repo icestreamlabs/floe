@@ -295,7 +295,11 @@ fn normalize_optimizer_source_projections(
                     }
                     .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?;
                     let output_schema = Arc::clone(&rebased.output_schema);
-                    (new_inputs, DbspNodeKind::Join(rebased), output_schema)
+                    (
+                        new_inputs,
+                        DbspNodeKind::Join(Box::new(rebased)),
+                        output_schema,
+                    )
                 }
                 _ => continue,
             };

@@ -313,8 +313,8 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub state: RelationState<(K, GroupedIncrementalAggregateState)>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) state: RelationState<(K, GroupedIncrementalAggregateState)>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     pub row_evaluator: BatchRowEvaluator<V, K>,
     output: VersionedZSet<(K, Vec<AggregateValue>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,

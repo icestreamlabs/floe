@@ -3971,6 +3971,12 @@ fn print_tail(path: PathBuf, lines: usize) {
     }
 }
 
+fn print_usage() {
+    println!(
+        "Usage: nexmark_cross_engine_compare [floe|materialize|risingwave|feldera|all] [all|nexmark_all|q0..q22]"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4006,10 +4012,4 @@ mod tests {
             assert!(!lower.contains("split_part("), "{query_id}: {query}");
         }
     }
-}
-
-fn print_usage() {
-    println!(
-        "Usage: nexmark_cross_engine_compare [floe|materialize|risingwave|feldera|all] [all|nexmark_all|q0..q22]"
-    );
 }

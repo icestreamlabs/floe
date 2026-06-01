@@ -549,6 +549,7 @@ impl ReplicationPipelineRuntime {
                     checkpoint_transaction_id,
                     target_state,
                     pending_transactions: stats.pending_transactions(),
+                    pending_objects: stats.pending_objects(),
                     pending_records: stats.pending_records(),
                     pending_bytes: stats.pending_bytes(),
                     oldest_pending_age_ms: stats.oldest_pending_age_ms(),

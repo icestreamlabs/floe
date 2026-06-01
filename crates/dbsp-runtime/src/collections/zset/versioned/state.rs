@@ -49,26 +49,6 @@ impl Default for CompactionPolicy {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{CompactionPolicy, VersionChainStats};
-
-    #[test]
-    fn compaction_policy_triggers_on_bucket_depth() {
-        let policy = CompactionPolicy {
-            max_chain_len: usize::MAX,
-            max_segments: usize::MAX,
-            max_bucket_segments: 3,
-        };
-        let stats = VersionChainStats {
-            version_count: 1,
-            segment_count: 2,
-            max_bucket_segment_count: 3,
-        };
-        assert!(policy.should_compact(stats));
-    }
-}
-
 #[allow(dead_code)]
 impl<K> VersionedZSet<K>
 where
@@ -250,5 +230,25 @@ where
         let id = self.next_segment_id;
         self.next_segment_id = self.next_segment_id.saturating_add(1);
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactionPolicy, VersionChainStats};
+
+    #[test]
+    fn compaction_policy_triggers_on_bucket_depth() {
+        let policy = CompactionPolicy {
+            max_chain_len: usize::MAX,
+            max_segments: usize::MAX,
+            max_bucket_segments: 3,
+        };
+        let stats = VersionChainStats {
+            version_count: 1,
+            segment_count: 2,
+            max_bucket_segment_count: 3,
+        };
+        assert!(policy.should_compact(stats));
     }
 }

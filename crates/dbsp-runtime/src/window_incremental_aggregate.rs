@@ -498,6 +498,8 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::Ordering;
 
+    type TestWindowInput = WindowIncrementalInput<i64, (i64, i64)>;
+
     async fn build_db() -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         Arc::new(
@@ -598,7 +600,7 @@ mod tests {
         let aggregate_op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|rows: &[(WindowIncrementalInput<i64, (i64, i64)>, i64)]| {
+            Arc::new(|rows: &[(TestWindowInput, i64)]| {
                 rows.iter()
                     .map(|(row, weight)| {
                         (

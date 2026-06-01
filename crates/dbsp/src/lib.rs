@@ -21,6 +21,7 @@ pub mod circuit {
     }
 }
 
+#[cfg(feature = "semantic")]
 pub mod semantic {
     pub use dbsp_semantic::*;
 }

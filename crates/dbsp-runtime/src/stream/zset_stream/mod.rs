@@ -94,6 +94,35 @@ impl CompactionScheduler {
     }
 }
 
+pub struct ZSetStream<K>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub(crate) stream: Stream<ZSetHandle>,
+    delta_stream: Stream<ZSetHandle>,
+    versioned: VersionedZSet<K>,
+    delta_versioned: VersionedZSet<K>,
+    overlay: HashMap<K, i64>,
+    retention: StreamRetention,
+    compaction: CompactionPolicy,
+    compaction_scheduler: CompactionScheduler,
+    retention_window: VecDeque<ZSetHandle>,
+    retention_counts: HashMap<u64, usize>,
+    current_handle: ZSetHandle,
+    delta_retention_window: VecDeque<ZSetHandle>,
+    delta_retention_counts: HashMap<u64, usize>,
+    delta_current_handle: ZSetHandle,
+    pending_compaction: Option<JoinHandle<anyhow::Result<CompactionResult>>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CompactionScheduler, CompactionSchedulerConfig};
@@ -139,33 +168,4 @@ mod tests {
             "scheduler should allow compaction after backoff"
         );
     }
-}
-
-pub struct ZSetStream<K>
-where
-    K: Archive
-        + Clone
-        + Eq
-        + Hash
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    pub(crate) stream: Stream<ZSetHandle>,
-    delta_stream: Stream<ZSetHandle>,
-    versioned: VersionedZSet<K>,
-    delta_versioned: VersionedZSet<K>,
-    overlay: HashMap<K, i64>,
-    retention: StreamRetention,
-    compaction: CompactionPolicy,
-    compaction_scheduler: CompactionScheduler,
-    retention_window: VecDeque<ZSetHandle>,
-    retention_counts: HashMap<u64, usize>,
-    current_handle: ZSetHandle,
-    delta_retention_window: VecDeque<ZSetHandle>,
-    delta_retention_counts: HashMap<u64, usize>,
-    delta_current_handle: ZSetHandle,
-    pending_compaction: Option<JoinHandle<anyhow::Result<CompactionResult>>>,
 }

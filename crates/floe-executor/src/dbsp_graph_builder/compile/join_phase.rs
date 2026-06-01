@@ -219,17 +219,15 @@ impl DbspGraphBuilder {
         let left_timestamp_option =
             direct_column_index(asof.left_timestamp_expression(), left_schema.as_ref());
         let mut left_key_columns = Vec::with_capacity(node.keys.len());
-        let left_timestamp_column = if left_key_column_options.iter().all(Option::is_some)
-            && left_timestamp_option.is_some()
-        {
-            left_key_columns.extend(
-                left_key_column_options
-                    .iter()
-                    .copied()
-                    .collect::<Option<Vec<_>>>()
-                    .expect("all left ASOF key columns should be direct"),
-            );
-            left_timestamp_option.expect("left ASOF timestamp should be direct")
+        let left_timestamp_column = if let (Some(timestamp_column), Some(key_columns)) = (
+            left_timestamp_option,
+            left_key_column_options
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>(),
+        ) {
+            left_key_columns.extend(key_columns);
+            timestamp_column
         } else {
             let mut items = Vec::with_capacity(left_schema.len() + node.keys.len() + 1);
             for field in left_schema.fields() {
@@ -280,17 +278,15 @@ impl DbspGraphBuilder {
         let right_timestamp_option =
             direct_column_index(asof.right_timestamp_expression(), right_schema.as_ref());
         let mut right_key_columns = Vec::with_capacity(node.keys.len());
-        let right_timestamp_column = if right_key_column_options.iter().all(Option::is_some)
-            && right_timestamp_option.is_some()
-        {
-            right_key_columns.extend(
-                right_key_column_options
-                    .iter()
-                    .copied()
-                    .collect::<Option<Vec<_>>>()
-                    .expect("all right ASOF key columns should be direct"),
-            );
-            right_timestamp_option.expect("right ASOF timestamp should be direct")
+        let right_timestamp_column = if let (Some(timestamp_column), Some(key_columns)) = (
+            right_timestamp_option,
+            right_key_column_options
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>(),
+        ) {
+            right_key_columns.extend(key_columns);
+            timestamp_column
         } else {
             let mut items = Vec::with_capacity(right_schema.len() + node.keys.len() + 1);
             for field in right_schema.fields() {
@@ -657,17 +653,15 @@ impl DbspGraphBuilder {
         let identity_left_key = |delta_values: &[(Vec<u8>, i64)]| {
             delta_values
                 .iter()
-                .filter_map(|(row, weight)| {
-                    (*weight != 0).then(|| (row.clone(), row.clone(), *weight))
-                })
+                .filter(|(_, weight)| *weight != 0)
+                .map(|(row, weight)| (row.clone(), row.clone(), *weight))
                 .collect::<Vec<_>>()
         };
         let identity_right_key = |delta_values: &[(Vec<u8>, i64)]| {
             delta_values
                 .iter()
-                .filter_map(|(row, weight)| {
-                    (*weight != 0).then(|| (row.clone(), row.clone(), *weight))
-                })
+                .filter(|(_, weight)| *weight != 0)
+                .map(|(row, weight)| (row.clone(), row.clone(), *weight))
                 .collect::<Vec<_>>()
         };
         let antijoin_events = task_events.clone();
@@ -778,8 +772,11 @@ impl DbspGraphBuilder {
         let right_key_column =
             direct_column_index(range.right_key_expression(), right_schema.as_ref());
 
-        let (left_lower_column, left_upper_column) =
-            if left_lower_column.is_none() || left_upper_column.is_none() {
+        let (left_lower_column, left_upper_column) = match (left_lower_column, left_upper_column) {
+            (Some(left_lower_column), Some(left_upper_column)) => {
+                (left_lower_column, left_upper_column)
+            }
+            (left_lower_column, left_upper_column) => {
                 let mut items = Vec::with_capacity(left_schema.len() + 2);
                 for field in left_schema.fields() {
                     items.push(dbsp::circuit::plan::ProjectItem {
@@ -808,8 +805,7 @@ impl DbspGraphBuilder {
                         expr: range.left_upper_expression().expr().clone(),
                         alias: Some(alias),
                     });
-                    let column_idx = next_index;
-                    column_idx
+                    next_index
                 };
                 let precompute = dbsp::DbspProjectNode::try_new(Arc::clone(&left_schema), items)
                     .context("build range join left bound precompute projection")?;
@@ -819,12 +815,8 @@ impl DbspGraphBuilder {
                     .await
                     .context("initialize range join left bound precompute map")?;
                 (lower_column, upper_column)
-            } else {
-                (
-                    left_lower_column.expect("left lower column should be direct"),
-                    left_upper_column.expect("left upper column should be direct"),
-                )
-            };
+            }
+        };
 
         let right_key_column = if let Some(column_idx) = right_key_column {
             column_idx

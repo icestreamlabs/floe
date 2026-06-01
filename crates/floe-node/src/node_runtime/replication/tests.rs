@@ -1248,6 +1248,7 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
     assert_eq!(snapshot.source_name(), "pg_main");
     assert_eq!(snapshot.target_kind(), "kafka");
     assert_eq!(snapshot.pending_transactions(), 1);
+    assert_eq!(snapshot.pending_objects(), 1);
     assert_eq!(snapshot.pending_records(), manifest.record_count());
     assert!(snapshot.pending_bytes() > 0);
     assert!(snapshot.oldest_pending_age_ms().is_some());
@@ -1316,6 +1317,7 @@ async fn status_snapshots_expose_buffer_checkpoint_replay_and_error_state() {
         Some("pg-xid-77")
     );
     assert_eq!(debug_pipeline.pending_transactions, 1);
+    assert_eq!(debug_pipeline.pending_objects, 1);
     assert_eq!(debug_pipeline.pending_records, manifest.record_count());
     assert!(debug_pipeline.pending_bytes > 0);
     assert!(debug_pipeline.oldest_pending_age_ms.is_some());
@@ -2165,6 +2167,7 @@ async fn durable_pipeline_stops_source_progress_when_buffer_cap_remains_exceeded
     let snapshots = runtime.status_snapshots(&storage).await.unwrap();
     let snapshot = snapshots.first().expect("snapshot");
     assert_eq!(snapshot.pending_transactions(), 1);
+    assert_eq!(snapshot.pending_objects(), 1);
     assert_eq!(snapshot.pending_records(), pending[0].record_count());
     assert!(snapshot.source_backpressure_active());
 }

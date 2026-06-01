@@ -514,7 +514,7 @@ mod tests {
         let mut batch = WriteBatch::new();
         let intent =
             encoding::encode(&super::ManifestIntent { version: 11 }).expect("encode intent");
-        batch.put(store.intent_key_bytes().to_vec(), intent);
+        batch.put(store.intent_key_bytes(), intent);
         table
             .write_batch(batch)
             .await

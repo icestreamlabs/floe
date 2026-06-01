@@ -1,16 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/node_process.rs"]
+mod node_process;
 #[path = "support/ports.rs"]
 mod ports;
 
 use anyhow::{Context, Result, bail};
+use node_process::{
+    post_bid_with_extra, spawn_node, spawn_node_with_args, stop_child, wait_for_healthz,
+};
 use ports::find_unused_port;
-use reqwest::StatusCode;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::TempDir;
-use tokio::process::{Child, Command};
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
@@ -324,106 +326,15 @@ default_source = "nexmark_bid"
     Ok(())
 }
 
-async fn spawn_node(
-    config_path: &Path,
-    data_dir: &Path,
-    pg_port: u16,
-    mv_sql: Option<&str>,
-) -> Result<Child> {
-    spawn_node_with_args(config_path, data_dir, pg_port, mv_sql, &[]).await
-}
-
-async fn spawn_node_with_args(
-    config_path: &Path,
-    data_dir: &Path,
-    pg_port: u16,
-    mv_sql: Option<&str>,
-    extra_args: &[&str],
-) -> Result<Child> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_floe-node"));
-    cmd.arg("run");
-    if pg_port > 0 {
-        cmd.arg("--pgwire-addr").arg(format!("127.0.0.1:{pg_port}"));
-    } else {
-        cmd.arg("--disable-pgwire");
-    }
-    cmd.arg("--data-dir")
-        .arg(data_dir)
-        .arg("--admin-port")
-        .arg("0")
-        .arg("--config")
-        .arg(config_path.to_string_lossy().to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    for arg in extra_args {
-        cmd.arg(arg);
-    }
-    if let Some(sql) = mv_sql {
-        cmd.arg("--mv-query").arg(sql);
-    }
-    cmd.spawn().context("spawn floe-node")
-}
-
-async fn stop_child(child: &mut Child, signal: &str) {
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("kill")
-            .arg(format!("-{signal}"))
-            .arg(pid.to_string())
-            .status();
-    }
-    let _ = child.wait().await;
-}
-
-async fn wait_for_healthz(addr: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    for attempt in 0..60 {
-        match client.get(format!("{addr}/healthz")).send().await {
-            Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(_) | Err(_) if attempt < 59 => sleep(Duration::from_millis(100)).await,
-            Ok(response) => bail!("healthz returned {}", response.status()),
-            Err(err) => bail!("healthz never became ready: {err}"),
-        }
-    }
-    unreachable!("loop either returns success or bails")
-}
-
 async fn post_bid(addr: &str, auction: i64, bidder: i64, price: i64) -> Result<()> {
-    let payload = json!({
-        "source": "nexmark_bid",
-        "data": {
-            "auction": auction,
-            "bidder": bidder,
-            "price": price,
-            "channel": "web",
-            "url": "http://example.com",
-            "date_time": 1_700_000_000_i64 + auction,
-            "extra": "smoke"
-        }
-    });
-    let response = reqwest::Client::new()
-        .post(format!("{addr}/ingest"))
-        .json(&payload)
-        .send()
-        .await
-        .context("post bid payload")?;
-    if response.status() != StatusCode::OK {
-        bail!("ingest returned {}", response.status());
-    }
-    Ok(())
+    post_bid_with_extra(addr, auction, bidder, price, "smoke").await
 }
 
 async fn wait_for_rows_matching(
     path: &Path,
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Vec<Value>> {
-    for _ in 0..80 {
-        let rows = read_rows(path).await?;
-        if rows.iter().any(&predicate) {
-            return Ok(rows);
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    bail!("predicate did not match rows in {}", path.to_string_lossy())
+    node_process::wait_for_jsonl_rows_matching(path, 80, predicate).await
 }
 
 async fn wait_for_mv_count_at_least(pg_port: u16, min_count: i64) -> Result<i64> {
@@ -537,24 +448,6 @@ async fn query_source_bid(pg_port: u16, auction: i64) -> Result<Option<SourceBid
         })
     })
     .transpose()
-}
-
-async fn read_rows(path: &Path) -> Result<Vec<Value>> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(contents) => {
-            let mut rows = Vec::new();
-            for line in contents.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                rows.push(serde_json::from_str(trimmed).context("parse sink row json")?);
-            }
-            Ok(rows)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 #[allow(dead_code)]

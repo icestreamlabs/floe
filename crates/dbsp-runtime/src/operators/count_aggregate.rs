@@ -106,8 +106,8 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub state: RelationState<(K, GroupedCountState)>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) state: RelationState<(K, GroupedCountState)>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     pub row_evaluator: BatchRowEvaluator<V, K, D>,
     output: VersionedZSet<(K, Vec<i64>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,

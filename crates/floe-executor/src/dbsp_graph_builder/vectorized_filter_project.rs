@@ -13,7 +13,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::datasource::MemTable;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::expr_fn::SimpleScalarUDF;
 use datafusion::logical_expr::{
@@ -34,6 +33,7 @@ pub(crate) struct VectorizedFilterProjectEvaluator {
     predicate_expr: Option<Expr>,
     projection_exprs: Arc<Vec<(Expr, String)>>,
     mode: VectorizedFilterProjectMode,
+    ctx: SessionContext,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +70,7 @@ impl VectorizedFilterProjectEvaluator {
             predicate_expr: Some(normalize_floe_udfs(predicate.expression().expr().clone())?),
             projection_exprs: Arc::new(Vec::new()),
             mode: VectorizedFilterProjectMode::FilterPassthrough,
+            ctx: SessionContext::new(),
         })
     }
 
@@ -107,6 +108,7 @@ impl VectorizedFilterProjectEvaluator {
                 .transpose()?,
             projection_exprs,
             mode,
+            ctx: SessionContext::new(),
         })
     }
 
@@ -129,15 +131,18 @@ impl VectorizedFilterProjectEvaluator {
             },
         )
         .context("create vectorized filter/project input delta buffer")?;
-        let mut staged_rows = Vec::with_capacity(delta_values.len());
+        let passthrough_filter = self.mode == VectorizedFilterProjectMode::FilterPassthrough;
+        let mut staged_rows = passthrough_filter.then(|| Vec::with_capacity(delta_values.len()));
         for (row, weight) in delta_values.iter() {
             if *weight == 0 {
                 continue;
             }
             let _ = buffer
-                .push(row.clone(), *weight, None)
+                .push_ref(row, *weight, None)
                 .with_context(|| format!("decode input row for vectorized graph '{graph_id}'"))?;
-            staged_rows.push((row.clone(), *weight));
+            if let Some(staged_rows) = staged_rows.as_mut() {
+                staged_rows.push((row.clone(), *weight));
+            }
         }
         let Some(input_batch) = buffer
             .flush_manual()
@@ -146,19 +151,13 @@ impl VectorizedFilterProjectEvaluator {
             return Ok(Vec::new());
         };
 
-        let ctx = SessionContext::new();
-        let delta_schema = input_batch.schema();
-        let table = MemTable::try_new(delta_schema, vec![vec![input_batch]])
-            .context("create DataFusion delta table for vectorized filter/project")?;
-        ctx.register_table("__floe_delta", Arc::new(table))
-            .context("register vectorized filter/project delta table")?;
-        let mut df = ctx
-            .table("__floe_delta")
-            .await
-            .context("open vectorized filter/project delta table")?;
-        if self.mode == VectorizedFilterProjectMode::FilterPassthrough {
+        let mut df = self
+            .ctx
+            .read_batch(input_batch)
+            .context("open vectorized filter/project delta batch")?;
+        if passthrough_filter {
             return self
-                .filter_passthrough(df, staged_rows)
+                .filter_passthrough(df, staged_rows.unwrap_or_default())
                 .await
                 .context("apply vectorized filter predicate");
         }

@@ -426,7 +426,7 @@ impl VectorizedTopNKeyParts {
             if *weight == 0 {
                 continue;
             }
-            if buffer.push(row.clone(), *weight, None)?.is_some() {
+            if buffer.push_ref(row, *weight, None)?.is_some() {
                 bail!("unbounded vectorized topn key extractor flushed before manual flush");
             }
             staged_rows.push((row.clone(), *weight));

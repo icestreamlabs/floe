@@ -313,7 +313,7 @@ impl TransientTopNKeyExtractor {
             if *diff == 0 {
                 continue;
             }
-            if buffer.push(row_key.clone(), *diff, None)?.is_some() {
+            if buffer.push_ref(row_key, *diff, None)?.is_some() {
                 bail!("unbounded transient topn key extractor flushed before manual flush");
             }
             staged_rows.push((row_key.clone(), *diff));
@@ -2169,7 +2169,7 @@ fn project_encoded_deltas(
         if *weight == 0 {
             continue;
         }
-        if buffer.push(encoded.clone(), *weight, None)?.is_some() {
+        if buffer.push_ref(encoded, *weight, None)?.is_some() {
             bail!("unbounded transient topn projection flushed before manual flush");
         }
         staged_weights.push(*weight);

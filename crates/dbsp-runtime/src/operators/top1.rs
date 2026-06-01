@@ -52,7 +52,7 @@ where
     O: Clone + Ord + Send + Sync + 'static,
 {
     pub input_index: IndexedBatchZSet<P, K>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     partition_output_cache: BTreeMap<P, K>,

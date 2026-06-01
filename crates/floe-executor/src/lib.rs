@@ -28,7 +28,6 @@ pub mod mv;
 pub mod mv_changelog;
 pub mod mv_loader;
 pub mod namespaces;
-pub mod nexmark_sources;
 pub mod operator_state;
 pub mod outer_stream;
 mod scalar_array_builder;

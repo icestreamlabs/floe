@@ -445,10 +445,10 @@ mod tests {
                 if *weight == 0 {
                     continue;
                 }
-                if let Some(value_key) = (key_extractor)(value) {
-                    if value_key == key {
-                        values.push((*value, *weight));
-                    }
+                if let Some(value_key) = (key_extractor)(value)
+                    && value_key == key
+                {
+                    values.push((*value, *weight));
                 }
             }
             if let Some(aggregate) = (spec.aggregator)(&key, &values) {
@@ -612,7 +612,7 @@ mod tests {
             );
 
             let mut input_state: HashMap<i64, i64> = HashMap::new();
-            let steps = vec![
+            let steps = [
                 vec![(1, 1), (2, 2), (3, 1)],
                 vec![(2, -1), (4, 3)],
                 vec![(1, -1), (2, -1), (3, -1), (4, -3)],

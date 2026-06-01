@@ -68,15 +68,14 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub left_state: RelationState<L>,
-    pub right_state: RelationState<R>,
-    pub left_index: IndexedBatchZSet<K, L>,
-    pub right_index: IndexedBatchZSet<K, ()>,
-    pub left_key: BatchJoinKeyExtractor<L, K>,
-    pub right_key: BatchJoinKeyExtractor<R, K>,
+    pub(crate) left_state: RelationState<L>,
+    pub(crate) left_index: IndexedBatchZSet<K, L>,
+    pub(crate) right_index: IndexedBatchZSet<K, ()>,
+    pub(crate) left_key: BatchJoinKeyExtractor<L, K>,
+    pub(crate) right_key: BatchJoinKeyExtractor<R, K>,
     pub mode: SemiJoinMode,
-    pub table: Arc<dyn KeyValueTable>,
-    pub integrated: Option<RelationState<L>>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
+    pub(crate) integrated: Option<RelationState<L>>,
     output: VersionedZSet<L>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
@@ -116,7 +115,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new_batch(
         left_state: RelationState<L>,
-        right_state: RelationState<R>,
+        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, ()>,
         left_key: BatchJoinKeyExtractor<L, K>,
@@ -128,7 +127,6 @@ where
     ) -> Self {
         Self {
             left_state,
-            right_state,
             left_index,
             right_index,
             left_key,

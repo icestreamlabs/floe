@@ -32,8 +32,8 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub state: RelationState<K>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) state: RelationState<K>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     integrated_cache: Option<HashMap<K, i64>>,

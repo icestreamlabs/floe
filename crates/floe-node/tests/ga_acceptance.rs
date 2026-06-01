@@ -1,7 +1,8 @@
 use std::path::Path;
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/node_process.rs"]
+mod node_process;
 #[path = "support/ports.rs"]
 mod ports;
 
@@ -10,6 +11,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use node_process::{
+    post_bid_with_extra, spawn_node, spawn_node_with_args, stop_child, wait_for_healthz,
+};
 use ports::find_unused_port;
 use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
@@ -18,7 +22,6 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener as TokioTcpListener;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tokio_postgres::NoTls;
@@ -1174,7 +1177,8 @@ async fn postgres_cdc_shared_source_snapshot_converges_to_wal_stream() -> Result
          SELECT b.auction, b.bidder, b.price, a.seller
          FROM {bid_table} AS b JOIN {auction_table} AS a ON b.auction = a.id"
     );
-    let admin_args = vec!["--admin-port".to_string(), admin_port.to_string()];
+    let admin_port_arg = admin_port.to_string();
+    let admin_args = ["--admin-port", admin_port_arg.as_str()];
     let mut child =
         spawn_node_with_args(&config_path, &data_dir, pg_port, Some(&sql), &admin_args).await?;
 
@@ -1458,8 +1462,7 @@ async fn postgres_cdc_auto_creates_publication_and_slot_acceptance() -> Result<(
             )
             .await
             .context("check auto-created slot")?
-            .map(|row| row.get::<_, Option<String>>(0))
-            .flatten();
+            .and_then(|row| row.get::<_, Option<String>>(0));
 
         ensure!(publication_exists, "publication was not auto-created");
         ensure!(
@@ -1777,78 +1780,6 @@ fn payload_to_rows(payload: Value) -> Vec<Value> {
     }
 }
 
-async fn spawn_node(
-    config_path: &Path,
-    data_dir: &Path,
-    pg_port: u16,
-    mv_sql: Option<&str>,
-) -> Result<Child> {
-    spawn_node_with_args(config_path, data_dir, pg_port, mv_sql, &[]).await
-}
-
-async fn spawn_node_with_args(
-    config_path: &Path,
-    data_dir: &Path,
-    pg_port: u16,
-    mv_sql: Option<&str>,
-    extra_args: &[String],
-) -> Result<Child> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_floe-node"));
-    cmd.arg("run");
-    if pg_port > 0 {
-        cmd.arg("--pgwire-addr").arg(format!("127.0.0.1:{pg_port}"));
-    } else {
-        cmd.arg("--disable-pgwire");
-    }
-    cmd.arg("--data-dir")
-        .arg(data_dir)
-        .arg("--config")
-        .arg(config_path.to_string_lossy().to_string())
-        .stdout(if std::env::var_os("FLOE_TEST_NODE_STDERR").is_some() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
-        .stderr(if std::env::var_os("FLOE_TEST_NODE_STDERR").is_some() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        });
-    if !extra_args.iter().any(|arg| arg == "--admin-port") {
-        cmd.arg("--admin-port").arg("0");
-    }
-    for arg in extra_args {
-        cmd.arg(arg);
-    }
-    if let Some(sql) = mv_sql {
-        cmd.arg("--mv-query").arg(sql);
-    }
-    cmd.spawn().context("spawn floe-node")
-}
-
-async fn stop_child(child: &mut Child, signal: &str) {
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("kill")
-            .arg(format!("-{signal}"))
-            .arg(pid.to_string())
-            .status();
-    }
-    let _ = child.wait().await;
-}
-
-async fn wait_for_healthz(addr: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    for attempt in 0..60 {
-        match client.get(format!("{addr}/healthz")).send().await {
-            Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(_) | Err(_) if attempt < 59 => sleep(Duration::from_millis(100)).await,
-            Ok(response) => bail!("healthz returned {}", response.status()),
-            Err(err) => bail!("healthz never became ready: {err}"),
-        }
-    }
-    unreachable!("loop either returns success or bails")
-}
-
 async fn wait_for_admin_metrics_contains(admin_port: u16, needle: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{admin_port}/metrics");
@@ -1868,28 +1799,7 @@ async fn wait_for_admin_metrics_contains(admin_port: u16, needle: &str) -> Resul
 }
 
 async fn post_bid(addr: &str, auction: i64, bidder: i64, price: i64) -> Result<()> {
-    let payload = json!({
-        "source": "nexmark_bid",
-        "data": {
-            "auction": auction,
-            "bidder": bidder,
-            "price": price,
-            "channel": "web",
-            "url": "http://example.com",
-            "date_time": 1_700_000_000_i64 + auction,
-            "extra": "acceptance"
-        }
-    });
-    let response = reqwest::Client::new()
-        .post(format!("{addr}/ingest"))
-        .json(&payload)
-        .send()
-        .await
-        .context("post acceptance bid payload")?;
-    if response.status() != StatusCode::OK {
-        bail!("ingest returned {}", response.status());
-    }
-    Ok(())
+    post_bid_with_extra(addr, auction, bidder, price, "acceptance").await
 }
 
 async fn create_kafka_topic(brokers: &str, topic: &str) -> Result<()> {
@@ -2379,29 +2289,5 @@ async fn wait_for_rows_matching(
     path: &Path,
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Vec<Value>> {
-    for _ in 0..120 {
-        let rows = read_rows(path).await?;
-        if rows.iter().any(&predicate) {
-            return Ok(rows);
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    bail!("predicate did not match rows in {}", path.to_string_lossy())
-}
-
-async fn read_rows(path: &Path) -> Result<Vec<Value>> {
-    let contents = match tokio::fs::read_to_string(path).await {
-        Ok(value) => value,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
-    let mut rows = Vec::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        rows.push(serde_json::from_str::<Value>(line).context("parse jsonl row")?);
-    }
-    Ok(rows)
+    node_process::wait_for_jsonl_rows_matching(path, 120, predicate).await
 }

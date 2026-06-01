@@ -1042,7 +1042,7 @@ pub enum DbspNodeKind {
     Source(DbspSourceNode),
     Select(DbspSelectNode),
     Project(DbspProjectNode),
-    Join(DbspJoinNode),
+    Join(Box<DbspJoinNode>),
     Aggregate(DbspAggregateNode),
     WindowAggregate(DbspWindowAggregateNode),
     TopN(DbspTopNNode),
