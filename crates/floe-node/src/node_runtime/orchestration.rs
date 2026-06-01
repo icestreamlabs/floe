@@ -1,4 +1,5 @@
 use super::*;
+use floe_executor::stream_types::EncodedDeltaBatch;
 
 pub(super) fn source_journal_required_sources(
     registry: &SourceRegistry,
@@ -1337,6 +1338,25 @@ fn build_tick_commit_for_checkpoint(
     )
     .with_kafka_offsets(checkpoint_kafka_offsets(committed_kafka_offsets))
     .with_operator_states(checkpoint_operator_states())
+}
+
+type SourceJournalTransientBatch = (usize, Option<i64>, EncodedDeltaBatch);
+type SourceJournalCommitBatch = (String, Option<i64>, EncodedDeltaBatch);
+
+fn build_source_journal_commit_batches(
+    source_names_by_id: &[String],
+    source_journal_batches: &[SourceJournalTransientBatch],
+) -> Vec<SourceJournalCommitBatch> {
+    source_journal_batches
+        .iter()
+        .map(|(source_id, max_event_time_ms, deltas)| {
+            (
+                source_names_by_id[*source_id].clone(),
+                *max_event_time_ms,
+                deltas.clone(),
+            )
+        })
+        .collect()
 }
 
 fn checkpoint_kafka_offsets(
@@ -3514,7 +3534,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 changed = true;
             }
 
-            let mut source_journal_batches = Vec::new();
+            let mut source_journal_batches: Vec<SourceJournalTransientBatch> = Vec::new();
             for &source_id in source_journal_source_ids_for_task.iter() {
                 let source_name = source_names_by_id_for_task[source_id].as_str();
                 let Some(writer) = registry.writer_mut(source_name) else {
@@ -3718,16 +3738,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 &next_committed_kafka_offsets,
             );
             let committed_at_ms = tick_commit.committed_at_unix_ms;
-            let source_journal_commit_batches: Vec<_> = source_journal_batches
-                .iter()
-                .map(|(source_id, max_event_time_ms, deltas)| {
-                    (
-                        source_names_by_id_for_task[*source_id].clone(),
-                        *max_event_time_ms,
-                        deltas.clone(),
-                    )
-                })
-                .collect();
+            let source_journal_commit_batches = build_source_journal_commit_batches(
+                &source_names_by_id_for_task,
+                &source_journal_batches,
+            );
             let checkpoint_write_start = Instant::now();
             let checkpoint_result = if let Some(staged_writes) = cdc_staged_writes {
                 checkpoint_manager

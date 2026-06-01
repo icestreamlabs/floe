@@ -24,6 +24,9 @@ struct JoinEvidenceState {
     right_empty: ZSetHandle,
 }
 
+type RowKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
+type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
+
 async fn build_db(name: &str) -> Arc<Db> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     Arc::new(Db::open(name, store).await.expect("open slate db"))
@@ -93,6 +96,19 @@ fn join_key(row: &i64) -> Option<i64> {
     Some(*row / 1_000)
 }
 
+fn batch_join_key<T, K>(key_extractor: RowKeyExtractor<T, K>) -> BatchJoinKeyExtractor<T, K>
+where
+    T: Clone + 'static,
+    K: 'static,
+{
+    Arc::new(move |deltas: &[(T, i64)]| {
+        deltas
+            .iter()
+            .filter_map(|(row, weight)| key_extractor(row).map(|key| (key, row.clone(), *weight)))
+            .collect()
+    })
+}
+
 async fn build_join_state(unrelated_history: usize, affected_fanout: usize) -> JoinEvidenceState {
     let id = BENCH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let prefix = format!("incrementality_evidence_{unrelated_history}_{affected_fanout}_{id}");
@@ -127,13 +143,13 @@ async fn build_join_state(unrelated_history: usize, affected_fanout: usize) -> J
         .await
         .expect("output zset");
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
         IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
-        Arc::new(join_key),
-        Arc::new(join_key),
+        batch_join_key(Arc::new(join_key)),
+        batch_join_key(Arc::new(join_key)),
         Arc::new(|left: &i64, right: &i64| join_key(left) == join_key(right)),
         Arc::new(|left: &i64, right: &i64| left + right),
         table.clone(),

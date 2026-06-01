@@ -1,12 +1,12 @@
 pub mod cdc_delta_encoder;
 pub mod connector;
 pub mod debezium_encoder;
-pub mod event_parser;
+pub(crate) mod event_parser;
 pub mod executor;
 pub mod file_connector;
 pub mod generator;
+pub mod harness;
 pub mod kafka_connector;
-pub mod nexmark_queries;
 pub mod object_store_connector;
 pub mod planner;
 pub mod postgres_cdc;

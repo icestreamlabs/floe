@@ -4,7 +4,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use floe_executor::dbsp_plan::{DbspPlanBuilder, nexmark_config, validate_dbsp_plan};
 use floe_node_core::generator;
-use floe_node_core::nexmark_queries::canonical_nexmark_queries;
+use floe_node_core::harness::nexmark_queries::canonical_nexmark_queries;
 use floe_node_core::planner::plan_materialized_views;
 use floe_node_core::source::SourceRegistry;
 use floe_sql_parser::parse_materialized_view;

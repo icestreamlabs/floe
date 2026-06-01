@@ -621,7 +621,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let rebuilt_join_schema = rebuilt_join.output_schema.clone();
         let rebuilt_join_id = self.add_node(
             vec![left.id, right.id],
-            DbspNodeKind::Join(rebuilt_join),
+            DbspNodeKind::Join(Box::new(rebuilt_join)),
             rebuilt_join_schema.clone(),
         );
         let mut current = PlannedNode {
@@ -859,7 +859,7 @@ impl<'cfg> PlannerContext<'cfg> {
                     let output_schema = range_join_node.output_schema.clone();
                     let id = self.add_node(
                         vec![left.id, right.id],
-                        DbspNodeKind::Join(range_join_node),
+                        DbspNodeKind::Join(Box::new(range_join_node)),
                         output_schema.clone(),
                     );
                     return Ok(PlannedNode {
@@ -886,7 +886,7 @@ impl<'cfg> PlannerContext<'cfg> {
                     let output_schema = asof_join_node.output_schema.clone();
                     let id = self.add_node(
                         vec![left.id, right.id],
-                        DbspNodeKind::Join(asof_join_node),
+                        DbspNodeKind::Join(Box::new(asof_join_node)),
                         output_schema.clone(),
                     );
                     return Ok(PlannedNode {
@@ -918,7 +918,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let output_schema = join_node.output_schema.clone();
         let id = self.add_node(
             vec![left.id, right.id],
-            DbspNodeKind::Join(join_node),
+            DbspNodeKind::Join(Box::new(join_node)),
             output_schema.clone(),
         );
         Ok(PlannedNode {
@@ -1000,7 +1000,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let output_schema = asof_join_node.output_schema.clone();
         let id = self.add_node(
             vec![left.id, right.id],
-            DbspNodeKind::Join(asof_join_node),
+            DbspNodeKind::Join(Box::new(asof_join_node)),
             output_schema.clone(),
         );
         Ok(PlannedNode {

@@ -367,6 +367,7 @@ async fn stats_report_size_and_oldest_age() {
 
     let stats = store.stats("pipe", 2500).await.expect("stats");
     assert_eq!(stats.pending_transactions(), 2);
+    assert_eq!(stats.pending_objects(), 2);
     assert_eq!(stats.pending_records(), 3);
     assert_eq!(stats.oldest_pending_age_ms(), Some(1500));
     assert!(stats.pending_bytes() > 0);
@@ -384,6 +385,7 @@ async fn stats_account_payload_bytes_separately_from_manifest_metadata() {
     let stats = store.stats("pipe", 2000).await.expect("stats");
 
     assert_eq!(stats.pending_transactions(), 1);
+    assert_eq!(stats.pending_objects(), 1);
     assert_eq!(stats.pending_records(), manifest.record_count());
     assert_eq!(stats.pending_bytes(), manifest.payload_bytes());
     assert!(serde_json::to_vec(&manifest).unwrap().len() > manifest.payload_bytes());

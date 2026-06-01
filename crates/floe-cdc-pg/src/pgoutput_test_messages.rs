@@ -139,7 +139,7 @@ pub(crate) fn relation_message_with_column_specs(
 ) -> Bytes {
     let columns: Vec<PgOutputTestColumn> = columns
         .iter()
-        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(*name, *type_oid, *is_key))
+        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(name, *type_oid, *is_key))
         .collect();
     relation_message_with_columns(relation_id, table, &columns)
 }
@@ -152,7 +152,7 @@ pub(crate) fn relation_message_with_identity_and_column_specs(
 ) -> Bytes {
     let columns: Vec<PgOutputTestColumn> = columns
         .iter()
-        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(*name, *type_oid, *is_key))
+        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(name, *type_oid, *is_key))
         .collect();
     relation_message_with_identity_and_columns(relation_id, table, replica_identity, &columns)
 }

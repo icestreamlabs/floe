@@ -92,9 +92,10 @@ fn empty_handle(namespace: &str) -> ZSetHandle {
     }
 }
 
-fn batch_join_key<T, K>(
-    key_extractor: Arc<dyn Fn(&T) -> Option<K> + Send + Sync>,
-) -> Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>
+type RowKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
+type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
+
+fn batch_join_key<T, K>(key_extractor: RowKeyExtractor<T, K>) -> BatchJoinKeyExtractor<T, K>
 where
     T: Clone + 'static,
     K: 'static,
@@ -548,8 +549,8 @@ async fn join_operator_skips_null_keys() {
         .expect("output");
     let left_index = IndexedBatchZSet::new(table.clone(), "null_left_index");
     let right_index = IndexedBatchZSet::new(table.clone(), "null_right_index");
-    let left_key = Arc::new(|value: &Option<i64>| value.clone());
-    let right_key = Arc::new(|value: &Option<i64>| value.clone());
+    let left_key = Arc::new(|value: &Option<i64>| *value);
+    let right_key = Arc::new(|value: &Option<i64>| *value);
 
     let mut op = JoinOp::new_batch(
         left_state,

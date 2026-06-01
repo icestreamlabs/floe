@@ -20,6 +20,7 @@ pub(in crate::node_runtime) struct ReplicationPipelineStatusSnapshot {
     pub(super) checkpoint_transaction_id: Option<CdcTransactionId>,
     pub(super) target_state: BTreeMap<String, String>,
     pub(super) pending_transactions: usize,
+    pub(super) pending_objects: usize,
     pub(super) pending_records: usize,
     pub(super) pending_bytes: usize,
     pub(super) oldest_pending_age_ms: Option<u64>,
@@ -75,6 +76,10 @@ impl ReplicationPipelineStatusSnapshot {
 
     pub(super) fn pending_transactions(&self) -> usize {
         self.pending_transactions
+    }
+
+    pub(super) fn pending_objects(&self) -> usize {
+        self.pending_objects
     }
 
     pub(super) fn pending_records(&self) -> usize {
@@ -155,7 +160,7 @@ pub(super) fn cdc_replication_debug_state_from_snapshots(
                     .map(|transaction_id| transaction_id.as_str().to_string()),
                 target_state: snapshot.target_state().clone(),
                 pending_transactions: snapshot.pending_transactions(),
-                pending_objects: snapshot.pending_transactions(),
+                pending_objects: snapshot.pending_objects(),
                 pending_records: snapshot.pending_records(),
                 pending_bytes: snapshot.pending_bytes(),
                 oldest_pending_age_ms: snapshot.oldest_pending_age_ms(),

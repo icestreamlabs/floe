@@ -15,8 +15,8 @@ use crate::collections::zset::VersionedZSet;
 use crate::collections::{DEFAULT_HOT_KEY_COMPACTION_THRESHOLD, IndexedBatchZSet};
 use crate::handles::ZSetHandle;
 use crate::operators::incremental_aggregate::{
-    AggregateValue, GroupedIncrementalAggregateState, IncrementalAggregateOp,
-    IncrementalAggregateRow, IncrementalAggregateSlotKind,
+    AggregateValue, GroupedIncrementalAggregateState, IncrementalAggregateIndexes,
+    IncrementalAggregateOp, IncrementalAggregateRow, IncrementalAggregateSlotKind,
 };
 use crate::operators::window::{
     WINDOW_DROPPED_TOO_LATE_TOTAL, WINDOW_STATE_ENTRIES, WINDOW_STATE_LIMIT,
@@ -408,9 +408,7 @@ impl DbspWindowIncrementalAggregate {
             Arc::new(row_evaluator) as BatchWindowRowEvaluator<K, V>,
             output,
             slot_kinds,
-            distinct_index,
-            None,
-            extrema_index,
+            IncrementalAggregateIndexes::new(distinct_index, None, extrema_index),
         );
         if append_only_input {
             aggregate_op.enable_append_only_input();
@@ -564,6 +562,8 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::Ordering;
 
+    type TestWindowInput = WindowIncrementalInput<i64, (i64, i64)>;
+
     async fn build_db() -> Arc<Db> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         Arc::new(
@@ -664,7 +664,7 @@ mod tests {
         let aggregate_op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
-            Arc::new(|rows: &[(WindowIncrementalInput<i64, (i64, i64)>, i64)]| {
+            Arc::new(|rows: &[(TestWindowInput, i64)]| {
                 rows.iter()
                     .map(|(row, weight)| {
                         (
@@ -690,16 +690,18 @@ mod tests {
                 IncrementalAggregateSlotKind::Sum(AggregateValueType::Int64),
                 IncrementalAggregateSlotKind::Min(AggregateValueType::Int64),
             ],
-            None,
-            Some(IndexedBatchZSet::with_hot_key_compaction_threshold(
-                table.clone(),
-                "window_incremental_input_index",
-                2,
-            )),
-            Some(IndexedBatchZSet::with_range_index(
-                table.clone(),
-                "window_incremental_extrema_index",
-            )),
+            IncrementalAggregateIndexes::new(
+                None,
+                Some(IndexedBatchZSet::with_hot_key_compaction_threshold(
+                    table.clone(),
+                    "window_incremental_input_index",
+                    2,
+                )),
+                Some(IndexedBatchZSet::with_range_index(
+                    table.clone(),
+                    "window_incremental_extrema_index",
+                )),
+            ),
         );
         let mut op = WindowIncrementalAggregateOp {
             table: table.clone(),

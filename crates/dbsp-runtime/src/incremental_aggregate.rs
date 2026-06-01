@@ -15,8 +15,9 @@ use crate::collections::{DEFAULT_HOT_KEY_COMPACTION_THRESHOLD, IndexedBatchZSet}
 use crate::ephemeral_state::build_ephemeral_state_table;
 use crate::handles::ZSetHandle;
 use crate::operators::incremental_aggregate::{
-    AggregateValue, DistinctGroupKey, GroupedIncrementalAggregateState, IncrementalAggregateOp,
-    IncrementalAggregateRow, IncrementalAggregateSlotKind,
+    AggregateValue, DistinctGroupKey, GroupedIncrementalAggregateState,
+    IncrementalAggregateIndexes, IncrementalAggregateOp, IncrementalAggregateRow,
+    IncrementalAggregateSlotKind,
 };
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
@@ -218,9 +219,7 @@ impl DbspIncrementalAggregate {
             Arc::new(row_evaluator) as BatchRowEvaluator<V, K>,
             output,
             slot_kinds,
-            distinct_index,
-            None,
-            extrema_index,
+            IncrementalAggregateIndexes::new(distinct_index, None, extrema_index),
         );
         if append_only_input {
             op.enable_append_only_input();
@@ -390,9 +389,7 @@ where
             Arc::new(row_evaluator) as BatchRowEvaluator<V, K>,
             output,
             slot_kinds,
-            distinct_index,
-            input_index,
-            None,
+            IncrementalAggregateIndexes::new(distinct_index, input_index, None),
         );
         op.enable_live_output_replayable();
 

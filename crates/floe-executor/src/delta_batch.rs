@@ -166,6 +166,15 @@ impl DeltaBatchBuffer {
         weight: Diff,
         key: Option<Vec<u8>>,
     ) -> Result<Option<RecordBatch>> {
+        self.push_ref(&row, weight, key.as_deref())
+    }
+
+    pub fn push_ref(
+        &mut self,
+        row: &[u8],
+        weight: Diff,
+        key: Option<&[u8]>,
+    ) -> Result<Option<RecordBatch>> {
         if weight == 0 {
             return Ok(None);
         }
@@ -186,7 +195,7 @@ impl DeltaBatchBuffer {
             (Some(_), Some(_), true) => bail!("delta buffer computes key bytes from Arrow columns"),
             (Some(keys), Some(key), false) => {
                 self.estimated_bytes += key.len();
-                keys.push(key);
+                keys.push(key.to_vec());
             }
             (Some(_), None, false) => bail!("delta buffer expects key bytes"),
             (Some(_), None, true) => {}
@@ -194,7 +203,7 @@ impl DeltaBatchBuffer {
             (None, None, _) => {}
         }
 
-        self.estimated_bytes += estimate_encoded_row_bytes(&row);
+        self.estimated_bytes += estimate_encoded_row_bytes(row);
         for (idx, value) in self.decode_scratch.iter().enumerate() {
             self.columns[idx].append_encoded_scalar(value.as_ref())?;
         }

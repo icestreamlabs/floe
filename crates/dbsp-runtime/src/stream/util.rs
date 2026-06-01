@@ -538,6 +538,20 @@ where
     stream.push_value_in_place(value);
 }
 
+pub(crate) fn set_value_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
+where
+    T: Archive
+        + Clone
+        + PartialEq
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    stream.set_value_at_in_place(timestamp, value);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{delta_zset_handle_batch, publish_transient_zset_batch};
@@ -570,18 +584,4 @@ mod tests {
 
         assert_eq!(actual.as_ref(), expected.as_ref());
     }
-}
-
-pub(crate) fn set_value_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    stream.set_value_at_in_place(timestamp, value);
 }

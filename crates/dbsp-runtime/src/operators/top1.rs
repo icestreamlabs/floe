@@ -54,8 +54,8 @@ where
     O: Clone + Ord + Send + Sync + 'static,
 {
     pub input_index: IndexedBatchZSet<P, K>,
-    pub ordered_index: Option<IndexedBatchZSet<OrderedBytes, K>>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) ordered_index: Option<IndexedBatchZSet<OrderedBytes, K>>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     partition_output_cache: BTreeMap<P, K>,

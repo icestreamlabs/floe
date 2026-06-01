@@ -25,6 +25,9 @@ struct JoinBenchState {
     right_delta: ZSetHandle,
 }
 
+type RowKeyExtractor<T, K> = Arc<dyn Fn(&T) -> Option<K> + Send + Sync>;
+type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
+
 async fn build_db(name: &str) -> Arc<Db> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     Arc::new(Db::open(name, store).await.expect("open slate db"))
@@ -87,6 +90,19 @@ fn bucket_for(id: u64) -> u16 {
     (id >> 48) as u16
 }
 
+fn batch_join_key<T, K>(key_extractor: RowKeyExtractor<T, K>) -> BatchJoinKeyExtractor<T, K>
+where
+    T: Clone + 'static,
+    K: 'static,
+{
+    Arc::new(move |deltas: &[(T, i64)]| {
+        deltas
+            .iter()
+            .filter_map(|(row, weight)| key_extractor(row).map(|key| (key, row.clone(), *weight)))
+            .collect()
+    })
+}
+
 async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
     let db = build_db(&format!("join-bench-{base_size}")).await;
     let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
@@ -118,13 +134,13 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
     let left_index = IndexedBatchZSet::new(table.clone(), "bench_left_index");
     let right_index = IndexedBatchZSet::new(table.clone(), "bench_right_index");
 
-    let mut op = JoinOp::new(
+    let mut op = JoinOp::new_batch(
         left_state,
         right_state,
         left_index,
         right_index,
-        Arc::new(|value: &i64| Some(*value)),
-        Arc::new(|value: &i64| Some(*value)),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        batch_join_key(Arc::new(|value: &i64| Some(*value))),
         Arc::new(|l: &i64, r: &i64| l == r),
         Arc::new(|l: &i64, r: &i64| l + r),
         table.clone(),

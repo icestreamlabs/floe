@@ -261,7 +261,7 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
                                 .await?;
                         Ok::<_, datafusion::error::DataFusionError>(result)
                     })
-                    .map(|result| black_box(result))
+                    .map(black_box)
                     .expect("datafusion collect");
             });
         });
@@ -280,7 +280,7 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
                                 .await?;
                         Ok::<_, datafusion::error::DataFusionError>(result)
                     })
-                    .map(|result| black_box(result))
+                    .map(black_box)
                     .expect("datafusion collect");
             });
         });
@@ -295,7 +295,7 @@ fn bench_vectorized_batch_sizes(c: &mut Criterion) {
                         let result = run_query(&ctx, batch).await?;
                         Ok::<_, datafusion::error::DataFusionError>(result)
                     })
-                    .map(|result| black_box(result))
+                    .map(black_box)
                     .expect("datafusion query");
             });
         });

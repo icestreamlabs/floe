@@ -780,7 +780,7 @@ async fn orphan_segment_write_is_not_visible_after_reopen() {
     let materialized = reopened.materialize().await.expect("materialize reopened");
     assert_eq!(materialized.get("base"), Some(&3));
     assert!(
-        materialized.get("orphan").is_none(),
+        !materialized.contains_key("orphan"),
         "orphan segment must not become visible without a manifest reference"
     );
 
@@ -855,12 +855,12 @@ async fn replayable_head_reads_from_transient_batch_without_persisting() {
         .await
         .expect("load replayable version");
     assert_eq!(live_materialized.get("live"), Some(&2));
-    assert!(live_materialized.get("removed").is_none());
+    assert!(!live_materialized.contains_key("removed"));
 
     let reopened = VersionedZSet::new(dict, table, "vz_replayable".to_string())
         .await
         .expect("reopen replayable zset");
     let reopened_view = reopened.materialize().await.expect("materialize reopened");
     assert_eq!(reopened_view.get("persisted"), Some(&1));
-    assert!(reopened_view.get("live").is_none());
+    assert!(!reopened_view.contains_key("live"));
 }

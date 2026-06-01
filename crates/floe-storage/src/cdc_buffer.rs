@@ -124,6 +124,7 @@ pub struct CdcBufferCleanupPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdcBufferStats {
     pending_transactions: usize,
+    pending_objects: usize,
     pending_records: usize,
     pending_bytes: usize,
     oldest_pending_age_ms: Option<u64>,
@@ -402,6 +403,10 @@ impl CdcBufferStore {
     pub async fn stats(&self, pipeline_name: &str, now_unix_ms: u64) -> Result<CdcBufferStats> {
         let manifests = self.pending_transactions(pipeline_name, usize::MAX).await?;
         let pending_transactions = manifests.len();
+        let pending_objects = manifests
+            .iter()
+            .filter(|manifest| manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore)
+            .count();
         let pending_records = manifests
             .iter()
             .map(CdcBufferedTransactionManifest::record_count)
@@ -416,6 +421,7 @@ impl CdcBufferStore {
             .max();
         Ok(CdcBufferStats {
             pending_transactions,
+            pending_objects,
             pending_records,
             pending_bytes,
             oldest_pending_age_ms,
@@ -1136,7 +1142,7 @@ impl CdcBufferStats {
     }
 
     pub fn pending_objects(&self) -> usize {
-        self.pending_transactions
+        self.pending_objects
     }
 
     pub fn pending_records(&self) -> usize {

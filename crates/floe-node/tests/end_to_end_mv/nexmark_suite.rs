@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use floe_node_core::nexmark_queries::{CANONICAL_NEXMARK_QUERY_IDS, canonical_nexmark_queries};
+use floe_node_core::harness::nexmark_queries::{
+    CANONICAL_NEXMARK_QUERY_IDS, canonical_nexmark_queries,
+};
 use serde::Deserialize;
 
 use super::harness::MvTestHarness;

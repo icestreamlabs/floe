@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicI64;
 type Row = i64;
 type RowKeyExtractor = Arc<dyn Fn(&Row) -> Option<i64> + Send + Sync>;
 type RowTimeExtractor = Arc<dyn Fn(&Row) -> Option<i64> + Send + Sync>;
+type WindowAggregator = Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync>;
 
 fn batch_window_extractor(
     key_extractor: RowKeyExtractor,
@@ -119,19 +120,18 @@ async fn window_aggregate_groups_by_window() {
     let index = IndexedBatchZSet::new(table.clone(), "window_index");
     let key_extractor: RowKeyExtractor = Arc::new(|row: &Row| Some(*row % 2));
     let time_extractor: RowTimeExtractor = Arc::new(|row: &Row| Some(*row));
-    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
-        Arc::new(|_key, values| {
-            let mut count = 0i64;
-            let mut has_rows = false;
-            for (_row, weight) in values {
-                if *weight == 0 {
-                    continue;
-                }
-                has_rows = true;
-                count += *weight;
+    let aggregator: WindowAggregator = Arc::new(|_key, values| {
+        let mut count = 0i64;
+        let mut has_rows = false;
+        for (_row, weight) in values {
+            if *weight == 0 {
+                continue;
             }
-            if has_rows { Some(count) } else { None }
-        });
+            has_rows = true;
+            count += *weight;
+        }
+        if has_rows { Some(count) } else { None }
+    });
     let watermark = Arc::new(AtomicI64::new(-1));
 
     let mut op = WindowAggregateOp::new_with_batch_extractor(
@@ -244,14 +244,13 @@ async fn window_aggregate_respects_watermark_allowed_lateness_cutoff() {
     let index = IndexedBatchZSet::new(table.clone(), "window_late_index");
     let key_extractor: RowKeyExtractor = Arc::new(|_row: &Row| Some(0_i64));
     let time_extractor: RowTimeExtractor = Arc::new(|row: &Row| Some(*row));
-    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
-        Arc::new(|_key, values| {
-            let mut count = 0i64;
-            for (_row, weight) in values {
-                count += *weight;
-            }
-            (count != 0).then_some(count)
-        });
+    let aggregator: WindowAggregator = Arc::new(|_key, values| {
+        let mut count = 0i64;
+        for (_row, weight) in values {
+            count += *weight;
+        }
+        (count != 0).then_some(count)
+    });
     let watermark = Arc::new(AtomicI64::new(5_000));
 
     let mut op = WindowAggregateOp::new_with_batch_extractor(
@@ -344,14 +343,13 @@ async fn window_aggregate_accepts_out_of_order_events_within_lateness() {
     let index = IndexedBatchZSet::new(table.clone(), "window_ooo_index");
     let key_extractor: RowKeyExtractor = Arc::new(|_row: &Row| Some(0_i64));
     let time_extractor: RowTimeExtractor = Arc::new(|row: &Row| Some(*row));
-    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
-        Arc::new(|_key, values| {
-            let mut count = 0i64;
-            for (_row, weight) in values {
-                count += *weight;
-            }
-            (count != 0).then_some(count)
-        });
+    let aggregator: WindowAggregator = Arc::new(|_key, values| {
+        let mut count = 0i64;
+        for (_row, weight) in values {
+            count += *weight;
+        }
+        (count != 0).then_some(count)
+    });
     let watermark = Arc::new(AtomicI64::new(5_000));
 
     let mut op = WindowAggregateOp::new_with_batch_extractor(
@@ -448,14 +446,13 @@ async fn window_aggregate_ignores_too_late_retractions_after_window_close() {
     let index = IndexedBatchZSet::new(table.clone(), "window_retract_index");
     let key_extractor: RowKeyExtractor = Arc::new(|_row: &Row| Some(0_i64));
     let time_extractor: RowTimeExtractor = Arc::new(|row: &Row| Some(*row));
-    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
-        Arc::new(|_key, values| {
-            let mut count = 0i64;
-            for (_row, weight) in values {
-                count += *weight;
-            }
-            (count != 0).then_some(count)
-        });
+    let aggregator: WindowAggregator = Arc::new(|_key, values| {
+        let mut count = 0i64;
+        for (_row, weight) in values {
+            count += *weight;
+        }
+        (count != 0).then_some(count)
+    });
     let watermark = Arc::new(AtomicI64::new(-1));
 
     let mut op = WindowAggregateOp::new_with_batch_extractor(
@@ -552,14 +549,13 @@ async fn window_aggregate_evicts_expired_windows_on_watermark_advance() {
     let index = IndexedBatchZSet::new(table.clone(), "window_evict_index");
     let key_extractor: RowKeyExtractor = Arc::new(|_row: &Row| Some(0_i64));
     let time_extractor: RowTimeExtractor = Arc::new(|row: &Row| Some(*row));
-    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
-        Arc::new(|_key, values| {
-            let mut count = 0_i64;
-            for (_row, weight) in values {
-                count += *weight;
-            }
-            (count != 0).then_some(count)
-        });
+    let aggregator: WindowAggregator = Arc::new(|_key, values| {
+        let mut count = 0_i64;
+        for (_row, weight) in values {
+            count += *weight;
+        }
+        (count != 0).then_some(count)
+    });
     let watermark = Arc::new(AtomicI64::new(-1));
 
     let mut op = WindowAggregateOp::new_with_batch_extractor(
@@ -647,14 +643,13 @@ async fn run_window_history_probe(history_rows: i64) -> metrics::LogicalWorkSnap
     let index = IndexedBatchZSet::new(table.clone(), index_ns);
     let key_extractor: RowKeyExtractor = Arc::new(|_row: &Row| Some(0_i64));
     let time_extractor: RowTimeExtractor = Arc::new(|row: &Row| Some(*row));
-    let aggregator: Arc<dyn Fn(&i64, &[(Row, i64)]) -> Option<i64> + Send + Sync> =
-        Arc::new(|_key, values| {
-            let mut count = 0i64;
-            for (_row, weight) in values {
-                count += *weight;
-            }
-            (count != 0).then_some(count)
-        });
+    let aggregator: WindowAggregator = Arc::new(|_key, values| {
+        let mut count = 0i64;
+        for (_row, weight) in values {
+            count += *weight;
+        }
+        (count != 0).then_some(count)
+    });
     let watermark = Arc::new(AtomicI64::new(-1));
 
     let mut op = WindowAggregateOp::new_with_batch_extractor(

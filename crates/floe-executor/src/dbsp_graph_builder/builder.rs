@@ -4717,7 +4717,7 @@ fn try_build_transient_join_pipeline_root_materialization(
                 right_input_idx,
                 left_source_root,
                 right_source_root,
-                join: join.clone(),
+                join: join.as_ref().clone(),
                 optimized_nodes: vec![root_idx],
                 steps: Vec::new(),
             }))

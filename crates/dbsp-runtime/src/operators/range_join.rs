@@ -59,13 +59,12 @@ where
     fn from_cache(cache: &LeftRangeCache<L, K>) -> Self {
         let intervals = cache
             .iter()
-            .filter_map(|(row, (lower, upper, weight))| {
-                (*weight != 0 && lower < upper).then(|| LeftInterval {
-                    row: row.clone(),
-                    lower: lower.clone(),
-                    upper: upper.clone(),
-                    weight: *weight,
-                })
+            .filter(|&(_row, (lower, upper, weight))| *weight != 0 && lower < upper)
+            .map(|(row, (lower, upper, weight))| LeftInterval {
+                row: row.clone(),
+                lower: lower.clone(),
+                upper: upper.clone(),
+                weight: *weight,
             })
             .collect::<Vec<_>>();
         Self {
@@ -216,15 +215,15 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub left_state: RelationState<L>,
-    pub right_state: RelationState<R>,
-    pub right_index: IndexedBatchZSet<K, R>,
+    pub(crate) left_state: RelationState<L>,
+    pub(crate) right_state: RelationState<R>,
+    pub(crate) right_index: IndexedBatchZSet<K, R>,
     pub left_range: BatchLeftRangeExtractor<L, K>,
-    pub right_key: BatchRightKeyExtractor<R, K>,
-    pub predicate: RangeJoinPredicate<L, R>,
-    pub projector: RangeJoinProjector<L, R, O>,
-    pub table: Arc<dyn KeyValueTable>,
-    pub integrated: Option<RelationState<O>>,
+    pub(crate) right_key: BatchRightKeyExtractor<R, K>,
+    pub(crate) predicate: RangeJoinPredicate<L, R>,
+    pub(crate) projector: RangeJoinProjector<L, R, O>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
+    pub(crate) integrated: Option<RelationState<O>>,
     output: VersionedZSet<O>,
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
@@ -904,10 +903,10 @@ where
             work.record_persisted_rows(persisted_records);
         }
 
-        if let Some(cache) = self.left_cache.as_mut() {
-            if Self::apply_left_ranges_to_cache(cache, &left_ranges) {
-                self.left_interval_index_dirty = true;
-            }
+        if let Some(cache) = self.left_cache.as_mut()
+            && Self::apply_left_ranges_to_cache(cache, &left_ranges)
+        {
+            self.left_interval_index_dirty = true;
         }
 
         if output_deltas.is_empty() {

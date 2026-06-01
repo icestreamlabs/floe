@@ -366,8 +366,8 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub state: RelationState<(K, GroupedIncrementalAggregateState)>,
-    pub table: Arc<dyn KeyValueTable>,
+    pub(crate) state: RelationState<(K, GroupedIncrementalAggregateState)>,
+    pub(crate) table: Arc<dyn KeyValueTable>,
     pub row_evaluator: BatchRowEvaluator<V, K>,
     output: VersionedZSet<(K, Vec<AggregateValue>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
@@ -378,6 +378,66 @@ where
     extrema_index: Option<IndexedBatchZSet<OrderedBytes, V>>,
     append_only_input: bool,
     logical_work: metrics::LogicalWorkCollector,
+}
+
+pub(crate) struct IncrementalAggregateIndexes<K, V>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    distinct: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
+    input: Option<IndexedBatchZSet<K, V>>,
+    extrema: Option<IndexedBatchZSet<OrderedBytes, V>>,
+}
+
+impl<K, V> IncrementalAggregateIndexes<K, V>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub(crate) fn new(
+        distinct: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
+        input: Option<IndexedBatchZSet<K, V>>,
+        extrema: Option<IndexedBatchZSet<OrderedBytes, V>>,
+    ) -> Self {
+        Self {
+            distinct,
+            input,
+            extrema,
+        }
+    }
 }
 
 impl<K, V> IncrementalAggregateOp<K, V>
@@ -407,9 +467,7 @@ where
         row_evaluator: BatchRowEvaluator<V, K>,
         output: VersionedZSet<(K, Vec<AggregateValue>)>,
         slot_kinds: Vec<IncrementalAggregateSlotKind>,
-        distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
-        input_index: Option<IndexedBatchZSet<K, V>>,
-        extrema_index: Option<IndexedBatchZSet<OrderedBytes, V>>,
+        indexes: IncrementalAggregateIndexes<K, V>,
     ) -> Self {
         Self {
             state,
@@ -419,9 +477,9 @@ where
             dict_cache: HashMap::new(),
             state_cache: None,
             slot_kinds,
-            distinct_index,
-            input_index,
-            extrema_index,
+            distinct_index: indexes.distinct,
+            input_index: indexes.input,
+            extrema_index: indexes.extrema,
             append_only_input: false,
             logical_work: metrics::LogicalWorkCollector::default(),
         }
@@ -2082,15 +2140,17 @@ mod tests {
                 IncrementalAggregateSlotKind::Min(AggregateValueType::Int64),
                 IncrementalAggregateSlotKind::Max(AggregateValueType::Utf8),
             ],
-            None,
-            Some(IndexedBatchZSet::new(
-                table.clone(),
-                "incremental_aggregate_input_index".to_string(),
-            )),
-            Some(IndexedBatchZSet::with_range_index(
-                table.clone(),
-                "incremental_aggregate_extrema_index".to_string(),
-            )),
+            IncrementalAggregateIndexes::new(
+                None,
+                Some(IndexedBatchZSet::new(
+                    table.clone(),
+                    "incremental_aggregate_input_index".to_string(),
+                )),
+                Some(IndexedBatchZSet::with_range_index(
+                    table.clone(),
+                    "incremental_aggregate_extrema_index".to_string(),
+                )),
+            ),
         );
 
         let batch_one = stage_version(
@@ -2258,15 +2318,17 @@ mod tests {
                 IncrementalAggregateSlotKind::Count,
                 IncrementalAggregateSlotKind::Min(AggregateValueType::Int64),
             ],
-            None,
-            Some(IndexedBatchZSet::new(
-                table.clone(),
-                "incremental_extrema_ordered_input_index".to_string(),
-            )),
-            Some(IndexedBatchZSet::with_range_index(
-                table.clone(),
-                "incremental_extrema_ordered_extrema_index".to_string(),
-            )),
+            IncrementalAggregateIndexes::new(
+                None,
+                Some(IndexedBatchZSet::new(
+                    table.clone(),
+                    "incremental_extrema_ordered_input_index".to_string(),
+                )),
+                Some(IndexedBatchZSet::with_range_index(
+                    table.clone(),
+                    "incremental_extrema_ordered_extrema_index".to_string(),
+                )),
+            ),
         );
 
         let seed = (0..100)
@@ -2384,9 +2446,7 @@ mod tests {
                     scale: 2,
                 },
             )],
-            None,
-            None,
-            None,
+            IncrementalAggregateIndexes::new(None, None, None),
         );
 
         let batch_one = stage_version(
@@ -2515,9 +2575,7 @@ mod tests {
             }),
             output,
             vec![IncrementalAggregateSlotKind::CountDistinct],
-            Some(distinct_index),
-            None,
-            None,
+            IncrementalAggregateIndexes::new(Some(distinct_index), None, None),
         );
         op.enable_append_only_input();
 
@@ -2647,9 +2705,7 @@ mod tests {
             }),
             output,
             vec![IncrementalAggregateSlotKind::Count],
-            None,
-            None,
-            None,
+            IncrementalAggregateIndexes::new(None, None, None),
         );
 
         let history = (0..history_rows)
@@ -2765,12 +2821,14 @@ mod tests {
             }),
             output,
             vec![IncrementalAggregateSlotKind::CountDistinct],
-            Some(IndexedBatchZSet::new(
-                table.clone(),
-                format!("incremental_count_distinct_history_{history_rows}_index"),
-            )),
-            None,
-            None,
+            IncrementalAggregateIndexes::new(
+                Some(IndexedBatchZSet::new(
+                    table.clone(),
+                    format!("incremental_count_distinct_history_{history_rows}_index"),
+                )),
+                None,
+                None,
+            ),
         );
 
         let history = (0..history_rows)

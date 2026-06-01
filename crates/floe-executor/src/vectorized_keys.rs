@@ -112,7 +112,7 @@ impl VectorizedEncodedKeyExtractor {
             if *diff == 0 {
                 continue;
             }
-            if buffer.push(row.clone(), *diff, None)?.is_some() {
+            if buffer.push_ref(row, *diff, None)?.is_some() {
                 bail!("unbounded vectorized key extractor flushed before manual flush");
             }
             staged_rows.push((row.clone(), *diff));
@@ -215,7 +215,7 @@ impl VectorizedEncodedKeyExtractor {
             if *diff == 0 {
                 continue;
             }
-            if buffer.push(row.clone(), *diff, None)?.is_some() {
+            if buffer.push_ref(row, *diff, None)?.is_some() {
                 bail!("unbounded vectorized key extractor flushed before manual flush");
             }
             staged_rows.push((row.clone(), *diff));
