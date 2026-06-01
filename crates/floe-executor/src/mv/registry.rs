@@ -8,6 +8,7 @@ use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Timestamp};
 use ahash::AHashMap;
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::LogicalWorkSnapshot;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
@@ -101,6 +102,8 @@ pub struct MaterializedViewHandle {
     staged_row_count_versions: RwLock<BTreeMap<i64, i64>>,
     state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
+    arrow_snapshots: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
+    arrow_deltas: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
     encoded_overlay_state: RwLock<Option<EncodedOverlayState>>,
     published_versions: RwLock<BTreeSet<i64>>,
@@ -127,6 +130,8 @@ impl MaterializedViewHandle {
             staged_row_count_versions: RwLock::new(BTreeMap::new()),
             state_authoritative: RwLock::new(false),
             watermark: RwLock::new(None),
+            arrow_snapshots: RwLock::new(BTreeMap::new()),
+            arrow_deltas: RwLock::new(BTreeMap::new()),
             dbsp_state: RwLock::new(None),
             encoded_overlay_state: RwLock::new(None),
             published_versions: RwLock::new(BTreeSet::new()),
@@ -358,6 +363,73 @@ impl MaterializedViewHandle {
             .expect("mutex poisoned")
             .insert(version, row_count);
         self.promote_staged_row_count_if_visible(version);
+    }
+
+    pub fn publish_arrow_version(
+        &self,
+        version: i64,
+        snapshot: Vec<RecordBatch>,
+        delta: Vec<RecordBatch>,
+    ) {
+        let row_count = snapshot
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+            .try_into()
+            .unwrap_or(i64::MAX);
+        {
+            let mut snapshots = self.arrow_snapshots.write().expect("mutex poisoned");
+            snapshots.insert(version, Arc::new(snapshot));
+        }
+        {
+            let mut deltas = self.arrow_deltas.write().expect("mutex poisoned");
+            deltas.insert(version, Arc::new(delta));
+        }
+        *self.state_row_count.write().expect("mutex poisoned") = row_count;
+        *self.published_row_count.write().expect("mutex poisoned") = row_count;
+        *self
+            .state_row_count_version
+            .write()
+            .expect("mutex poisoned") = Some(version);
+        self.record_latest_version(version);
+        self.prune_versions();
+        self.prune_arrow_versions();
+        tracing::debug!(
+            view = %self.name,
+            version,
+            rows = row_count,
+            "materialized view Arrow version recorded"
+        );
+    }
+
+    pub fn arrow_snapshot_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
+        self.arrow_snapshots
+            .read()
+            .expect("mutex poisoned")
+            .get(&version)
+            .cloned()
+    }
+
+    pub fn latest_arrow_snapshot(&self) -> Option<(i64, Arc<Vec<RecordBatch>>)> {
+        self.arrow_snapshots
+            .read()
+            .expect("mutex poisoned")
+            .iter()
+            .next_back()
+            .map(|(version, batches)| (*version, Arc::clone(batches)))
+    }
+
+    pub fn arrow_delta_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
+        self.arrow_deltas
+            .read()
+            .expect("mutex poisoned")
+            .get(&version)
+            .cloned()
+    }
+
+    pub fn arrow_row_count_for(&self, version: i64) -> Option<usize> {
+        self.arrow_snapshot_for(version)
+            .map(|batches| batches.iter().map(RecordBatch::num_rows).sum())
     }
 
     pub fn set_dbsp_state(&self, state: DbspPersistedState) {
@@ -688,6 +760,23 @@ impl MaterializedViewHandle {
         }
     }
 
+    fn prune_arrow_versions(&self) {
+        let Some(keep_last) = self.retention_keep_last else {
+            return;
+        };
+        if keep_last == 0 {
+            return;
+        }
+        prune_btree_to_last_n(
+            &mut self.arrow_snapshots.write().expect("mutex poisoned"),
+            keep_last,
+        );
+        prune_btree_to_last_n(
+            &mut self.arrow_deltas.write().expect("mutex poisoned"),
+            keep_last,
+        );
+    }
+
     fn record_latest_version(&self, version: i64) {
         let version_time = self
             .watermark()
@@ -775,6 +864,17 @@ fn current_time_micros() -> i64 {
 fn watermark_to_micros(watermark: Timestamp) -> i64 {
     let micros = watermark.saturating_mul(1_000);
     i64::try_from(micros).unwrap_or(i64::MAX)
+}
+
+fn prune_btree_to_last_n<T>(map: &mut BTreeMap<i64, T>, keep_last: usize) {
+    if map.len() <= keep_last {
+        return;
+    }
+    let remove_count = map.len().saturating_sub(keep_last);
+    let remove_versions = map.keys().copied().take(remove_count).collect::<Vec<_>>();
+    for version in remove_versions {
+        map.remove(&version);
+    }
 }
 
 impl fmt::Debug for MaterializedViewHandle {

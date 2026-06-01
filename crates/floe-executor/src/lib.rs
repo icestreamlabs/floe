@@ -20,6 +20,7 @@ pub mod dbsp_graph_builder;
 pub mod dbsp_plan;
 pub mod dbsp_table_environment;
 pub mod delta_batch;
+pub mod delta_consolidation;
 mod encoded_batch;
 pub mod encoding;
 pub mod materialized_view;
@@ -38,6 +39,7 @@ pub mod subscribe;
 pub mod table_provider;
 pub mod task_events;
 pub mod vectorized_keys;
+pub mod vectorized_runtime;
 
 pub use context::FloeQueryContext;
 pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
@@ -56,11 +58,15 @@ pub use mv::runtime::MaterializedView;
 pub use mv_loader::load_or_register_mv;
 pub use operator_state::OperatorStateHandle;
 pub use outer_stream::OuterStreamRegistry;
-pub use source_decoder::SourceRowDecoder;
+pub use source_decoder::{SourceArrowBatchBuilder, SourceRowDecoder};
 pub use stream_types::{Diff, Timestamp};
 pub use subscribe::SubscribeExecutionConfig;
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider, SourceTableProvider};
 pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};
 pub use vectorized_keys::{
     build_delta_batch, build_source_delta_batch, source_primary_key_columns,
+};
+pub use vectorized_runtime::{
+    VectorizedExecutionRuntime, VectorizedMaterializedViewPlan, VectorizedSourceDelta,
+    weighted_batch_from_diffs,
 };

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use bytes::{Buf, Bytes};
-use dbsp::StreamRetention;
+use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::record_batch::RecordBatch;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::materialized_view::DbspPersistedState;
 use floe_executor::{FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider};
 use floe_storage::{MaterializedViewMetadata, SlateCatalog};
 use futures::StreamExt;
@@ -14,7 +14,6 @@ use pgwire::api::stmt::StoredStatement;
 use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::Bind;
 use postgres_types::Type as PgType;
-use slatedb::Db;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -336,14 +335,6 @@ async fn streaming_execute_respects_mv_version_filter() {
 
 const STREAM_VIEW_NAME: &str = "mv_stream_filter";
 
-fn encode_i64_row(value: i64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(4 + 1 + 8);
-    encoded.extend_from_slice(&1_u32.to_le_bytes());
-    encoded.push(0x01);
-    encoded.extend_from_slice(&value.to_le_bytes());
-    encoded
-}
-
 async fn streaming_state_with_rows(rows: &[i64]) -> (Arc<FloeServerState>, Vec<u64>) {
     let catalog = Arc::new(SlateCatalog::in_memory().await.expect("catalog"));
     let query = FloeQueryContext::new(Arc::clone(&catalog));
@@ -353,11 +344,16 @@ async fn streaming_state_with_rows(rows: &[i64]) -> (Arc<FloeServerState>, Vec<u
         false,
     )]));
     let db = catalog.db();
-    let (dbsp_state, versions) = seed_mv_state(Arc::clone(&db), rows, Arc::clone(&schema)).await;
+    let versions = vec![1_u64];
     let registry = Arc::new(MaterializedViewRegistry::new());
     registry.set_schema(STREAM_VIEW_NAME.to_string(), Arc::clone(&schema));
     let handle = registry.register(STREAM_VIEW_NAME.to_string());
-    handle.set_dbsp_state(dbsp_state);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from_iter_values(rows.iter().copied()))],
+    )
+    .expect("build Arrow MV snapshot");
+    handle.publish_arrow_version(1, vec![batch], Vec::new());
     let provider = MaterializedViewTableProvider::new(
         Arc::clone(&registry),
         STREAM_VIEW_NAME.to_string(),
@@ -370,31 +366,6 @@ async fn streaming_state_with_rows(rows: &[i64]) -> (Arc<FloeServerState>, Vec<u
     let bridge = DbspBridge::new(db).await.expect("bridge");
     let state = FloeServerState::new(query, registry, bridge);
     (Arc::new(state), versions)
-}
-
-async fn seed_mv_state(
-    db: Arc<Db>,
-    rows: &[i64],
-    schema: SchemaRef,
-) -> (DbspPersistedState, Vec<u64>) {
-    let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-    let mut view = bridge
-        .new_view(STREAM_VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
-        .await
-        .expect("create view");
-    view.add_deltas(rows.iter().copied().map(|value| (encode_i64_row(value), 1)));
-    let handle = view.flush().await.expect("flush view");
-    let versions = vec![handle.version];
-    bridge
-        .save_mv_schema(STREAM_VIEW_NAME, Arc::clone(&schema))
-        .await
-        .expect("persist schema");
-    let handle_view = view.latest_handle_view();
-    let (dict, table, namespace, version) = handle_view.into_parts();
-    (
-        DbspPersistedState::new(dict, table, namespace, version),
-        versions,
-    )
 }
 
 #[tokio::test]

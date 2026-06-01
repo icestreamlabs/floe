@@ -201,7 +201,7 @@ fn split_index_value(text: &str, delimiter: &str, index: i64) -> Option<String> 
         .map(str::to_string)
 }
 
-fn planner_udfs() -> Vec<ScalarUDF> {
+pub fn planner_udfs() -> Vec<ScalarUDF> {
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
         |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
             Ok(args

@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use datafusion::arrow::array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
-    TimestampMillisecondArray,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
+    Decimal128Builder, Int64Array, Int64Builder, RecordBatch, StringArray, StringBuilder,
+    TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
-use floe_core::RowValue;
 use floe_core::source::{AppendIngestEvent, SourceDataType, SourceDefinition};
+use floe_core::{RowValue, source::SourceColumn};
 use serde_json::Value;
 
 use crate::stream_types::Timestamp;
@@ -209,6 +210,239 @@ impl SourceRowDecoder {
             .and_then(|columns| columns.get(idx))
             .copied()
             .unwrap_or(true)
+    }
+}
+
+pub struct SourceArrowBatchBuilder {
+    definition: SourceDefinition,
+    builders: Vec<SourceArrowColumnBuilder>,
+    row_count: usize,
+}
+
+impl SourceArrowBatchBuilder {
+    pub fn new(definition: SourceDefinition, capacity: usize) -> Self {
+        let builders = definition
+            .columns()
+            .iter()
+            .map(|column| SourceArrowColumnBuilder::new(column.data_type(), capacity))
+            .collect();
+        Self {
+            definition,
+            builders,
+            row_count: 0,
+        }
+    }
+
+    pub fn append_event(&mut self, event: &AppendIngestEvent) -> Result<Option<Timestamp>> {
+        if event.source() != self.definition.name() {
+            bail!(
+                "event source {} does not match definition {}",
+                event.source(),
+                self.definition.name()
+            );
+        }
+        if event.preencoded_row_key().is_some() {
+            bail!("preencoded row ingest is not accepted by the vectorized source batch builder");
+        }
+        let payload = AppendIngestEvent::payload(event)
+            .require_payload("source payload must be present for vectorized events")?;
+        let object = payload
+            .as_object()
+            .context("source payload must be a JSON object")?;
+        let mut event_ts = None;
+        for (builder, column) in self.builders.iter_mut().zip(self.definition.columns()) {
+            let value = object.get(column.name());
+            builder.append_json_value(column, value, &mut event_ts)?;
+        }
+        self.row_count += 1;
+        Ok(event_ts)
+    }
+
+    pub fn finish(&mut self) -> Result<Option<RecordBatch>> {
+        if self.row_count == 0 {
+            return Ok(None);
+        }
+        let arrays = self
+            .builders
+            .iter_mut()
+            .map(SourceArrowColumnBuilder::finish)
+            .collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(self.definition.to_arrow_schema(), arrays)?;
+        self.row_count = 0;
+        Ok(Some(batch))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+}
+
+enum SourceArrowColumnBuilder {
+    Int64(Int64Builder),
+    Bool(BooleanBuilder),
+    Utf8(StringBuilder),
+    TimestampMillis(TimestampMillisecondBuilder),
+    DateDays(Date32Builder),
+    Decimal128(Decimal128Builder),
+    Numeric(StringBuilder),
+}
+
+impl SourceArrowColumnBuilder {
+    fn new(data_type: &SourceDataType, capacity: usize) -> Self {
+        match data_type {
+            SourceDataType::Int64 => Self::Int64(Int64Builder::with_capacity(capacity)),
+            SourceDataType::Bool => Self::Bool(BooleanBuilder::with_capacity(capacity)),
+            SourceDataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(
+                capacity,
+                capacity.saturating_mul(16),
+            )),
+            SourceDataType::TimestampMillis => {
+                Self::TimestampMillis(TimestampMillisecondBuilder::with_capacity(capacity))
+            }
+            SourceDataType::DateDays => Self::DateDays(Date32Builder::with_capacity(capacity)),
+            SourceDataType::Decimal128 { precision, scale } => {
+                let data_type =
+                    datafusion::arrow::datatypes::DataType::Decimal128(*precision, *scale);
+                Self::Decimal128(
+                    Decimal128Builder::with_capacity(capacity).with_data_type(data_type),
+                )
+            }
+            SourceDataType::Numeric => Self::Numeric(StringBuilder::with_capacity(
+                capacity,
+                capacity.saturating_mul(16),
+            )),
+        }
+    }
+
+    fn append_json_value(
+        &mut self,
+        column: &SourceColumn,
+        value: Option<&Value>,
+        event_ts: &mut Option<Timestamp>,
+    ) -> Result<()> {
+        match value {
+            None if column.nullable() => self.append_null(),
+            None => bail!("missing field '{}' in source payload", column.name()),
+            Some(value) if value.is_null() => {
+                if column.nullable() {
+                    return self.append_null();
+                }
+                bail!(
+                    "null value violates non-nullable column '{}'",
+                    column.name()
+                );
+            }
+            Some(value) => match (column.data_type(), self) {
+                (SourceDataType::Int64, Self::Int64(builder)) => {
+                    builder.append_value(value.as_i64().with_context(|| {
+                        format!(
+                            "expected integer value for '{}', found {value}",
+                            column.name()
+                        )
+                    })?);
+                    Ok(())
+                }
+                (SourceDataType::Bool, Self::Bool(builder)) => {
+                    builder.append_value(value.as_bool().with_context(|| {
+                        format!(
+                            "expected boolean value for '{}', found {value}",
+                            column.name()
+                        )
+                    })?);
+                    Ok(())
+                }
+                (SourceDataType::Utf8, Self::Utf8(builder)) => {
+                    builder.append_value(value.as_str().with_context(|| {
+                        format!(
+                            "expected string value for '{}', found {value}",
+                            column.name()
+                        )
+                    })?);
+                    Ok(())
+                }
+                (SourceDataType::TimestampMillis, Self::TimestampMillis(builder)) => {
+                    let number = value.as_i64().with_context(|| {
+                        format!(
+                            "expected integer timestamp for '{}', found {value}",
+                            column.name()
+                        )
+                    })?;
+                    builder.append_value(number);
+                    if event_ts.is_none() && number >= 0 {
+                        *event_ts = Some(number as u64);
+                    }
+                    Ok(())
+                }
+                (SourceDataType::DateDays, Self::DateDays(builder)) => {
+                    let days = value.as_i64().with_context(|| {
+                        format!(
+                            "expected integer date days for '{}', found {value}",
+                            column.name()
+                        )
+                    })?;
+                    builder.append_value(i32::try_from(days).with_context(|| {
+                        format!(
+                            "date days value out of range for '{}': {value}",
+                            column.name()
+                        )
+                    })?);
+                    Ok(())
+                }
+                (SourceDataType::Decimal128 { scale, .. }, Self::Decimal128(builder)) => {
+                    let number = match value {
+                        Value::String(value) => parse_decimal_text_to_i128(value, *scale)?,
+                        Value::Number(value) => {
+                            parse_decimal_text_to_i128(&value.to_string(), *scale)?
+                        }
+                        other => bail!("expected decimal string or JSON number, found {other}"),
+                    };
+                    builder.append_value(number);
+                    Ok(())
+                }
+                (SourceDataType::Numeric, Self::Numeric(builder)) => {
+                    let number = match value {
+                        Value::String(value) => value.as_str(),
+                        Value::Number(_) => {
+                            builder.append_value(value.to_string());
+                            return Ok(());
+                        }
+                        other => bail!("expected numeric string or JSON number, found {other}"),
+                    };
+                    builder.append_value(number);
+                    Ok(())
+                }
+                (data_type, _) => bail!(
+                    "source column '{}' does not match Arrow builder for {data_type:?}",
+                    column.name()
+                ),
+            },
+        }
+    }
+
+    fn append_null(&mut self) -> Result<()> {
+        match self {
+            Self::Int64(builder) => builder.append_null(),
+            Self::Bool(builder) => builder.append_null(),
+            Self::Utf8(builder) => builder.append_null(),
+            Self::TimestampMillis(builder) => builder.append_null(),
+            Self::DateDays(builder) => builder.append_null(),
+            Self::Decimal128(builder) => builder.append_null(),
+            Self::Numeric(builder) => builder.append_null(),
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef> {
+        let array: ArrayRef = match self {
+            Self::Int64(builder) => Arc::new(builder.finish()),
+            Self::Bool(builder) => Arc::new(builder.finish()),
+            Self::Utf8(builder) => Arc::new(builder.finish()),
+            Self::TimestampMillis(builder) => Arc::new(builder.finish()),
+            Self::DateDays(builder) => Arc::new(builder.finish()),
+            Self::Decimal128(builder) => Arc::new(builder.finish()),
+            Self::Numeric(builder) => Arc::new(builder.finish()),
+        };
+        Ok(array)
     }
 }
 

@@ -17,7 +17,9 @@ use crate::outer_stream::OuterStreamRegistry;
 
 const SOURCE_BATCH_JOURNAL_PREFIX: &str = "source_journal";
 const KAFKA_SOURCE_JOURNAL_PREFIX: &str = "kafka_source_journal";
+const VECTORIZED_SOURCE_BATCH_JOURNAL_PREFIX: &str = "vectorized_source_journal";
 const SOURCE_BATCH_JOURNAL_ARROW_MAGIC: &[u8] = b"FLOE_SOURCE_BATCH_ARROW_V1";
+const VECTORIZED_SOURCE_BATCH_JOURNAL_ARROW_MAGIC: &[u8] = b"FLOE_VECTORIZED_SOURCE_BATCH_ARROW_V1";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -27,6 +29,14 @@ pub struct SourceBatchJournalEntry {
     pub tick_id: u64,
     pub max_event_time_ms: Option<i64>,
     pub deltas: Vec<(Vec<u8>, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorizedSourceBatchJournalEntry {
+    pub source: String,
+    pub tick_id: u64,
+    pub max_event_time_ms: Option<i64>,
+    pub batches: Vec<RecordBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +59,11 @@ pub struct KafkaSourceJournalEntry {
 
 #[derive(Clone)]
 pub struct SourceBatchJournal {
+    table: Arc<dyn KeyValueTable>,
+}
+
+#[derive(Clone)]
+pub struct VectorizedSourceBatchJournal {
     table: Arc<dyn KeyValueTable>,
 }
 
@@ -201,6 +216,73 @@ impl SourceBatchJournal {
     }
 }
 
+impl VectorizedSourceBatchJournal {
+    pub fn new(table: Arc<dyn KeyValueTable>) -> Self {
+        Self { table }
+    }
+
+    pub async fn append(
+        &self,
+        source: &str,
+        tick_id: u64,
+        max_event_time_ms: Option<i64>,
+        batches: &[RecordBatch],
+    ) -> Result<usize> {
+        let mut batch = WriteBatch::new();
+        let encoded_len = append_vectorized_entry_to_batch(
+            &mut batch,
+            source,
+            tick_id,
+            max_event_time_ms,
+            batches,
+        )?;
+        if encoded_len == 0 {
+            return Ok(0);
+        }
+        self.table.write_batch(batch).await.with_context(|| {
+            format!(
+                "persist vectorized source batch journal entry for '{source}' at tick {tick_id}"
+            )
+        })?;
+        Ok(encoded_len)
+    }
+
+    pub async fn load_committed_entries_up_to(
+        &self,
+        max_tick_id: u64,
+        allowed_sources: &BTreeSet<String>,
+    ) -> Result<Vec<VectorizedSourceBatchJournalEntry>> {
+        let entries = self
+            .table
+            .scan_prefix(&vectorized_entry_prefix(), &ScanOptions::default())
+            .await
+            .context("scan vectorized source batch journal")?;
+        let mut recovered = Vec::new();
+        for (key, value) in entries {
+            let (tick_id, source) = parse_vectorized_entry_key(&key)?;
+            if tick_id > max_tick_id {
+                break;
+            }
+            if !allowed_sources.is_empty() && !allowed_sources.contains(&source) {
+                continue;
+            }
+            let (max_event_time_ms, batches) =
+                decode_vectorized_entry(&value).with_context(|| {
+                    format!(
+                        "decode vectorized source batch journal entry for '{source}' at tick {tick_id}"
+                    )
+                })?;
+            recovered.push(VectorizedSourceBatchJournalEntry {
+                source,
+                tick_id,
+                max_event_time_ms,
+                batches,
+            });
+        }
+        Ok(recovered)
+    }
+}
+
 impl KafkaSourceJournal {
     pub fn new(table: Arc<dyn KeyValueTable>) -> Self {
         Self { table }
@@ -295,6 +377,22 @@ pub(crate) fn append_kafka_source_metadata_entry_to_batch(
     Ok(encoded_len)
 }
 
+pub fn append_vectorized_entry_to_batch(
+    batch: &mut WriteBatch,
+    source: &str,
+    tick_id: u64,
+    max_event_time_ms: Option<i64>,
+    batches: &[RecordBatch],
+) -> Result<usize> {
+    let encoded = encode_vectorized_entry(max_event_time_ms, batches)?;
+    if encoded.is_empty() {
+        return Ok(0);
+    }
+    let encoded_len = encoded.len();
+    batch.put(vectorized_entry_key(source, tick_id)?, encoded);
+    Ok(encoded_len)
+}
+
 pub fn kafka_source_journal_initial_checksum() -> u64 {
     FNV_OFFSET_BASIS
 }
@@ -320,6 +418,21 @@ fn entry_key(source: &str, tick_id: u64) -> Result<Vec<u8>> {
     Ok(format!("{SOURCE_BATCH_JOURNAL_PREFIX}/entries/{tick_id:020}/{source}").into_bytes())
 }
 
+fn vectorized_entry_prefix() -> Vec<u8> {
+    format!("{VECTORIZED_SOURCE_BATCH_JOURNAL_PREFIX}/entries/").into_bytes()
+}
+
+fn vectorized_entry_key(source: &str, tick_id: u64) -> Result<Vec<u8>> {
+    ensure!(
+        !source.is_empty() && !source.contains('/'),
+        "invalid vectorized source batch journal source '{source}'"
+    );
+    Ok(
+        format!("{VECTORIZED_SOURCE_BATCH_JOURNAL_PREFIX}/entries/{tick_id:020}/{source}")
+            .into_bytes(),
+    )
+}
+
 fn parse_entry_key(key: &[u8]) -> Result<(u64, String)> {
     let key_str = std::str::from_utf8(key).context("source batch journal key must be utf8")?;
     let mut parts = key_str.split('/');
@@ -333,6 +446,26 @@ fn parse_entry_key(key: &[u8]) -> Result<(u64, String)> {
     let tick_id = tick_id
         .parse::<u64>()
         .with_context(|| format!("parse source batch journal tick from '{key_str}'"))?;
+    Ok((tick_id, source.to_string()))
+}
+
+fn parse_vectorized_entry_key(key: &[u8]) -> Result<(u64, String)> {
+    let key_str =
+        std::str::from_utf8(key).context("vectorized source batch journal key must be utf8")?;
+    let mut parts = key_str.split('/');
+    let prefix = parts.next().unwrap_or_default();
+    let section = parts.next().unwrap_or_default();
+    let tick_id = parts.next().unwrap_or_default();
+    let source = parts.next().unwrap_or_default();
+    if prefix != VECTORIZED_SOURCE_BATCH_JOURNAL_PREFIX || section != "entries" || source.is_empty()
+    {
+        return Err(anyhow!(
+            "invalid vectorized source batch journal key '{key_str}'"
+        ));
+    }
+    let tick_id = tick_id
+        .parse::<u64>()
+        .with_context(|| format!("parse vectorized source batch journal tick from '{key_str}'"))?;
     Ok((tick_id, source.to_string()))
 }
 
@@ -362,6 +495,66 @@ fn parse_kafka_entry_key(key: &[u8]) -> Result<(u64, String)> {
         .parse::<u64>()
         .with_context(|| format!("parse kafka source journal tick from '{key_str}'"))?;
     Ok((tick_id, source.to_string()))
+}
+
+fn encode_vectorized_entry(
+    max_event_time_ms: Option<i64>,
+    batches: &[RecordBatch],
+) -> Result<Vec<u8>> {
+    let mut non_empty = batches.iter().filter(|batch| batch.num_rows() > 0);
+    let Some(first) = non_empty.next() else {
+        return Ok(Vec::new());
+    };
+    let schema = first.schema();
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(VECTORIZED_SOURCE_BATCH_JOURNAL_ARROW_MAGIC);
+    encoded.extend_from_slice(&max_event_time_ms.unwrap_or(-1).to_le_bytes());
+    {
+        let mut writer = StreamWriter::try_new(&mut encoded, schema.as_ref())
+            .context("create vectorized source batch journal Arrow writer")?;
+        writer
+            .write(first)
+            .context("write vectorized source batch journal Arrow batch")?;
+        for batch in non_empty {
+            if batch.schema().as_ref() != schema.as_ref() {
+                bail!("vectorized source batch journal entry contains mixed schemas");
+            }
+            writer
+                .write(batch)
+                .context("write vectorized source batch journal Arrow batch")?;
+        }
+        writer
+            .finish()
+            .context("finalize vectorized source batch journal Arrow writer")?;
+    }
+    Ok(encoded)
+}
+
+fn decode_vectorized_entry(value: &[u8]) -> Result<(Option<i64>, Vec<RecordBatch>)> {
+    if !value.starts_with(VECTORIZED_SOURCE_BATCH_JOURNAL_ARROW_MAGIC) {
+        bail!("vectorized source batch journal entry missing Arrow header");
+    }
+    let mut cursor = VECTORIZED_SOURCE_BATCH_JOURNAL_ARROW_MAGIC.len();
+    if value.len() < cursor + 8 {
+        bail!("vectorized source batch journal Arrow entry missing metadata header");
+    }
+    let max_event_time_ms = i64::from_le_bytes(
+        value[cursor..cursor + 8]
+            .try_into()
+            .expect("slice width already checked"),
+    );
+    cursor += 8;
+
+    let reader = StreamReader::try_new(Cursor::new(&value[cursor..]), None)
+        .context("create vectorized source batch journal Arrow reader")?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.context("read vectorized source batch journal Arrow batch")?);
+    }
+    Ok((
+        (max_event_time_ms >= 0).then_some(max_event_time_ms),
+        batches,
+    ))
 }
 
 fn encode_entry(max_event_time_ms: Option<i64>, deltas: &[(Vec<u8>, i64)]) -> Result<Vec<u8>> {
@@ -402,10 +595,10 @@ fn encode_entry(max_event_time_ms: Option<i64>, deltas: &[(Vec<u8>, i64)]) -> Re
 }
 
 fn decode_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)> {
-    if value.starts_with(SOURCE_BATCH_JOURNAL_ARROW_MAGIC) {
-        return decode_arrow_entry(value);
+    if !value.starts_with(SOURCE_BATCH_JOURNAL_ARROW_MAGIC) {
+        bail!("source batch journal entry missing Arrow header");
     }
-    decode_legacy_entry(value)
+    decode_arrow_entry(value)
 }
 
 fn decode_arrow_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)> {
@@ -438,57 +631,6 @@ fn decode_arrow_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)
         for idx in 0..batch.num_rows() {
             deltas.push((rows.value(idx).to_vec(), diffs.value(idx)));
         }
-    }
-    Ok((
-        (max_event_time_ms >= 0).then_some(max_event_time_ms),
-        deltas,
-    ))
-}
-
-fn decode_legacy_entry(value: &[u8]) -> Result<(Option<i64>, Vec<(Vec<u8>, i64)>)> {
-    if value.len() < 12 {
-        bail!("source batch journal entry missing header");
-    }
-    let mut cursor = 0usize;
-    let max_event_time_ms = i64::from_le_bytes(
-        value[cursor..cursor + 8]
-            .try_into()
-            .expect("slice width already checked"),
-    );
-    cursor += 8;
-    let count = u32::from_le_bytes(
-        value[cursor..cursor + 4]
-            .try_into()
-            .expect("slice width already checked"),
-    ) as usize;
-    cursor += 4;
-
-    let mut deltas = Vec::with_capacity(count);
-    for _ in 0..count {
-        if cursor + 4 > value.len() {
-            bail!("source batch journal entry truncated before row length");
-        }
-        let key_len = u32::from_le_bytes(
-            value[cursor..cursor + 4]
-                .try_into()
-                .expect("slice width already checked"),
-        ) as usize;
-        cursor += 4;
-        if cursor + key_len + 8 > value.len() {
-            bail!("source batch journal entry truncated while decoding row");
-        }
-        let key = value[cursor..cursor + key_len].to_vec();
-        cursor += key_len;
-        let diff = i64::from_le_bytes(
-            value[cursor..cursor + 8]
-                .try_into()
-                .expect("slice width already checked"),
-        );
-        cursor += 8;
-        deltas.push((key, diff));
-    }
-    if cursor != value.len() {
-        bail!("source batch journal entry had trailing bytes");
     }
     Ok((
         (max_event_time_ms >= 0).then_some(max_event_time_ms),
@@ -671,24 +813,6 @@ mod tests {
         assert_eq!(entries[0].tick_id, 7);
         assert_eq!(entries[0].max_event_time_ms, Some(123));
         assert_eq!(entries[0].deltas.len(), 2);
-    }
-
-    #[test]
-    fn source_batch_journal_decodes_legacy_entries() {
-        let mut legacy = Vec::new();
-        legacy.extend_from_slice(&123_i64.to_le_bytes());
-        legacy.extend_from_slice(&2_u32.to_le_bytes());
-        legacy.extend_from_slice(&1_u32.to_le_bytes());
-        legacy.extend_from_slice(b"a");
-        legacy.extend_from_slice(&1_i64.to_le_bytes());
-        legacy.extend_from_slice(&1_u32.to_le_bytes());
-        legacy.extend_from_slice(b"b");
-        legacy.extend_from_slice(&(-1_i64).to_le_bytes());
-
-        let (max_event_time_ms, deltas) = decode_entry(&legacy).expect("decode legacy");
-
-        assert_eq!(max_event_time_ms, Some(123));
-        assert_eq!(deltas, vec![(b"a".to_vec(), 1), (b"b".to_vec(), -1)]);
     }
 
     #[tokio::test]

@@ -1,15 +1,5 @@
 use super::*;
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn lookup_decoder_for_source<'a>(
-    decoders: &'a HashMap<String, SourceRowDecoder>,
-    source_name: &str,
-) -> anyhow::Result<&'a SourceRowDecoder> {
-    decoders
-        .get(source_name)
-        .ok_or_else(|| anyhow!("received event for unknown source '{source_name}'"))
-}
-
 pub(super) fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     if every == 0 {
         return true;
@@ -202,11 +192,12 @@ impl KafkaSourceJournalRangeAccumulator {
         }
     }
 
-    fn observe_row(&mut self, offset: i64, encoded_row: &[u8]) {
+    fn observe_event(&mut self, offset: i64, event: &core_source::AppendIngestEvent) {
         self.start_offset = self.start_offset.min(offset);
         self.end_offset = self.end_offset.max(offset);
         self.row_count = self.row_count.saturating_add(1);
-        update_kafka_source_journal_checksum(&mut self.checksum, offset, encoded_row);
+        let checksum_bytes = kafka_source_journal_event_checksum_bytes(event);
+        update_kafka_source_journal_checksum(&mut self.checksum, offset, &checksum_bytes);
     }
 
     pub(super) fn into_range(self) -> KafkaSourceJournalRange {
@@ -221,18 +212,33 @@ impl KafkaSourceJournalRangeAccumulator {
     }
 }
 
-pub(super) fn observe_kafka_source_journal_row(
+pub(super) fn observe_kafka_source_journal_event(
     ranges: &mut Option<HashMap<(Arc<str>, i32), KafkaSourceJournalRangeAccumulator>>,
     topic: Arc<str>,
     partition: i32,
     offset: i64,
-    encoded_row: &[u8],
+    event: &core_source::AppendIngestEvent,
 ) {
     let entry = ranges
         .get_or_insert_with(HashMap::new)
         .entry((Arc::clone(&topic), partition))
         .or_insert_with(|| KafkaSourceJournalRangeAccumulator::new(topic, partition, offset));
-    entry.observe_row(offset, encoded_row);
+    entry.observe_event(offset, event);
+}
+
+pub(super) fn kafka_source_journal_event_checksum_bytes(
+    event: &core_source::AppendIngestEvent,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(event.source().as_bytes());
+    bytes.push(0);
+    if let Some(payload) = event.payload() {
+        match serde_json::to_vec(payload) {
+            Ok(payload) => bytes.extend_from_slice(&payload),
+            Err(_) => bytes.extend_from_slice(b"<unserializable-json-payload>"),
+        }
+    }
+    bytes
 }
 
 pub(super) fn advance_kafka_offset_commit_state(

@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::handles::ZSetHandleView;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::watch;
 
 use super::registry::MaterializedViewHandle;
@@ -13,6 +15,8 @@ pub trait MaterializedView: Send + Sync {
     fn subscribe_versions(&self) -> watch::Receiver<Option<i64>>;
     fn handle_for(&self, version: i64) -> Result<ZSetHandleView<Vec<u8>>>;
     fn version_time(&self, version: i64) -> Option<i64>;
+    fn arrow_snapshot_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>>;
+    fn arrow_delta_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>>;
     async fn snapshot_for(&self, version: i64) -> Result<HashMap<Vec<u8>, i64>>;
     async fn delta_for(&self, version: i64) -> Result<Vec<(Vec<u8>, i64)>>;
 }
@@ -54,6 +58,14 @@ impl MaterializedView for MaterializedViewHandle {
 
     fn version_time(&self, version: i64) -> Option<i64> {
         MaterializedViewHandle::version_time(self, version)
+    }
+
+    fn arrow_snapshot_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
+        MaterializedViewHandle::arrow_snapshot_for(self, version)
+    }
+
+    fn arrow_delta_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
+        MaterializedViewHandle::arrow_delta_for(self, version)
     }
 
     async fn snapshot_for(&self, version: i64) -> Result<HashMap<Vec<u8>, i64>> {
