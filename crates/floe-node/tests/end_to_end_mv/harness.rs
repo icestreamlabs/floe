@@ -2,10 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanBuilder, Date32Builder, Int64Builder, StringBuilder,
+    TimestampMillisecondBuilder,
+};
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::StreamRetention;
+use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
 use floe_executor::{
-    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
+    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError, MaterializedView,
     MaterializedViewRegistry, OuterStreamRegistry, ValidatedPlan, load_or_register_mv,
     validate_dbsp_plan,
 };
@@ -114,6 +121,7 @@ impl MvTestHarness {
     pub(crate) async fn session_with_view(
         &self,
     ) -> Result<(datafusion::execution::context::SessionContext, DbspBridge)> {
+        self.publish_arrow_snapshots_from_encoded_state().await?;
         let query = FloeQueryContext::new(Arc::clone(&self.catalog));
         let session = query.session();
         let mut bridge = DbspBridge::new(Arc::clone(&self.db)).await?;
@@ -125,6 +133,42 @@ impl MvTestHarness {
         )
         .await?;
         Ok((session, bridge))
+    }
+
+    async fn publish_arrow_snapshots_from_encoded_state(&self) -> Result<()> {
+        let handle = self
+            .mv_registry
+            .get(&self.view_name)
+            .with_context(|| format!("materialized view handle for '{}'", self.view_name))?;
+        let schema = self
+            .mv_registry
+            .schema(&self.view_name)
+            .with_context(|| format!("schema for materialized view '{}'", self.view_name))?;
+
+        let mut versions = Vec::new();
+        let mut cursor = -1_i64;
+        while let Some(version) = handle.next_version_after(cursor) {
+            versions.push(version);
+            cursor = version;
+        }
+
+        for version in versions {
+            let state = if let Some((_base, _target, overlay)) = u64::try_from(version)
+                .ok()
+                .and_then(|as_of| handle.encoded_overlay_merged_delta(Some(as_of)))
+            {
+                overlay
+            } else if version == 0 {
+                std::collections::HashMap::new()
+            } else {
+                MaterializedView::handle_for(handle.as_ref(), version)?
+                    .materialize()
+                    .await?
+            };
+            let batches = encoded_state_to_arrow_batches(Arc::clone(&schema), state)?;
+            handle.publish_arrow_version(version, batches, Vec::new());
+        }
+        Ok(())
     }
 }
 
@@ -158,4 +202,113 @@ fn gather_transient_streams(
         }
     }
     map
+}
+
+fn encoded_state_to_arrow_batches(
+    schema: datafusion::arrow::datatypes::SchemaRef,
+    state: std::collections::HashMap<Vec<u8>, i64>,
+) -> Result<Vec<RecordBatch>> {
+    let mut rows = Vec::new();
+    for (encoded, diff) in state {
+        if diff <= 0 {
+            continue;
+        }
+        let decoded = decode_all_encoded_row_scalars(&encoded)?;
+        for _ in 0..diff {
+            rows.push(decoded.clone());
+        }
+    }
+    let columns = (0..schema.fields().len())
+        .map(|idx| build_arrow_column(schema.field(idx), &rows, idx))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(vec![RecordBatch::try_new(schema, columns)?])
+}
+
+fn build_arrow_column(
+    field: &datafusion::arrow::datatypes::Field,
+    rows: &[Vec<Option<EncodedRowScalar>>],
+    idx: usize,
+) -> Result<ArrayRef> {
+    match field.data_type() {
+        DataType::Int64 => {
+            let mut builder = Int64Builder::new();
+            for row in rows {
+                match row.get(idx).and_then(Option::as_ref) {
+                    Some(EncodedRowScalar::Int64(value)) => builder.append_value(*value),
+                    Some(other) => bail!(
+                        "encoded MV column '{}' expected Int64, got {:?}",
+                        field.name(),
+                        other
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for row in rows {
+                match row.get(idx).and_then(Option::as_ref) {
+                    Some(EncodedRowScalar::Utf8(value)) => builder.append_value(value),
+                    Some(other) => bail!(
+                        "encoded MV column '{}' expected Utf8, got {:?}",
+                        field.name(),
+                        other
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::new();
+            for row in rows {
+                match row.get(idx).and_then(Option::as_ref) {
+                    Some(EncodedRowScalar::Bool(value)) => builder.append_value(*value),
+                    Some(other) => bail!(
+                        "encoded MV column '{}' expected Boolean, got {:?}",
+                        field.name(),
+                        other
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Date32 => {
+            let mut builder = Date32Builder::new();
+            for row in rows {
+                match row.get(idx).and_then(Option::as_ref) {
+                    Some(EncodedRowScalar::DateDays(value)) => builder.append_value(*value),
+                    Some(other) => bail!(
+                        "encoded MV column '{}' expected Date32, got {:?}",
+                        field.name(),
+                        other
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let mut builder = TimestampMillisecondBuilder::new();
+            for row in rows {
+                match row.get(idx).and_then(Option::as_ref) {
+                    Some(EncodedRowScalar::TimestampMillis(value)) => builder.append_value(*value),
+                    Some(other) => bail!(
+                        "encoded MV column '{}' expected Timestamp(Millisecond), got {:?}",
+                        field.name(),
+                        other
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        other => bail!(
+            "end-to-end MV harness cannot publish Arrow snapshots for column '{}' with type {:?}",
+            field.name(),
+            other
+        ),
+    }
 }

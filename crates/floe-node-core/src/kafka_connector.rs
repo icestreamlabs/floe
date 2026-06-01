@@ -1,6 +1,4 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -12,14 +10,13 @@ use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::message::{BorrowedMessage, Timestamp};
 use rdkafka::{Offset, TopicPartitionList};
 use serde::Deserialize;
-use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
 use crate::source::AppendIngestEventSender;
-use floe_core::source::{AppendIngestEvent, SourceDataType, SourceDefinition};
+use floe_core::source::{AppendIngestEvent, SourceDefinition};
 
 static KAFKA_CONNECTOR_TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 256;
@@ -91,7 +88,6 @@ pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     message_format: KafkaMessageFormat,
     definitions: Vec<SourceDefinition>,
-    direct_decode_lookup: DirectDecodeLookup,
     topic_arcs: HashMap<String, Arc<str>>,
     consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
@@ -99,18 +95,11 @@ pub struct KafkaConnector {
     first_batch_logged: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct DirectDecodeLookup {
-    definition_index_by_name: HashMap<String, usize>,
-    column_indexes_by_definition: Vec<HashMap<String, usize>>,
-    required_columns_by_definition: Vec<Option<Arc<[bool]>>>,
-}
-
 impl KafkaConnector {
     pub fn new(
         config: KafkaConnectorConfig,
         definitions: Vec<SourceDefinition>,
-        required_columns_by_source: HashMap<String, Arc<[bool]>>,
+        _required_columns_by_source: HashMap<String, Arc<[bool]>>,
     ) -> Result<Self> {
         ensure!(
             !config.brokers.trim().is_empty(),
@@ -122,8 +111,6 @@ impl KafkaConnector {
             "kafka max messages per tick must be positive"
         );
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
-        let direct_decode_lookup =
-            build_direct_decode_lookup(&definitions, &required_columns_by_source);
         let topic_arcs = config
             .topics
             .iter()
@@ -133,7 +120,6 @@ impl KafkaConnector {
             config,
             message_format,
             definitions,
-            direct_decode_lookup,
             topic_arcs,
             consumer: None,
             last_committed_tick_id: 0,
@@ -283,44 +269,11 @@ impl KafkaConnector {
             }
         };
         let events = match self.message_format {
-            KafkaMessageFormat::FloeJson => match parse_direct_default_source_payload_event(
+            KafkaMessageFormat::FloeJson => parse_floe_json_events(
                 payload,
                 self.config.default_source.as_deref(),
-                &self.definitions,
-                &self.direct_decode_lookup,
-                self.config.default_source_id,
-            )
-            .or_else(|_| {
-                parse_direct_floe_json_event(
-                    payload,
-                    self.config.default_source.as_deref(),
-                    message.topic(),
-                    &self.definitions,
-                    &self.direct_decode_lookup,
-                    self.config.default_source_id,
-                )
-            }) {
-                Ok(Some(event)) => Ok(vec![event]),
-                Ok(None) => parse_floe_json_events(
-                    payload,
-                    self.config.default_source.as_deref(),
-                    message.topic(),
-                ),
-                Err(err) => {
-                    tracing::debug!(
-                        topic = message.topic(),
-                        partition = message.partition(),
-                        offset = message.offset(),
-                        error = %err,
-                        "direct kafka floe_json parse fell back to serde_json::Value path"
-                    );
-                    parse_floe_json_events(
-                        payload,
-                        self.config.default_source.as_deref(),
-                        message.topic(),
-                    )
-                }
-            },
+                message.topic(),
+            ),
             KafkaMessageFormat::DebeziumJson => {
                 let value: Value = match serde_json::from_slice(payload) {
                     Ok(value) => value,
@@ -591,525 +544,6 @@ fn parse_floe_json_event(
     }
 }
 
-fn parse_direct_default_source_payload_event(
-    payload: &[u8],
-    default_source: Option<&str>,
-    definitions: &[SourceDefinition],
-    lookup: &DirectDecodeLookup,
-    default_source_id: Option<usize>,
-) -> Result<Option<AppendIngestEvent>> {
-    let Some(source_name) = default_source else {
-        return Ok(None);
-    };
-    let Some((definition_idx, definition)) =
-        lookup_source_definition(definitions, &lookup.definition_index_by_name, source_name)
-    else {
-        return Ok(None);
-    };
-    let mut deserializer = serde_json::Deserializer::from_slice(payload);
-    let (encoded_row, event_ts) = DirectSourceDataSeed {
-        definition,
-        column_indexes: &lookup.column_indexes_by_definition[definition_idx],
-        required_columns: lookup.required_columns_by_definition[definition_idx].as_deref(),
-    }
-    .deserialize(&mut deserializer)
-    .map_err(|err| anyhow::anyhow!("direct default-source floe_json decode failed: {err}"))?;
-    let mut event = if let Some(source_id) = default_source_id {
-        AppendIngestEvent::preencoded_for_source_id(source_id, encoded_row)
-    } else {
-        AppendIngestEvent::preencoded(source_name, encoded_row)
-    };
-    if let Some(event_time_ms) = event_ts {
-        event = event.with_event_time_ms(event_time_ms);
-    }
-    Ok(Some(event))
-}
-
-fn parse_direct_floe_json_event(
-    payload: &[u8],
-    default_source: Option<&str>,
-    topic: &str,
-    definitions: &[SourceDefinition],
-    lookup: &DirectDecodeLookup,
-    default_source_id: Option<usize>,
-) -> Result<Option<AppendIngestEvent>> {
-    let mut deserializer = serde_json::Deserializer::from_slice(payload);
-    DirectFloeJsonEventSeed {
-        default_source,
-        topic,
-        definitions,
-        lookup,
-        default_source_id,
-    }
-    .deserialize(&mut deserializer)
-    .map_err(|err| anyhow::anyhow!("direct floe_json decode failed: {err}"))
-}
-
-struct DirectFloeJsonEventSeed<'a> {
-    default_source: Option<&'a str>,
-    topic: &'a str,
-    definitions: &'a [SourceDefinition],
-    lookup: &'a DirectDecodeLookup,
-    default_source_id: Option<usize>,
-}
-
-impl<'de> DeserializeSeed<'de> for DirectFloeJsonEventSeed<'_> {
-    type Value = Option<AppendIngestEvent>;
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(DirectFloeJsonEventVisitor { seed: self })
-    }
-}
-
-struct DirectFloeJsonEventVisitor<'a> {
-    seed: DirectFloeJsonEventSeed<'a>,
-}
-
-impl<'de> Visitor<'de> for DirectFloeJsonEventVisitor<'_> {
-    type Value = Option<AppendIngestEvent>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a single floe_json source/data wrapper object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut source = self.seed.default_source.map(ToOwned::to_owned);
-        let mut encoded_row = None;
-        let mut event_ts = None;
-        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
-            match key.as_ref() {
-                "source" => {
-                    source = Some(map.next_value::<String>()?);
-                }
-                "data" => {
-                    let Some(source_name) = source
-                        .as_deref()
-                        .or(self.seed.default_source)
-                        .or(Some(self.seed.topic))
-                    else {
-                        let _: IgnoredAny = map.next_value()?;
-                        skip_remaining_map(&mut map)?;
-                        return Ok(None);
-                    };
-                    let Some((definition_idx, definition)) = lookup_source_definition(
-                        self.seed.definitions,
-                        &self.seed.lookup.definition_index_by_name,
-                        source_name,
-                    ) else {
-                        let _: IgnoredAny = map.next_value()?;
-                        skip_remaining_map(&mut map)?;
-                        return Ok(None);
-                    };
-                    let (encoded, parsed_event_ts) = map.next_value_seed(DirectSourceDataSeed {
-                        definition,
-                        column_indexes: &self.seed.lookup.column_indexes_by_definition
-                            [definition_idx],
-                        required_columns: self.seed.lookup.required_columns_by_definition
-                            [definition_idx]
-                            .as_deref(),
-                    })?;
-                    let source_id = self
-                        .seed
-                        .default_source_id
-                        .filter(|_| Some(source_name) == self.seed.default_source);
-                    encoded_row = Some((encoded, source_id));
-                    if event_ts.is_none() {
-                        event_ts = parsed_event_ts;
-                    }
-                }
-                _ => {
-                    let _: IgnoredAny = map.next_value()?;
-                }
-            }
-        }
-        let Some((encoded_row, source_id)) = encoded_row else {
-            return Ok(None);
-        };
-        let Some(source_name) = source
-            .or_else(|| self.seed.default_source.map(str::to_string))
-            .or_else(|| Some(self.seed.topic.to_string()))
-        else {
-            return Ok(None);
-        };
-        let mut event = if let Some(source_id) = source_id {
-            AppendIngestEvent::preencoded_for_source_id(source_id, encoded_row)
-        } else {
-            AppendIngestEvent::new(source_name, Value::Null).with_preencoded_row_key(encoded_row)
-        };
-        if let Some(event_time_ms) = event_ts {
-            event = event.with_event_time_ms(event_time_ms);
-        }
-        Ok(Some(event))
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: de::SeqAccess<'de>,
-    {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(None)
-    }
-}
-
-struct DirectSourceDataSeed<'a> {
-    definition: &'a SourceDefinition,
-    column_indexes: &'a HashMap<String, usize>,
-    required_columns: Option<&'a [bool]>,
-}
-
-impl<'de> DeserializeSeed<'de> for DirectSourceDataSeed<'_> {
-    type Value = (Vec<u8>, Option<u64>);
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_map(DirectSourceDataVisitor {
-            definition: self.definition,
-            column_indexes: self.column_indexes,
-            required_columns: self.required_columns,
-        })
-    }
-}
-
-struct DirectSourceDataVisitor<'a> {
-    definition: &'a SourceDefinition,
-    column_indexes: &'a HashMap<String, usize>,
-    required_columns: Option<&'a [bool]>,
-}
-
-enum DirectColumnValue<'de> {
-    Int64(i64),
-    TimestampMillis(i64),
-    Utf8(Cow<'de, str>),
-    Bool(bool),
-    DateDays(i32),
-    Numeric(Cow<'de, str>),
-    Decimal128(i128),
-    Null,
-}
-
-impl<'de> Visitor<'de> for DirectSourceDataVisitor<'_> {
-    type Value = (Vec<u8>, Option<u64>);
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a source data object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut encoded_columns: Vec<Option<DirectColumnValue<'de>>> =
-            self.definition.columns().iter().map(|_| None).collect();
-        let mut event_ts = None;
-        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
-            if let Some((idx, column)) =
-                lookup_source_column(self.definition, self.column_indexes, key.as_ref())
-            {
-                if !column_required(self.required_columns, idx) {
-                    let _: IgnoredAny = map.next_value()?;
-                    continue;
-                }
-                let (encoded, parsed_event_ts) = map.next_value_seed(DirectSourceColumnSeed {
-                    data_type: column.data_type(),
-                    nullable: column.nullable(),
-                    field_name: column.name(),
-                })?;
-                encoded_columns[idx] = Some(encoded);
-                if event_ts.is_none() {
-                    event_ts = parsed_event_ts;
-                }
-            } else {
-                let _: IgnoredAny = map.next_value()?;
-            }
-        }
-
-        let mut row = Vec::with_capacity(4 + self.definition.columns().len() * 9);
-        let count = u32::try_from(self.definition.columns().len())
-            .map_err(|_| de::Error::custom("too many source columns to encode"))?;
-        row.extend_from_slice(&count.to_le_bytes());
-        for (idx, column) in self.definition.columns().iter().enumerate() {
-            if !column_required(self.required_columns, idx) {
-                encode_typed_null(&mut row, column.data_type());
-                continue;
-            }
-            if let Some(encoded) = encoded_columns[idx].take() {
-                encode_direct_column_value(&mut row, encoded, column.data_type())?;
-            } else if column.nullable() {
-                encode_typed_null(&mut row, column.data_type());
-            } else {
-                return Err(de::Error::custom(format!(
-                    "missing field '{}' in source payload",
-                    column.name()
-                )));
-            }
-        }
-        Ok((row, event_ts))
-    }
-}
-
-struct DirectSourceColumnSeed<'a> {
-    data_type: &'a SourceDataType,
-    nullable: bool,
-    field_name: &'a str,
-}
-
-impl<'de> DeserializeSeed<'de> for DirectSourceColumnSeed<'_> {
-    type Value = (DirectColumnValue<'de>, Option<u64>);
-
-    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        match self.data_type {
-            SourceDataType::Int64 => {
-                let value = Option::<i64>::deserialize(deserializer)?;
-                match value {
-                    Some(value) => Ok((DirectColumnValue::Int64(value), None)),
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-            SourceDataType::TimestampMillis => {
-                let value = Option::<i64>::deserialize(deserializer)?;
-                match value {
-                    Some(value) => {
-                        let event_ts = (value >= 0).then_some(value as u64);
-                        Ok((DirectColumnValue::TimestampMillis(value), event_ts))
-                    }
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-            SourceDataType::Utf8 => {
-                let value = Option::<Cow<'de, str>>::deserialize(deserializer)?;
-                match value {
-                    Some(value) => Ok((DirectColumnValue::Utf8(value), None)),
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-            SourceDataType::Bool => {
-                let value = Option::<bool>::deserialize(deserializer)?;
-                match value {
-                    Some(value) => Ok((DirectColumnValue::Bool(value), None)),
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-            SourceDataType::DateDays => {
-                let value = Option::<i32>::deserialize(deserializer)?;
-                match value {
-                    Some(value) => Ok((DirectColumnValue::DateDays(value), None)),
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-            SourceDataType::Numeric => {
-                let value = Option::<Cow<'de, str>>::deserialize(deserializer)?;
-                match value {
-                    Some(value) => Ok((DirectColumnValue::Numeric(value), None)),
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-            SourceDataType::Decimal128 { scale, .. } => {
-                let value = Option::<Value>::deserialize(deserializer)?;
-                match value {
-                    Some(Value::String(value)) => parse_decimal_text_to_i128(&value, *scale)
-                        .map(|value| (DirectColumnValue::Decimal128(value), None))
-                        .map_err(de::Error::custom),
-                    Some(Value::Number(value)) => {
-                        parse_decimal_text_to_i128(&value.to_string(), *scale)
-                            .map(|value| (DirectColumnValue::Decimal128(value), None))
-                            .map_err(de::Error::custom)
-                    }
-                    Some(other) => Err(de::Error::custom(format!(
-                        "expected numeric string or JSON number for column '{}', found {other}",
-                        self.field_name
-                    ))),
-                    None if self.nullable => Ok((DirectColumnValue::Null, None)),
-                    None => Err(de::Error::custom(format!(
-                        "null value violates non-nullable column '{}'",
-                        self.field_name
-                    ))),
-                }
-            }
-        }
-    }
-}
-
-fn encode_direct_column_value<E>(
-    row: &mut Vec<u8>,
-    value: DirectColumnValue<'_>,
-    data_type: &SourceDataType,
-) -> std::result::Result<(), E>
-where
-    E: de::Error,
-{
-    match value {
-        DirectColumnValue::Int64(value) => {
-            row.push(0x01);
-            row.extend_from_slice(&value.to_le_bytes());
-        }
-        DirectColumnValue::TimestampMillis(value) => {
-            row.push(0x03);
-            row.extend_from_slice(&value.to_le_bytes());
-        }
-        DirectColumnValue::Utf8(value) => {
-            let bytes = value.as_bytes();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| E::custom("utf8 value too large for MV key"))?;
-            row.push(0x02);
-            row.extend_from_slice(&len.to_le_bytes());
-            row.extend_from_slice(bytes);
-        }
-        DirectColumnValue::Bool(value) => {
-            row.push(0x04);
-            row.push(if value { 1 } else { 0 });
-        }
-        DirectColumnValue::DateDays(value) => {
-            row.push(0x09);
-            row.extend_from_slice(&value.to_le_bytes());
-        }
-        DirectColumnValue::Numeric(value) => {
-            let bytes = value.as_bytes();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| E::custom("numeric value too large for MV key"))?;
-            row.push(0x02);
-            row.extend_from_slice(&len.to_le_bytes());
-            row.extend_from_slice(bytes);
-        }
-        DirectColumnValue::Decimal128(value) => {
-            row.push(0x0B);
-            row.extend_from_slice(&value.to_le_bytes());
-        }
-        DirectColumnValue::Null => encode_typed_null(row, data_type),
-    }
-    Ok(())
-}
-
-fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
-    match data_type {
-        SourceDataType::Int64 => buf.push(0x05),
-        SourceDataType::Utf8 => buf.push(0x06),
-        SourceDataType::TimestampMillis => buf.push(0x07),
-        SourceDataType::Bool => buf.push(0x08),
-        SourceDataType::DateDays => buf.push(0x0A),
-        SourceDataType::Numeric => buf.push(0x06),
-        SourceDataType::Decimal128 { .. } => buf.push(0x0C),
-    }
-}
-
-fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
-    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
-    let value = value.trim();
-    let (negative, unsigned) = value
-        .strip_prefix('-')
-        .map(|rest| (true, rest))
-        .unwrap_or((false, value));
-    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    let mut digits = String::with_capacity(whole.len() + scale as usize);
-    digits.push_str(whole);
-    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
-    ensure!(
-        fraction.len() <= scale_usize,
-        "decimal value '{value}' has more fractional digits than scale {scale}"
-    );
-    digits.push_str(fraction);
-    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
-    let parsed = digits
-        .parse::<i128>()
-        .with_context(|| format!("decode decimal value '{value}'"))?;
-    Ok(if negative { -parsed } else { parsed })
-}
-
-fn column_required(required_columns: Option<&[bool]>, idx: usize) -> bool {
-    required_columns
-        .and_then(|columns| columns.get(idx))
-        .copied()
-        .unwrap_or(true)
-}
-
-fn lookup_source_definition<'a>(
-    definitions: &'a [SourceDefinition],
-    definition_index_by_name: &HashMap<String, usize>,
-    source: &str,
-) -> Option<(usize, &'a SourceDefinition)> {
-    let idx = definition_index_by_name.get(source).copied()?;
-    Some((idx, definitions.get(idx)?))
-}
-
-fn lookup_source_column<'a>(
-    definition: &'a SourceDefinition,
-    column_indexes: &HashMap<String, usize>,
-    field_name: &str,
-) -> Option<(usize, &'a floe_core::source::SourceColumn)> {
-    let idx = column_indexes.get(field_name).copied()?;
-    Some((idx, definition.columns().get(idx)?))
-}
-
-fn build_direct_decode_lookup(
-    definitions: &[SourceDefinition],
-    required_columns_by_source: &HashMap<String, Arc<[bool]>>,
-) -> DirectDecodeLookup {
-    let mut definition_index_by_name = HashMap::with_capacity(definitions.len());
-    let mut column_indexes_by_definition = Vec::with_capacity(definitions.len());
-    let mut required_columns_by_definition = Vec::with_capacity(definitions.len());
-    for (definition_idx, definition) in definitions.iter().enumerate() {
-        definition_index_by_name.insert(definition.name().to_string(), definition_idx);
-        let mut column_indexes = HashMap::with_capacity(definition.columns().len());
-        for (column_idx, column) in definition.columns().iter().enumerate() {
-            column_indexes.insert(column.name().to_string(), column_idx);
-        }
-        column_indexes_by_definition.push(column_indexes);
-        required_columns_by_definition.push(
-            required_columns_by_source
-                .get(definition.name())
-                .map(Arc::clone),
-        );
-    }
-    DirectDecodeLookup {
-        definition_index_by_name,
-        column_indexes_by_definition,
-        required_columns_by_definition,
-    }
-}
-
-fn skip_remaining_map<'de, A>(map: &mut A) -> std::result::Result<(), A::Error>
-where
-    A: MapAccess<'de>,
-{
-    while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-    Ok(())
-}
-
 fn parse_debezium_events(
     value: Value,
     default_source: Option<&str>,
@@ -1229,8 +663,6 @@ fn kafka_message_timestamp_ms(message: &BorrowedMessage<'_>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use floe_core::source::{SourceColumn, SourceDataType};
-    use floe_executor::SourceRowDecoder;
     use serde_json::json;
 
     #[test]
@@ -1303,165 +735,6 @@ mod tests {
                 .and_then(|payload| payload.get("auction"))
                 .and_then(Value::as_i64),
             Some(1)
-        );
-    }
-
-    #[test]
-    fn direct_floe_json_parse_matches_source_decoder_encoding() {
-        let definition = SourceDefinition::new(
-            "nexmark_bid",
-            vec![
-                SourceColumn::new("auction", SourceDataType::Int64),
-                SourceColumn::new("bidder", SourceDataType::Int64),
-                SourceColumn::new("price", SourceDataType::Int64),
-                SourceColumn::new("channel", SourceDataType::Utf8),
-                SourceColumn::new("url", SourceDataType::Utf8),
-                SourceColumn::new("date_time", SourceDataType::TimestampMillis),
-                SourceColumn::new("extra", SourceDataType::Utf8),
-            ],
-        )
-        .expect("definition");
-        let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}}"#;
-        let lookup = build_direct_decode_lookup(std::slice::from_ref(&definition), &HashMap::new());
-
-        let direct = parse_direct_floe_json_event(
-            payload,
-            None,
-            "topic",
-            std::slice::from_ref(&definition),
-            &lookup,
-            None,
-        )
-        .expect("direct parse")
-        .expect("direct event");
-        let expected_event = AppendIngestEvent::new(
-            "nexmark_bid",
-            json!({
-                "auction": 100,
-                "bidder": 42,
-                "price": 99,
-                "channel": "web",
-                "url": "http://example.com",
-                "date_time": 1700000000000_i64,
-                "extra": "bid_extra"
-            }),
-        );
-        let decoder = SourceRowDecoder::new(definition);
-        let (expected_encoded, expected_ts) = decoder
-            .encode_row_key(&expected_event)
-            .expect("expected encoding");
-
-        assert_eq!(
-            direct.preencoded_row_key(),
-            Some(expected_encoded.as_slice())
-        );
-        assert_eq!(direct.event_time_ms(), expected_ts);
-        assert_eq!(direct.source(), "nexmark_bid");
-    }
-
-    #[test]
-    fn direct_default_source_json_parse_matches_source_decoder_encoding() {
-        let definition = SourceDefinition::new(
-            "nexmark_bid",
-            vec![
-                SourceColumn::new("auction", SourceDataType::Int64),
-                SourceColumn::new("bidder", SourceDataType::Int64),
-                SourceColumn::new("price", SourceDataType::Int64),
-                SourceColumn::new("channel", SourceDataType::Utf8),
-                SourceColumn::new("url", SourceDataType::Utf8),
-                SourceColumn::new("date_time", SourceDataType::TimestampMillis),
-                SourceColumn::new("extra", SourceDataType::Utf8),
-            ],
-        )
-        .expect("definition");
-        let payload = br#"{"auction":100,"bidder":42,"price":99,"channel":"web","url":"http://example.com","date_time":1700000000000,"extra":"bid_extra"}"#;
-        let lookup = build_direct_decode_lookup(std::slice::from_ref(&definition), &HashMap::new());
-
-        let direct = parse_direct_default_source_payload_event(
-            payload,
-            Some("nexmark_bid"),
-            std::slice::from_ref(&definition),
-            &lookup,
-            Some(7),
-        )
-        .expect("direct parse")
-        .expect("direct event");
-        let expected_event = AppendIngestEvent::new(
-            "nexmark_bid",
-            json!({
-                "auction": 100,
-                "bidder": 42,
-                "price": 99,
-                "channel": "web",
-                "url": "http://example.com",
-                "date_time": 1700000000000_i64,
-                "extra": "bid_extra"
-            }),
-        );
-        let decoder = SourceRowDecoder::new(definition);
-        let (expected_encoded, expected_ts) = decoder
-            .encode_row_key(&expected_event)
-            .expect("expected encoding");
-
-        assert_eq!(
-            direct.preencoded_row_key(),
-            Some(expected_encoded.as_slice())
-        );
-        assert_eq!(direct.event_time_ms(), expected_ts);
-        assert_eq!(direct.source_id(), Some(7));
-        assert_eq!(direct.source(), "");
-    }
-
-    #[test]
-    fn direct_floe_json_parse_skips_unneeded_columns() {
-        let definition = SourceDefinition::new(
-            "nexmark_bid",
-            vec![
-                SourceColumn::new("auction", SourceDataType::Int64),
-                SourceColumn::new("bidder", SourceDataType::Int64),
-                SourceColumn::new("price", SourceDataType::Int64),
-                SourceColumn::new_nullable("channel", SourceDataType::Utf8, false),
-            ],
-        )
-        .expect("definition");
-        let payload = br#"{"source":"nexmark_bid","data":{"auction":100,"bidder":42,"price":99}}"#;
-        let lookup = build_direct_decode_lookup(
-            std::slice::from_ref(&definition),
-            &HashMap::from([(
-                "nexmark_bid".to_string(),
-                Arc::from([true, true, true, false]),
-            )]),
-        );
-
-        let direct = parse_direct_floe_json_event(
-            payload,
-            None,
-            "topic",
-            std::slice::from_ref(&definition),
-            &lookup,
-            None,
-        )
-        .expect("direct parse")
-        .expect("direct event");
-        let decoder = SourceRowDecoder::new_with_encoded_required_columns(
-            definition,
-            Some(Arc::from([true, true, true, false])),
-        );
-        let expected_event = AppendIngestEvent::new(
-            "nexmark_bid",
-            json!({
-                "auction": 100,
-                "bidder": 42,
-                "price": 99
-            }),
-        );
-        let (expected_encoded, _) = decoder
-            .encode_row_key(&expected_event)
-            .expect("expected encoding");
-
-        assert_eq!(
-            direct.preencoded_row_key(),
-            Some(expected_encoded.as_slice())
         );
     }
 }

@@ -4,8 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::execution::context::SessionContext;
 
 use crate::dbsp_bridge::DbspBridge;
-use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
-use crate::namespaces;
+use crate::materialized_view::MaterializedViewRegistry;
 use crate::table_provider::MaterializedViewTableProvider;
 
 pub async fn load_or_register_mv(
@@ -38,42 +37,7 @@ pub async fn load_or_register_mv(
         }
     };
 
-    let handle = registry.register(view_name.to_string());
-    if handle.dbsp_state().is_none() && !handle.has_encoded_overlay() {
-        tracing::info!(
-            view = %view_name,
-            "materialized view missing DBSP state, loading from SlateDB"
-        );
-        let namespace = namespaces::materialized_view(view_name)
-            .context("derive namespace for materialized view")?;
-        let latest_handle = bridge
-            .latest_view_handle(&namespace)
-            .await
-            .with_context(|| format!("load latest handle for materialized view '{view_name}'"))?;
-        let handle_view = bridge
-            .handle_view_for(&latest_handle.ns, latest_handle.version)
-            .await
-            .with_context(|| {
-                format!(
-                    "open handle view for materialized view '{view}' (version {})",
-                    latest_handle.version,
-                    view = view_name
-                )
-            })?;
-        let (dict, table, ns, version) = handle_view.into_parts();
-        let logical_version = bridge
-            .load_mv_logical_version(view_name)
-            .await?
-            .unwrap_or(version);
-        let state =
-            DbspPersistedState::new(dict, table, ns, version).with_logical_version(logical_version);
-        handle.set_dbsp_state(state);
-        handle.mark_state_non_authoritative();
-        handle.publish_version(
-            i64::try_from(logical_version).unwrap_or(i64::MAX),
-            latest_handle,
-        );
-    }
+    registry.register(view_name.to_string());
 
     let provider = MaterializedViewTableProvider::new(
         Arc::clone(&registry),
@@ -111,7 +75,7 @@ mod tests {
     async fn registers_provider_when_state_warm() -> Result<()> {
         let db = test_db("mv-loader-warm").await;
         let schema = test_schema();
-        let state = seed_view(
+        seed_view(
             Arc::clone(&db),
             &[encoded_i64_row(1)],
             Arc::clone(&schema),
@@ -122,9 +86,13 @@ mod tests {
         let registry = Arc::new(MaterializedViewRegistry::new());
         let handle = registry.register(VIEW_NAME.to_string());
         registry.set_schema(VIEW_NAME.to_string(), Arc::clone(&schema));
-        handle.set_dbsp_state(state.clone());
-        handle.publish_logical_version(
-            i64::try_from(state.logical_version()).expect("logical version"),
+        handle.publish_arrow_version(
+            1,
+            vec![RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values([1_i64]))],
+            )?],
+            Vec::new(),
         );
 
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
@@ -136,10 +104,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loads_state_from_slate_when_missing_in_registry() -> Result<()> {
+    async fn does_not_load_legacy_state_from_slate_when_missing_in_registry() -> Result<()> {
         let db = test_db("mv-loader-cold").await;
         let schema = test_schema();
-        let _ = seed_view(
+        seed_view(
             Arc::clone(&db),
             &[encoded_i64_row(2), encoded_i64_row(3)],
             Arc::clone(&schema),
@@ -156,10 +124,10 @@ mod tests {
 
         let handle = registry.get(VIEW_NAME).expect("view registered");
         assert!(
-            handle.dbsp_state().is_some(),
-            "state not recovered from SlateDB"
+            handle.dbsp_state().is_none(),
+            "legacy DBSP state should not be recovered from SlateDB"
         );
-        assert_eq!(query_values(&session).await?, vec![2, 3]);
+        assert_eq!(query_values(&session).await?, Vec::<i64>::new());
         Ok(())
     }
 
@@ -167,7 +135,7 @@ mod tests {
     async fn recovers_schema_from_persisted_metadata() -> Result<()> {
         let db = test_db("mv-loader-schema").await;
         let schema = test_schema();
-        let _ = seed_view(
+        seed_view(
             Arc::clone(&db),
             &[encoded_i64_row(4)],
             Arc::clone(&schema),
@@ -184,7 +152,7 @@ mod tests {
             registry.schema(VIEW_NAME).is_some(),
             "schema should be recovered from SlateDB"
         );
-        assert_eq!(query_values(&session).await?, vec![4]);
+        assert_eq!(query_values(&session).await?, Vec::<i64>::new());
         Ok(())
     }
 
@@ -231,7 +199,7 @@ mod tests {
         rows: &[Vec<u8>],
         schema: SchemaRef,
         persist_schema: bool,
-    ) -> Result<DbspPersistedState> {
+    ) -> Result<()> {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
         let mut view = bridge
             .new_view(VIEW_NAME, StreamRetention::KeepLast { keep_last: 1 })
@@ -243,9 +211,7 @@ mod tests {
                 .save_mv_schema(VIEW_NAME, Arc::clone(&schema))
                 .await?;
         }
-        let handle_view = view.latest_handle_view();
-        let (dict, table, namespace, version) = handle_view.into_parts();
-        Ok(DbspPersistedState::new(dict, table, namespace, version))
+        Ok(())
     }
 
     async fn test_db(name: &str) -> Arc<Db> {

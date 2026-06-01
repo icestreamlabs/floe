@@ -1,5 +1,6 @@
 use std::sync::LazyLock;
 
+use crate::delta_consolidation::ConsolidationStats;
 use prometheus::{
     Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, register_histogram,
     register_histogram_vec, register_int_counter, register_int_counter_vec,
@@ -53,6 +54,23 @@ static DELTA_BATCH_FLUSHES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register floe_delta_batch_flush_total")
 });
 
+static DELTA_CONSOLIDATION_ROWS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "floe_delta_consolidation_rows",
+        "Rows observed during vectorized delta consolidation",
+        &["phase"]
+    )
+    .expect("register floe_delta_consolidation_rows")
+});
+
+static DELTA_CONSOLIDATION_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(HistogramOpts::new(
+        "floe_delta_consolidation_latency_ms",
+        "Time spent consolidating vectorized delta batches in milliseconds",
+    ))
+    .expect("register floe_delta_consolidation_latency_ms")
+});
+
 static MV_OPTIMIZATION_HOTSPOTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_mv_optimization_hotspots_total",
@@ -93,6 +111,22 @@ pub(crate) fn inc_delta_batch_flushes() {
     DELTA_BATCH_FLUSHES.inc();
 }
 
+pub(crate) fn observe_delta_consolidation(stats: ConsolidationStats, latency_ms: u64) {
+    DELTA_CONSOLIDATION_ROWS
+        .with_label_values(&["input"])
+        .observe(stats.input_rows as f64);
+    DELTA_CONSOLIDATION_ROWS
+        .with_label_values(&["grouped"])
+        .observe(stats.grouped_rows as f64);
+    DELTA_CONSOLIDATION_ROWS
+        .with_label_values(&["output"])
+        .observe(stats.output_rows as f64);
+    DELTA_CONSOLIDATION_ROWS
+        .with_label_values(&["zero_weight_dropped"])
+        .observe(stats.zero_weight_dropped_rows as f64);
+    DELTA_CONSOLIDATION_LATENCY_MS.observe(latency_ms as f64);
+}
+
 pub(crate) fn observe_mv_update_latency_ms(latency_ms: u64) {
     MV_UPDATE_LATENCY_MS.observe(latency_ms as f64);
 }
@@ -131,6 +165,8 @@ pub(crate) fn init() {
     let _ = &*DELTA_BATCH_ROWS;
     let _ = &*DELTA_BATCH_BYTES;
     let _ = &*DELTA_BATCH_FLUSHES;
+    let _ = &*DELTA_CONSOLIDATION_ROWS;
+    let _ = &*DELTA_CONSOLIDATION_LATENCY_MS;
     let _ = &*MV_OPTIMIZATION_HOTSPOTS;
     let _ = &*MV_OPTIMIZATION_HOTSPOT_SHARE;
     let _ = &*MV_OPTIMIZATION_TOTAL_MS;

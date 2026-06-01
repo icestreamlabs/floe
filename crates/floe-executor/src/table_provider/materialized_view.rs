@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
 
 #[cfg(test)]
 use datafusion::arrow::record_batch::RecordBatch;
@@ -9,17 +8,14 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use dbsp::handles::ZSetHandleView;
 
-use crate::materialized_view::{
-    DbspPersistedState, EncodedStateMap, MaterializedViewHandle, MaterializedViewRegistry,
-};
+use crate::materialized_view::MaterializedViewRegistry;
 
 use super::MV_VERSION_COLUMN;
 use super::SnapshotScanExec;
 use super::filters::{extract_mv_version_filter, parse_mv_version_expr};
 use super::helpers::{
-    append_mv_version_field, build_batches_from_encoded_snapshot,
+    append_mv_version_field, build_batches_from_arrow_snapshot,
     build_constant_u64_projection_batches,
 };
 
@@ -93,13 +89,21 @@ impl MaterializedViewTableProvider {
                 return Ok((projected_schema, batches));
             }
         }
-        let (snapshot, version) = self.load_snapshot(as_of_version).await?;
-        build_batches_from_encoded_snapshot(
-            snapshot,
-            self.schema.clone(),
+        if let Some((snapshot, version)) = self.load_arrow_snapshot(as_of_version)? {
+            return build_batches_from_arrow_snapshot(
+                snapshot,
+                Arc::clone(&self.schema),
+                projection,
+                limit,
+                version,
+            );
+        }
+        build_batches_from_arrow_snapshot(
+            Arc::new(Vec::new()),
+            Arc::clone(&self.schema),
             projection,
             limit,
-            Some(version),
+            as_of_version.unwrap_or(0),
         )
     }
 
@@ -115,138 +119,31 @@ impl MaterializedViewTableProvider {
         Ok(batches)
     }
 
-    async fn load_snapshot(&self, as_of_version: Option<u64>) -> DFResult<(EncodedStateMap, u64)> {
-        let total_start = Instant::now();
-        let view = self.registry.get(&self.view_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "materialized view '{}' is not registered",
-                self.view_name
-            ))
-        })?;
+    fn load_arrow_snapshot(
+        &self,
+        as_of_version: Option<u64>,
+    ) -> DFResult<Option<(Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>, u64)>> {
+        let Some(view) = self.registry.get(&self.view_name) else {
+            return Ok(None);
+        };
         let latest_visible_version = view
             .latest_version()
             .and_then(|version| u64::try_from(version).ok());
         let target_version = as_of_version.or(latest_visible_version).unwrap_or(0);
-
-        if latest_visible_version == Some(target_version)
-            && let Some(visible_row_count) = view.authoritative_row_count_for(target_version)
-            && view.authoritative_row_count() == Some(visible_row_count)
-        {
-            let snapshot = view.snapshot_encoded();
-            let snapshot_row_count = snapshot
-                .values()
-                .copied()
-                .map(|diff| diff.max(0) as usize)
-                .sum::<usize>();
-            if snapshot_row_count != visible_row_count {
-                tracing::debug!(
-                    view = %self.view_name,
-                    version = target_version,
-                    cached_rows = visible_row_count,
-                    snapshot_rows = snapshot_row_count,
-                    "materialized view authoritative state cache row count mismatch"
-                );
-            } else {
-                tracing::info!(
-                    view = %self.view_name,
-                    version = target_version,
-                    rows = snapshot.len(),
-                    storage = "authoritative_state",
-                    total_ms = total_start.elapsed().as_millis() as u64,
-                    "materialized view loaded rows"
-                );
-                return Ok((snapshot, target_version));
-            }
-        }
-
-        if let Some((base_version, target_version, overlay)) =
-            view.encoded_overlay_batches(as_of_version)
-        {
-            let mut snapshot = if let Some(state) = view.dbsp_state() {
-                match Self::resolve_dbsp_version(view.as_ref(), &state, base_version) {
-                    Some(base_dbsp_version) => {
-                        self.materialize_dbsp_rows(state, Some(base_dbsp_version))
-                            .await?
-                    }
-                    None => EncodedStateMap::default(),
-                }
-            } else {
-                EncodedStateMap::default()
-            };
-            for (key, diff) in overlay {
-                if diff == 0 {
-                    continue;
-                }
-                let previous = snapshot.get(&key).copied().unwrap_or(0);
-                let next = previous.saturating_add(diff);
-                if next <= 0 {
-                    snapshot.remove(&key);
-                } else {
-                    snapshot.insert(key, next);
-                }
-            }
-            self.maybe_seed_authoritative_row_count(view.as_ref(), target_version, &snapshot);
-            tracing::info!(
-                view = %self.view_name,
-                version = target_version,
-                rows = snapshot.len(),
-                storage = "hybrid_overlay",
-                total_ms = total_start.elapsed().as_millis() as u64,
-                "materialized view loaded rows"
-            );
-            return Ok((snapshot, target_version));
-        }
-
-        let Some(state) = view.dbsp_state() else {
-            tracing::warn!(
-                view = %self.view_name,
-                "materialized view has no DBSP state when loading rows"
-            );
-            return Ok((EncodedStateMap::default(), 0));
+        let Some(snapshot) = i64::try_from(target_version)
+            .ok()
+            .and_then(|version| view.arrow_snapshot_for(version))
+        else {
+            return Ok(None);
         };
-        let snapshot = if let Some(dbsp_version) =
-            Self::resolve_dbsp_version(view.as_ref(), &state, target_version)
-        {
-            self.materialize_dbsp_rows(state, Some(dbsp_version))
-                .await?
-        } else {
-            EncodedStateMap::default()
-        };
-        self.maybe_seed_authoritative_row_count(view.as_ref(), target_version, &snapshot);
         tracing::info!(
             view = %self.view_name,
             version = target_version,
-            rows = snapshot.len(),
-            storage = "slatedb",
-            total_ms = total_start.elapsed().as_millis() as u64,
+            rows = snapshot.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            storage = "arrow_snapshot",
             "materialized view loaded rows"
         );
-        Ok((snapshot, target_version))
-    }
-
-    fn resolve_dbsp_version(
-        view: &MaterializedViewHandle,
-        state: &DbspPersistedState,
-        target_version: u64,
-    ) -> Option<u64> {
-        let target_version_i64 = i64::try_from(target_version).ok()?;
-        if let Some(handle) = view.handle_for_version(target_version_i64) {
-            return Some(handle.version);
-        }
-        if view.is_version_published(target_version_i64) {
-            return view
-                .handle_at_or_before_version(target_version_i64)
-                .map(|handle| handle.version)
-                .or_else(|| (target_version == state.logical_version()).then_some(state.version()))
-                .or_else(|| (state.version() == 0).then_some(0));
-        }
-        if target_version <= state.version() {
-            Some(target_version)
-        } else if target_version == state.logical_version() {
-            Some(state.version())
-        } else {
-            None
-        }
+        Ok(Some((snapshot, target_version)))
     }
 
     fn fast_count_batches(
@@ -254,12 +151,9 @@ impl MaterializedViewTableProvider {
         as_of_version: Option<u64>,
         limit: Option<usize>,
     ) -> DFResult<Option<(usize, u64)>> {
-        let view = self.registry.get(&self.view_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "materialized view '{}' is not registered",
-                self.view_name
-            ))
-        })?;
+        let Some(view) = self.registry.get(&self.view_name) else {
+            return Ok(Some((0, as_of_version.unwrap_or(0))));
+        };
         let latest_version = view
             .latest_version()
             .and_then(|version| u64::try_from(version).ok());
@@ -267,70 +161,21 @@ impl MaterializedViewTableProvider {
         if as_of_version.is_some() && latest_version != Some(target_version) {
             return Ok(None);
         }
-        let Some(row_count) = view.authoritative_row_count_for(target_version) else {
-            return Ok(None);
-        };
-        let row_count = limit.map(|limit| row_count.min(limit)).unwrap_or(row_count);
-        tracing::info!(
-            view = %self.view_name,
-            version = target_version,
-            rows = row_count,
-            storage = "hybrid_overlay_cached_count",
-            "materialized view loaded rows"
-        );
-        Ok(Some((row_count, target_version)))
-    }
-
-    fn maybe_seed_authoritative_row_count(
-        &self,
-        view: &MaterializedViewHandle,
-        version: u64,
-        snapshot: &EncodedStateMap,
-    ) {
-        if view.authoritative_row_count_for(version).is_some() {
-            return;
-        }
-        let row_count = snapshot
-            .values()
-            .copied()
-            .map(|diff| diff.max(0) as usize)
-            .sum();
-        if view.seed_cached_row_count_if_latest(version, row_count) {
-            tracing::debug!(
+        if let Some(row_count) = i64::try_from(target_version)
+            .ok()
+            .and_then(|version| view.arrow_row_count_for(version))
+        {
+            let row_count = limit.map(|limit| row_count.min(limit)).unwrap_or(row_count);
+            tracing::info!(
                 view = %self.view_name,
-                version,
+                version = target_version,
                 rows = row_count,
-                "materialized view row count recovered"
+                storage = "arrow_snapshot_cached_count",
+                "materialized view loaded rows"
             );
+            return Ok(Some((row_count, target_version)));
         }
-    }
-
-    async fn materialize_dbsp_rows(
-        &self,
-        state: DbspPersistedState,
-        as_of_version: Option<u64>,
-    ) -> DFResult<EncodedStateMap> {
-        let total_start = Instant::now();
-        let target_version = as_of_version.unwrap_or(state.version());
-        let handle_view = ZSetHandleView::new(
-            state.dictionary(),
-            state.table(),
-            state.namespace().to_string(),
-            target_version,
-        );
-        let snapshot = handle_view
-            .materialize()
-            .await
-            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        let snapshot = snapshot.into_iter().collect::<EncodedStateMap>();
-        tracing::debug!(
-            view = %self.view_name,
-            version = target_version,
-            snapshot_len = snapshot.len(),
-            total_ms = total_start.elapsed().as_millis() as u64,
-            "materialize dbsp rows"
-        );
-        Ok(snapshot)
+        Ok(Some((0, target_version)))
     }
 }
 

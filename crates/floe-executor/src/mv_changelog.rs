@@ -6,15 +6,14 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, ensure};
+use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::encoded_batch::{
-    EncodedRowBatchMode, ExpandedEncodedBatch, build_expanded_batches_from_encoded_rows,
-};
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
 use crate::mv::runtime::MaterializedView;
@@ -358,21 +357,16 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     version: i64,
     version_time: Option<i64>,
 ) -> MvChangelogResult<Vec<MvChangelogBatch>> {
-    let snapshot = mv.snapshot_for(version).await?;
-    let (_schema, rows) = build_expanded_batches_from_encoded_rows(
-        snapshot,
-        schema,
-        None,
-        None,
-        None,
-        EncodedRowBatchMode::Snapshot,
-    )?;
-    Ok(build_mv_changelog_batches(
-        rows,
+    if let Some(snapshot) = mv.arrow_snapshot_for(version) {
+        return arrow_snapshot_batches_to_changelog(snapshot, schema, version, version_time);
+    }
+    Ok(vec![MvChangelogBatch {
         version,
         version_time,
-        MvChangelogBatchKind::Snapshot,
-    ))
+        kind: MvChangelogBatchKind::Snapshot,
+        batch: RecordBatch::new_empty(schema),
+        diffs: Vec::new(),
+    }])
 }
 
 async fn materialize_delta_batches<M: MaterializedView>(
@@ -382,74 +376,113 @@ async fn materialize_delta_batches<M: MaterializedView>(
     version_time: Option<i64>,
 ) -> MvChangelogResult<Vec<MvChangelogBatch>> {
     let total_start = Instant::now();
-    let delta_iter_start = Instant::now();
-    let deltas = mv.delta_for(version).await?;
-    let delta_iter_ms = delta_iter_start.elapsed().as_millis() as u64;
-    let rows_decode_start = Instant::now();
-    let (_schema, rows) = build_expanded_batches_from_encoded_rows(
-        deltas,
-        schema,
-        None,
-        None,
-        None,
-        EncodedRowBatchMode::Delta,
-    )?;
-    let rows_decode_ms = rows_decode_start.elapsed().as_millis() as u64;
-    let rows_len = rows.iter().map(|row| row.diffs.len()).sum::<usize>();
-    let batch_build_start = Instant::now();
-    let batches =
-        build_mv_changelog_batches(rows, version, version_time, MvChangelogBatchKind::Delta);
-    let batch_build_ms = batch_build_start.elapsed().as_millis() as u64;
-    let total_ms = total_start.elapsed().as_millis() as u64;
-    if version <= 8 || total_ms >= 1000 {
-        tracing::info!(
-            version,
-            rows = rows_len,
-            delta_iter_ms,
-            rows_decode_ms,
-            batch_build_ms,
-            total_ms,
-            "mv changelog delta materialize breakdown"
+    if let Some(delta) = mv.arrow_delta_for(version) {
+        return arrow_delta_batches_to_changelog(delta, schema, version, version_time);
+    }
+    tracing::debug!(
+        version,
+        total_ms = total_start.elapsed().as_millis() as u64,
+        "mv changelog has no Arrow delta for version"
+    );
+    Ok(vec![MvChangelogBatch {
+        version,
+        version_time,
+        kind: MvChangelogBatchKind::Delta,
+        batch: RecordBatch::new_empty(schema),
+        diffs: Vec::new(),
+    }])
+}
+
+fn arrow_snapshot_batches_to_changelog(
+    snapshot: Arc<Vec<RecordBatch>>,
+    schema: SchemaRef,
+    version: i64,
+    version_time: Option<i64>,
+) -> MvChangelogResult<Vec<MvChangelogBatch>> {
+    let mut batches = Vec::new();
+    for batch in snapshot.iter() {
+        ensure!(
+            batch.schema().as_ref() == schema.as_ref(),
+            "Arrow MV snapshot schema does not match catalog schema"
         );
+        batches.push(MvChangelogBatch {
+            version,
+            version_time,
+            kind: MvChangelogBatchKind::Snapshot,
+            batch: batch.clone(),
+            diffs: vec![1; batch.num_rows()],
+        });
+    }
+    if batches.is_empty() {
+        batches.push(MvChangelogBatch {
+            version,
+            version_time,
+            kind: MvChangelogBatchKind::Snapshot,
+            batch: RecordBatch::new_empty(schema),
+            diffs: Vec::new(),
+        });
     }
     Ok(batches)
 }
 
-fn build_mv_changelog_batches(
-    rows: Vec<ExpandedEncodedBatch>,
+fn arrow_delta_batches_to_changelog(
+    delta: Arc<Vec<RecordBatch>>,
+    schema: SchemaRef,
     version: i64,
     version_time: Option<i64>,
-    kind: MvChangelogBatchKind,
-) -> Vec<MvChangelogBatch> {
-    rows.into_iter()
-        .map(|row| {
-            debug_assert_eq!(row.diffs.len(), row.batch.num_rows());
-            MvChangelogBatch {
-                version,
-                version_time,
-                kind,
-                batch: row.batch,
-                diffs: row.diffs,
-            }
-        })
-        .collect()
+) -> MvChangelogResult<Vec<MvChangelogBatch>> {
+    let mut batches = Vec::new();
+    for batch in delta.iter() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let weight_idx = batch.schema().index_of(WEIGHT_COLUMN_NAME)?;
+        let weight_col = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("Arrow MV delta {} column must be Int64", WEIGHT_COLUMN_NAME))?;
+        ensure!(
+            weight_col.null_count() == 0,
+            "Arrow MV delta {} column cannot contain NULL",
+            WEIGHT_COLUMN_NAME
+        );
+        let diffs = weight_col.values().to_vec();
+        let columns = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
+            .collect::<Vec<_>>();
+        let projected = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        batches.push(MvChangelogBatch {
+            version,
+            version_time,
+            kind: MvChangelogBatchKind::Delta,
+            batch: projected,
+            diffs,
+        });
+    }
+    if batches.is_empty() {
+        batches.push(MvChangelogBatch {
+            version,
+            version_time,
+            kind: MvChangelogBatchKind::Delta,
+            batch: RecordBatch::new_empty(schema),
+            diffs: Vec::new(),
+        });
+    }
+    Ok(batches)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use crate::dbsp_bridge::DbspBridge;
-    use crate::encoding::decode_all_encoded_row_scalars_into;
-    use crate::materialized_view::DbspPersistedState;
-    use crate::mv::registry::MaterializedViewRegistry;
-    use crate::mv::runtime::MaterializedView;
+    use crate::mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use dbsp::StreamRetention;
     use futures::StreamExt;
-    use object_store::memory::InMemory;
-    use slatedb::Db;
     use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
 
@@ -463,63 +496,58 @@ mod tests {
         )]))
     }
 
-    fn encoded_i64_row(value: i64) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(4 + 1 + 8);
-        encoded.extend_from_slice(&(1_u32).to_le_bytes());
-        encoded.push(0x01);
-        encoded.extend_from_slice(&value.to_le_bytes());
-        encoded
+    fn value_batch(values: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            build_schema(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                values.iter().copied(),
+            ))],
+        )
+        .expect("build Arrow value batch")
     }
 
-    async fn append_version(
-        view: &mut crate::dbsp_bridge::DbspView,
-        values: &[i64],
-    ) -> MvChangelogResult<dbsp::handles::ZSetHandle> {
-        view.add_deltas(
-            values
-                .iter()
-                .copied()
-                .map(|value| (encoded_i64_row(value), 1)),
-        );
-        view.flush().await
+    fn delta_batch(deltas: &[(i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN_NAME, DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    deltas.iter().map(|(value, _)| *value),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    deltas.iter().map(|(_, diff)| *diff),
+                )),
+            ],
+        )
+        .expect("build Arrow delta batch")
     }
 
-    async fn append_deltas(
-        view: &mut crate::dbsp_bridge::DbspView,
+    fn publish_arrow_version(
+        handle: &MaterializedViewHandle,
+        version: i64,
+        snapshot_values: &[i64],
         deltas: &[(i64, i64)],
-    ) -> MvChangelogResult<dbsp::handles::ZSetHandle> {
-        view.add_deltas(
-            deltas
-                .iter()
-                .copied()
-                .map(|(value, diff)| (encoded_i64_row(value), diff)),
-        );
-        view.flush().await
+    ) {
+        let delta = if deltas.is_empty() {
+            Vec::new()
+        } else {
+            vec![delta_batch(deltas)]
+        };
+        handle.publish_arrow_version(version, vec![value_batch(snapshot_values)], delta);
     }
 
     #[tokio::test]
     async fn snapshot_then_streams_new_versions() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("subscribe-test", store).await.expect("db"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view("mv_subscribe", StreamRetention::KeepLast { keep_last: 1 })
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe", build_schema());
         let handle = registry.register("mv_subscribe");
 
-        let handle1 = append_version(&mut dbsp_view, &[1]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        handle.publish_version(handle1.version as i64, handle1);
-
-        let handle2 = append_version(&mut dbsp_view, &[2]).await?;
-        let handle2_version = handle2.version as i64;
-        handle.publish_version(handle2_version, handle2);
+        publish_arrow_version(handle.as_ref(), 1, &[1], &[(1, 1)]);
+        let handle2_version = 2_i64;
+        publish_arrow_version(handle.as_ref(), handle2_version, &[1, 2], &[(2, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe".to_string(),
@@ -541,9 +569,8 @@ mod tests {
         let first_snapshot: Vec<i64> = (0..values.len()).map(|idx| values.value(idx)).collect();
         assert!(first_snapshot.contains(&2));
 
-        let handle3 = append_version(&mut dbsp_view, &[3]).await?;
-        let handle3_version = handle3.version as i64;
-        handle.publish_version(handle3_version, handle3);
+        let handle3_version = 3_i64;
+        publish_arrow_version(handle.as_ref(), handle3_version, &[1, 2, 3], &[(3, 1)]);
 
         let second_batch = stream.next().await.expect("expected update batch")?;
         assert_eq!(second_batch.version, handle3_version);
@@ -563,27 +590,12 @@ mod tests {
 
     #[tokio::test]
     async fn changelog_emits_delta_diffs() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("subscribe-delta-diffs", store).await.expect("db"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_delta_diffs",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_delta_diffs", build_schema());
         let handle = registry.register("mv_subscribe_delta_diffs");
 
-        let handle1 = append_deltas(&mut dbsp_view, &[(1, 1)]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        let handle1_version = handle1.version as i64;
-        handle.publish_version(handle1_version, handle1);
+        let handle1_version = 1_i64;
+        publish_arrow_version(handle.as_ref(), handle1_version, &[1], &[(1, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_delta_diffs".to_string(),
@@ -593,9 +605,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
 
-        let handle2 = append_deltas(&mut dbsp_view, &[(1, -1), (2, 1)]).await?;
-        let handle2_version = handle2.version as i64;
-        handle.publish_version(handle2_version, handle2);
+        let handle2_version = 2_i64;
+        publish_arrow_version(handle.as_ref(), handle2_version, &[2], &[(1, -1), (2, 1)]);
 
         let batch = timeout(Duration::from_millis(200), stream.next())
             .await
@@ -623,32 +634,13 @@ mod tests {
 
     #[tokio::test]
     async fn delta_output_is_bounded_by_delta_not_snapshot_size() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(
-            Db::open("subscribe-delta-bounded", store)
-                .await
-                .expect("db"),
-        );
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_delta_bounded",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_delta_bounded", build_schema());
         let handle = registry.register("mv_subscribe_delta_bounded");
 
         let initial_values = (0..100).collect::<Vec<_>>();
-        let handle1 = append_version(&mut dbsp_view, &initial_values).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        let handle1_version = handle1.version as i64;
-        handle.publish_version(handle1_version, handle1);
+        let handle1_version = 1_i64;
+        publish_arrow_version(handle.as_ref(), handle1_version, &initial_values, &[]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_delta_bounded".to_string(),
@@ -658,9 +650,19 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
 
-        let handle2 = append_deltas(&mut dbsp_view, &[(1, -1), (101, 1)]).await?;
-        let handle2_version = handle2.version as i64;
-        handle.publish_version(handle2_version, handle2);
+        let handle2_version = 2_i64;
+        let mut next_snapshot = initial_values
+            .iter()
+            .copied()
+            .filter(|value| *value != 1)
+            .collect::<Vec<_>>();
+        next_snapshot.push(101);
+        publish_arrow_version(
+            handle.as_ref(),
+            handle2_version,
+            &next_snapshot,
+            &[(1, -1), (101, 1)],
+        );
 
         let batch = timeout(Duration::from_millis(200), stream.next())
             .await
@@ -678,31 +680,12 @@ mod tests {
 
     #[tokio::test]
     async fn emits_empty_batch_for_published_noop_version() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(
-            Db::open("subscribe-empty-version", store)
-                .await
-                .expect("db"),
-        );
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_empty_version",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_empty_version", build_schema());
         let handle = registry.register("mv_subscribe_empty_version");
 
-        let handle1 = append_deltas(&mut dbsp_view, &[(1, 1)]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version).with_logical_version(2);
-        handle.set_dbsp_state(state);
-        let handle1_version = handle1.version as i64;
-        handle.publish_version(handle1_version, handle1);
+        let handle1_version = 1_i64;
+        publish_arrow_version(handle.as_ref(), handle1_version, &[1], &[(1, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_empty_version".to_string(),
@@ -712,7 +695,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
 
-        handle.publish_logical_version(2);
+        publish_arrow_version(handle.as_ref(), 2, &[1], &[]);
 
         let batch = timeout(Duration::from_millis(200), stream.next())
             .await
@@ -728,31 +711,12 @@ mod tests {
 
     #[tokio::test]
     async fn deltas_match_materialized_state() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(
-            Db::open("subscribe-delta-validate", store)
-                .await
-                .expect("db"),
-        );
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_delta_validate",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_delta_validate", build_schema());
         let handle = registry.register("mv_subscribe_delta_validate");
 
-        let handle1 = append_deltas(&mut dbsp_view, &[(1, 1), (2, 1)]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        let handle1_version = handle1.version as i64;
-        handle.publish_version(handle1_version, handle1);
+        let handle1_version = 1_i64;
+        publish_arrow_version(handle.as_ref(), handle1_version, &[1, 2], &[(1, 1), (2, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_delta_validate".to_string(),
@@ -762,13 +726,21 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
 
-        let handle2 = append_deltas(&mut dbsp_view, &[(1, -1), (3, 1)]).await?;
-        let handle2_version = handle2.version as i64;
-        handle.publish_version(handle2_version, handle2);
+        let handle2_version = 2_i64;
+        publish_arrow_version(
+            handle.as_ref(),
+            handle2_version,
+            &[2, 3],
+            &[(1, -1), (3, 1)],
+        );
 
-        let handle3 = append_deltas(&mut dbsp_view, &[(2, -1), (4, 1)]).await?;
-        let handle3_version = handle3.version as i64;
-        handle.publish_version(handle3_version, handle3);
+        let handle3_version = 3_i64;
+        publish_arrow_version(
+            handle.as_ref(),
+            handle3_version,
+            &[3, 4],
+            &[(2, -1), (4, 1)],
+        );
 
         let mut state: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         for _ in 0..3 {
@@ -793,20 +765,9 @@ mod tests {
             }
         }
 
-        let view = MaterializedView::handle_for(handle.as_ref(), handle3_version)?;
-        let snapshot = view.materialize().await?;
         let mut expected: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        let mut decode_scratch = Vec::new();
-        for (key, diff) in snapshot {
-            if diff == 0 {
-                continue;
-            }
-            decode_all_encoded_row_scalars_into(&key, &mut decode_scratch)?;
-            let value = match decode_scratch.first().and_then(|value| value.as_ref()) {
-                Some(crate::encoding::EncodedRowScalar::Int64(v)) => v,
-                _ => continue,
-            };
-            expected.insert(*value, diff);
+        for value in [3_i64, 4_i64] {
+            expected.insert(value, 1);
         }
 
         assert_eq!(state, expected);
@@ -816,26 +777,11 @@ mod tests {
 
     #[tokio::test]
     async fn changelog_stream_cancels() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("subscribe-cancel", store).await.expect("db"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_cancel",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_cancel", build_schema());
         let handle = registry.register("mv_subscribe_cancel");
 
-        let handle1 = append_version(&mut dbsp_view, &[1]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        handle.publish_version(handle1.version as i64, handle1);
+        publish_arrow_version(handle.as_ref(), 1, &[1], &[(1, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_cancel".to_string(),
@@ -856,30 +802,13 @@ mod tests {
 
     #[tokio::test]
     async fn as_of_with_snapshot_emits_requested_version() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("subscribe-asof-snap", store).await.expect("db"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_asof_snap",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_asof_snap", build_schema());
         let handle = registry.register("mv_subscribe_asof_snap");
 
-        let handle1 = append_version(&mut dbsp_view, &[10]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        let handle1_version = handle1.version as i64;
-        handle.publish_version(handle1_version, handle1);
-
-        let handle2 = append_version(&mut dbsp_view, &[20]).await?;
-        handle.publish_version(handle2.version as i64, handle2);
+        let handle1_version = 1_i64;
+        publish_arrow_version(handle.as_ref(), handle1_version, &[10], &[(10, 1)]);
+        publish_arrow_version(handle.as_ref(), 2, &[10, 20], &[(20, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_asof_snap".to_string(),
@@ -898,31 +827,12 @@ mod tests {
     #[tokio::test]
     async fn as_of_with_snapshot_accepts_published_empty_logical_version() -> MvChangelogResult<()>
     {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(
-            Db::open("subscribe-asof-empty-logical", store)
-                .await
-                .expect("db"),
-        );
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_asof_empty_logical",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_asof_empty_logical", build_schema());
         let handle = registry.register("mv_subscribe_asof_empty_logical");
 
-        let handle1 = append_version(&mut dbsp_view, &[10]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version).with_logical_version(2);
-        handle.set_dbsp_state(state);
-        handle.publish_version(handle1.version as i64, handle1);
-        handle.publish_logical_version(2);
+        publish_arrow_version(handle.as_ref(), 1, &[10], &[(10, 1)]);
+        publish_arrow_version(handle.as_ref(), 2, &[10], &[]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_asof_empty_logical".to_string(),
@@ -941,30 +851,13 @@ mod tests {
 
     #[tokio::test]
     async fn as_of_without_snapshot_starts_after_version() -> MvChangelogResult<()> {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("subscribe-asof-no-snap", store).await.expect("db"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_asof_no_snap",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
-
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_asof_no_snap", build_schema());
         let handle = registry.register("mv_subscribe_asof_no_snap");
 
-        let handle1 = append_version(&mut dbsp_view, &[1]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state = DbspPersistedState::new(dict, table, ns, version);
-        handle.set_dbsp_state(state);
-        handle.publish_version(handle1.version as i64, handle1);
-
-        let handle2 = append_version(&mut dbsp_view, &[2]).await?;
-        let handle2_version = handle2.version as i64;
-        handle.publish_version(handle2_version, handle2);
+        publish_arrow_version(handle.as_ref(), 1, &[1], &[(1, 1)]);
+        let handle2_version = 2_i64;
+        publish_arrow_version(handle.as_ref(), handle2_version, &[1, 2], &[(2, 1)]);
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_asof_no_snap".to_string(),
@@ -980,9 +873,8 @@ mod tests {
                 .is_err()
         );
 
-        let handle3 = append_version(&mut dbsp_view, &[3]).await?;
-        let handle3_version = handle3.version as i64;
-        handle.publish_version(handle3_version, handle3);
+        let handle3_version = 3_i64;
+        publish_arrow_version(handle.as_ref(), handle3_version, &[1, 2, 3], &[(3, 1)]);
 
         let batch = stream.next().await.expect("post-asof batch")?;
         assert_eq!(batch.version, handle3_version);
@@ -996,16 +888,6 @@ mod tests {
         let registry = Arc::new(MaterializedViewRegistry::new());
         registry.set_schema("mv_subscribe_empty_start", build_schema());
         let handle = registry.register("mv_subscribe_empty_start");
-
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let db = Arc::new(Db::open("subscribe-empty-start", store).await.expect("db"));
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut dbsp_view = bridge
-            .new_view(
-                "mv_subscribe_empty_start",
-                StreamRetention::KeepLast { keep_last: 1 },
-            )
-            .await?;
 
         let params = MvChangelogParams {
             mv_name: "mv_subscribe_empty_start".to_string(),
@@ -1021,13 +903,7 @@ mod tests {
                 .is_err()
         );
 
-        let handle1 = append_version(&mut dbsp_view, &[11]).await?;
-        let latest_view = dbsp_view.latest_handle_view();
-        let (dict, table, ns, version) = latest_view.into_parts();
-        let state =
-            DbspPersistedState::new(dict, table, ns, version).with_logical_version(handle1.version);
-        handle.set_dbsp_state(state);
-        handle.publish_version(handle1.version as i64, handle1);
+        publish_arrow_version(handle.as_ref(), 1, &[11], &[(11, 1)]);
 
         let batch = timeout(Duration::from_millis(200), stream.next())
             .await

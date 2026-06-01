@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Column;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, lit};
 use datafusion::physical_plan::collect;
-use dbsp::StreamRetention;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use object_store::{ObjectStore, memory::InMemory};
@@ -15,7 +15,7 @@ use slatedb::Db;
 
 use crate::checkpoint::{CheckpointStore, TickCommit};
 use crate::dbsp_bridge::DbspBridge;
-use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::table_provider::MaterializedViewTableProvider;
 
@@ -43,37 +43,79 @@ fn encode_i64_utf8_row(id: i64, label: &str) -> Vec<u8> {
     encoded
 }
 
+fn id_label_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]))
+}
+
+fn id_schema(nullable: bool) -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        nullable,
+    )]))
+}
+
+fn arrow_i64_utf8_batch(schema: Arc<Schema>, rows: &[(i64, &str)]) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|(id, _)| *id))),
+            Arc::new(StringArray::from_iter_values(
+                rows.iter().map(|(_, label)| *label),
+            )),
+        ],
+    )
+    .expect("build Arrow id/label batch")
+}
+
+fn arrow_i64_batch(schema: Arc<Schema>, values: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from_iter_values(
+            values.iter().copied(),
+        ))],
+    )
+    .expect("build Arrow i64 batch")
+}
+
+fn publish_id_label_snapshot(
+    view: &MaterializedViewHandle,
+    version: i64,
+    schema: Arc<Schema>,
+    rows: &[(i64, &str)],
+) {
+    view.publish_arrow_version(
+        version,
+        vec![arrow_i64_utf8_batch(schema, rows)],
+        Vec::new(),
+    );
+}
+
+fn publish_i64_snapshot(
+    view: &MaterializedViewHandle,
+    version: i64,
+    schema: Arc<Schema>,
+    values: &[i64],
+) {
+    view.publish_arrow_version(version, vec![arrow_i64_batch(schema, values)], Vec::new());
+}
+
 #[tokio::test]
 async fn materialized_view_provider_emits_rows() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_test");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(Db::open("mv-provider", store).await.expect("open SlateDB"));
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view("mv_test", StreamRetention::KeepLast { keep_last: 1 })
-        .await
-        .expect("dbsp view");
-    let row_one = encode_i64_utf8_row(1, "one");
-    dbsp_view.add_delta(row_one, 1);
-    let version_one = dbsp_view
-        .flush()
-        .await
-        .expect("flush first version")
-        .version;
-    let row_two = encode_i64_utf8_row(2, "two");
-    dbsp_view.add_delta(row_two, 1);
-    dbsp_view.flush().await.expect("flush second version");
-    let handle_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = handle_view.into_parts();
-    view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
-    view.publish_logical_version(i64::try_from(version).expect("logical version"));
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("label", DataType::Utf8, true),
-    ]));
+    let schema = id_label_schema();
+    publish_id_label_snapshot(view.as_ref(), 1, Arc::clone(&schema), &[(1, "one")]);
+    publish_id_label_snapshot(
+        view.as_ref(),
+        2,
+        Arc::clone(&schema),
+        &[(1, "one"), (2, "two")],
+    );
 
     let provider = MaterializedViewTableProvider::new(registry.clone(), "mv_test", schema);
     let latest = provider
@@ -85,7 +127,7 @@ async fn materialized_view_provider_emits_rows() {
     assert_eq!(latest[0].num_columns(), 3);
 
     let as_of = provider
-        .build_batches_at_version(version_one)
+        .build_batches_at_version(1)
         .await
         .expect("build as of version");
     assert_eq!(as_of.len(), 1);
@@ -97,36 +139,14 @@ async fn materialized_view_provider_resolves_logical_versions_to_dbsp_handles() 
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_logical_version_test");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("mv-provider-logical-version", store)
-            .await
-            .expect("open SlateDB"),
-    );
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_logical_version_test",
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-    let row = encode_i64_utf8_row(7, "seven");
-    dbsp_view.add_delta(row, 1);
-    let handle = dbsp_view.flush().await.expect("flush logical version test");
     let logical_version = 42_i64;
-    view.publish_version(logical_version, handle.clone());
-    let latest_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = latest_view.into_parts();
-    view.set_dbsp_state(
-        DbspPersistedState::new(dict, table, namespace, version)
-            .with_logical_version(logical_version as u64),
+    let schema = id_label_schema();
+    publish_id_label_snapshot(
+        view.as_ref(),
+        logical_version,
+        Arc::clone(&schema),
+        &[(7, "seven")],
     );
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("label", DataType::Utf8, true),
-    ]));
     let provider = MaterializedViewTableProvider::new(registry, "mv_logical_version_test", schema);
 
     let as_of = provider
@@ -140,33 +160,9 @@ async fn materialized_view_provider_resolves_logical_versions_to_dbsp_handles() 
 #[tokio::test]
 async fn materialized_view_provider_hides_unpublished_dbsp_state() {
     let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_unpublished_state");
+    registry.register("mv_unpublished_state");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("mv-provider-unpublished-state", store)
-            .await
-            .expect("open SlateDB"),
-    );
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_unpublished_state",
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-    let row = encode_i64_utf8_row(9, "nine");
-    dbsp_view.add_delta(row, 1);
-    dbsp_view.flush().await.expect("flush unpublished state");
-    let handle_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = handle_view.into_parts();
-    view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("label", DataType::Utf8, true),
-    ]));
+    let schema = id_label_schema();
     let provider = MaterializedViewTableProvider::new(registry, "mv_unpublished_state", schema);
 
     let batches = provider
@@ -182,36 +178,11 @@ async fn materialized_view_provider_resolves_published_empty_logical_versions() 
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_empty_logical_versions");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("mv-provider-empty-logical-version", store)
-            .await
-            .expect("open SlateDB"),
-    );
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_empty_logical_versions",
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-    let row = encode_i64_utf8_row(9, "nine");
-    dbsp_view.add_delta(row, 1);
-    let handle = dbsp_view.flush().await.expect("flush base version");
-    let latest_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = latest_view.into_parts();
-    view.set_dbsp_state(
-        DbspPersistedState::new(dict, table, namespace, version).with_logical_version(3),
-    );
-    view.publish_version(1, handle);
-    view.publish_logical_version(2);
-    view.publish_logical_version(3);
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("label", DataType::Utf8, true),
-    ]));
+    let schema = id_label_schema();
+    let rows = [(9, "nine")];
+    publish_id_label_snapshot(view.as_ref(), 1, Arc::clone(&schema), &rows);
+    publish_id_label_snapshot(view.as_ref(), 2, Arc::clone(&schema), &rows);
+    publish_id_label_snapshot(view.as_ref(), 3, Arc::clone(&schema), &rows);
     let provider =
         MaterializedViewTableProvider::new(registry, "mv_empty_logical_versions", schema);
 
@@ -235,32 +206,13 @@ async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_projection_limit");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("mv-provider-limit", store)
-            .await
-            .expect("open SlateDB"),
+    let schema = id_label_schema();
+    publish_id_label_snapshot(
+        view.as_ref(),
+        1,
+        Arc::clone(&schema),
+        &[(1, "one"), (2, "two")],
     );
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_projection_limit",
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-    dbsp_view.add_delta(encode_i64_utf8_row(1, "one"), 1);
-    dbsp_view.add_delta(encode_i64_utf8_row(2, "two"), 1);
-    dbsp_view.flush().await.expect("flush");
-    let handle_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = handle_view.into_parts();
-    view.set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
-    view.publish_logical_version(i64::try_from(version).expect("logical version"));
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, true),
-        Field::new("label", DataType::Utf8, true),
-    ]));
     let provider = MaterializedViewTableProvider::new(registry, "mv_projection_limit", schema);
     let session = SessionContext::new();
     let state = session.state();
@@ -280,7 +232,7 @@ async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
 #[tokio::test]
 async fn materialized_view_provider_empty_then_populated() {
     let registry = Arc::new(MaterializedViewRegistry::new());
-    registry.register("mv_empty");
+    let view = registry.register("mv_empty");
     let schema = Arc::new(Schema::new(vec![Field::new(
         "auction",
         DataType::Int64,
@@ -295,25 +247,7 @@ async fn materialized_view_provider_empty_then_populated() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 0);
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(Db::open("mv-empty", store).await.expect("open SlateDB"));
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view("mv_empty", StreamRetention::KeepLast { keep_last: 1 })
-        .await
-        .expect("view");
-    dbsp_view.add_delta(encode_i64_row(5), 1);
-    dbsp_view.flush().await.expect("flush view");
-    let handle_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = handle_view.into_parts();
-    registry
-        .get("mv_empty")
-        .expect("view registered")
-        .set_dbsp_state(DbspPersistedState::new(dict, table, namespace, version));
-    registry
-        .get("mv_empty")
-        .expect("view registered")
-        .publish_logical_version(i64::try_from(version).expect("logical version"));
+    publish_i64_snapshot(view.as_ref(), 1, Arc::clone(&schema), &[5]);
 
     let populated = provider
         .build_batches_for_test()
@@ -328,35 +262,14 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_latest
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_recovery");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("mv-provider-count-recovery", store)
-            .await
-            .expect("open SlateDB"),
+    let schema = id_schema(true);
+    let handle_version = 1_u64;
+    publish_i64_snapshot(
+        view.as_ref(),
+        handle_version as i64,
+        Arc::clone(&schema),
+        &[1, 2, 3],
     );
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_count_recovery",
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-    for id in [1_i64, 2_i64, 3_i64] {
-        dbsp_view.add_delta(encode_i64_row(id), 1);
-    }
-    dbsp_view.flush().await.expect("flush count recovery");
-    let handle_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, handle_version) = handle_view.into_parts();
-    view.set_dbsp_state(DbspPersistedState::new(
-        dict,
-        table,
-        namespace,
-        handle_version,
-    ));
-    view.publish_logical_version(i64::try_from(handle_version).expect("logical version"));
-
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let provider =
         MaterializedViewTableProvider::new(Arc::clone(&registry), "mv_count_recovery", schema);
 
@@ -380,39 +293,21 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_overla
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_overlay_count_recovery");
 
-    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("mv-provider-overlay-count-recovery", store)
-            .await
-            .expect("open SlateDB"),
+    let schema = id_schema(true);
+    let handle_version = 1_u64;
+    let latest_version = handle_version.saturating_add(1);
+    publish_i64_snapshot(
+        view.as_ref(),
+        handle_version as i64,
+        Arc::clone(&schema),
+        &[1, 2],
     );
-    let mut bridge = DbspBridge::new(db).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_overlay_count_recovery",
-            StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-    for id in [1_i64, 2_i64] {
-        dbsp_view.add_delta(encode_i64_row(id), 1);
-    }
-    dbsp_view.flush().await.expect("flush overlay base");
-    let handle_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, handle_version) = handle_view.into_parts();
-    view.set_dbsp_state(DbspPersistedState::new(
-        dict,
-        table,
-        namespace,
-        handle_version,
-    ));
-    view.publish_logical_version(i64::try_from(handle_version).expect("logical version"));
-    view.append_encoded_overlay_batch(
-        handle_version.saturating_add(1),
-        vec![(encode_i64_row(3), 1)],
+    publish_i64_snapshot(
+        view.as_ref(),
+        latest_version as i64,
+        Arc::clone(&schema),
+        &[1, 2, 3],
     );
-
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
     let provider = MaterializedViewTableProvider::new(
         Arc::clone(&registry),
         "mv_overlay_count_recovery",
@@ -425,10 +320,7 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_overla
         .await
         .expect("build recovered overlay snapshot");
     assert_eq!(batches[0].num_rows(), 3);
-    assert_eq!(
-        view.authoritative_row_count_for(handle_version.saturating_add(1)),
-        Some(3)
-    );
+    assert_eq!(view.authoritative_row_count_for(latest_version), Some(3));
     assert_eq!(view.authoritative_row_count(), None);
     let second = provider
         .build_batches_for_test()
@@ -443,17 +335,17 @@ async fn materialized_view_provider_invalidates_stale_authoritative_count_after_
     let view = registry.register("mv_stale_count_recovery");
     view.publish_logical_version(0);
     assert!(view.seed_authoritative_row_count_if_latest(0, 0));
-    view.append_encoded_overlay_batch(1, vec![(encode_i64_row(9), 1)]);
 
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let schema = id_schema(true);
+    publish_i64_snapshot(view.as_ref(), 1, Arc::clone(&schema), &[9]);
     let provider = MaterializedViewTableProvider::new(
         Arc::clone(&registry),
         "mv_stale_count_recovery",
         schema,
     );
 
-    assert_eq!(view.authoritative_row_count_for(0), Some(0));
-    assert_eq!(view.authoritative_row_count_for(1), None);
+    assert_eq!(view.authoritative_row_count_for(0), None);
+    assert_eq!(view.authoritative_row_count_for(1), Some(1));
     let batches = provider
         .build_batches_for_test()
         .await
@@ -471,14 +363,9 @@ async fn materialized_view_provider_invalidates_stale_authoritative_count_after_
 async fn materialized_view_provider_builds_mv_version_only_batches_from_authoritative_state() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_version_only");
-    view.mark_state_authoritative();
-    view.publish_logical_version(7);
-    for id in [1_i64, 2_i64, 3_i64] {
-        view.apply_encoded_state_batch(7, &[(encode_i64_row(id), 1)])
-            .expect("apply authoritative row");
-    }
 
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let schema = id_schema(true);
+    publish_i64_snapshot(view.as_ref(), 7, Arc::clone(&schema), &[1, 2, 3]);
     let provider = MaterializedViewTableProvider::new(registry, "mv_version_only", schema);
     let session = SessionContext::new();
     let state = session.state();
@@ -515,14 +402,9 @@ async fn materialized_view_provider_builds_mv_version_only_batches_from_authorit
 async fn materialized_view_provider_answers_count_star_from_authoritative_state() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_fast");
-    view.mark_state_authoritative();
-    view.publish_logical_version(11);
-    for id in [1_i64, 2_i64, 3_i64] {
-        view.apply_encoded_state_batch(11, &[(encode_i64_row(id), 1)])
-            .expect("apply authoritative row");
-    }
 
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let schema = id_schema(true);
+    publish_i64_snapshot(view.as_ref(), 11, Arc::clone(&schema), &[1, 2, 3]);
     let provider = MaterializedViewTableProvider::new(registry, "mv_count_fast", schema);
     let ctx = SessionContext::new();
     ctx.register_table(
@@ -553,14 +435,9 @@ async fn materialized_view_provider_answers_count_star_from_authoritative_state(
 async fn materialized_view_provider_answers_count_star_from_authoritative_non_null_state() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_fast_non_null");
-    view.mark_state_authoritative();
-    view.publish_logical_version(11);
-    for id in [1_i64, 2_i64, 3_i64] {
-        view.apply_encoded_state_batch(11, &[(encode_i64_row(id), 1)])
-            .expect("apply authoritative row");
-    }
 
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let schema = id_schema(false);
+    publish_i64_snapshot(view.as_ref(), 11, Arc::clone(&schema), &[1, 2, 3]);
     let provider = MaterializedViewTableProvider::new(registry, "mv_count_fast_non_null", schema);
     let ctx = SessionContext::new();
     ctx.register_table(
@@ -590,12 +467,8 @@ async fn materialized_view_provider_answers_count_star_from_authoritative_non_nu
 async fn materialized_view_provider_hides_unpublished_authoritative_count_until_version_visible() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_visibility");
-    view.mark_state_authoritative();
 
-    view.apply_encoded_state_batch(2, &[(encode_i64_row(7), 1)])
-        .expect("apply authoritative row");
-
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let schema = id_schema(true);
     let provider = MaterializedViewTableProvider::new(registry, "mv_count_visibility", schema);
     let ctx = SessionContext::new();
     ctx.register_table(
@@ -619,7 +492,7 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
         .value(0);
     assert_eq!(count_before, 0);
 
-    view.publish_logical_version(2);
+    publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[7]);
 
     let after_publish = ctx
         .sql("SELECT COUNT(*) AS row_count FROM mv_count_visibility")
@@ -641,13 +514,9 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
 async fn materialized_view_provider_keeps_latest_visible_count_while_next_version_is_staged() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_staged_visibility");
-    view.mark_state_authoritative();
-    view.publish_logical_version(1);
 
-    view.apply_encoded_state_batch(1, &[(encode_i64_row(1), 1)])
-        .expect("apply visible row");
-
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let schema = id_schema(true);
+    publish_i64_snapshot(view.as_ref(), 1, Arc::clone(&schema), &[1]);
     let provider =
         MaterializedViewTableProvider::new(registry, "mv_count_staged_visibility", schema);
     let ctx = SessionContext::new();
@@ -656,9 +525,6 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
         Arc::new(provider) as Arc<dyn TableProvider>,
     )
     .expect("register mv provider");
-
-    view.apply_encoded_state_batch(2, &[(encode_i64_row(2), 1)])
-        .expect("apply staged row");
 
     let while_staged = ctx
         .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
@@ -675,7 +541,7 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
         .value(0);
     assert_eq!(count_while_staged, 1);
 
-    view.publish_logical_version(2);
+    publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[1, 2]);
     let after_publish = ctx
         .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
         .await
@@ -696,16 +562,10 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
 async fn materialized_view_provider_uses_cached_count_on_first_overlay_visible_version() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_overlay_first_visible_count");
-    view.mark_state_authoritative();
-    view.publish_logical_version(0);
 
-    let encoded = encode_i64_row(7);
-    view.append_shared_encoded_overlay_batch(1, Arc::new(vec![(encoded.clone(), 1)]));
-    view.apply_encoded_state_batch(1, &[(encoded, 1)])
-        .expect("apply authoritative overlay row");
-    view.publish_logical_version(1);
-
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+    let schema = id_schema(true);
+    publish_i64_snapshot(view.as_ref(), 0, Arc::clone(&schema), &[]);
+    publish_i64_snapshot(view.as_ref(), 1, Arc::clone(&schema), &[7]);
     let provider =
         MaterializedViewTableProvider::new(registry, "mv_overlay_first_visible_count", schema);
     let session = SessionContext::new();

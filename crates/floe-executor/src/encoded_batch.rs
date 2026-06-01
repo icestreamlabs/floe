@@ -11,16 +11,9 @@ use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
 
 pub(crate) const ENCODED_BATCH_ROW_LIMIT: usize = 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EncodedRowBatchMode {
-    Snapshot,
-    Delta,
-}
-
 #[derive(Debug)]
 pub(crate) struct ExpandedEncodedBatch {
     pub(crate) batch: RecordBatch,
-    pub(crate) diffs: Vec<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,12 +48,11 @@ pub(crate) fn build_expanded_batches_from_encoded_rows<I>(
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
     virtual_u64: Option<VirtualU64Column<'_>>,
-    mode: EncodedRowBatchMode,
 ) -> Result<(SchemaRef, Vec<ExpandedEncodedBatch>)>
 where
     I: IntoIterator<Item = (Vec<u8>, i64)>,
 {
-    let rows = normalize_rows(rows, mode)?;
+    let rows = normalize_snapshot_rows(rows)?;
     let (projected_schema, projected_indices) = project_schema(&schema, projection)?;
     let virtual_index = virtual_u64.and_then(|column| {
         schema
@@ -71,16 +63,15 @@ where
     let source_indices = projected_source_indices(&projected_indices, virtual_index);
 
     if projected_indices.is_empty() {
-        return build_zero_column_batches(projected_schema, &rows, limit, mode);
+        return build_zero_column_batches(projected_schema, &rows, limit);
     }
 
-    let expansion = expansion_plan(&rows, limit, mode)?;
+    let expansion = expansion_plan(&rows, limit)?;
     if expansion.is_empty() {
         return Ok((
             Arc::clone(&projected_schema),
             vec![ExpandedEncodedBatch {
                 batch: RecordBatch::new_empty(projected_schema),
-                diffs: Vec::new(),
             }],
         ));
     }
@@ -117,7 +108,6 @@ where
             Arc::clone(&projected_schema),
             vec![ExpandedEncodedBatch {
                 batch: RecordBatch::new_empty(projected_schema),
-                diffs: Vec::new(),
             }],
         ));
     };
@@ -139,39 +129,20 @@ where
     )
 }
 
-fn normalize_rows<I>(rows: I, mode: EncodedRowBatchMode) -> Result<Vec<(Vec<u8>, i64)>>
+fn normalize_snapshot_rows<I>(rows: I) -> Result<Vec<(Vec<u8>, i64)>>
 where
     I: IntoIterator<Item = (Vec<u8>, i64)>,
 {
-    match mode {
-        EncodedRowBatchMode::Snapshot => {
-            let mut output = Vec::new();
-            for (row, diff) in rows {
-                if diff < 0 {
-                    bail!("snapshot contains negative diff {diff}");
-                }
-                if diff != 0 {
-                    output.push((row, diff));
-                }
-            }
-            Ok(output)
+    let mut output = Vec::new();
+    for (row, diff) in rows {
+        if diff < 0 {
+            bail!("snapshot contains negative diff {diff}");
         }
-        EncodedRowBatchMode::Delta => {
-            let mut merged = HashMap::<Vec<u8>, i64>::new();
-            for (row, diff) in rows {
-                if diff == 0 {
-                    continue;
-                }
-                let next = merged.get(&row).copied().unwrap_or(0).saturating_add(diff);
-                if next == 0 {
-                    merged.remove(&row);
-                } else {
-                    merged.insert(row, next);
-                }
-            }
-            Ok(merged.into_iter().collect())
+        if diff != 0 {
+            output.push((row, diff));
         }
     }
+    Ok(output)
 }
 
 fn projected_source_indices(
@@ -202,11 +173,7 @@ fn schema_for_indices(schema: &SchemaRef, indices: &[usize]) -> Result<SchemaRef
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn expansion_plan(
-    rows: &[(Vec<u8>, i64)],
-    limit: Option<usize>,
-    mode: EncodedRowBatchMode,
-) -> Result<Vec<(u32, i64)>> {
+fn expansion_plan(rows: &[(Vec<u8>, i64)], limit: Option<usize>) -> Result<Vec<u32>> {
     let mut output = Vec::new();
     let mut remaining = limit.unwrap_or(usize::MAX);
     for (row_idx, (_row, diff)) in rows.iter().enumerate() {
@@ -220,12 +187,7 @@ fn expansion_plan(
         if repeat == 0 {
             continue;
         }
-        let out_diff = match mode {
-            EncodedRowBatchMode::Snapshot => 1,
-            EncodedRowBatchMode::Delta if *diff > 0 => 1,
-            EncodedRowBatchMode::Delta => -1,
-        };
-        output.extend(std::iter::repeat_n((row_idx, out_diff), repeat));
+        output.extend(std::iter::repeat_n(row_idx, repeat));
         remaining = remaining.saturating_sub(repeat);
     }
     Ok(output)
@@ -235,18 +197,11 @@ fn build_zero_column_batches(
     schema: SchemaRef,
     rows: &[(Vec<u8>, i64)],
     limit: Option<usize>,
-    mode: EncodedRowBatchMode,
 ) -> Result<(SchemaRef, Vec<ExpandedEncodedBatch>)> {
-    let expansion = expansion_plan(rows, limit, mode)?;
+    let expansion = expansion_plan(rows, limit)?;
     let options = RecordBatchOptions::new().with_row_count(Some(expansion.len()));
     let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), vec![], &options)?;
-    Ok((
-        schema,
-        vec![ExpandedEncodedBatch {
-            batch,
-            diffs: expansion.into_iter().map(|(_, diff)| diff).collect(),
-        }],
-    ))
+    Ok((schema, vec![ExpandedEncodedBatch { batch }]))
 }
 
 fn build_virtual_only_batches(
@@ -254,7 +209,7 @@ fn build_virtual_only_batches(
     projected_indices: &[usize],
     virtual_index: Option<usize>,
     virtual_u64: Option<VirtualU64Column<'_>>,
-    expansion: Vec<(u32, i64)>,
+    expansion: Vec<u32>,
 ) -> Result<(SchemaRef, Vec<ExpandedEncodedBatch>)> {
     build_projected_batches(
         projected_schema,
@@ -274,11 +229,11 @@ fn build_projected_batches(
     virtual_u64: Option<VirtualU64Column<'_>>,
     decoded_batch: &RecordBatch,
     source_positions: &HashMap<usize, usize>,
-    expansion: Vec<(u32, i64)>,
+    expansion: Vec<u32>,
 ) -> Result<(SchemaRef, Vec<ExpandedEncodedBatch>)> {
     let mut batches = Vec::new();
     for chunk in expansion.chunks(ENCODED_BATCH_ROW_LIMIT) {
-        let take_indices = UInt32Array::from_iter_values(chunk.iter().map(|(row_idx, _)| *row_idx));
+        let take_indices = UInt32Array::from_iter_values(chunk.iter().copied());
         let arrays = projected_indices
             .iter()
             .copied()
@@ -294,15 +249,11 @@ fn build_projected_batches(
             })
             .collect::<Result<Vec<ArrayRef>>>()?;
         let batch = RecordBatch::try_new(Arc::clone(&projected_schema), arrays)?;
-        batches.push(ExpandedEncodedBatch {
-            batch,
-            diffs: chunk.iter().map(|(_, diff)| *diff).collect(),
-        });
+        batches.push(ExpandedEncodedBatch { batch });
     }
     if batches.is_empty() {
         batches.push(ExpandedEncodedBatch {
             batch: RecordBatch::new_empty(Arc::clone(&projected_schema)),
-            diffs: Vec::new(),
         });
     }
     Ok((projected_schema, batches))
@@ -334,7 +285,7 @@ pub(crate) fn append_virtual_u64_field(schema: &SchemaRef, name: &str) -> Schema
 
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::{Array, Int64Array, StringArray, UInt64Array};
+    use datafusion::arrow::array::{Array, StringArray, UInt64Array};
 
     use super::*;
 
@@ -369,11 +320,9 @@ mod tests {
                 name: "__floe_mv_version",
                 value: 7,
             }),
-            EncodedRowBatchMode::Snapshot,
         )
         .expect("build batches");
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].diffs, vec![1, 1, 1]);
         let labels = batches[0]
             .batch
             .column(0)
@@ -390,32 +339,5 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(versions.values(), &[7, 7, 7]);
-    }
-
-    #[test]
-    fn coalesces_delta_rows_and_expands_signed_diffs() {
-        let (_schema, batches) = build_expanded_batches_from_encoded_rows(
-            vec![
-                (encoded_row(1, "one"), 2),
-                (encoded_row(1, "one"), -1),
-                (encoded_row(2, "two"), -2),
-            ],
-            schema(),
-            None,
-            None,
-            None,
-            EncodedRowBatchMode::Delta,
-        )
-        .expect("build batches");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].diffs.iter().sum::<i64>(), -1);
-        assert_eq!(batches[0].batch.num_rows(), 3);
-        let ids = batches[0]
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert!(ids.value(0) == 1 || ids.value(0) == 2);
     }
 }

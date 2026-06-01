@@ -1,5 +1,4 @@
 use super::*;
-use floe_executor::stream_types::EncodedDeltaBatch;
 
 pub(super) fn source_journal_required_sources(
     registry: &SourceRegistry,
@@ -47,10 +46,10 @@ fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn replay_committed_source_journal_entries(
-    source_batch_journal: &SourceBatchJournal,
-    journal: &KafkaSourceJournal,
-    registry: &Arc<Mutex<OuterStreamRegistry>>,
+async fn replay_committed_vectorized_source_journal_entries(
+    source_batch_journal: &VectorizedSourceBatchJournal,
+    kafka_journal: &KafkaSourceJournal,
+    vectorized_runtime: &mut VectorizedExecutionRuntime,
     max_tick_id: u64,
     raw_journal_sources: &BTreeSet<String>,
     kafka_metadata_sources: &BTreeSet<String>,
@@ -58,9 +57,6 @@ async fn replay_committed_source_journal_entries(
     run_args: &cli::RunArgs,
     definitions: &[SourceDefinition],
     source_id_by_name: &HashMap<String, usize>,
-    source_names_by_id: &[String],
-    decoders_by_source_id: &[Option<SourceRowDecoder>],
-    required_columns_by_source: &HashMap<String, Arc<[bool]>>,
 ) -> anyhow::Result<(usize, usize)> {
     let raw_entries = if raw_journal_sources.is_empty() {
         Vec::new()
@@ -72,10 +68,11 @@ async fn replay_committed_source_journal_entries(
     let kafka_entries = if kafka_metadata_sources.is_empty() {
         Vec::new()
     } else {
-        journal
+        kafka_journal
             .load_committed_entries_up_to(max_tick_id, kafka_metadata_sources)
             .await?
     };
+
     let mut raw_entry_by_tick_and_source = BTreeMap::new();
     for entry in raw_entries {
         raw_entry_by_tick_and_source.insert((entry.tick_id, entry.source.clone()), entry);
@@ -92,60 +89,73 @@ async fn replay_committed_source_journal_entries(
     let mut replayed_raw = 0usize;
     let mut replayed_kafka = 0usize;
     for tick_id in 1..=max_tick_id {
+        let mut tick_changed = false;
         for source in &replay_sources {
-            let deltas = if raw_journal_sources.contains(source) {
-                match raw_entry_by_tick_and_source.remove(&(tick_id, source.clone())) {
-                    Some(entry) => {
-                        replayed_raw = replayed_raw.saturating_add(1);
-                        entry.deltas
-                    }
-                    None => Vec::new(),
+            if raw_journal_sources.contains(source) {
+                let Some(entry) = raw_entry_by_tick_and_source.remove(&(tick_id, source.clone()))
+                else {
+                    continue;
+                };
+                replayed_raw = replayed_raw.saturating_add(1);
+                for batch in entry.batches {
+                    vectorized_runtime
+                        .apply_weighted_source_delta(&entry.source, batch)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "replay vectorized source journal for '{}' at tick {}",
+                                entry.source, tick_id
+                            )
+                        })?;
+                    tick_changed = true;
                 }
             } else if kafka_metadata_sources.contains(source) {
-                match kafka_entry_by_tick_and_source.remove(&(tick_id, source.clone())) {
-                    Some(entry) => {
-                        replayed_kafka = replayed_kafka.saturating_add(1);
-                        replay_kafka_source_journal_entry(
-                            entry,
-                            connector_specs,
-                            run_args,
-                            definitions,
-                            source_id_by_name,
-                            source_names_by_id,
-                            decoders_by_source_id,
-                            required_columns_by_source,
-                        )
-                        .await?
-                    }
-                    None => Vec::new(),
+                let Some(entry) = kafka_entry_by_tick_and_source.remove(&(tick_id, source.clone()))
+                else {
+                    continue;
+                };
+                replayed_kafka = replayed_kafka.saturating_add(1);
+                let replayed_batches = replay_kafka_source_journal_entry_as_arrow(
+                    entry,
+                    connector_specs,
+                    run_args,
+                    definitions,
+                    source_id_by_name,
+                )
+                .await?;
+                for (source_name, batch) in replayed_batches {
+                    vectorized_runtime
+                        .apply_weighted_source_delta(&source_name, batch)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "replay kafka metadata journal into vectorized source '{}' at tick {}",
+                                source_name, tick_id
+                            )
+                        })?;
+                    tick_changed = true;
                 }
-            } else {
-                Vec::new()
-            };
-            registry
-                .lock()
+            }
+        }
+        if tick_changed {
+            vectorized_runtime
+                .run_tick(i64::try_from(tick_id).unwrap_or(i64::MAX))
                 .await
-                .replay_transient_batch(source, i64::try_from(tick_id).unwrap_or(i64::MAX), deltas)
-                .with_context(|| {
-                    format!("replay committed source journal for '{source}' at tick {tick_id}")
-                })?;
+                .with_context(|| format!("run vectorized replay tick {tick_id}"))?;
         }
     }
     Ok((replayed_raw, replayed_kafka))
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn replay_kafka_source_journal_entry(
+async fn replay_kafka_source_journal_entry_as_arrow(
     entry: floe_executor::source_journal::KafkaSourceJournalEntry,
     connector_specs: &[config::ConnectorSpec],
     run_args: &cli::RunArgs,
     definitions: &[SourceDefinition],
     source_id_by_name: &HashMap<String, usize>,
-    source_names_by_id: &[String],
-    decoders_by_source_id: &[Option<SourceRowDecoder>],
-    required_columns_by_source: &HashMap<String, Arc<[bool]>>,
-) -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-    let mut deltas = Vec::new();
+) -> anyhow::Result<Vec<(String, RecordBatch)>> {
+    let mut batches = Vec::new();
     for range in entry.ranges {
         let config = kafka_replay_connector_config(
             connector_specs,
@@ -165,10 +175,7 @@ async fn replay_kafka_source_journal_entry(
         let replayed = KafkaConnector::replay_range(
             config,
             definitions.to_vec(),
-            required_columns_by_source
-                .iter()
-                .map(|(source, columns)| (source.clone(), Arc::clone(columns)))
-                .collect(),
+            HashMap::new(),
             replay_range,
         )
         .await
@@ -183,16 +190,62 @@ async fn replay_kafka_source_journal_entry(
                 entry.tick_id
             )
         })?;
-        let mut replayed_range = encode_replayed_kafka_events_for_range(
-            &entry.source,
-            &range,
-            replayed.events,
-            source_id_by_name,
-            source_names_by_id,
-            decoders_by_source_id,
-        )?;
-        if replayed_range.row_count != range.row_count || replayed_range.checksum != range.checksum
-        {
+
+        let source_id = source_id_by_name
+            .get(entry.source.as_str())
+            .copied()
+            .ok_or_else(|| anyhow!("missing source id for '{}'", entry.source))?;
+        let definition = definitions
+            .get(source_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing source definition for '{}'", entry.source))?;
+        let mut builder =
+            SourceArrowBatchBuilder::new(definition.clone(), replayed.events.len().max(1));
+        let mut row_count = 0u64;
+        let mut checksum = kafka_source_journal_initial_checksum();
+        for event in replayed.events {
+            let Some(event_source_id) = event
+                .source_id()
+                .or_else(|| source_id_by_name.get(event.source()).copied())
+            else {
+                continue;
+            };
+            if event_source_id != source_id {
+                continue;
+            }
+            let Some((topic, partition, offset)) = event_fast_kafka_offset(&event)
+                .or_else(|| event_kafka_offset(event.resume_token()))
+            else {
+                return Err(anyhow!(
+                    "replayed kafka event for source '{}' missing kafka position",
+                    entry.source
+                ));
+            };
+            if topic.as_ref() != range.topic.as_str()
+                || partition != range.partition
+                || offset < range.start_offset
+                || offset > range.end_offset
+            {
+                return Err(anyhow!(
+                    "replayed kafka event for source '{}' had unexpected position {}[{}] {}; expected {}[{}] {}..{}",
+                    entry.source,
+                    topic.as_ref(),
+                    partition,
+                    offset,
+                    range.topic,
+                    range.partition,
+                    range.start_offset,
+                    range.end_offset
+                ));
+            }
+            let checksum_bytes = kafka_source_journal_event_checksum_bytes(&event);
+            update_kafka_source_journal_checksum(&mut checksum, offset, &checksum_bytes);
+            builder
+                .append_event(&event)
+                .with_context(|| format!("decode replayed kafka event for '{}'", entry.source))?;
+            row_count = row_count.saturating_add(1);
+        }
+        if row_count != range.row_count || checksum != range.checksum {
             return Err(anyhow!(
                 "kafka replay validation failed for source '{}' tick {} range {}[{}] {}..{}: expected rows/checksum {}/{:016x}, got {}/{:016x}",
                 entry.source,
@@ -203,19 +256,21 @@ async fn replay_kafka_source_journal_entry(
                 range.end_offset,
                 range.row_count,
                 range.checksum,
-                replayed_range.row_count,
-                replayed_range.checksum
+                row_count,
+                checksum
             ));
         }
-        deltas.append(&mut replayed_range.deltas);
+        let Some(batch) = builder.finish()? else {
+            continue;
+        };
+        let weighted_schema = floe_executor::delta_consolidation::weighted_snapshot_schema(
+            &definition.to_arrow_schema(),
+        )?;
+        let weighted =
+            floe_executor::delta_consolidation::add_weight_column(&batch, &weighted_schema, 1)?;
+        batches.push((entry.source.clone(), weighted));
     }
-    Ok(deltas)
-}
-
-struct ReplayedKafkaRangeDeltas {
-    deltas: Vec<(Vec<u8>, i64)>,
-    row_count: u64,
-    checksum: u64,
+    Ok(batches)
 }
 
 fn kafka_replay_connector_config(
@@ -263,83 +318,6 @@ fn kafka_replay_connector_config(
     Err(anyhow!(
         "no kafka connector configured for replay topic '{topic}'"
     ))
-}
-
-fn encode_replayed_kafka_events_for_range(
-    expected_source: &str,
-    range: &KafkaSourceJournalRange,
-    events: Vec<core_source::AppendIngestEvent>,
-    source_id_by_name: &HashMap<String, usize>,
-    source_names_by_id: &[String],
-    decoders_by_source_id: &[Option<SourceRowDecoder>],
-) -> anyhow::Result<ReplayedKafkaRangeDeltas> {
-    let mut deltas = Vec::new();
-    let mut row_count = 0u64;
-    let mut checksum = kafka_source_journal_initial_checksum();
-    for mut event in events {
-        let Some(source_id) = event
-            .source_id()
-            .or_else(|| source_id_by_name.get(event.source()).copied())
-        else {
-            continue;
-        };
-        let Some(source_name) = source_names_by_id.get(source_id) else {
-            continue;
-        };
-        if source_name != expected_source {
-            continue;
-        }
-        let Some((topic, partition, offset)) =
-            event_fast_kafka_offset(&event).or_else(|| event_kafka_offset(event.resume_token()))
-        else {
-            return Err(anyhow!(
-                "replayed kafka event for source '{expected_source}' missing kafka position"
-            ));
-        };
-        if topic.as_ref() != range.topic.as_str()
-            || partition != range.partition
-            || offset < range.start_offset
-            || offset > range.end_offset
-        {
-            return Err(anyhow!(
-                "replayed kafka event for source '{}' had unexpected position {}[{}] {}; expected {}[{}] {}..{}",
-                expected_source,
-                topic.as_ref(),
-                partition,
-                offset,
-                range.topic,
-                range.partition,
-                range.start_offset,
-                range.end_offset
-            ));
-        }
-        let encoded = if let Some(preencoded_row_key) = event.take_preencoded_row_key() {
-            preencoded_row_key
-        } else {
-            let Some(decoder) = decoders_by_source_id
-                .get(source_id)
-                .and_then(|decoder| decoder.as_ref())
-            else {
-                return Err(anyhow!(
-                    "missing decoder for replayed kafka source '{expected_source}'"
-                ));
-            };
-            decoder
-                .encode_row_key(&event)
-                .with_context(|| {
-                    format!("encode replayed kafka event for source '{expected_source}'")
-                })?
-                .0
-        };
-        row_count = row_count.saturating_add(1);
-        update_kafka_source_journal_checksum(&mut checksum, offset, &encoded);
-        deltas.push((encoded, 1));
-    }
-    Ok(ReplayedKafkaRangeDeltas {
-        deltas,
-        row_count,
-        checksum,
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1340,20 +1318,20 @@ fn build_tick_commit_for_checkpoint(
     .with_operator_states(checkpoint_operator_states())
 }
 
-type SourceJournalTransientBatch = (usize, Option<i64>, EncodedDeltaBatch);
-type SourceJournalCommitBatch = (String, Option<i64>, EncodedDeltaBatch);
+type VectorizedSourceJournalTransientBatch = (usize, Option<i64>, Vec<RecordBatch>);
+type VectorizedSourceJournalCommitBatch = (String, Option<i64>, Vec<RecordBatch>);
 
-fn build_source_journal_commit_batches(
+fn build_vectorized_source_journal_commit_batches(
     source_names_by_id: &[String],
-    source_journal_batches: &[SourceJournalTransientBatch],
-) -> Vec<SourceJournalCommitBatch> {
+    source_journal_batches: &[VectorizedSourceJournalTransientBatch],
+) -> Vec<VectorizedSourceJournalCommitBatch> {
     source_journal_batches
         .iter()
-        .map(|(source_id, max_event_time_ms, deltas)| {
+        .map(|(source_id, max_event_time_ms, batches)| {
             (
                 source_names_by_id[*source_id].clone(),
                 *max_event_time_ms,
-                deltas.clone(),
+                batches.clone(),
             )
         })
         .collect()
@@ -1807,22 +1785,32 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .as_ref()
         .and_then(|config| config.storage.source_journal)
         .unwrap_or(SourceJournalConfig::Auto);
+    let vectorized_replay_candidate_sources = all_required_sources.clone();
     let source_journal_required_sources = source_journal_required_sources(
         &source_registry,
-        &transient_only_sources,
+        &vectorized_replay_candidate_sources,
         source_journal_mode,
     );
     let kafka_metadata_journal_required_sources = kafka_metadata_journal_required_sources(
         &source_registry,
-        &transient_only_sources,
+        &vectorized_replay_candidate_sources,
         source_journal_mode,
     );
+    if !source_journal_required_sources.is_empty()
+        || !kafka_metadata_journal_required_sources.is_empty()
+    {
+        tracing::info!(
+            source_journal_sources = ?source_journal_required_sources,
+            kafka_metadata_sources = ?kafka_metadata_journal_required_sources,
+            "resolved vectorized source replay journals"
+        );
+    }
     let source_replay_covered_sources: BTreeSet<String> = source_journal_required_sources
         .union(&kafka_metadata_journal_required_sources)
         .cloned()
         .collect();
     let source_journal_skipped_sources: BTreeSet<String> = transient_only_sources
-        .difference(&source_journal_required_sources)
+        .difference(&source_replay_covered_sources)
         .cloned()
         .collect();
     tracing::info!(
@@ -1845,78 +1833,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tracing::warn!(
             sources = ?non_replayable_skipped_sources,
             "source journal disabled for non-replayable transient sources; committed source rows will not be recoverable or queryable after restart"
-        );
-    }
-    let mut transient_required_columns_by_source = {
-        let definition_by_name: HashMap<&str, &SourceDefinition> = source_registry
-            .definitions()
-            .iter()
-            .map(|definition| (definition.name(), definition))
-            .collect();
-        let mut required_columns_by_source: HashMap<String, BTreeSet<usize>> = HashMap::new();
-        let mut pruning_blocked_sources = BTreeSet::new();
-        for (plan, required_sources) in circuit_plans.iter().zip(plan_required_sources.iter()) {
-            let Some(requirements) = plan_source_requirements(plan)? else {
-                pruning_blocked_sources.extend(required_sources.iter().cloned());
-                continue;
-            };
-            let covered_sources: BTreeSet<_> = requirements
-                .iter()
-                .map(|requirement| requirement.source_name.clone())
-                .collect();
-            if covered_sources != *required_sources {
-                pruning_blocked_sources.extend(required_sources.iter().cloned());
-                continue;
-            }
-            for requirement in requirements {
-                required_columns_by_source
-                    .entry(requirement.source_name)
-                    .or_default()
-                    .extend(requirement.required_columns);
-            }
-        }
-        let mut masks = HashMap::new();
-        for (source_name, required_columns) in required_columns_by_source {
-            if pruning_blocked_sources.contains(&source_name) {
-                continue;
-            }
-            let definition = definition_by_name
-                .get(source_name.as_str())
-                .copied()
-                .ok_or_else(|| anyhow!("missing source definition for '{source_name}'"))?;
-            if required_columns.len() >= definition.columns().len() {
-                continue;
-            }
-            let mut mask = vec![false; definition.columns().len()];
-            for column_idx in required_columns {
-                let Some(required) = mask.get_mut(column_idx) else {
-                    return Err(anyhow!(
-                        "required column index {column_idx} out of bounds for source '{source_name}'"
-                    ));
-                };
-                *required = true;
-            }
-            if mask.iter().all(|required| *required) {
-                continue;
-            }
-            masks.insert(source_name, Arc::<[bool]>::from(mask));
-        }
-        masks
-    };
-    for source in &source_journal_required_sources {
-        transient_required_columns_by_source.remove(source);
-    }
-    if !transient_required_columns_by_source.is_empty() {
-        let pruned_sources = transient_required_columns_by_source
-            .iter()
-            .map(|(source, columns)| {
-                let required = columns.iter().filter(|required| **required).count();
-                format!("{source}:{required}/{}", columns.len())
-            })
-            .collect::<Vec<_>>();
-        tracing::info!(
-            pruned_sources = ?pruned_sources,
-            "resolved source column pruning"
         );
     }
     if run_args.dry_run {
@@ -1963,7 +1879,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(tick_commit) = checkpoint_manager.latest_tick_commit() {
         metrics::record_last_committed_tick(tick_commit.tick_id);
     }
-    let source_batch_journal = SourceBatchJournal::new(checkpoint_manager.store().table());
+    let vectorized_source_batch_journal =
+        VectorizedSourceBatchJournal::new(checkpoint_manager.store().table());
     let kafka_source_journal = KafkaSourceJournal::new(checkpoint_manager.store().table());
     let outer_registry = {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
@@ -1991,7 +1908,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     }
 
-    let mv_retention = if run_args.mv_retain_last == 0 {
+    let _mv_retention = if run_args.mv_retain_last == 0 {
         StreamRetention::None
     } else {
         StreamRetention::KeepLast {
@@ -2006,6 +1923,26 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             Some(run_args.mv_retain_last)
         },
     ));
+    let vectorized_mv_plans = planned_materialized_views
+        .iter()
+        .map(|mv| {
+            let arrow_schema = df_schema_to_arrow(mv.logical_plan().schema())?;
+            Ok(VectorizedMaterializedViewPlan::new(
+                mv.definition().name().to_string(),
+                mv.definition().query().to_string(),
+                arrow_schema,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut vectorized_runtime = VectorizedExecutionRuntime::new_with_udfs(
+        &source_registry,
+        vectorized_mv_plans,
+        Arc::clone(&mv_registry),
+        planner_udfs(),
+    )
+    .await
+    .context("initialize vectorized execution runtime")?;
+    let vectorized_source_table_providers = vectorized_runtime.table_providers();
     let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .context("initialize DBSP graph builder")?;
@@ -2090,7 +2027,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let shutdown_signal = CancellationToken::new();
     let runtime_failure = Arc::new(StdMutex::new(None::<String>));
     let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
-    let graph_cancel = runtime_cancel.clone();
     let cancel_for_monitor = runtime_cancel.clone();
     let failure_for_monitor = Arc::clone(&runtime_failure);
     let task_monitor: JoinHandle<()> = tokio::spawn(async move {
@@ -2120,7 +2056,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
         }
     });
-    for (idx, plan) in circuit_plans.iter().enumerate() {
+    for (idx, _plan) in circuit_plans.iter().enumerate() {
         let mv_def = &planned_materialized_views[idx];
         let view_name = mv_def.definition().name();
         let namespace = floe_executor::namespaces::materialized_view(view_name)
@@ -2142,32 +2078,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             "building DBSP graph"
         );
 
-        let enable_source_batch_journal =
-            source_batch_journal_root_sources_with_config(plan, persistence_policy_config)?
-                .as_ref()
-                .is_some_and(|source_names| {
-                    !source_names.is_empty() && source_names == required_sources
-                });
-
-        graph_builder
-            .build(BuildInputs {
-                graph_id: view_name,
-                view_name,
-                plan,
-                cancel: graph_cancel.clone(),
-                task_events: task_event_tx.clone(),
-                mv_registry: Arc::clone(&mv_registry),
-                outer_handle_streams: &handle_streams,
-                outer_transient_streams: &transient_streams,
-                enable_source_batch_journal,
-                restore_transient_helper_state: required_sources
-                    .iter()
-                    .all(|source| !source_replay_covered_sources.contains(source)),
-                mv_retention,
-                watermark: Arc::clone(&event_watermark),
-            })
-            .await
-            .with_context(|| format!("building DBSP graph for '{view_name}'"))?;
+        tracing::info!(
+            view = %view_name,
+            namespace = %namespace,
+            required_sources = ?required_sources,
+            handle_streams = ?handle_streams.keys(),
+            transient_streams = ?transient_streams.keys(),
+            "skipping legacy DBSP row-wise graph; vectorized runtime owns materialization"
+        );
     }
     let mut replayed_committed_source_batches = false;
     let connector_resume_only_sources: BTreeSet<String> = source_journal_skipped_sources
@@ -2233,7 +2151,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();
     let mut postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>> = Vec::new();
     let definitions = source_registry.definitions().to_vec();
-    let transient_required_columns_by_source = Arc::new(transient_required_columns_by_source);
     let source_id_by_name: HashMap<String, usize> = definitions
         .iter()
         .enumerate()
@@ -2365,18 +2282,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .map(|definition| definition.name().to_string())
             .collect::<Vec<_>>(),
     );
-    let decoders_by_source_id = Arc::new(
+    let active_source_definitions_by_id = Arc::new(
         definitions
             .iter()
             .map(|definition| {
-                all_required_sources.contains(definition.name()).then(|| {
-                    SourceRowDecoder::new_with_encoded_required_columns(
-                        definition.clone(),
-                        transient_required_columns_by_source
-                            .get(definition.name())
-                            .map(Arc::clone),
-                    )
-                })
+                all_required_sources
+                    .contains(definition.name())
+                    .then_some(definition.clone())
             })
             .collect::<Vec<_>>(),
     );
@@ -2384,17 +2296,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         definitions
             .iter()
             .map(|definition| all_required_sources.contains(definition.name()))
-            .collect::<Vec<_>>(),
-    );
-    let source_journal_source_ids = Arc::new(
-        definitions
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, definition)| {
-                source_journal_required_sources
-                    .contains(definition.name())
-                    .then_some(idx)
-            })
             .collect::<Vec<_>>(),
     );
     let kafka_metadata_journal_source_ids = Arc::new(
@@ -2408,12 +2309,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>(),
     );
-    let kafka_metadata_journal_source_flags = Arc::new(
-        definitions
-            .iter()
-            .map(|definition| kafka_metadata_journal_required_sources.contains(definition.name()))
-            .collect::<Vec<_>>(),
-    );
+    let source_journal_required_sources_for_task =
+        Arc::new(source_journal_required_sources.clone());
     let cdc_schemas_by_source_id = Arc::new(
         postgres_cdc_runtime_plans_by_connector
             .values()
@@ -2448,10 +2345,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(tick_commit) = recovered_tick_commit.as_ref()
         && !source_replay_covered_sources.is_empty()
     {
-        let (replayed_raw, replayed_kafka) = replay_committed_source_journal_entries(
-            &source_batch_journal,
+        let (replayed_raw, replayed_kafka) = replay_committed_vectorized_source_journal_entries(
+            &vectorized_source_batch_journal,
             &kafka_source_journal,
-            &outer_registry,
+            &mut vectorized_runtime,
             tick_commit.tick_id,
             &source_journal_required_sources,
             &kafka_metadata_journal_required_sources,
@@ -2459,19 +2356,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             &run_args,
             &definitions,
             &source_id_by_name,
-            source_names_by_id.as_slice(),
-            decoders_by_source_id.as_slice(),
-            transient_required_columns_by_source.as_ref(),
         )
         .await
-        .context("replay committed source journal entries")?;
+        .context("replay committed vectorized source journal entries")?;
         tracing::info!(
-            replayed_raw_entries = replayed_raw,
+            replayed_vectorized_entries = replayed_raw,
             replayed_kafka_metadata_entries = replayed_kafka,
             committed_tick = tick_commit.tick_id,
-            raw_journal_sources = ?source_journal_required_sources,
+            vectorized_journal_sources = ?source_journal_required_sources,
             kafka_metadata_sources = ?kafka_metadata_journal_required_sources,
-            "replayed committed source journal entries"
+            "replayed committed vectorized source journal entries"
         );
         replayed_committed_source_batches = true;
     }
@@ -2594,8 +2488,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
                 kafka_commit_senders.push(commit_tx);
                 let definitions = definitions.clone();
-                let transient_required_columns_by_source =
-                    Arc::clone(&transient_required_columns_by_source);
                 let failure_state = Arc::clone(&failure_state);
                 connector_handles.push(tokio::spawn(async move {
                     let config = KafkaConnectorConfig {
@@ -2610,25 +2502,19 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         commit_offsets_rx: Some(commit_rx),
                         resume_from_offsets,
                     };
-                    let mut connector = match KafkaConnector::new(
-                        config,
-                        definitions,
-                        transient_required_columns_by_source
-                            .iter()
-                            .map(|(source, columns)| (source.clone(), Arc::clone(columns)))
-                            .collect(),
-                    ) {
-                        Ok(connector) => connector,
-                        Err(err) => {
-                            tracing::error!(error = %err, "Kafka connector config invalid");
-                            record_runtime_failure(
-                                &failure_state,
-                                format!("Kafka connector config invalid: {err}"),
-                            );
-                            runtime_cancel.cancel();
-                            return;
-                        }
-                    };
+                    let mut connector =
+                        match KafkaConnector::new(config, definitions, HashMap::new()) {
+                            Ok(connector) => connector,
+                            Err(err) => {
+                                tracing::error!(error = %err, "Kafka connector config invalid");
+                                record_runtime_failure(
+                                    &failure_state,
+                                    format!("Kafka connector config invalid: {err}"),
+                                );
+                                runtime_cancel.cancel();
+                                return;
+                            }
+                        };
                     let ctx = ConnectorContext::new(sender);
                     if let Err(err) = run_connector(&mut connector, &ctx, cancel.clone()).await {
                         tracing::error!(error = %err, "Kafka connector failed");
@@ -2810,7 +2696,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let cdc_schemas_by_source_id_for_task = Arc::clone(&cdc_schemas_by_source_id);
     let cdc_stateful_table_ids_by_source_id_for_task =
         Arc::clone(&cdc_stateful_table_ids_by_source_id);
-    let decoders_by_source_id_for_task = Arc::clone(&decoders_by_source_id);
+    let active_source_definitions_by_id_for_task = Arc::clone(&active_source_definitions_by_id);
     let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
     let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
     let watermark_for_task = Arc::clone(&event_watermark);
@@ -2823,15 +2709,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let cdc_replication_debug_for_task = Arc::clone(&cdc_replication_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
-    let source_journal_source_ids_for_task = Arc::clone(&source_journal_source_ids);
     let kafka_metadata_journal_source_ids_for_task = Arc::clone(&kafka_metadata_journal_source_ids);
-    let kafka_metadata_journal_source_flags_for_task =
-        Arc::clone(&kafka_metadata_journal_source_flags);
+    let source_journal_required_sources_for_task =
+        Arc::clone(&source_journal_required_sources_for_task);
     let source_id_by_name_for_task = source_id_by_name;
     let storage_for_replication_task = storage.clone();
     let replication_pipeline_runtime_for_task = Arc::clone(&replication_pipeline_runtime);
     let mut connector_receiver_for_task = connector_receiver;
     let mut cdc_transaction_receiver_for_task = cdc_transaction_receiver;
+    let mut vectorized_runtime_for_task = vectorized_runtime;
     let tracked_mv_names: Vec<String> = planned_materialized_views
         .iter()
         .map(|plan| plan.definition().name().to_string())
@@ -2984,7 +2870,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let mut tick_postgres_sources: HashMap<String, String> = HashMap::new();
             let mut tick_postgres_table_lsns: Vec<(String, String, String, u64)> = Vec::new();
             let mut tick_source_max_event_ts = vec![None::<i64>; source_count];
-            let mut encoded_batches_by_source = vec![Vec::new(); source_count];
+            let mut arrow_batches_by_source = vec![Vec::new(); source_count];
+            let mut weighted_arrow_batches_by_source = vec![Vec::new(); source_count];
+            let mut vectorized_source_journal_batches =
+                Vec::<VectorizedSourceJournalTransientBatch>::new();
+            let mut arrow_builders_by_source = active_source_definitions_by_id_for_task
+                .iter()
+                .map(|definition| {
+                    definition.as_ref().map(|definition| {
+                        SourceArrowBatchBuilder::new(definition.clone(), max_batch_per_source)
+                    })
+                })
+                .collect::<Vec<_>>();
             let mut commit_acks_by_source = vec![Vec::new(); source_count];
             let mut cdc_staged_writes = None::<WriteBatch>;
             let mut per_connector_counts = vec![0usize; connector_queues.len()];
@@ -3195,10 +3092,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         );
                         continue;
                     }
-                    let Some(decoder) = decoders_by_source_id_for_task
-                        .get(source_id)
-                        .and_then(|decoder| decoder.as_ref())
-                    else {
+                    let Some(definition) = definitions.get(source_id) else {
                         let message =
                             format!("received CDC deltas for unknown source '{source_name}'");
                         tracing::error!(source = %source_name, "{message}");
@@ -3206,16 +3100,29 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         executor_cancel.cancel();
                         break 'executor;
                     };
-                    match encode_cdc_table_deltas(decoder, table_deltas) {
-                        Ok(mut encoded) => {
+                    match CdcArrowDeltaBatch::from_table_deltas(definition, table_deltas).and_then(
+                        |arrow_delta| {
+                            let weighted_schema =
+                                floe_executor::delta_consolidation::weighted_snapshot_schema(
+                                    &definition.to_arrow_schema(),
+                                )?;
+                            weighted_batch_from_diffs(
+                                arrow_delta.record_batch(),
+                                &weighted_schema,
+                                arrow_delta.diffs(),
+                            )
+                            .map(|batch| (arrow_delta.len(), batch))
+                        },
+                    ) {
+                        Ok((row_count, batch)) => {
                             decoded_counts[source_id] =
-                                decoded_counts[source_id].saturating_add(encoded.len());
-                            decoded_rows_len = decoded_rows_len.saturating_add(encoded.len());
-                            encoded_batches_by_source[source_id].append(&mut encoded);
+                                decoded_counts[source_id].saturating_add(row_count);
+                            decoded_rows_len = decoded_rows_len.saturating_add(row_count);
+                            weighted_arrow_batches_by_source[source_id].push(batch);
                         }
                         Err(err) => {
                             let message = format!(
-                                "failed to encode native CDC deltas for source '{source_name}': {err}"
+                                "failed to build native CDC Arrow deltas for source '{source_name}': {err}"
                             );
                             tracing::error!(source = %source_name, error = %err, "{message}");
                             record_runtime_failure(&failure_for_executor, message);
@@ -3255,7 +3162,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 };
 
                 batch_len = batch.len();
-                let mut encoded_rows = Vec::with_capacity(batch_len);
                 let decode_span = tracing::debug_span!(
                     "ingest_decode",
                     epoch = pending_epoch,
@@ -3264,7 +3170,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let _decode_guard = decode_span.enter();
                 for SelectedAppendIngestEvent {
                     source_id,
-                    mut event,
+                    event,
                     commit_ack,
                 } in batch
                 {
@@ -3313,9 +3219,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         }
                         continue;
                     }
-                    let Some(decoder) = decoders_by_source_id_for_task
-                        .get(source_id)
-                        .and_then(|decoder| decoder.as_ref())
+                    let Some(builder) = arrow_builders_by_source
+                        .get_mut(source_id)
+                        .and_then(Option::as_mut)
                     else {
                         let message = format!("received event for unknown source '{source_name}'");
                         tracing::error!(source = %source_name, "{message}");
@@ -3326,60 +3232,34 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         executor_cancel.cancel();
                         break 'executor;
                     };
-                    let event_ts = if let Some(preencoded_row_key) = event.take_preencoded_row_key()
-                    {
-                        if kafka_metadata_journal_source_flags_for_task
-                            .get(source_id)
-                            .copied()
-                            .unwrap_or(false)
-                            && let Some((topic, partition, offset)) = kafka_position.clone()
-                        {
-                            observe_kafka_source_journal_row(
-                                &mut tick_kafka_source_ranges[source_id],
-                                topic,
-                                partition,
-                                offset,
-                                &preencoded_row_key,
+                    let event_ts = match builder.append_event(&event) {
+                        Ok(event_ts) => event_ts,
+                        Err(err) => {
+                            tracing::warn!(
+                                source = %source_name,
+                                error = %err,
+                                "failed to decode append ingest event into Arrow"
                             );
-                        }
-                        encoded_rows.push((source_id, preencoded_row_key, commit_ack));
-                        None
-                    } else {
-                        match decoder.encode_row_key(&event) {
-                            Ok((encoded, event_ts)) => {
-                                if kafka_metadata_journal_source_flags_for_task
-                                    .get(source_id)
-                                    .copied()
-                                    .unwrap_or(false)
-                                    && let Some((topic, partition, offset)) = kafka_position.clone()
-                                {
-                                    observe_kafka_source_journal_row(
-                                        &mut tick_kafka_source_ranges[source_id],
-                                        topic,
-                                        partition,
-                                        offset,
-                                        &encoded,
-                                    );
-                                }
-                                encoded_rows.push((source_id, encoded, commit_ack));
-                                event_ts
+                            if let Some(ack) = commit_ack {
+                                ack.record_failed(format!(
+                                    "failed to decode append ingest event for '{source_name}': {err}"
+                                ))
+                                .await;
                             }
-                            Err(err) => {
-                                tracing::warn!(
-                                    source = %source_name,
-                                    error = %err,
-                                    "failed to encode append ingest event"
-                                );
-                                if let Some(ack) = commit_ack {
-                                    ack.record_failed(format!(
-                                        "failed to encode append ingest event for '{source_name}': {err}"
-                                    ))
-                                    .await;
-                                }
-                                continue;
-                            }
+                            continue;
                         }
                     };
+                    if kafka_metadata_journal_source_ids_for_task.contains(&source_id)
+                        && let Some((topic, partition, offset)) = kafka_position.clone()
+                    {
+                        observe_kafka_source_journal_event(
+                            &mut tick_kafka_source_ranges[source_id],
+                            topic,
+                            partition,
+                            offset,
+                            &event,
+                        );
+                    }
                     // Prefer row-derived event time (from decoded timestamp columns) when available.
                     // Connector-level event_time_ms is a fallback for sources without row timestamps.
                     let event_ts = event_ts.or(event.event_time_ms());
@@ -3389,18 +3269,40 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         *entry = (*entry).max(ts_i64);
                     }
                     decoded_counts[source_id] = decoded_counts[source_id].saturating_add(1);
-                }
-
-                if encoded_rows.is_empty() {
-                    continue;
-                }
-
-                decoded_rows_len = encoded_rows.len();
-                for (source_id, encoded, commit_ack) in encoded_rows {
-                    encoded_batches_by_source[source_id].push((encoded, 1));
                     if let Some(ack) = commit_ack {
                         commit_acks_by_source[source_id].push(ack);
                     }
+                }
+                for (source_id, builder) in arrow_builders_by_source.iter_mut().enumerate() {
+                    let Some(builder) = builder.as_mut() else {
+                        continue;
+                    };
+                    match builder.finish() {
+                        Ok(Some(batch)) => {
+                            decoded_rows_len = decoded_rows_len.saturating_add(batch.num_rows());
+                            arrow_batches_by_source[source_id].push(batch);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            let source_name = source_names_by_id_for_task[source_id].as_str();
+                            tracing::error!(
+                                source = %source_name,
+                                error = %err,
+                                "failed to finish Arrow ingest batch"
+                            );
+                            record_runtime_failure(
+                                &failure_for_executor,
+                                format!(
+                                    "failed to finish Arrow ingest batch for '{source_name}': {err}"
+                                ),
+                            );
+                            executor_cancel.cancel();
+                            break 'executor;
+                        }
+                    }
+                }
+                if decoded_rows_len == 0 {
+                    continue;
                 }
             }
             let decode_latency_ms = decode_start.elapsed().as_millis() as u64;
@@ -3501,55 +3403,110 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 }
                 continue;
             }
-            let mut registry = outer_for_task.lock().await;
-            let mut changed = false;
-            for (source_id, encoded_batch) in encoded_batches_by_source.into_iter().enumerate() {
-                if encoded_batch.is_empty() {
+            for source_id in 0..source_count {
+                let source_name = source_names_by_id_for_task[source_id].as_str();
+                if !source_journal_required_sources_for_task.contains(source_name) {
                     continue;
                 }
-                let source_name = source_names_by_id_for_task[source_id].as_str();
-                let Some(writer) = registry.writer_mut(&source_name) else {
-                    tracing::warn!(
-                        source = %source_name,
-                        rows = encoded_batch.len(),
-                        "no writer for source, skipping encoded row batch"
-                    );
+                let Some(definition) = definitions.get(source_id) else {
                     continue;
                 };
-                if let Err(err) = writer.append_encoded_batch(encoded_batch) {
-                    tracing::error!(
-                        source = %source_name,
-                        error = %err,
-                        "failed to append encoded row batch"
-                    );
-                    for ack in commit_acks_by_source[source_id].drain(..) {
-                        ack.record_failed(format!(
-                            "failed to append encoded row batch for '{source_name}': {err}"
-                        ))
-                        .await;
+                let source_schema = definition.to_arrow_schema();
+                let weighted_schema =
+                    match floe_executor::delta_consolidation::weighted_snapshot_schema(
+                        &source_schema,
+                    ) {
+                        Ok(schema) => schema,
+                        Err(err) => {
+                            let message = format!(
+                                "failed to build vectorized source journal schema for '{source_name}': {err}"
+                            );
+                            tracing::error!(source = %source_name, error = %err, "{message}");
+                            record_runtime_failure(&failure_for_executor, message);
+                            executor_cancel.cancel();
+                            break 'executor;
+                        }
+                    };
+                let mut journal_batches = Vec::with_capacity(
+                    arrow_batches_by_source[source_id].len()
+                        + weighted_arrow_batches_by_source[source_id].len(),
+                );
+                for batch in &arrow_batches_by_source[source_id] {
+                    match floe_executor::delta_consolidation::add_weight_column(
+                        batch,
+                        &weighted_schema,
+                        1,
+                    ) {
+                        Ok(weighted) => journal_batches.push(weighted),
+                        Err(err) => {
+                            let message = format!(
+                                "failed to build vectorized source journal batch for '{source_name}': {err}"
+                            );
+                            tracing::error!(source = %source_name, error = %err, "{message}");
+                            record_runtime_failure(&failure_for_executor, message);
+                            executor_cancel.cancel();
+                            break 'executor;
+                        }
                     }
-                    continue;
                 }
-                tick_commit_acks.append(&mut commit_acks_by_source[source_id]);
-                changed = true;
+                journal_batches.extend(weighted_arrow_batches_by_source[source_id].iter().cloned());
+                if !journal_batches.is_empty() {
+                    vectorized_source_journal_batches.push((
+                        source_id,
+                        tick_source_max_event_ts[source_id],
+                        journal_batches,
+                    ));
+                }
             }
-
-            let mut source_journal_batches: Vec<SourceJournalTransientBatch> = Vec::new();
-            for &source_id in source_journal_source_ids_for_task.iter() {
+            let mut changed = false;
+            for (source_id, batches) in arrow_batches_by_source.into_iter().enumerate() {
                 let source_name = source_names_by_id_for_task[source_id].as_str();
-                let Some(writer) = registry.writer_mut(source_name) else {
-                    continue;
-                };
-                let Some(batch) = writer
-                    .pending_transient_batch(i64::try_from(pending_epoch).unwrap_or(i64::MAX))
-                else {
-                    continue;
-                };
-                source_journal_batches.push((
-                    source_id,
-                    tick_source_max_event_ts[source_id],
-                    batch.deltas,
-                ));
+                for batch in batches {
+                    if let Err(err) = vectorized_runtime_for_task
+                        .append_source_batch(source_name, batch)
+                        .await
+                    {
+                        tracing::error!(
+                            source = %source_name,
+                            error = %err,
+                            "failed to append Arrow source batch"
+                        );
+                        for ack in commit_acks_by_source[source_id].drain(..) {
+                            ack.record_failed(format!(
+                                "failed to append Arrow source batch for '{source_name}': {err}"
+                            ))
+                            .await;
+                        }
+                        continue;
+                    }
+                    changed = true;
+                }
+            }
+            for (source_id, batches) in weighted_arrow_batches_by_source.into_iter().enumerate() {
+                let source_name = source_names_by_id_for_task[source_id].as_str();
+                for batch in batches {
+                    if let Err(err) = vectorized_runtime_for_task
+                        .apply_weighted_source_delta(source_name, batch)
+                        .await
+                    {
+                        tracing::error!(
+                            source = %source_name,
+                            error = %err,
+                            "failed to apply weighted Arrow source delta"
+                        );
+                        for ack in commit_acks_by_source[source_id].drain(..) {
+                            ack.record_failed(format!(
+                                "failed to apply weighted Arrow source delta for '{source_name}': {err}"
+                            ))
+                            .await;
+                        }
+                        continue;
+                    }
+                    changed = true;
+                }
+            }
+            for acks in &mut commit_acks_by_source {
+                tick_commit_acks.append(acks);
             }
             let mut kafka_metadata_journal_batches = Vec::new();
             for &source_id in kafka_metadata_journal_source_ids_for_task.iter() {
@@ -3574,8 +3531,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     ranges,
                 ));
             }
-            drop(registry);
-
             if !changed {
                 continue;
             }
@@ -3618,18 +3573,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if pre_tick_commit_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
             }
-            // Advance frontier for all sources this epoch, even if they had no rows.
-            let mut registry = outer_for_task.lock().await;
             let tick_all_start = Instant::now();
-            if let Err(err) = registry
-                .tick_all_with_version(i64::try_from(epoch).unwrap_or(i64::MAX))
+            if let Err(err) = vectorized_runtime_for_task
+                .run_tick(i64::try_from(epoch).unwrap_or(i64::MAX))
                 .await
             {
                 metrics::observe_tick_phase_latency_ms(
                     "state_write",
                     tick_all_start.elapsed().as_millis() as u64,
                 );
-                tracing::error!(epoch, error = %err, "failed to tick outer streams");
+                tracing::error!(epoch, error = %err, "failed to run vectorized materialization tick");
                 metrics::inc_ingest_tick("error");
                 continue;
             } else if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
@@ -3637,7 +3590,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     "state_write",
                     tick_all_start.elapsed().as_millis() as u64,
                 );
-                tracing::debug!(epoch, "advanced all source frontiers");
+                tracing::debug!(epoch, "completed vectorized materialization tick");
                 metrics::inc_ingest_tick("ok");
             } else {
                 metrics::observe_tick_phase_latency_ms(
@@ -3650,7 +3603,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if epoch <= 8 || epoch % 128 == 0 {
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
-            drop(registry);
 
             let mv_visibility_start = Instant::now();
             let target_mv_version = i64::try_from(epoch).unwrap_or(i64::MAX);
@@ -3738,16 +3690,39 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 &next_committed_kafka_offsets,
             );
             let committed_at_ms = tick_commit.committed_at_unix_ms;
-            let source_journal_commit_batches = build_source_journal_commit_batches(
-                &source_names_by_id_for_task,
-                &source_journal_batches,
-            );
+            let vectorized_source_journal_commit_batches =
+                build_vectorized_source_journal_commit_batches(
+                    &source_names_by_id_for_task,
+                    &vectorized_source_journal_batches,
+                );
+            let mut staged_writes_for_checkpoint = cdc_staged_writes;
+            let mut vectorized_journal_stage_error = None;
+            if !vectorized_source_journal_commit_batches.is_empty() {
+                let staged_writes =
+                    staged_writes_for_checkpoint.get_or_insert_with(WriteBatch::new);
+                for (source, max_event_time_ms, batches) in
+                    &vectorized_source_journal_commit_batches
+                {
+                    if let Err(err) = append_vectorized_entry_to_batch(
+                        staged_writes,
+                        source,
+                        epoch,
+                        *max_event_time_ms,
+                        batches,
+                    ) {
+                        vectorized_journal_stage_error = Some(err);
+                        break;
+                    }
+                }
+            }
             let checkpoint_write_start = Instant::now();
-            let checkpoint_result = if let Some(staged_writes) = cdc_staged_writes {
+            let checkpoint_result = if let Some(err) = vectorized_journal_stage_error {
+                Err(err)
+            } else if let Some(staged_writes) = staged_writes_for_checkpoint {
                 checkpoint_manager
                     .persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
                         tick_commit,
-                        &source_journal_commit_batches,
+                        &[],
                         &kafka_metadata_journal_batches,
                         staged_writes,
                     )
@@ -3756,7 +3731,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 checkpoint_manager
                     .persist_tick_commit_with_source_batches_and_kafka_metadata(
                         tick_commit,
-                        &source_journal_commit_batches,
+                        &[],
                         &kafka_metadata_journal_batches,
                     )
                     .await
@@ -3942,22 +3917,20 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         executor_running_for_task.store(false, Ordering::Relaxed);
     });
 
-    let source_bridge = Arc::new(Mutex::new(DbspBridge::new(Arc::clone(&db)).await?));
     let query = FloeQueryContext::new(storage);
     query
         .preload_tables()
         .await
         .context("failed to register tables with DataFusion")?;
-    register_source_tables(
-        &query,
-        &source_registry,
-        Arc::clone(&source_bridge),
-        &source_journal_required_sources,
-        Arc::clone(&checkpoint_table),
-        CHECKPOINT_GRAPH_ID,
-    )
-    .await
-    .context("register source tables")?;
+    {
+        let session = query.session();
+        for (name, provider) in vectorized_source_table_providers {
+            let _ = session.deregister_table(&name);
+            session
+                .register_table(&name, provider)
+                .with_context(|| format!("register vectorized source table {name}"))?;
+        }
+    }
     register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
         .await
         .context("register materialized view tables")?;
@@ -4077,7 +4050,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tracing::error!(error = %err, "cancellation propagation task joined with error");
     }
 
-    drop(source_bridge);
     drop(query);
     drop(mv_registry);
     drop(outer_registry);

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchemaRef;
 use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
@@ -43,17 +44,19 @@ use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
 };
 use floe_executor::source_journal::{
-    KafkaSourceJournal, KafkaSourceJournalRange, SourceBatchJournal,
-    kafka_source_journal_initial_checksum, update_kafka_source_journal_checksum,
+    KafkaSourceJournal, KafkaSourceJournalRange, VectorizedSourceBatchJournal,
+    append_vectorized_entry_to_batch, kafka_source_journal_initial_checksum,
+    update_kafka_source_journal_checksum,
 };
 use floe_executor::{
-    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError,
-    MaterializedViewRegistry, MaterializedViewTableProvider, MvFlushCoalescingConfig,
-    OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig, SourceRowDecoder,
-    SourceTableProvider, SubscribeExecutionConfig, ValidatedPlan, plan_source_requirements,
-    source_batch_journal_root_sources_with_config, validate_dbsp_plan,
+    DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError, MaterializedViewRegistry,
+    MaterializedViewTableProvider, MvFlushCoalescingConfig, OuterStreamRegistry,
+    OverlaySnapshotConfig, PersistencePolicyConfig, SourceArrowBatchBuilder,
+    SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
+    VectorizedMaterializedViewPlan, source_batch_journal_root_sources_with_config,
+    validate_dbsp_plan, weighted_batch_from_diffs,
 };
-use floe_node_core::cdc_delta_encoder::encode_cdc_table_deltas;
+use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};
 use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
 use floe_node_core::kafka_connector::{
@@ -61,9 +64,7 @@ use floe_node_core::kafka_connector::{
     KafkaTopicPartitionOffset,
 };
 use floe_node_core::object_store_connector::{ObjectStoreConnector, ObjectStoreConnectorConfig};
-use floe_node_core::planner::{
-    PlannedMaterializedView, camel_case_schema, plan_materialized_views,
-};
+use floe_node_core::planner::{PlannedMaterializedView, plan_materialized_views, planner_udfs};
 use floe_node_core::postgres_cdc::{
     PostgresCdcCommit, PostgresCdcSourceConfig, PostgresSlotCommit, default_postgres_publication,
     replication_config_from_connection_string, stored_slot_start_lsn,
