@@ -2179,9 +2179,13 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         let _ = observer_tx.send((version, deltas));
     });
     let (left_transient_tx, left_transient_rx) =
-        mpsc::unbounded_channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>();
+        mpsc::channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>(
+            dbsp::join::TRANSIENT_JOIN_INPUT_CHANNEL_CAPACITY,
+        );
     let (right_transient_tx, right_transient_rx) =
-        mpsc::unbounded_channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>();
+        mpsc::channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>(
+            dbsp::join::TRANSIENT_JOIN_INPUT_CHANNEL_CAPACITY,
+        );
     DbspJoin::spawn_transient_with_inputs::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
         &left_stream,
         &right_stream,
@@ -2228,6 +2232,7 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
             deltas: Arc::new(transformed_right_tick1),
             closed_keys: Arc::new(Vec::new()),
         })
+        .await
         .expect("send auction transient batch");
     {
         let writer = registry
@@ -2276,7 +2281,7 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         timeout(Duration::from_millis(100), observer_rx.recv())
             .await
             .is_err(),
-        "auction build tick should not emit transient join output"
+        "auction build tick should not emit transient join output until the other side advances"
     );
 
     let mut cache = HashMap::new();
@@ -2311,6 +2316,7 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
                     deltas: Arc::new(transformed_left),
                     closed_keys: Arc::new(Vec::new()),
                 })
+                .await
                 .expect("send bid transient batch");
         }
         right_transient_tx
@@ -2319,6 +2325,7 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
                 deltas: Arc::new(Vec::new()),
                 closed_keys: Arc::new(Vec::new()),
             })
+            .await
             .expect("send empty right transient batch");
         {
             let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
@@ -2355,22 +2362,25 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
             actual
         };
 
+        let mut transient_raw = Vec::new();
         let recv_timeout = if actual.is_empty() {
             Duration::from_millis(100)
         } else {
             Duration::from_secs(1)
         };
-        let transient_raw = match timeout(recv_timeout, observer_rx.recv()).await {
-            Ok(Some((version, transient_batch))) => {
-                assert_eq!(
-                    version, expected_transient_version,
-                    "unexpected transient join output version at bid tick {tick}"
-                );
-                expected_transient_version = expected_transient_version.saturating_add(1);
-                transient_batch.as_ref().clone()
+        while let Ok(Some((version, transient_batch))) =
+            timeout(recv_timeout, observer_rx.recv()).await
+        {
+            assert_eq!(
+                version, expected_transient_version,
+                "unexpected transient join output version at bid tick {tick}"
+            );
+            expected_transient_version = expected_transient_version.saturating_add(1);
+            transient_raw = transient_batch.as_ref().clone();
+            if !transient_raw.is_empty() || actual.is_empty() {
+                break;
             }
-            Ok(None) | Err(_) => Vec::new(),
-        };
+        }
         let transient_raw = if let Some(evaluator) = residual_evaluator.as_ref() {
             evaluator
                 .transform_delta_arrow("benchmark_join_tick_residual", Arc::new(transient_raw))
@@ -2508,6 +2518,7 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         &transient_streams,
         None,
         &cancel,
+        &task_tx,
     )
     .expect("left transient input opt")
     .expect("left transient input opt");
@@ -2518,6 +2529,7 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         &transient_streams,
         None,
         &cancel,
+        &task_tx,
     )
     .expect("right transient input opt")
     .expect("right transient input opt");
@@ -2701,11 +2713,15 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         build_tick_delta.is_empty(),
         "auction build tick should emit an explicit empty canonical join handle"
     );
-    assert!(
-        timeout(Duration::from_millis(100), observer_rx.recv())
+    let (build_version, build_transient_batch) =
+        timeout(Duration::from_secs(1), observer_rx.recv())
             .await
-            .is_err(),
-        "auction build tick should not emit transient join output"
+            .expect("wait transient join build tick")
+            .expect("transient join build tick");
+    assert_eq!(build_version, 1);
+    assert!(
+        build_transient_batch.is_empty(),
+        "auction build tick should emit an explicit empty transient join batch"
     );
 
     let mut cache = HashMap::new();

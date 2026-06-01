@@ -33,6 +33,7 @@ impl DbspGraphBuilder {
 
     pub(crate) async fn compile_distinct(
         &mut self,
+        node_idx: usize,
         _node: &DbspDistinctNode,
         upstream: DeltaHandleStream,
         append_only_input: bool,
@@ -51,8 +52,9 @@ impl DbspGraphBuilder {
             );
         });
 
-        let distinct = DbspDistinct::new_with_append_only_input::<Vec<u8>>(
+        let distinct = DbspDistinct::new_with_state_namespace_and_append_only_input::<Vec<u8>>(
             &upstream,
+            Some(self.operator_state_namespace(node_idx, "distinct")),
             append_only_input,
             Some(distinct_error_handler),
         )
@@ -63,6 +65,7 @@ impl DbspGraphBuilder {
 
     pub(crate) async fn compile_topn(
         &mut self,
+        node_idx: usize,
         node: &DbspTopNNode,
         mut upstream: DeltaHandleStream,
         task_events: &GraphTaskSender,
@@ -212,6 +215,7 @@ impl DbspGraphBuilder {
             order_value_types,
             Arc::clone(&order_specs),
             graph_id.clone(),
+            Arc::clone(&error_handler),
             partitioned,
         ));
 
@@ -312,8 +316,14 @@ impl DbspGraphBuilder {
         let key_parts_for_topn = Arc::clone(&key_parts);
         let key_parts_batch =
             move |delta_values: &[(Vec<u8>, i64)]| key_parts_for_topn.extract(delta_values);
-        let topn = DbspTopN::new_with_batch_key_extractor::<Vec<u8>, Vec<u8>, TopNKey, _>(
+        let topn = DbspTopN::new_with_state_namespace_and_batch_key_extractor::<
+            Vec<u8>,
+            Vec<u8>,
+            TopNKey,
+            _,
+        >(
             &upstream,
+            Some(self.operator_state_namespace(node_idx, "topn")),
             key_parts_batch,
             limit,
             offset,
@@ -379,6 +389,7 @@ struct VectorizedTopNKeyParts {
     order_value_types: Arc<Vec<DbspScalarType>>,
     order_specs: Arc<Vec<TopNSortSpec>>,
     graph_id: String,
+    error_handler: RuntimeErrorHandler,
     partitioned: bool,
 }
 
@@ -390,6 +401,7 @@ impl VectorizedTopNKeyParts {
         order_value_types: Arc<Vec<DbspScalarType>>,
         order_specs: Arc<Vec<TopNSortSpec>>,
         graph_id: String,
+        error_handler: RuntimeErrorHandler,
         partitioned: bool,
     ) -> Self {
         Self {
@@ -399,6 +411,7 @@ impl VectorizedTopNKeyParts {
             order_value_types,
             order_specs,
             graph_id,
+            error_handler,
             partitioned,
         }
     }
@@ -414,6 +427,11 @@ impl VectorizedTopNKeyParts {
                     graph_id = %self.graph_id,
                     error = %err,
                     "failed to evaluate vectorized topn keys"
+                );
+                report_operator_closure_error(
+                    &self.error_handler,
+                    "failed to evaluate vectorized topn keys",
+                    err,
                 );
                 Vec::new()
             }

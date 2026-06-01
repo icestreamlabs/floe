@@ -276,8 +276,9 @@ impl DbspWindowIncrementalAggregate {
             + Sync
             + 'static,
     {
-        Self::new_batch_with_append_only_input(
+        Self::new_batch_with_state_namespace_and_append_only_input(
             input,
+            None,
             window_extractor,
             row_evaluator,
             slot_kinds,
@@ -294,6 +295,66 @@ impl DbspWindowIncrementalAggregate {
     #[allow(clippy::too_many_arguments)]
     pub async fn new_batch_with_append_only_input<K, V, FWindow, FRow>(
         input: &DeltaHandleStream,
+        window_extractor: FWindow,
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+        window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FWindow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
+        FRow: Fn(
+                &[(WindowIncrementalInput<K, V>, i64)],
+            ) -> Vec<(
+                WindowIncrementalInput<K, V>,
+                IncrementalAggregateRow<WindowKey<K>>,
+                i64,
+            )> + Send
+            + Sync
+            + 'static,
+    {
+        Self::new_batch_with_state_namespace_and_append_only_input(
+            input,
+            None,
+            window_extractor,
+            row_evaluator,
+            slot_kinds,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+            append_only_input,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_batch_with_state_namespace_and_append_only_input<K, V, FWindow, FRow>(
+        input: &DeltaHandleStream,
+        state_namespace: Option<String>,
         window_extractor: FWindow,
         row_evaluator: FRow,
         slot_kinds: Vec<IncrementalAggregateSlotKind>,
@@ -355,11 +416,22 @@ impl DbspWindowIncrementalAggregate {
             version: 0,
         };
 
-        let state = RelationState::<(WindowKey<K>, GroupedIncrementalAggregateState)>::empty(
-            table.clone(),
-            format!("window_incremental_aggregate_state_{aggregate_id}"),
-        )
-        .await?;
+        let state = match state_namespace {
+            Some(namespace) => {
+                RelationState::<(WindowKey<K>, GroupedIncrementalAggregateState)>::empty(
+                    table.clone(),
+                    namespace,
+                )
+                .await?
+            }
+            None => {
+                RelationState::<(WindowKey<K>, GroupedIncrementalAggregateState)>::empty_uncheckpointed(
+                    table.clone(),
+                    format!("window_incremental_aggregate_state_{aggregate_id}"),
+                )
+                .await?
+            }
+        };
         let output_dict = Arc::new(
             Dictionary::<(WindowKey<K>, Vec<AggregateValue>)>::with_table(
                 table.clone(),

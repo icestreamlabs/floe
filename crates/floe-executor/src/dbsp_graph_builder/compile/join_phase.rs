@@ -1,6 +1,8 @@
 use super::*;
 use crate::dbsp_graph_builder::materialize::DeltaTransformFn;
-use crate::dbsp_graph_builder::materialize::TransientMaterializeBatch;
+use crate::dbsp_graph_builder::materialize::{
+    TransientMaterializeBatch, TransientMaterializeSender,
+};
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, PreparedJoinedEncodedRowProjection,
@@ -199,7 +201,7 @@ impl DbspGraphBuilder {
         let right_schema = Arc::clone(&node.right_schema);
         let output_schema = Arc::clone(&node.output_schema);
         let graph_id = self.graph_id().to_string();
-        let asof_state_namespace = format!("{graph_id}_asof_join_{node_idx}");
+        let asof_state_namespace = self.operator_state_namespace(node_idx, "asof_join");
 
         let original_left_stream = left.clone();
         let mut left_join_input = left;
@@ -755,7 +757,7 @@ impl DbspGraphBuilder {
         let right_schema = Arc::clone(&node.right_schema);
         let output_schema = Arc::clone(&node.output_schema);
         let graph_id = self.graph_id().to_string();
-        let range_join_state_namespace = format!("{graph_id}_range_join_{node_idx}");
+        let range_join_state_namespace = self.operator_state_namespace(node_idx, "range_join");
 
         let mut left_join_input = left;
         let mut right_join_input = right;
@@ -1069,14 +1071,14 @@ impl DbspGraphBuilder {
     fn remap_transient_join_input_batches(
         graph_id: &str,
         side: &'static str,
-        mut input: tokio::sync::mpsc::UnboundedReceiver<
+        mut input: tokio::sync::mpsc::Receiver<
             dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
         >,
         transform: Arc<DeltaTransformFn>,
         task_events: &GraphTaskSender,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>
-    {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> tokio::sync::mpsc::Receiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>> {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel(dbsp::join::TRANSIENT_JOIN_INPUT_CHANNEL_CAPACITY);
         let graph_id = graph_id.to_string();
         let task_events = task_events.clone();
         let task_label = format!("transient-join-{side}-precompute:{graph_id}");
@@ -1095,6 +1097,7 @@ impl DbspGraphBuilder {
                         deltas: Arc::new(transformed),
                         closed_keys: Arc::clone(&batch.closed_keys),
                     })
+                    .await
                     .is_err()
                 {
                     break;
@@ -1135,7 +1138,7 @@ impl DbspGraphBuilder {
             ));
         }
         let graph_id = self.graph_id().to_string();
-        let join_state_namespace = format!("{graph_id}_join_{node_idx}");
+        let join_state_namespace = self.operator_state_namespace(node_idx, "join");
         let join_events = task_events.clone();
         let join_graph_id = graph_id.clone();
         let join_label = format!("join:{graph_id}");
@@ -1537,6 +1540,7 @@ impl DbspGraphBuilder {
             .then(|| Arc::new((0..right_schema.len()).collect::<Vec<_>>()));
 
         let left_key_extractor_for_join = Arc::clone(&left_key_extractor);
+        let left_key_error_handler = Arc::clone(&join_error_handler);
         let left_key = move |delta_values: &[(Vec<u8>, i64)]| match left_key_extractor_for_join
             .extract_keyed_deltas(delta_values)
         {
@@ -1547,11 +1551,17 @@ impl DbspGraphBuilder {
                     error = %err,
                     "failed to extract vectorized join left key columns"
                 );
+                report_operator_closure_error(
+                    &left_key_error_handler,
+                    "failed to extract vectorized join left key columns",
+                    err,
+                );
                 Vec::new()
             }
         };
 
         let right_key_extractor_for_join = Arc::clone(&right_key_extractor);
+        let right_key_error_handler = Arc::clone(&join_error_handler);
         let right_key = move |delta_values: &[(Vec<u8>, i64)]| match right_key_extractor_for_join
             .extract_keyed_deltas(delta_values)
         {
@@ -1561,6 +1571,11 @@ impl DbspGraphBuilder {
                     graph_id = %right_graph_id,
                     error = %err,
                     "failed to extract vectorized join right key columns"
+                );
+                report_operator_closure_error(
+                    &right_key_error_handler,
+                    "failed to extract vectorized join right key columns",
+                    err,
                 );
                 Vec::new()
             }
@@ -1608,6 +1623,7 @@ impl DbspGraphBuilder {
                 None
             };
 
+        let projector_error_handler = Arc::clone(&join_error_handler);
         let projector = move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
             if let Some(plan) = prepared_output_projection.as_ref() {
                 return match project_joined_encoded_rows_prepared(left_bytes, right_bytes, plan) {
@@ -1617,6 +1633,11 @@ impl DbspGraphBuilder {
                             graph_id = %projector_graph_id,
                             error = %err,
                             "failed to project join output columns directly"
+                        );
+                        report_operator_closure_error(
+                            &projector_error_handler,
+                            "failed to project join output columns directly",
+                            err,
                         );
                         Vec::new()
                     }
@@ -1629,6 +1650,11 @@ impl DbspGraphBuilder {
                         graph_id = %projector_graph_id,
                         error = %err,
                         "failed to concatenate join projection rows"
+                    );
+                    report_operator_closure_error(
+                        &projector_error_handler,
+                        "failed to concatenate join projection rows",
+                        err,
                     );
                     Vec::new()
                 }
@@ -2005,19 +2031,15 @@ impl DbspGraphBuilder {
         mut left: DeltaHandleStream,
         mut right: DeltaHandleStream,
         mut left_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
-            >,
+            tokio::sync::mpsc::Receiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
         >,
         mut right_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
-            >,
+            tokio::sync::mpsc::Receiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
         >,
         left_retention: dbsp::JoinInputRetention,
         right_retention: dbsp::JoinInputRetention,
         mut output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
-        output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
+        output_tx: TransientMaterializeSender,
         task_events: &GraphTaskSender,
         restore_transient_state: bool,
     ) -> Result<()> {
@@ -2328,14 +2350,10 @@ impl DbspGraphBuilder {
         left: DeltaHandleStream,
         right: DeltaHandleStream,
         left_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
-            >,
+            tokio::sync::mpsc::Receiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
         >,
         right_transient: Option<
-            tokio::sync::mpsc::UnboundedReceiver<
-                dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>,
-            >,
+            tokio::sync::mpsc::Receiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
         >,
         left_key_columns: Arc<Vec<usize>>,
         right_key_columns: Arc<Vec<usize>>,
@@ -2348,7 +2366,7 @@ impl DbspGraphBuilder {
         left_retention: dbsp::JoinInputRetention,
         right_retention: dbsp::JoinInputRetention,
         output_projection: Option<Arc<Vec<EncodedRowProjectionColumn>>>,
-        output_tx: tokio::sync::mpsc::UnboundedSender<TransientMaterializeBatch>,
+        output_tx: TransientMaterializeSender,
         task_events: &GraphTaskSender,
         join_error_handler: RuntimeErrorHandler,
         restore_transient_state: bool,
@@ -2424,9 +2442,11 @@ impl DbspGraphBuilder {
         let make_projector = {
             let prepared_output_projection = prepared_output_projection.clone();
             let projector_graph_id = projector_graph_id.clone();
+            let projector_error_handler = Arc::clone(&join_error_handler);
             move || {
                 let prepared_output_projection = prepared_output_projection.clone();
                 let projector_graph_id = projector_graph_id.clone();
+                let projector_error_handler = Arc::clone(&projector_error_handler);
                 move |left_bytes: &Vec<u8>, right_bytes: &Vec<u8>| -> Vec<u8> {
                     if let Some(plan) = prepared_output_projection.as_ref() {
                         return match project_joined_encoded_rows_prepared(
@@ -2441,6 +2461,11 @@ impl DbspGraphBuilder {
                                     error = %err,
                                     "failed to project join output columns directly"
                                 );
+                                report_operator_closure_error(
+                                    &projector_error_handler,
+                                    "failed to project join output columns directly",
+                                    err,
+                                );
                                 Vec::new()
                             }
                         };
@@ -2452,6 +2477,11 @@ impl DbspGraphBuilder {
                                 graph_id = %projector_graph_id,
                                 error = %err,
                                 "failed to concatenate join projection rows"
+                            );
+                            report_operator_closure_error(
+                                &projector_error_handler,
+                                "failed to concatenate join projection rows",
+                                err,
                             );
                             Vec::new()
                         }
@@ -2492,27 +2522,27 @@ impl DbspGraphBuilder {
                     deltas.as_ref().clone()
                 };
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    eprintln!(
-                        "transient-join-output graph_id={} version={} rows={}",
-                        observer_filter_graph_id,
+                    tracing::debug!(
+                        graph_id = %observer_filter_graph_id,
                         version,
-                        filtered.len()
+                        rows = filtered.len(),
+                        "transient join output"
                     );
                 }
-                if filtered.is_empty() {
-                    continue;
-                }
-                let _ = observer_output_tx.send(TransientMaterializeBatch {
-                    version,
-                    deltas: Arc::new(filtered),
-                    deltas_consolidated: false,
-                });
+                let _ = observer_output_tx
+                    .send(TransientMaterializeBatch {
+                        version,
+                        deltas: Arc::new(filtered),
+                        deltas_consolidated: false,
+                    })
+                    .await;
             }
         });
         let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
             let _ = observer_filter_tx.send((version, deltas));
         });
 
+        let left_key_error_handler = Arc::clone(&join_error_handler);
         let left_key = move |delta_values: &[(Vec<u8>, i64)]| match left_key_extractor
             .extract_keyed_deltas(delta_values)
         {
@@ -2523,10 +2553,16 @@ impl DbspGraphBuilder {
                     error = %err,
                     "failed to extract vectorized transient join left key columns"
                 );
+                report_operator_closure_error(
+                    &left_key_error_handler,
+                    "failed to extract vectorized transient join left key columns",
+                    err,
+                );
                 Vec::new()
             }
         };
 
+        let right_key_error_handler = Arc::clone(&join_error_handler);
         let right_key = move |delta_values: &[(Vec<u8>, i64)]| match right_key_extractor
             .extract_keyed_deltas(delta_values)
         {
@@ -2536,6 +2572,11 @@ impl DbspGraphBuilder {
                     graph_id = %right_graph_id,
                     error = %err,
                     "failed to extract vectorized transient join right key columns"
+                );
+                report_operator_closure_error(
+                    &right_key_error_handler,
+                    "failed to extract vectorized transient join right key columns",
+                    err,
                 );
                 Vec::new()
             }

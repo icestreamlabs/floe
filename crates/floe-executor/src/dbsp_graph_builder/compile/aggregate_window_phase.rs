@@ -132,12 +132,14 @@ enum EncodedAggregateAccumulator {
 impl DbspGraphBuilder {
     pub(crate) async fn compile_aggregate(
         &mut self,
+        node_idx: usize,
         node: &DbspAggregateNode,
         mut upstream: DeltaHandleStream,
         append_only_input: bool,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let input_schema = Arc::clone(node.input_schema());
+        let state_namespace = self.operator_state_namespace(node_idx, "aggregate");
         let group_keys = node.group_keys().to_vec();
         let aggregates = node.aggregates().to_vec();
         let mut precompute_expressions = Vec::new();
@@ -195,20 +197,22 @@ impl DbspGraphBuilder {
                 "aggregate",
             );
 
-            let count_aggregate = DbspCountAggregate::new_batch_with_append_only_input::<
-                Vec<u8>,
-                Vec<u8>,
-                Vec<u8>,
-                _,
-            >(
-                &upstream,
-                row_evaluator,
-                slot_kinds,
-                append_only_input,
-                Some(aggregate_error_handler),
-            )
-            .await
-            .context("initialize DBSP count aggregate")?;
+            let count_aggregate =
+                DbspCountAggregate::new_batch_with_state_namespace_and_append_only_input::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    Vec<u8>,
+                    _,
+                >(
+                    &upstream,
+                    Some(state_namespace),
+                    row_evaluator,
+                    slot_kinds,
+                    append_only_input,
+                    Some(aggregate_error_handler),
+                )
+                .await
+                .context("initialize DBSP count aggregate")?;
 
             let mapped = self
                 .map_count_aggregate_output(
@@ -232,12 +236,13 @@ impl DbspGraphBuilder {
             );
 
             let incremental_aggregate =
-                dbsp::DbspIncrementalAggregate::new_batch_with_append_only_input::<
+                dbsp::DbspIncrementalAggregate::new_batch_with_state_namespace_and_append_only_input::<
                     Vec<u8>,
                     Vec<u8>,
                     _,
                 >(
                     &upstream,
+                    Some(state_namespace),
                     row_evaluator,
                     slot_kinds,
                     append_only_input,
@@ -265,6 +270,7 @@ impl DbspGraphBuilder {
             .context("initialize vectorized aggregate key extractor")?,
         );
         let key_graph_id = graph_id.clone();
+        let key_error_handler = Arc::clone(&aggregate_error_handler);
         let key_extractor = move |delta_values: &[(Vec<u8>, i64)]| match key_extractor
             .extract_keyed_deltas(delta_values)
         {
@@ -275,11 +281,17 @@ impl DbspGraphBuilder {
                     error = %err,
                     "failed to evaluate vectorized aggregate group keys"
                 );
+                report_operator_closure_error(
+                    &key_error_handler,
+                    "failed to evaluate vectorized aggregate group keys",
+                    err,
+                );
                 Vec::new()
             }
         };
 
         let agg_graph_id = graph_id.clone();
+        let agg_error_handler = Arc::clone(&aggregate_error_handler);
         let agg_layout = Arc::new(build_count_eval_layout(
             &aggregates,
             eval_schema.as_ref(),
@@ -306,6 +318,11 @@ impl DbspGraphBuilder {
                         error = %err,
                         "failed to encode aggregate output"
                     );
+                    report_operator_closure_error(
+                        &agg_error_handler,
+                        "failed to encode aggregate output",
+                        err,
+                    );
                     None
                 }
             }
@@ -316,14 +333,16 @@ impl DbspGraphBuilder {
             aggregator,
         );
 
-        let aggregate = DbspAggregate::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _>(
-            &upstream,
-            key_extractor,
-            aggregate_spec,
-            Some(aggregate_error_handler),
-        )
-        .await
-        .context("initialize DBSP aggregate")?;
+        let aggregate =
+            DbspAggregate::new_batch_with_state_namespace::<Vec<u8>, Vec<u8>, Vec<u8>, _>(
+                &upstream,
+                Some(state_namespace),
+                key_extractor,
+                aggregate_spec,
+                Some(aggregate_error_handler),
+            )
+            .await
+            .context("initialize DBSP aggregate")?;
 
         let mapped = self
             .map_aggregate_output(
@@ -339,12 +358,14 @@ impl DbspGraphBuilder {
 
     pub(crate) async fn compile_window_aggregate(
         &mut self,
+        node_idx: usize,
         node: &DbspWindowAggregateNode,
         mut upstream: DeltaHandleStream,
         append_only_input: bool,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let aggregate = &node.aggregate;
+        let state_namespace = self.operator_state_namespace(node_idx, "window_aggregate");
         let input_schema = Arc::clone(aggregate.input_schema());
         let group_keys = aggregate.group_keys().to_vec();
         let aggregates = aggregate.aggregates().to_vec();
@@ -411,6 +432,7 @@ impl DbspGraphBuilder {
             );
             let key_extractor = Arc::clone(&vectorized_window_extractor);
             let row_graph_id = graph_id.clone();
+            let row_error_handler = Arc::clone(&window_error_handler);
             let row_extractor = move |delta_values: &[(Vec<u8>, i64)]| match key_extractor
                 .extract_keyed_time_deltas(delta_values, direct_time_column)
             {
@@ -421,11 +443,17 @@ impl DbspGraphBuilder {
                         error = %err,
                         "failed to evaluate vectorized session window aggregate keys"
                     );
+                    report_operator_closure_error(
+                        &row_error_handler,
+                        "failed to evaluate vectorized session window aggregate keys",
+                        err,
+                    );
                     Vec::new()
                 }
             };
 
             let agg_graph_id = graph_id.clone();
+            let agg_error_handler = Arc::clone(&window_error_handler);
             let agg_layout = Arc::new(build_count_eval_layout(
                 &aggregates,
                 eval_schema.as_ref(),
@@ -452,14 +480,26 @@ impl DbspGraphBuilder {
                             error = %err,
                             "failed to encode session window aggregate output"
                         );
+                        report_operator_closure_error(
+                            &agg_error_handler,
+                            "failed to encode session window aggregate output",
+                            err,
+                        );
                         None
                     }
                 }
             };
 
             let session_aggregate =
-                dbsp::DbspSessionWindowAggregate::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+                dbsp::DbspSessionWindowAggregate::new_batch_with_state_namespace::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    Vec<u8>,
+                    _,
+                    _,
+                >(
                     &upstream,
+                    Some(state_namespace),
                     row_extractor,
                     aggregator,
                     *gap_ms,
@@ -494,6 +534,7 @@ impl DbspGraphBuilder {
             );
             let key_extractor = Arc::clone(&vectorized_window_extractor);
             let row_graph_id = graph_id.clone();
+            let row_error_handler = Arc::clone(&window_error_handler);
             let row_extractor = move |delta_values: &[(Vec<u8>, i64)]| match key_extractor
                 .extract_keyed_time_deltas(delta_values, direct_time_column)
             {
@@ -504,12 +545,22 @@ impl DbspGraphBuilder {
                         error = %err,
                         "failed to evaluate vectorized window count-star keys"
                     );
+                    report_operator_closure_error(
+                        &row_error_handler,
+                        "failed to evaluate vectorized window count-star keys",
+                        err,
+                    );
                     Vec::new()
                 }
             };
             let window_count_star_aggregate =
-                dbsp::DbspWindowCountStarAggregate::new_batch::<Vec<u8>, Vec<u8>, _>(
+                dbsp::DbspWindowCountStarAggregate::new_batch_with_state_namespace::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    _,
+                >(
                     &upstream,
+                    Some(state_namespace),
                     row_extractor,
                     window_size,
                     window_slide,
@@ -537,6 +588,7 @@ impl DbspGraphBuilder {
         {
             let key_extractor = Arc::clone(&vectorized_window_extractor);
             let window_graph_id = graph_id.clone();
+            let window_error_handler_for_keys = Arc::clone(&window_error_handler);
             let window_extractor = move |delta_values: &[(Vec<u8>, i64)]| match key_extractor
                 .extract_keyed_time_deltas(delta_values, direct_time_column)
             {
@@ -546,6 +598,11 @@ impl DbspGraphBuilder {
                         graph_id = %window_graph_id,
                         error = %err,
                         "failed to evaluate vectorized window count aggregate keys"
+                    );
+                    report_operator_closure_error(
+                        &window_error_handler_for_keys,
+                        "failed to evaluate vectorized window count aggregate keys",
+                        err,
                     );
                     Vec::new()
                 }
@@ -560,8 +617,15 @@ impl DbspGraphBuilder {
                 "window aggregate",
             );
             let window_count_aggregate =
-                dbsp::DbspWindowCountAggregate::new_batch::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
+                dbsp::DbspWindowCountAggregate::new_batch_with_state_namespace::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    Vec<u8>,
+                    _,
+                    _,
+                >(
                     &upstream,
+                    Some(state_namespace),
                     window_extractor,
                     row_evaluator,
                     slot_kinds,
@@ -588,6 +652,7 @@ impl DbspGraphBuilder {
         if let Some(slot_kinds) = build_incremental_aggregate_slot_kinds(&aggregates) {
             let key_extractor = Arc::clone(&vectorized_window_extractor);
             let window_graph_id = graph_id.clone();
+            let window_error_handler_for_keys = Arc::clone(&window_error_handler);
             let window_extractor = move |delta_values: &[(Vec<u8>, i64)]| match key_extractor
                 .extract_keyed_time_deltas(delta_values, direct_time_column)
             {
@@ -597,6 +662,11 @@ impl DbspGraphBuilder {
                         graph_id = %window_graph_id,
                         error = %err,
                         "failed to evaluate vectorized window incremental aggregate keys"
+                    );
+                    report_operator_closure_error(
+                        &window_error_handler_for_keys,
+                        "failed to evaluate vectorized window incremental aggregate keys",
+                        err,
                     );
                     Vec::new()
                 }
@@ -610,13 +680,14 @@ impl DbspGraphBuilder {
                 "window aggregate",
             );
             let window_incremental_aggregate =
-                dbsp::DbspWindowIncrementalAggregate::new_batch_with_append_only_input::<
+                dbsp::DbspWindowIncrementalAggregate::new_batch_with_state_namespace_and_append_only_input::<
                     Vec<u8>,
                     Vec<u8>,
                     _,
                     _,
                 >(
                     &upstream,
+                    Some(state_namespace),
                     window_extractor,
                     row_evaluator,
                     slot_kinds,
@@ -643,6 +714,7 @@ impl DbspGraphBuilder {
 
         let key_extractor = Arc::clone(&vectorized_window_extractor);
         let key_graph_id = graph_id.clone();
+        let key_error_handler = Arc::clone(&window_error_handler);
         let window_extractor = move |delta_values: &[(Vec<u8>, i64)]| match key_extractor
             .extract_keyed_time_deltas(delta_values, direct_time_column)
         {
@@ -653,11 +725,17 @@ impl DbspGraphBuilder {
                     error = %err,
                     "failed to evaluate vectorized window aggregate keys"
                 );
+                report_operator_closure_error(
+                    &key_error_handler,
+                    "failed to evaluate vectorized window aggregate keys",
+                    err,
+                );
                 Vec::new()
             }
         };
 
         let agg_graph_id = graph_id.clone();
+        let agg_error_handler = Arc::clone(&window_error_handler);
         let agg_layout = Arc::new(build_count_eval_layout(
             &aggregates,
             eval_schema.as_ref(),
@@ -684,24 +762,35 @@ impl DbspGraphBuilder {
                         error = %err,
                         "failed to encode window aggregate output"
                     );
+                    report_operator_closure_error(
+                        &agg_error_handler,
+                        "failed to encode window aggregate output",
+                        err,
+                    );
                     None
                 }
             }
         };
 
-        let window_aggregate =
-            DbspWindowAggregate::new_with_batch_extractor::<Vec<u8>, Vec<u8>, Vec<u8>, _, _>(
-                &upstream,
-                window_extractor,
-                aggregator,
-                window_size,
-                window_slide,
-                allowed_lateness_ms,
-                watermark,
-                Some(window_error_handler),
-            )
-            .await
-            .context("initialize DBSP window aggregate")?;
+        let window_aggregate = DbspWindowAggregate::new_with_state_namespace_and_batch_extractor::<
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            _,
+            _,
+        >(
+            &upstream,
+            Some(state_namespace),
+            window_extractor,
+            aggregator,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+            Some(window_error_handler),
+        )
+        .await
+        .context("initialize DBSP window aggregate")?;
 
         self.map_window_aggregate_output(
             &graph_id,

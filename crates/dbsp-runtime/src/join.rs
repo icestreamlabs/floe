@@ -31,6 +31,8 @@ static JOIN_STEP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const JOIN_STEP_LOG_SAMPLE_EVERY: u64 = 256;
 type JoinObserver<O> = Arc<dyn Fn(i64, Arc<Vec<(O, i64)>>) + Send + Sync + 'static>;
 
+pub const TRANSIENT_JOIN_INPUT_CHANNEL_CAPACITY: usize = 1024;
+
 #[derive(Clone)]
 pub struct TransientJoinInputBatch<T, K> {
     pub ts: i64,
@@ -39,14 +41,14 @@ pub struct TransientJoinInputBatch<T, K> {
 }
 
 struct JoinTransientInputBuffer<T, K> {
-    receiver: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<T, K>>>,
+    receiver: Option<mpsc::Receiver<TransientJoinInputBatch<T, K>>>,
     pending: BTreeMap<i64, TransientJoinInputBatch<T, K>>,
     replay_cutoff_ts: i64,
 }
 
 impl<T, K> JoinTransientInputBuffer<T, K> {
     fn new(
-        receiver: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<T, K>>>,
+        receiver: Option<mpsc::Receiver<TransientJoinInputBatch<T, K>>>,
         replay_cutoff_ts: i64,
     ) -> Self {
         Self {
@@ -112,10 +114,20 @@ impl<T, K> JoinTransientInputBuffer<T, K> {
         }
     }
 
-    async fn recv_for_ts(&mut self, ts: i64) -> Option<TransientJoinInputBatch<T, K>> {
+    async fn recv_optional_for_ts(
+        &mut self,
+        ts: i64,
+    ) -> Option<Option<TransientJoinInputBatch<T, K>>> {
         loop {
             if let Some(batch) = self.take_pending_for_ts(ts) {
-                return Some(batch);
+                return Some(Some(batch));
+            }
+            if self
+                .pending
+                .first_key_value()
+                .is_some_and(|(pending_ts, _)| *pending_ts > ts)
+            {
+                return Some(None);
             }
             let receiver = self.receiver.as_mut()?;
             match receiver.recv().await {
@@ -136,8 +148,8 @@ struct JoinTransientInputState<L, R, K> {
 
 impl<L, R, K> JoinTransientInputState<L, R, K> {
     fn new(
-        left: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L, K>>>,
-        right: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R, K>>>,
+        left: Option<mpsc::Receiver<TransientJoinInputBatch<L, K>>>,
+        right: Option<mpsc::Receiver<TransientJoinInputBatch<R, K>>>,
         replay_cutoff_ts: i64,
     ) -> Self {
         Self {
@@ -220,13 +232,22 @@ impl DbspJoin {
         let table = left.table();
         let frontier = left.current_time().max(right.current_time());
         let horizon = left.semantic_horizon().max(right.semantic_horizon());
+        let checkpoint_state = state_namespace.is_some();
         let join_id = state_namespace
             .unwrap_or_else(|| NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
-        let left_state =
-            RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
-        let right_state =
-            RelationState::empty(table.clone(), format!("join_right_state_{join_id}")).await?;
+        let left_state_ns = format!("join_left_state_{join_id}");
+        let right_state_ns = format!("join_right_state_{join_id}");
+        let left_state = if checkpoint_state {
+            RelationState::empty(table.clone(), left_state_ns).await?
+        } else {
+            RelationState::empty_uncheckpointed(table.clone(), left_state_ns).await?
+        };
+        let right_state = if checkpoint_state {
+            RelationState::empty(table.clone(), right_state_ns).await?
+        } else {
+            RelationState::empty_uncheckpointed(table.clone(), right_state_ns).await?
+        };
 
         let output_ns = format!("join_output_{join_id}");
         let output_dict = Arc::new(
@@ -438,8 +459,8 @@ impl DbspJoin {
     pub async fn spawn_transient_with_inputs<L, R, O, K, KL, KR, P, F>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,
-        left_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L, K>>>,
-        right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R, K>>>,
+        left_transient: Option<mpsc::Receiver<TransientJoinInputBatch<L, K>>>,
+        right_transient: Option<mpsc::Receiver<TransientJoinInputBatch<R, K>>>,
         prefer_source_driven_runtime: bool,
         state_namespace: Option<String>,
         left_key: KL,
@@ -526,8 +547,8 @@ impl DbspJoin {
     pub async fn spawn_transient_with_inputs_and_retention<L, R, O, K, KL, KR, P, F>(
         left: &DeltaHandleStream,
         right: &DeltaHandleStream,
-        left_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<L, K>>>,
-        right_transient: Option<mpsc::UnboundedReceiver<TransientJoinInputBatch<R, K>>>,
+        left_transient: Option<mpsc::Receiver<TransientJoinInputBatch<L, K>>>,
+        right_transient: Option<mpsc::Receiver<TransientJoinInputBatch<R, K>>>,
         prefer_source_driven_runtime: bool,
         state_namespace: Option<String>,
         left_retention: JoinInputRetention,
@@ -586,10 +607,18 @@ impl DbspJoin {
         let join_id = state_namespace
             .unwrap_or_else(|| NEXT_JOIN_ID.fetch_add(1, Ordering::Relaxed).to_string());
 
-        let left_state =
-            RelationState::empty(table.clone(), format!("join_left_state_{join_id}")).await?;
-        let right_state =
-            RelationState::empty(table.clone(), format!("join_right_state_{join_id}")).await?;
+        let left_state_ns = format!("join_left_state_{join_id}");
+        let right_state_ns = format!("join_right_state_{join_id}");
+        let left_state = if persist_indexes {
+            RelationState::empty(table.clone(), left_state_ns).await?
+        } else {
+            RelationState::empty_uncheckpointed(table.clone(), left_state_ns).await?
+        };
+        let right_state = if persist_indexes {
+            RelationState::empty(table.clone(), right_state_ns).await?
+        } else {
+            RelationState::empty_uncheckpointed(table.clone(), right_state_ns).await?
+        };
         let left_index = crate::collections::IndexedBatchZSet::with_hot_key_compaction_threshold(
             table.clone(),
             format!("join_left_index_{join_id}"),
@@ -935,7 +964,11 @@ where
     let batch = op_guard
         .on_step_transient_with_inputs(ts, &handles, transient_inputs)
         .await?;
-    if let Some(batch) = batch {
+    if let Some(batch) = batch.or_else(|| {
+        observer_version_override
+            .is_some()
+            .then(|| Arc::new(Vec::new()))
+    }) {
         let version = observer_version_override.unwrap_or_else(|| {
             let version = output_version
                 .fetch_add(1, Ordering::Relaxed)
@@ -954,8 +987,8 @@ async fn run_source_driven_join_transient<L, R, O, K>(
     output_version: Arc<AtomicU64>,
     left_default: ZSetHandle,
     right_default: ZSetHandle,
-    left_transient: mpsc::UnboundedReceiver<TransientJoinInputBatch<L, K>>,
-    right_transient: mpsc::UnboundedReceiver<TransientJoinInputBatch<R, K>>,
+    left_transient: mpsc::Receiver<TransientJoinInputBatch<L, K>>,
+    right_transient: mpsc::Receiver<TransientJoinInputBatch<R, K>>,
     replay_cutoff_ts: i64,
 ) -> Result<()>
 where
@@ -1009,22 +1042,46 @@ where
     };
     next_ts = next_ts.max(right_start_ts);
     loop {
-        let Some(left_batch) = transient_inputs.left.recv_for_ts(next_ts).await else {
+        let Some(left_batch) = transient_inputs.left.recv_optional_for_ts(next_ts).await else {
             break;
         };
-        let Some(right_batch) = transient_inputs.right.recv_for_ts(next_ts).await else {
+        let Some(right_batch) = transient_inputs.right.recv_optional_for_ts(next_ts).await else {
             break;
         };
+        let empty_left = Arc::new(Vec::new());
+        let empty_right = Arc::new(Vec::new());
+        let empty_left_closed = Arc::new(Vec::new());
+        let empty_right_closed = Arc::new(Vec::new());
         drive_join_transient(
             &op,
             &observer,
             &output_version,
             Some(next_ts.saturating_sub(1)),
             Some(JoinTransientInputs {
-                left: Some(Arc::clone(&left_batch.deltas)),
-                right: Some(Arc::clone(&right_batch.deltas)),
-                left_closed_keys: Some(Arc::clone(&left_batch.closed_keys)),
-                right_closed_keys: Some(Arc::clone(&right_batch.closed_keys)),
+                left: Some(
+                    left_batch
+                        .as_ref()
+                        .map(|batch| Arc::clone(&batch.deltas))
+                        .unwrap_or_else(|| Arc::clone(&empty_left)),
+                ),
+                right: Some(
+                    right_batch
+                        .as_ref()
+                        .map(|batch| Arc::clone(&batch.deltas))
+                        .unwrap_or_else(|| Arc::clone(&empty_right)),
+                ),
+                left_closed_keys: Some(
+                    left_batch
+                        .as_ref()
+                        .map(|batch| Arc::clone(&batch.closed_keys))
+                        .unwrap_or_else(|| Arc::clone(&empty_left_closed)),
+                ),
+                right_closed_keys: Some(
+                    right_batch
+                        .as_ref()
+                        .map(|batch| Arc::clone(&batch.closed_keys))
+                        .unwrap_or_else(|| Arc::clone(&empty_right_closed)),
+                ),
             }),
             next_ts,
             vec![left_default.clone(), right_default.clone()],

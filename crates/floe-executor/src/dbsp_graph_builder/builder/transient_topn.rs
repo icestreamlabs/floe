@@ -2200,7 +2200,7 @@ pub(super) fn build_transient_topn_receiver(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
+) -> TransientMaterializeReceiver {
     // Source roots are ZSet inputs, not a proven append-only contract. Keeping
     // full TopN input state is required to recompute replacement winners after
     // retractions; winner-only compact state is only correct for strictly
@@ -2232,7 +2232,7 @@ pub(super) fn build_transient_topn_receiver(
 pub(super) fn build_transient_topn_receiver_from_batches(
     graph_id: &str,
     topn: &DbspTopNNode,
-    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    mut upstream_rx: TransientMaterializeReceiver,
     append_only_input: bool,
     compact_append_only_state: bool,
     output_projection: Option<Arc<Vec<usize>>>,
@@ -2240,8 +2240,9 @@ pub(super) fn build_transient_topn_receiver_from_batches(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+) -> TransientMaterializeReceiver {
+    let (tx, rx) =
+        mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
     let graph_id = graph_id.to_string();
     let task_label = format!("transient-topn:{graph_id}");
     let task_events = task_events.clone();
@@ -2313,18 +2314,18 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             None => output_deltas,
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-topn-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                output_deltas.len()
+                            tracing::debug!(
+                                graph_id = %graph_id,
+                                version = batch.version,
+                                rows = output_deltas.len(),
+                                "transient topn output"
                             );
                         }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
                             deltas_consolidated: false,
-                        }).is_err() {
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -2418,18 +2419,18 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             None => output_deltas,
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-topn-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                output_deltas.len()
+                            tracing::debug!(
+                                graph_id = %graph_id,
+                                version = batch.version,
+                                rows = output_deltas.len(),
+                                "transient topn output"
                             );
                         }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
                             deltas_consolidated: false,
-                        }).is_err() {
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -2514,18 +2515,18 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             None => output_deltas,
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-topn-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                output_deltas.len()
+                            tracing::debug!(
+                                graph_id = %graph_id,
+                                version = batch.version,
+                                rows = output_deltas.len(),
+                                "transient topn output"
                             );
                         }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
                             deltas_consolidated: false,
-                        }).is_err() {
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -2615,18 +2616,18 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                             None => output_deltas,
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-topn-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                output_deltas.len()
+                            tracing::debug!(
+                                graph_id = %graph_id,
+                                version = batch.version,
+                                rows = output_deltas.len(),
+                                "transient topn output"
                             );
                         }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(output_deltas),
                             deltas_consolidated: false,
-                        }).is_err() {
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -2709,18 +2710,18 @@ pub(super) fn build_transient_topn_receiver_from_batches(
                         None => output_deltas,
                     };
                     if debug_transient_join {
-                        eprintln!(
-                            "transient-topn-output graph_id={} version={} rows={}",
-                            graph_id,
-                            batch.version,
-                            output_deltas.len()
+                        tracing::debug!(
+                            graph_id = %graph_id,
+                            version = batch.version,
+                            rows = output_deltas.len(),
+                            "transient topn output"
                         );
                     }
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(output_deltas),
                         deltas_consolidated: false,
-                    }).is_err() {
+                    }).await.is_err() {
                         break;
                     }
                 }

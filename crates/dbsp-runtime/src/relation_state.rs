@@ -5,7 +5,9 @@ use rkyv::bytecheck::CheckBytes;
 
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
-use crate::operator_state_registry::{record_operator_state, restored_operator_state};
+use crate::operator_state_registry::{
+    record_operator_state, restored_operator_state, uncheckpointed_operator_state_namespace,
+};
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -98,6 +100,13 @@ where
             integrated,
             latest_handle,
         })
+    }
+
+    pub async fn empty_uncheckpointed(
+        table: Arc<dyn KeyValueTable>,
+        namespace: String,
+    ) -> anyhow::Result<Self> {
+        Self::empty(table, uncheckpointed_operator_state_namespace(namespace)).await
     }
 }
 

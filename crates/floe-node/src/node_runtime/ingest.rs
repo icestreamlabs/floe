@@ -1,15 +1,5 @@
 use super::*;
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn lookup_decoder_for_source<'a>(
-    decoders: &'a HashMap<String, SourceRowDecoder>,
-    source_name: &str,
-) -> anyhow::Result<&'a SourceRowDecoder> {
-    decoders
-        .get(source_name)
-        .ok_or_else(|| anyhow!("received event for unknown source '{source_name}'"))
-}
-
 pub(super) fn should_sample(counter: &AtomicU64, every: u64) -> bool {
     if every == 0 {
         return true;

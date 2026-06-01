@@ -108,7 +108,7 @@ where
 {
     pub(crate) state: RelationState<(K, GroupedCountState)>,
     pub(crate) table: Arc<dyn KeyValueTable>,
-    pub row_evaluator: BatchRowEvaluator<V, K, D>,
+    pub(crate) row_evaluator: BatchRowEvaluator<V, K, D>,
     output: VersionedZSet<(K, Vec<i64>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     state_cache: Option<HashMap<K, GroupedCountState>>,

@@ -107,7 +107,8 @@ async fn checkpoint_snapshot_skips_overlay_only_materialized_view_state() -> Res
     assert!(
         operator_states.iter().any(|handle| {
             handle.kind == handle_kinds::OPERATOR_STATE
-                && handle.namespace.starts_with("incremental_aggregate_state_")
+                && handle.namespace.starts_with("op/mv_checkpoint_restart/")
+                && handle.namespace.ends_with("/aggregate")
                 && handle.version > 0
         }),
         "aggregate operator state should be included in runtime checkpoint handles: {operator_states:?}"

@@ -118,8 +118,9 @@ impl DbspIncrementalAggregate {
         V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
     {
-        Self::new_batch_with_append_only_input(
+        Self::new_batch_with_state_namespace_and_append_only_input(
             input,
+            None,
             row_evaluator,
             slot_kinds,
             false,
@@ -156,6 +157,46 @@ impl DbspIncrementalAggregate {
         V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
     {
+        Self::new_batch_with_state_namespace_and_append_only_input(
+            input,
+            None,
+            row_evaluator,
+            slot_kinds,
+            append_only_input,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch_with_state_namespace_and_append_only_input<K, V, FRow>(
+        input: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -166,11 +207,22 @@ impl DbspIncrementalAggregate {
             version: 0,
         };
 
-        let state = RelationState::<(K, GroupedIncrementalAggregateState)>::empty(
-            table.clone(),
-            format!("incremental_aggregate_state_{aggregate_id}"),
-        )
-        .await?;
+        let state = match state_namespace {
+            Some(namespace) => {
+                RelationState::<(K, GroupedIncrementalAggregateState)>::empty(
+                    table.clone(),
+                    namespace,
+                )
+                .await?
+            }
+            None => {
+                RelationState::<(K, GroupedIncrementalAggregateState)>::empty_uncheckpointed(
+                    table.clone(),
+                    format!("incremental_aggregate_state_{aggregate_id}"),
+                )
+                .await?
+            }
+        };
         let output_dict = Arc::new(
             Dictionary::<(K, Vec<AggregateValue>)>::with_table(
                 table.clone(),
@@ -343,7 +395,7 @@ where
             "transient_incremental_aggregate_state_{aggregate_id}"
         ))
         .await?;
-        let state = RelationState::<(K, GroupedIncrementalAggregateState)>::empty(
+        let state = RelationState::<(K, GroupedIncrementalAggregateState)>::empty_uncheckpointed(
             table.clone(),
             format!("transient_incremental_aggregate_state_{aggregate_id}"),
         )

@@ -51,6 +51,40 @@ impl DbspTopN {
         O: Ord + Clone + Send + Sync + 'static,
         F: Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync + Clone + 'static,
     {
+        Self::new_with_state_namespace_and_batch_key_extractor(
+            input,
+            None,
+            key_extractor,
+            limit,
+            offset,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_with_state_namespace_and_batch_key_extractor<K, P, O, F>(
+        input: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        key_extractor: F,
+        limit: usize,
+        offset: usize,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Ord
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        P: Ord + Clone + Send + Sync + 'static,
+        O: Ord + Clone + Send + Sync + 'static,
+        F: Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync + Clone + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -61,7 +95,13 @@ impl DbspTopN {
             version: 0,
         };
 
-        let state = RelationState::empty(table.clone(), format!("topn_state_{topn_id}")).await?;
+        let state = match state_namespace {
+            Some(namespace) => RelationState::empty(table.clone(), namespace).await?,
+            None => {
+                RelationState::empty_uncheckpointed(table.clone(), format!("topn_state_{topn_id}"))
+                    .await?
+            }
+        };
         let output_dict = Arc::new(
             Dictionary::<K>::with_table(table.clone(), output_ns.clone(), None)
                 .await

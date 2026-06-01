@@ -53,7 +53,7 @@ where
     P::Archived: RkyvDeserialize<P, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     O: Clone + Ord + Send + Sync + 'static,
 {
-    pub input_index: IndexedBatchZSet<P, K>,
+    pub(crate) input_index: IndexedBatchZSet<P, K>,
     pub(crate) ordered_index: Option<IndexedBatchZSet<OrderedBytes, K>>,
     pub(crate) table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,

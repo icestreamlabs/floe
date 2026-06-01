@@ -73,7 +73,7 @@ where
     pub(crate) right_index: IndexedBatchZSet<K, ()>,
     pub(crate) left_key: BatchJoinKeyExtractor<L, K>,
     pub(crate) right_key: BatchJoinKeyExtractor<R, K>,
-    pub mode: SemiJoinMode,
+    pub(crate) mode: SemiJoinMode,
     pub(crate) table: Arc<dyn KeyValueTable>,
     pub(crate) integrated: Option<RelationState<L>>,
     output: VersionedZSet<L>,

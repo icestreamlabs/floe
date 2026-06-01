@@ -368,7 +368,7 @@ where
 {
     pub(crate) state: RelationState<(K, GroupedIncrementalAggregateState)>,
     pub(crate) table: Arc<dyn KeyValueTable>,
-    pub row_evaluator: BatchRowEvaluator<V, K>,
+    pub(crate) row_evaluator: BatchRowEvaluator<V, K>,
     output: VersionedZSet<(K, Vec<AggregateValue>)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     state_cache: Option<HashMap<K, GroupedIncrementalAggregateState>>,

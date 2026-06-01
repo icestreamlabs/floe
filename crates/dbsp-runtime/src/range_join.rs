@@ -159,22 +159,25 @@ impl DbspRangeJoin {
         let table = left.table();
         let frontier = left.current_time().max(right.current_time());
         let horizon = left.semantic_horizon().max(right.semantic_horizon());
+        let checkpoint_state = state_namespace.is_some();
         let range_join_id = state_namespace.unwrap_or_else(|| {
             NEXT_RANGE_JOIN_ID
                 .fetch_add(1, Ordering::Relaxed)
                 .to_string()
         });
 
-        let left_state = RelationState::empty(
-            table.clone(),
-            format!("range_join_left_state_{range_join_id}"),
-        )
-        .await?;
-        let right_state = RelationState::empty(
-            table.clone(),
-            format!("range_join_right_state_{range_join_id}"),
-        )
-        .await?;
+        let left_state_ns = format!("range_join_left_state_{range_join_id}");
+        let right_state_ns = format!("range_join_right_state_{range_join_id}");
+        let left_state = if checkpoint_state {
+            RelationState::empty(table.clone(), left_state_ns).await?
+        } else {
+            RelationState::empty_uncheckpointed(table.clone(), left_state_ns).await?
+        };
+        let right_state = if checkpoint_state {
+            RelationState::empty(table.clone(), right_state_ns).await?
+        } else {
+            RelationState::empty_uncheckpointed(table.clone(), right_state_ns).await?
+        };
 
         let output_ns = format!("range_join_output_{range_join_id}");
         let output_dict = Arc::new(

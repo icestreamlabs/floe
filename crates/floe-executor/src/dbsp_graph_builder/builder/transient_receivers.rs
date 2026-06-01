@@ -7,9 +7,10 @@ pub(super) fn build_transient_source_receiver(
     input_transform: Arc<DeltaTransformFn>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
-) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
+) -> TransientMaterializeReceiver {
     let mut upstream_rx = upstream.subscribe();
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+    let (tx, rx) =
+        mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
     let graph_id = graph_id.to_string();
     let task_label = task_label.into();
     let task_events = task_events.clone();
@@ -33,7 +34,7 @@ pub(super) fn build_transient_source_receiver(
                         version: batch.version,
                         deltas: Arc::new(input_deltas),
                         deltas_consolidated: false,
-                    }).is_err() {
+                    }).await.is_err() {
                         break;
                     }
                 }
@@ -46,12 +47,13 @@ pub(super) fn build_transient_source_receiver(
 pub(super) fn build_transient_transform_receiver(
     graph_id: &str,
     task_label: impl Into<String>,
-    mut upstream: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    mut upstream: TransientMaterializeReceiver,
     transform: Arc<DeltaTransformFn>,
     cancel: &CancellationToken,
     task_events: &GraphTaskSender,
-) -> mpsc::UnboundedReceiver<TransientMaterializeBatch> {
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+) -> TransientMaterializeReceiver {
+    let (tx, rx) =
+        mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
     let graph_id = graph_id.to_string();
     let task_label = task_label.into();
     let task_events = task_events.clone();
@@ -73,19 +75,19 @@ pub(super) fn build_transient_transform_receiver(
                         }
                     };
                     if debug_transient_join {
-                        eprintln!(
-                            "transient-transform-output graph_id={} task={} version={} rows={}",
-                            graph_id,
-                            task_label,
-                            batch.version,
-                            output_deltas.len()
+                        tracing::debug!(
+                            graph_id = %graph_id,
+                            task = %task_label,
+                            version = batch.version,
+                            rows = output_deltas.len(),
+                            "transient transform output"
                         );
                     }
                     if tx.send(TransientMaterializeBatch {
                         version: batch.version,
                         deltas: Arc::new(output_deltas),
                         deltas_consolidated: false,
-                    }).is_err() {
+                    }).await.is_err() {
                         break;
                     }
                 }

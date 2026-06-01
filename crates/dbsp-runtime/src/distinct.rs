@@ -63,12 +63,46 @@ impl DbspDistinct {
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
+        Self::new_with_state_namespace_and_append_only_input::<K>(
+            input,
+            None,
+            append_only_input,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_with_state_namespace_and_append_only_input<K>(
+        input: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + std::hash::Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
         let distinct_id = NEXT_DISTINCT_ID.fetch_add(1, Ordering::Relaxed);
-        let state =
-            RelationState::empty(table.clone(), format!("distinct_state_{distinct_id}")).await?;
+        let state = match state_namespace {
+            Some(namespace) => RelationState::empty(table.clone(), namespace).await?,
+            None => {
+                RelationState::empty_uncheckpointed(
+                    table.clone(),
+                    format!("distinct_state_{distinct_id}"),
+                )
+                .await?
+            }
+        };
         let output_ns = format!("distinct_output_{distinct_id}");
         let empty_handle = ZSetHandle {
             ns: output_ns.clone(),

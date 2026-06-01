@@ -39,6 +39,9 @@ const MV_OPTIMIZATION_LOG_MIN_TOTAL_MS: u64 = 250;
 pub(super) type DeltaTransformFn =
     dyn Fn(EncodedDeltaBatch) -> BoxFuture<'static, Result<Vec<(Vec<u8>, i64)>>> + Send + Sync;
 
+pub(crate) const TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY: usize = 1024;
+const OVERLAY_SNAPSHOT_FLUSH_CHANNEL_CAPACITY: usize = 16;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TransientMaterializeBatch {
     pub version: i64,
@@ -46,6 +49,9 @@ pub(crate) struct TransientMaterializeBatch {
     /// True when deltas are already coalesced by encoded row.
     pub deltas_consolidated: bool,
 }
+
+pub(crate) type TransientMaterializeReceiver = mpsc::Receiver<TransientMaterializeBatch>;
+pub(crate) type TransientMaterializeSender = mpsc::Sender<TransientMaterializeBatch>;
 
 impl From<TransientSourceBatch> for TransientMaterializeBatch {
     fn from(batch: TransientSourceBatch) -> Self {
@@ -710,7 +716,8 @@ impl DbspGraphBuilder {
         let cancel = cancel.clone();
         let bridge_clone = Arc::clone(&self.bridge);
         let snapshot_cfg = self.mv_overlay_snapshot;
-        let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<OverlaySnapshotFlushRequest>();
+        let (flush_tx, mut flush_rx) =
+            mpsc::channel::<OverlaySnapshotFlushRequest>(OVERLAY_SNAPSHOT_FLUSH_CHANNEL_CAPACITY);
         let flush_registry = Arc::clone(&registry_handle);
         let flush_graph_id = graph_id.clone();
         let flush_view_label = view_label.clone();
@@ -750,7 +757,7 @@ impl DbspGraphBuilder {
                     tokio::select! {
                         _ = cancel.cancelled() => {
                             if let Some(request) = pending_snapshot.take_request("shutdown")
-                                && flush_tx.send(request).is_err()
+                                && flush_tx.send(request).await.is_err()
                             {
                                 report_graph_task_error(
                                     &task_events,
@@ -763,7 +770,7 @@ impl DbspGraphBuilder {
                         },
                         _ = tokio::time::sleep(delay_remaining) => {
                             if let Some(request) = pending_snapshot.take_request("max_delay")
-                                && flush_tx.send(request).is_err()
+                                && flush_tx.send(request).await.is_err()
                             {
                                 report_graph_task_error(
                                     &task_events,
@@ -777,7 +784,7 @@ impl DbspGraphBuilder {
                         maybe_batch = rx.recv() => {
                             let Some(batch) = maybe_batch else {
                                 if let Some(request) = pending_snapshot.take_request("channel_closed")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -804,7 +811,7 @@ impl DbspGraphBuilder {
                             }
                             if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                                 if let Some(request) = pending_snapshot.take_request("background_threshold")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -840,7 +847,7 @@ impl DbspGraphBuilder {
                             }
                             if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                                 if let Some(request) = pending_snapshot.take_request("background_threshold")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -863,7 +870,7 @@ impl DbspGraphBuilder {
         &mut self,
         view_name: &str,
         schema: Arc<RowSchema>,
-        mut upstream: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+        mut upstream: TransientMaterializeReceiver,
         delta_transform: Option<Arc<DeltaTransformFn>>,
         cancel: &CancellationToken,
         task_events: &GraphTaskSender,
@@ -931,7 +938,8 @@ impl DbspGraphBuilder {
         let cancel = cancel.clone();
         let bridge_clone = Arc::clone(&self.bridge);
         let snapshot_cfg = self.mv_overlay_snapshot;
-        let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<OverlaySnapshotFlushRequest>();
+        let (flush_tx, mut flush_rx) =
+            mpsc::channel::<OverlaySnapshotFlushRequest>(OVERLAY_SNAPSHOT_FLUSH_CHANNEL_CAPACITY);
         let flush_registry = Arc::clone(&registry_handle);
         let flush_graph_id = graph_id.clone();
         let flush_view_label = view_label.clone();
@@ -970,7 +978,7 @@ impl DbspGraphBuilder {
                     tokio::select! {
                         _ = cancel.cancelled() => {
                             if let Some(request) = pending_snapshot.take_request("shutdown")
-                                && flush_tx.send(request).is_err()
+                                && flush_tx.send(request).await.is_err()
                             {
                                 report_graph_task_error(
                                     &task_events,
@@ -983,7 +991,7 @@ impl DbspGraphBuilder {
                         },
                         _ = tokio::time::sleep(delay_remaining) => {
                             if let Some(request) = pending_snapshot.take_request("max_delay")
-                                && flush_tx.send(request).is_err()
+                                && flush_tx.send(request).await.is_err()
                             {
                                 report_graph_task_error(
                                     &task_events,
@@ -997,7 +1005,7 @@ impl DbspGraphBuilder {
                         maybe_batch = upstream.recv() => {
                             let Some(batch) = maybe_batch else {
                                 if let Some(request) = pending_snapshot.take_request("channel_closed")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -1024,7 +1032,7 @@ impl DbspGraphBuilder {
                             }
                             if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                                 if let Some(request) = pending_snapshot.take_request("background_threshold")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -1060,7 +1068,7 @@ impl DbspGraphBuilder {
                             }
                             if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                                 if let Some(request) = pending_snapshot.take_request("background_threshold")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -1159,7 +1167,8 @@ impl DbspGraphBuilder {
         let cancel = cancel.clone();
         let bridge_clone = Arc::clone(&self.bridge);
         let snapshot_cfg = self.mv_overlay_snapshot;
-        let (flush_tx, mut flush_rx) = mpsc::unbounded_channel::<OverlaySnapshotFlushRequest>();
+        let (flush_tx, mut flush_rx) =
+            mpsc::channel::<OverlaySnapshotFlushRequest>(OVERLAY_SNAPSHOT_FLUSH_CHANNEL_CAPACITY);
         let flush_registry = Arc::clone(&registry_handle);
         let flush_graph_id = graph_id.clone();
         let flush_view_label = view_label.clone();
@@ -1212,7 +1221,7 @@ impl DbspGraphBuilder {
                 .await?;
                 if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                     if let Some(request) = pending_snapshot.take_request("background_threshold")
-                        && flush_tx.send(request).is_err()
+                        && flush_tx.send(request).await.is_err()
                     {
                         return Err(anyhow::anyhow!(
                             "overlay snapshot flush task unexpectedly stopped"
@@ -1231,7 +1240,7 @@ impl DbspGraphBuilder {
                     tokio::select! {
                         _ = cancel.cancelled() => {
                             if let Some(request) = pending_snapshot.take_request("shutdown")
-                                && flush_tx.send(request).is_err()
+                                && flush_tx.send(request).await.is_err()
                             {
                                 report_graph_task_error(
                                     &task_events,
@@ -1244,7 +1253,7 @@ impl DbspGraphBuilder {
                         },
                         _ = tokio::time::sleep(delay_remaining) => {
                             if let Some(request) = pending_snapshot.take_request("max_delay")
-                                && flush_tx.send(request).is_err()
+                                && flush_tx.send(request).await.is_err()
                             {
                                 report_graph_task_error(
                                     &task_events,
@@ -1273,7 +1282,7 @@ impl DbspGraphBuilder {
                             }
                             if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                                 if let Some(request) = pending_snapshot.take_request("background_threshold")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,
@@ -1307,7 +1316,7 @@ impl DbspGraphBuilder {
                             }
                             if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
                                 if let Some(request) = pending_snapshot.take_request("background_threshold")
-                                    && flush_tx.send(request).is_err()
+                                    && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
                                         &task_events,

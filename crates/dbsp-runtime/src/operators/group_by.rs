@@ -55,10 +55,10 @@ where
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub(crate) state: RelationState<(K, A)>,
-    pub index: IndexedBatchZSet<K, V>,
+    pub(crate) index: IndexedBatchZSet<K, V>,
     pub(crate) table: Arc<dyn KeyValueTable>,
-    pub key_extractor: BatchKeyExtractor<V, K>,
-    pub aggregator: Aggregator<K, V, A>,
+    pub(crate) key_extractor: BatchKeyExtractor<V, K>,
+    pub(crate) aggregator: Aggregator<K, V, A>,
     output: VersionedZSet<(K, A)>,
     dict_cache: HashMap<String, Arc<Dictionary<V>>>,
     aggregate_cache: Option<HashMap<K, A>>,

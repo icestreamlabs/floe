@@ -218,7 +218,7 @@ where
     pub(crate) left_state: RelationState<L>,
     pub(crate) right_state: RelationState<R>,
     pub(crate) right_index: IndexedBatchZSet<K, R>,
-    pub left_range: BatchLeftRangeExtractor<L, K>,
+    pub(crate) left_range: BatchLeftRangeExtractor<L, K>,
     pub(crate) right_key: BatchRightKeyExtractor<R, K>,
     pub(crate) predicate: RangeJoinPredicate<L, R>,
     pub(crate) projector: RangeJoinProjector<L, R, O>,
@@ -229,7 +229,7 @@ where
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
     left_cache: Option<LeftRangeCache<L, K>>,
     left_interval_index: Option<LeftIntervalIndex<L, K>>,
-    left_interval_index_dirty: bool,
+    left_interval_overlay: LeftRangeCache<L, K>,
     range_lookup_mode: RangeLookupMode,
     logical_work: metrics::LogicalWorkCollector,
 }
@@ -333,7 +333,7 @@ where
             dict_cache_right: HashMap::new(),
             left_cache: None,
             left_interval_index: None,
-            left_interval_index_dirty: true,
+            left_interval_overlay: HashMap::new(),
             range_lookup_mode,
             logical_work: metrics::LogicalWorkCollector::default(),
         }
@@ -364,14 +364,14 @@ where
                 cache.insert(row, (lower, upper, weight));
             }
             self.left_interval_index = Some(LeftIntervalIndex::from_cache(&cache));
-            self.left_interval_index_dirty = false;
+            self.left_interval_overlay.clear();
             self.left_cache = Some(cache);
         }
         Ok(())
     }
 
     fn ensure_left_interval_index(&mut self) -> Result<()> {
-        if !self.left_interval_index_dirty && self.left_interval_index.is_some() {
+        if self.left_interval_index.is_some() {
             return Ok(());
         }
         let cache = self
@@ -379,8 +379,19 @@ where
             .as_ref()
             .context("range join left cache missing while rebuilding interval index")?;
         self.left_interval_index = Some(LeftIntervalIndex::from_cache(cache));
-        self.left_interval_index_dirty = false;
+        self.left_interval_overlay.clear();
         Ok(())
+    }
+
+    fn rebuild_left_interval_index_if_overlay_large(&mut self) {
+        let Some(cache) = self.left_cache.as_ref() else {
+            return;
+        };
+        let rebuild_threshold = (cache.len() / 8).max(1024);
+        if self.left_interval_overlay.len() >= rebuild_threshold {
+            self.left_interval_index = Some(LeftIntervalIndex::from_cache(cache));
+            self.left_interval_overlay.clear();
+        }
     }
 
     fn coalesce_deltas<T>(deltas: &[(T, i64)]) -> RowDeltas<T>
@@ -564,6 +575,7 @@ where
 
     fn join_right_delta_with_left_index(
         left_index: &LeftIntervalIndex<L, K>,
+        left_overlay: &LeftRangeCache<L, K>,
         right_keyed: &RightKeyedDeltas<R, K>,
         predicate: &RangeJoinPredicate<L, R>,
         projector: &RangeJoinProjector<L, R, O>,
@@ -575,6 +587,9 @@ where
             .saturating_add(right_keyed.len() as u64);
         for (right_key, right_rows) in right_keyed {
             left_index.visit_point(right_key, &mut |left, _lower, _upper, left_weight| {
+                if left_overlay.contains_key(left) {
+                    return;
+                }
                 work.left_state_rows_examined = work.left_state_rows_examined.saturating_add(1);
                 work.state_scan_rows = work.state_scan_rows.saturating_add(1);
                 for (right, right_weight) in right_rows {
@@ -591,6 +606,26 @@ where
                     }
                 }
             });
+            for (left, (lower, upper, left_weight)) in left_overlay {
+                if *left_weight == 0 || right_key < lower || right_key >= upper {
+                    continue;
+                }
+                work.left_state_rows_examined = work.left_state_rows_examined.saturating_add(1);
+                work.state_scan_rows = work.state_scan_rows.saturating_add(1);
+                for (right, right_weight) in right_rows {
+                    if let Some((out, weight)) = Self::join_pair(
+                        predicate,
+                        projector,
+                        left,
+                        *left_weight,
+                        right,
+                        *right_weight,
+                    ) {
+                        Self::add_output(output_deltas, out, weight);
+                        work.join_output_rows = work.join_output_rows.saturating_add(1);
+                    }
+                }
+            }
         }
     }
 
@@ -627,25 +662,32 @@ where
 
     fn apply_left_ranges_to_cache(
         cache: &mut LeftRangeCache<L, K>,
+        overlay: &mut LeftRangeCache<L, K>,
         left_ranges: &LeftRangeDeltas<L, K>,
     ) -> bool {
         let mut changed = false;
         for (left, (lower, upper, weight)) in left_ranges {
+            if *weight == 0 {
+                continue;
+            }
             match cache.entry(left.clone()) {
                 Entry::Occupied(mut entry) => {
                     let next = entry.get().2.saturating_add(*weight);
                     if next == 0 {
                         entry.remove();
+                        overlay.insert(left.clone(), (lower.clone(), upper.clone(), 0));
                         changed = true;
                     } else {
                         entry.get_mut().0 = lower.clone();
                         entry.get_mut().1 = upper.clone();
                         entry.get_mut().2 = next;
+                        overlay.insert(left.clone(), (lower.clone(), upper.clone(), next));
                         changed = true;
                     }
                 }
                 Entry::Vacant(entry) => {
                     entry.insert((lower.clone(), upper.clone(), *weight));
+                    overlay.insert(left.clone(), (lower.clone(), upper.clone(), *weight));
                     changed = true;
                 }
             }
@@ -855,6 +897,7 @@ where
         if let Some(left_index) = self.left_interval_index.as_ref() {
             Self::join_right_delta_with_left_index(
                 left_index,
+                &self.left_interval_overlay,
                 &right_keyed,
                 &self.predicate,
                 &self.projector,
@@ -904,9 +947,13 @@ where
         }
 
         if let Some(cache) = self.left_cache.as_mut()
-            && Self::apply_left_ranges_to_cache(cache, &left_ranges)
+            && Self::apply_left_ranges_to_cache(
+                cache,
+                &mut self.left_interval_overlay,
+                &left_ranges,
+            )
         {
-            self.left_interval_index_dirty = true;
+            self.rebuild_left_interval_index_if_overlay_large();
         }
 
         if output_deltas.is_empty() {
@@ -1295,5 +1342,99 @@ mod tests {
             1,
             "right-delta probing should visit matching left intervals, not the whole left cache",
         );
+    }
+
+    #[tokio::test]
+    async fn range_join_interval_overlay_masks_stale_index_entries() {
+        let suffix = next_test_suffix();
+        let (mut op, left_dict, right_dict, table) = build_op(suffix).await;
+        let mut cache = HashMap::new();
+
+        let left_t1 = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "range_overlay_left_stream_t1",
+            &[((1, 10, 20), 1)],
+        )
+        .await;
+        let right_t1 = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "range_overlay_right_stream_t1",
+            &[],
+        )
+        .await;
+        op.on_step(1, &[left_t1, right_t1])
+            .await
+            .expect("seed left range");
+
+        let left_t2 = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "range_overlay_left_stream_t2",
+            &[((1, 10, 20), -1), ((1, 30, 40), 1)],
+        )
+        .await;
+        let right_t2 = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "range_overlay_right_stream_t2",
+            &[],
+        )
+        .await;
+        op.on_step(2, &[left_t2, right_t2])
+            .await
+            .expect("move left range");
+
+        let left_t3 = stage_version(
+            left_dict.clone(),
+            table.clone(),
+            "range_overlay_left_stream_t3",
+            &[],
+        )
+        .await;
+        let right_t3 = stage_version(
+            right_dict.clone(),
+            table.clone(),
+            "range_overlay_right_stream_t3",
+            &[((15, 100), 1)],
+        )
+        .await;
+        let out_t3 = op
+            .on_step(3, &[left_t3, right_t3])
+            .await
+            .expect("probe stale interval")
+            .expect("empty output handle t3");
+        let materialized_t3 = materialize_zset_handle::<OutRow>(table.clone(), &mut cache, &out_t3)
+            .await
+            .expect("materialize t3");
+        assert!(
+            materialized_t3.is_empty(),
+            "right probe must not join against an interval removed after the index was built"
+        );
+
+        let left_t4 = stage_version(
+            left_dict,
+            table.clone(),
+            "range_overlay_left_stream_t4",
+            &[],
+        )
+        .await;
+        let right_t4 = stage_version(
+            right_dict,
+            table.clone(),
+            "range_overlay_right_stream_t4",
+            &[((35, 101), 1)],
+        )
+        .await;
+        let out_t4 = op
+            .on_step(4, &[left_t4, right_t4])
+            .await
+            .expect("probe overlay interval")
+            .expect("output t4");
+        let materialized_t4 = materialize_zset_handle::<OutRow>(table.clone(), &mut cache, &out_t4)
+            .await
+            .expect("materialize t4");
+        assert_eq!(materialized_t4, HashMap::from([((1, 101), 1)]));
     }
 }

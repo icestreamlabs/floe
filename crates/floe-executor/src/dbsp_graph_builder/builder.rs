@@ -41,7 +41,10 @@ use super::compile::{
     build_count_batch_row_evaluator, build_incremental_aggregate_batch_row_evaluator,
     build_incremental_aggregate_slot_kinds, build_prekeyed_incremental_aggregate_batch_evaluator,
 };
-use super::materialize::{DeltaTransformFn, TransientMaterializeBatch};
+use super::materialize::{
+    DeltaTransformFn, TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY, TransientMaterializeBatch,
+    TransientMaterializeReceiver,
+};
 use super::persistence_policy::{
     PersistencePolicy, PersistencePolicyConfig, TransientSegmentSpec, TransientSegmentStep,
 };
@@ -500,6 +503,7 @@ impl DbspGraphBuilder {
                         inputs.outer_transient_streams,
                         None,
                         &inputs.cancel,
+                        &inputs.task_events,
                     )?;
                     let mut right_transient_input = try_build_transient_join_input_optimization(
                         self.graph_id(),
@@ -508,6 +512,7 @@ impl DbspGraphBuilder {
                         inputs.outer_transient_streams,
                         None,
                         &inputs.cancel,
+                        &inputs.task_events,
                     )?;
                     if left_transient_input.is_some() ^ right_transient_input.is_some() {
                         tracing::info!(
@@ -544,8 +549,9 @@ impl DbspGraphBuilder {
                     } else {
                         Some(Arc::clone(&transient_opt.transform))
                     };
-                    let (tx, rx) =
-                        tokio::sync::mpsc::unbounded_channel::<TransientMaterializeBatch>();
+                    let (tx, rx) = tokio::sync::mpsc::channel::<TransientMaterializeBatch>(
+                        TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY,
+                    );
                     tracing::info!(
                         graph_id = %self.graph_id(),
                         view = %inputs.view_name,
@@ -698,7 +704,7 @@ impl DbspGraphBuilder {
         mv_retention: StreamRetention,
         persistence_policy: &PersistencePolicy,
         state_table: Option<Arc<dyn KeyValueTable>>,
-    ) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+    ) -> Result<TransientMaterializeReceiver> {
         let left = self
             .compile_node(
                 plan,
@@ -734,6 +740,7 @@ impl DbspGraphBuilder {
             outer_transient_streams,
             None,
             cancel,
+            task_events,
         )?
         .ok_or_else(|| {
             anyhow!(
@@ -748,6 +755,7 @@ impl DbspGraphBuilder {
             outer_transient_streams,
             None,
             cancel,
+            task_events,
         )?
         .ok_or_else(|| {
             anyhow!(
@@ -756,7 +764,8 @@ impl DbspGraphBuilder {
             )
         })?;
 
-        let (tx, mut receiver) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+        let (tx, mut receiver) =
+            mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
         // Join pipeline outputs are general ZSets under CDC. Matched input rows
         // must remain available for future retractions and replacement joins.
         let left_retention = dbsp::JoinInputRetention::RetainAll;
@@ -837,6 +846,11 @@ impl DbspGraphBuilder {
 
     pub(super) fn graph_id(&self) -> &str {
         &self.ns.graph_id
+    }
+
+    pub(super) fn operator_state_namespace(&self, node_idx: usize, side: &str) -> String {
+        crate::namespaces::operator_state(self.graph_id(), node_idx, side)
+            .unwrap_or_else(|_| format!("op_{}_{}_{}", self.graph_id(), node_idx, side))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -981,8 +995,14 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_aggregate(aggregate, upstream, append_only_input, task_events)
-                    .await?
+                self.compile_aggregate(
+                    node_idx,
+                    aggregate,
+                    upstream,
+                    append_only_input,
+                    task_events,
+                )
+                .await?
             }
             DbspNodeKind::TopN(topn) => {
                 let input_idx = first_input(node, "topn")?;
@@ -1000,7 +1020,8 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_topn(topn, upstream, task_events).await?
+                self.compile_topn(node_idx, topn, upstream, task_events)
+                    .await?
             }
             DbspNodeKind::Distinct(distinct) => {
                 let input_idx = first_input(node, "distinct")?;
@@ -1019,7 +1040,7 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_distinct(distinct, upstream, append_only_input, task_events)
+                self.compile_distinct(node_idx, distinct, upstream, append_only_input, task_events)
                     .await?
             }
             DbspNodeKind::WindowAggregate(window) => {
@@ -1039,8 +1060,14 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_window_aggregate(window, upstream, append_only_input, task_events)
-                    .await?
+                self.compile_window_aggregate(
+                    node_idx,
+                    window,
+                    upstream,
+                    append_only_input,
+                    task_events,
+                )
+                .await?
             }
             DbspNodeKind::Union(union) => {
                 let mut inputs = Vec::with_capacity(node.inputs.len());
@@ -1299,33 +1326,32 @@ struct TransientSourceRootMaterialization {
 struct TransientSourceTopNRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
-    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    receiver: TransientMaterializeReceiver,
     transform: Option<Arc<DeltaTransformFn>>,
 }
 
 struct TransientSourceAggregateRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
-    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    receiver: TransientMaterializeReceiver,
 }
 
 struct TransientSourceWindowCountStarRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
-    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    receiver: TransientMaterializeReceiver,
 }
 
 struct TransientSourceWindowAggregateRootMaterialization {
     source_name: String,
     optimized_nodes: Vec<usize>,
-    receiver: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    receiver: TransientMaterializeReceiver,
 }
 
 struct TransientJoinInputOptimization {
     source_name: String,
     optimized_nodes: Vec<usize>,
-    receiver:
-        tokio::sync::mpsc::UnboundedReceiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
+    receiver: tokio::sync::mpsc::Receiver<dbsp::join::TransientJoinInputBatch<Vec<u8>, Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -1562,6 +1588,7 @@ fn try_build_transient_join_input_optimization(
     outer_transient_streams: &HashMap<String, TransientSourceHandleStream>,
     closed_key_columns: Option<Arc<Vec<usize>>>,
     cancel: &CancellationToken,
+    task_events: &GraphTaskSender,
 ) -> Result<Option<TransientJoinInputOptimization>> {
     let Some(source_root) = try_build_transient_source_root_materialization(plan, input_idx)?
     else {
@@ -1575,9 +1602,11 @@ fn try_build_transient_join_input_optimization(
     };
 
     let mut upstream_rx = upstream.subscribe();
-    let (tx, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, receiver) =
+        tokio::sync::mpsc::channel(dbsp::join::TRANSIENT_JOIN_INPUT_CHANNEL_CAPACITY);
     let graph_id = graph_id.to_string();
     let input_label = format!("join_input:{input_idx}");
+    let task_events = task_events.clone();
     let source_name = source_root.source_name.clone();
     let optimized_nodes = source_root.optimized_nodes.clone();
     let transform = Arc::clone(&source_root.transform);
@@ -1603,9 +1632,15 @@ fn try_build_transient_join_input_optimization(
                                 source = %batch.source,
                                 version = batch.version,
                                 error = %err,
-                                "dropping transient join input batch after transform failure"
+                                "stopping transient join input after transform failure"
                             );
-                            continue;
+                            report_graph_task_error(
+                                &task_events,
+                                &graph_id,
+                                input_label.clone(),
+                                err,
+                            );
+                            break;
                         }
                     };
                         let join_ts = batch.version.saturating_add(1);
@@ -1619,30 +1654,36 @@ fn try_build_transient_join_input_optimization(
                                         source = %batch.source,
                                         version = batch.version,
                                         error = %err,
-                                        "dropping transient join closed-key batch after transform failure"
+                                        "stopping transient join input after closed-key transform failure"
                                     );
-                                    Vec::new()
+                                    report_graph_task_error(
+                                        &task_events,
+                                        &graph_id,
+                                        input_label.clone(),
+                                        err,
+                                    );
+                                    break;
                                 }
                             },
                             None => Vec::new(),
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-join-input graph_id={} input_idx={} source={} version={} join_ts={} rows={} closed_keys={}",
-                                graph_id,
+                            tracing::debug!(
+                                graph_id = %graph_id,
                                 input_idx,
-                                batch.source,
-                                batch.version,
+                                source = %batch.source,
+                                version = batch.version,
                                 join_ts,
-                                transformed.len(),
-                                closed_keys.len()
+                                rows = transformed.len(),
+                                closed_keys = closed_keys.len(),
+                                "transient join input"
                             );
                         }
                         if tx.send(dbsp::join::TransientJoinInputBatch {
                             ts: join_ts,
                             deltas: Arc::new(transformed),
                             closed_keys: Arc::new(closed_keys),
-                        }).is_err() {
+                        }).await.is_err() {
                         tracing::debug!(
                             graph_id = %graph_id,
                             input_idx,
@@ -2418,7 +2459,7 @@ async fn build_transient_aggregate_receiver(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+) -> Result<TransientMaterializeReceiver> {
     let state_label = state_label.into();
     let compact_source_state =
         should_compact_transient_helper_state(&upstream, state_table.as_ref());
@@ -2458,7 +2499,7 @@ async fn build_transient_aggregate_receiver(
 async fn build_transient_aggregate_receiver_from_batches(
     graph_id: &str,
     aggregate: &DbspAggregateNode,
-    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    mut upstream_rx: TransientMaterializeReceiver,
     output_transform: Arc<DeltaTransformFn>,
     append_only_input: bool,
     compact_source_state: bool,
@@ -2466,8 +2507,9 @@ async fn build_transient_aggregate_receiver_from_batches(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+) -> Result<TransientMaterializeReceiver> {
+    let (tx, rx) =
+        mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
     let (precompute_evaluator, aggregate_input_schema, aggregate_expression_columns) =
         build_transient_aggregate_precompute(aggregate)?;
     let graph_id = graph_id.to_string();
@@ -2586,18 +2628,18 @@ async fn build_transient_aggregate_receiver_from_batches(
                             }
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-aggregate-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                final_deltas.len()
+                            tracing::debug!(
+                                graph_id = %graph_id,
+                                version = batch.version,
+                                rows = final_deltas.len(),
+                                "transient aggregate output"
                             );
                         }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(final_deltas),
                             deltas_consolidated: false,
-                        }).is_err() {
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -2726,18 +2768,18 @@ async fn build_transient_aggregate_receiver_from_batches(
                             }
                         };
                         if debug_transient_join {
-                            eprintln!(
-                                "transient-aggregate-output graph_id={} version={} rows={}",
-                                graph_id,
-                                batch.version,
-                                final_deltas.len()
+                            tracing::debug!(
+                                graph_id = %graph_id,
+                                version = batch.version,
+                                rows = final_deltas.len(),
+                                "transient aggregate output"
                             );
                         }
                         if tx.send(TransientMaterializeBatch {
                             version: batch.version,
                             deltas: Arc::new(final_deltas),
                             deltas_consolidated: false,
-                        }).is_err() {
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -2761,7 +2803,7 @@ async fn build_transient_window_count_star_receiver(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+) -> Result<TransientMaterializeReceiver> {
     let state_label = state_label.into();
     let compact_count_state =
         should_compact_transient_helper_state(&upstream, state_table.as_ref());
@@ -2800,7 +2842,7 @@ async fn build_transient_window_count_star_receiver(
 async fn build_transient_window_count_star_receiver_from_batches(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
-    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    mut upstream_rx: TransientMaterializeReceiver,
     output_transform: Option<Arc<DeltaTransformFn>>,
     output_projection: Option<TransientWindowCountOutputProjection>,
     watermark: Arc<AtomicI64>,
@@ -2809,8 +2851,9 @@ async fn build_transient_window_count_star_receiver_from_batches(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+) -> Result<TransientMaterializeReceiver> {
+    let (tx, rx) =
+        mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
     let (precompute_evaluator, eval_schema, expression_columns) =
         build_transient_window_count_star_precompute(window)?;
     let group_key_columns = transient_window_direct_group_key_columns(
@@ -2966,7 +3009,7 @@ async fn build_transient_window_count_star_receiver_from_batches(
                         version: batch.version,
                         deltas: Arc::new(final_deltas),
                         deltas_consolidated: output_transform.is_none(),
-                    }).is_err() {
+                    }).await.is_err() {
                         break;
                     }
                 }
@@ -3093,7 +3136,7 @@ async fn build_transient_window_incremental_receiver(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
+) -> Result<TransientMaterializeReceiver> {
     let state_label = state_label.into();
     let compact_source_state =
         should_compact_transient_helper_state(&upstream, state_table.as_ref());
@@ -3131,7 +3174,7 @@ async fn build_transient_window_incremental_receiver(
 async fn build_transient_window_incremental_receiver_from_batches(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
-    mut upstream_rx: mpsc::UnboundedReceiver<TransientMaterializeBatch>,
+    mut upstream_rx: TransientMaterializeReceiver,
     output_transform: Arc<DeltaTransformFn>,
     watermark: Arc<AtomicI64>,
     compact_source_state: bool,
@@ -3139,8 +3182,9 @@ async fn build_transient_window_incremental_receiver_from_batches(
     task_events: &GraphTaskSender,
     state_table: Option<Arc<dyn KeyValueTable>>,
     state_label: impl Into<String>,
-) -> Result<mpsc::UnboundedReceiver<TransientMaterializeBatch>> {
-    let (tx, rx) = mpsc::unbounded_channel::<TransientMaterializeBatch>();
+) -> Result<TransientMaterializeReceiver> {
+    let (tx, rx) =
+        mpsc::channel::<TransientMaterializeBatch>(TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY);
     let (precompute_evaluator, eval_schema, expression_columns) =
         build_transient_window_aggregate_precompute(window)?;
     let group_key_columns = transient_window_direct_group_key_columns(
@@ -3414,7 +3458,7 @@ async fn build_transient_window_incremental_receiver_from_batches(
                         version: batch.version,
                         deltas: Arc::new(final_deltas),
                         deltas_consolidated: false,
-                    }).is_err() {
+                    }).await.is_err() {
                         break;
                     }
                 }

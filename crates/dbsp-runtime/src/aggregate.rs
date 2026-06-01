@@ -69,6 +69,46 @@ impl DbspAggregate {
         A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FKey: Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync + 'static,
     {
+        Self::new_batch_with_state_namespace(input, None, key_extractor, spec, error_handler).await
+    }
+
+    pub async fn new_batch_with_state_namespace<K, V, A, FKey>(
+        input: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        key_extractor: FKey,
+        spec: AggregateSpec<K, V, A>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        A: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FKey: Fn(&[(V, i64)]) -> Vec<(K, V, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -79,8 +119,16 @@ impl DbspAggregate {
             version: 0,
         };
 
-        let state =
-            RelationState::empty(table.clone(), format!("aggregate_state_{aggregate_id}")).await?;
+        let state = match state_namespace {
+            Some(namespace) => RelationState::empty(table.clone(), namespace).await?,
+            None => {
+                RelationState::empty_uncheckpointed(
+                    table.clone(),
+                    format!("aggregate_state_{aggregate_id}"),
+                )
+                .await?
+            }
+        };
         let output_dict = Arc::new(
             Dictionary::<(K, A)>::with_table(table.clone(), output_ns.clone(), None)
                 .await

@@ -670,6 +670,61 @@ impl DbspSessionWindowAggregate {
         FWindow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
         FAgg: Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync + 'static,
     {
+        Self::new_batch_with_state_namespace(
+            input,
+            None,
+            row_extractor,
+            aggregator,
+            gap_ms,
+            allowed_lateness_ms,
+            watermark,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_batch_with_state_namespace<K, V, A, FWindow, FAgg>(
+        input: &DeltaHandleStream,
+        state_namespace: Option<String>,
+        row_extractor: FWindow,
+        aggregator: FAgg,
+        gap_ms: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        A: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FWindow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
+        FAgg: Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync + 'static,
+    {
         ensure!(gap_ms > 0, "session gap must be positive");
         ensure!(
             allowed_lateness_ms >= 0,
@@ -686,11 +741,18 @@ impl DbspSessionWindowAggregate {
             version: 0,
         };
 
-        let state = RelationState::<(WindowKey<K>, A)>::empty(
-            table.clone(),
-            format!("session_window_agg_state_{aggregate_id}"),
-        )
-        .await?;
+        let state = match state_namespace {
+            Some(namespace) => {
+                RelationState::<(WindowKey<K>, A)>::empty(table.clone(), namespace).await?
+            }
+            None => {
+                RelationState::<(WindowKey<K>, A)>::empty_uncheckpointed(
+                    table.clone(),
+                    format!("session_window_agg_state_{aggregate_id}"),
+                )
+                .await?
+            }
+        };
         let output_dict = Arc::new(
             Dictionary::<(WindowKey<K>, A)>::with_table(table.clone(), output_ns.clone(), None)
                 .await

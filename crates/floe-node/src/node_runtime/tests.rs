@@ -1308,17 +1308,6 @@ async fn postgres_cdc_runtime_plan_rejects_unbound_include_table() {
 }
 
 #[test]
-fn lookup_decoder_for_source_rejects_unknown_source() {
-    let decoders: HashMap<String, SourceRowDecoder> = HashMap::new();
-    let err = lookup_decoder_for_source(&decoders, "missing_source")
-        .expect_err("unknown source should fail");
-    assert!(
-        err.to_string()
-            .contains("received event for unknown source 'missing_source'")
-    );
-}
-
-#[test]
 fn build_postgres_cdc_commit_orders_slots() {
     let mut slots = HashMap::new();
     slots.insert("z_slot".to_string(), (10_u64, "0/0000000A".to_string()));
