@@ -25,6 +25,7 @@ struct TestKey {
 struct CountingTable {
     inner: Arc<dyn KeyValueTable>,
     get_bytes_calls: AtomicUsize,
+    scan_range_calls: AtomicUsize,
 }
 
 impl CountingTable {
@@ -32,15 +33,21 @@ impl CountingTable {
         Self {
             inner,
             get_bytes_calls: AtomicUsize::new(0),
+            scan_range_calls: AtomicUsize::new(0),
         }
     }
 
     fn reset_get_bytes_calls(&self) {
         self.get_bytes_calls.store(0, Ordering::Relaxed);
+        self.scan_range_calls.store(0, Ordering::Relaxed);
     }
 
     fn get_bytes_calls(&self) -> usize {
         self.get_bytes_calls.load(Ordering::Relaxed)
+    }
+
+    fn scan_range_calls(&self) -> usize {
+        self.scan_range_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -60,6 +67,7 @@ impl KeyValueTable for CountingTable {
         range: Range<Vec<u8>>,
         options: &ScanOptions,
     ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan_range_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.scan_range_bytes(range, options).await
     }
 }
@@ -283,6 +291,55 @@ async fn interns_owned_unique_batch_without_cloning_keys() {
         .map(|entry| entry.value)
         .collect::<Vec<_>>();
     assert_eq!(resolved_values, vec!["alpha", "beta", "gamma"]);
+}
+
+#[tokio::test]
+async fn resolve_many_uses_one_range_scan_for_adjacent_ids() {
+    let table = build_table().await;
+    let seed = Dictionary::<TestKey>::with_table(table.clone(), "resolve_adjacent", None)
+        .await
+        .expect("build dictionary");
+    let ids = seed
+        .intern_many_values_unique_owned(vec![
+            TestKey {
+                value: "a".to_string(),
+            },
+            TestKey {
+                value: "b".to_string(),
+            },
+        ])
+        .await
+        .expect("intern adjacent ids");
+    drop(seed);
+
+    let counting = Arc::new(CountingTable::new(table));
+    let dict = Dictionary::<TestKey>::with_table(
+        counting.clone() as Arc<dyn KeyValueTable>,
+        "resolve_adjacent",
+        None,
+    )
+    .await
+    .expect("reopen dictionary");
+
+    counting.reset_get_bytes_calls();
+    let resolved = dict.resolve_many(&ids).await.expect("resolve ids");
+    assert_eq!(
+        resolved
+            .into_iter()
+            .map(|key| key.value)
+            .collect::<Vec<_>>(),
+        vec!["a", "b"],
+    );
+    assert_eq!(
+        counting.scan_range_calls(),
+        1,
+        "adjacent cold IDs should be resolved with one id2k range scan",
+    );
+    assert_eq!(
+        counting.get_bytes_calls(),
+        0,
+        "adjacent cold IDs should not issue per-ID point reads",
+    );
 }
 
 #[tokio::test]

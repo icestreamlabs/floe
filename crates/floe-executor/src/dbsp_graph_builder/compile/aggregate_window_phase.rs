@@ -232,10 +232,15 @@ impl DbspGraphBuilder {
             );
 
             let incremental_aggregate =
-                dbsp::DbspIncrementalAggregate::new_batch::<Vec<u8>, Vec<u8>, _>(
+                dbsp::DbspIncrementalAggregate::new_batch_with_append_only_input::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    _,
+                >(
                     &upstream,
                     row_evaluator,
                     slot_kinds,
+                    append_only_input,
                     Some(aggregate_error_handler),
                 )
                 .await
@@ -336,6 +341,7 @@ impl DbspGraphBuilder {
         &mut self,
         node: &DbspWindowAggregateNode,
         mut upstream: DeltaHandleStream,
+        append_only_input: bool,
         task_events: &GraphTaskSender,
     ) -> Result<DeltaHandleStream> {
         let aggregate = &node.aggregate;
@@ -604,7 +610,12 @@ impl DbspGraphBuilder {
                 "window aggregate",
             );
             let window_incremental_aggregate =
-                dbsp::DbspWindowIncrementalAggregate::new_batch::<Vec<u8>, Vec<u8>, _, _>(
+                dbsp::DbspWindowIncrementalAggregate::new_batch_with_append_only_input::<
+                    Vec<u8>,
+                    Vec<u8>,
+                    _,
+                    _,
+                >(
                     &upstream,
                     window_extractor,
                     row_evaluator,
@@ -613,6 +624,7 @@ impl DbspGraphBuilder {
                     window_slide,
                     allowed_lateness_ms,
                     watermark,
+                    append_only_input,
                     Some(Arc::clone(&window_error_handler)),
                 )
                 .await

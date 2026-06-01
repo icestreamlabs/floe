@@ -73,72 +73,166 @@ materialization can publish no-op logical versions.
 
 ### 2. Ordered Extrema/Top1 Indexes
 
-Status: pending.
+Status: implemented and validated in `codex/storage-cost-remediation`.
 
 Problem: min/max/top1-style deletion or repair can reload an entire affected
 group from an unordered key-group index.
 
-Target: store exact ordered per-group state keyed by `(group, aggregate_value,
-row_id)` or equivalent so next extrema/top1 lookup is a bounded seek rather than
-a full group scan.
+Implemented:
+
+- Persistent incremental MIN/MAX repair now uses an ordered range-only extrema
+  index keyed by `(group, slot, ordered_aggregate_value)`, with the original row
+  stored as the index value. This is enough to distinguish tied rows without
+  duplicating the full row bytes in the ordered key.
+- The extrema index uses range-only postings. It does not write point-lookup
+  postings that the extrema repair path never reads.
+- SQL partitioned `LIMIT 1` / `ROW_NUMBER() <= 1` plans now pass an ordered
+  key extractor into `DbspPartitionedTop1`, which maintains an ordered
+  range-only index per partition.
+- The no-ordered-index aggregate hot path still moves rows into the legacy
+  transient input index instead of cloning them. This protects source-batch
+  Nexmark paths that do not use the new persistent ordered extrema index.
 
 Proof target:
 
 - Before: `O(group_size)` index entries and segment values on affected extrema
   deletion.
-- After: `O(1)` or `O(log group_size + output_ties)` ordered reads, subject to
-  SlateDB seek/scan primitive support.
+- After: one bounded ordered range cursor over the first live ordered key,
+  reading the first posting group plus one boundary entry. Returned rows are
+  `O(output_ties)`.
+- Write-side replacement: optimized ordered repair paths write range-only
+  postings instead of both lookup and range postings. For persistent MIN/MAX,
+  this replaces the old unordered repair index on the retractable path; for
+  ordered Top1 it replaces the old unordered partition repair index.
+
+Validation:
+
+- `incremental_aggregate_extrema_delete_uses_ordered_index` proves deleting the
+  current extrema examines one replacement row rather than the whole group.
+- `partitioned_top1_ordered_index_bounds_delete_repair` proves deleting the
+  partition winner repairs from the ordered index without scanning the whole
+  partition.
+- `arrow_indexed_range_only_writes_no_lookup_postings` proves the range-only
+  index layout does not write unused point-lookup postings.
 
 ### 3. Native ASOF/Range Trace Access
 
-Status: pending.
+Status: partially implemented; one generic interval-stabbing gap remains.
 
 Problem: current range/asof decomposition can use broad right-side range scans
 and scan the left in-memory range cache for right-side changes.
 
-Target: implement native ordered trace access for ASOF/range workloads over
-`(join_key, timestamp)` or equivalent, so updates touch changed keys and affected
-timestamp neighborhoods.
+Implemented:
+
+- ASOF right keys are now encoded as `(join_key, descending timestamp)`.
+- ASOF left deltas use `RangeLookupMode::First`, so a left row reads only the
+  latest qualifying right row instead of materializing every prior right row in
+  the range.
+- Generic range joins still use the original `RangeLookupMode::All` path.
+  The mode branch is outside the hot loop so existing full-range joins keep the
+  old tight scan path.
 
 Proof target:
 
 - Before: right-side change can examine `O(left_state_size)` cached left ranges;
   left-side change can materialize all range postings for its interval.
-- After: right-side/left-side changes read only ordered trace neighborhoods plus
-  matching output rows.
+- After for ASOF left deltas: `O(first_live_right_key_posting_group + boundary)`
+  range-index entries plus the output ties for that timestamp.
+- Remaining gap: right-side changes still use the existing left range cache
+  scan. A fully generic fix needs a second interval index for left ranges; a
+  lower-bound-only index is not enough to prove fewer operations for arbitrary
+  intervals because it can still scan all intervals with `lower <= point`.
 
 ### 4. Range Index Cursor/Filter Layout
 
-Status: pending.
+Status: implemented and validated in `codex/storage-cost-remediation`.
 
 Problem: `IndexedBatchZSet::values_for_key_range` materializes all SlateDB range
 postings into a vector before loading segments.
 
-Target: expose storage access that supports ordered cursor reads, bounded scans,
-and block/key filters. Streaming alone is not sufficient unless callers can skip
-or stop before reading the whole range.
+Implemented:
+
+- `KeyValueTable::scan_range_bytes_until` allows a caller to stop a SlateDB
+  range scan as soon as the next posting group is outside the requested cursor
+  target.
+- `IndexedBatchZSet::first_values_for_key_range(_with_metrics)` uses that cursor
+  to return only the first live logical key in a range.
+- The full `values_for_key_range` decoder keeps its no-extra-allocation decode
+  path; the richer decoder that materializes the range-key bytes is used only by
+  bounded first-key lookups.
+- Range-only index writes are exposed for callers that only need range cursors
+  and never need point lookup by index key.
 
 Proof target:
 
 - Before: one range scan returning `O(range_postings)` entries and then segment
   loads for all referenced segments.
-- After: bounded cursor/filter reads where entries examined are proportional to
-  matching blocks/rows rather than the entire posting range.
+- After: first-key callers examine one posting group plus one boundary posting,
+  then load only the referenced segments for that first live key.
+
+Validation:
+
+- `arrow_indexed_first_range_lookup_stops_after_first_posting_group` proves a
+  first-key lookup reads two range entries in the fixture where the full range
+  reads four.
+- `arrow_indexed_range_scan_filters_keys` and
+  `arrow_indexed_range_scan_rejects_legacy_layout` cover the unchanged full
+  range path and legacy-layout guard.
 
 ### 5. Dictionary Round-Trip Reduction
 
-Status: pending.
+Status: implemented for adjacent cold ID resolution.
 
 Problem: versioned ZSet reads resolve dictionary IDs back to keys, adding point
 or range reads plus decompression on cold paths.
 
-Target: avoid global dictionary resolution where operator-private segments
-already carry enough encoded row data, or replace global resolution with a
-storage layout that proves fewer cold reads.
+Implemented:
+
+- `Dictionary::resolve_many` now switches to the existing range-scan resolver
+  for adjacent cold IDs at a threshold of two IDs rather than waiting for a large
+  batch. This targets the common ZSet segment read pattern where dictionary IDs
+  are close together.
 
 Proof target:
 
 - Before: `O(unique_key_ids)` dictionary resolution work per cold delta/version
   read, with point/range reads depending on ID locality.
-- After: fewer dictionary storage reads on the same cold path, with any byte-size
-  tradeoff explicitly accounted for.
+- After for adjacent IDs: one bounded ID range scan instead of one point read per
+  ID. The improvement is workload-conditional on ID locality, which is exactly
+  the cold segment pattern this path sees.
+
+Validation:
+
+- `resolve_many_uses_one_range_scan_for_adjacent_ids` proves two adjacent cold
+  IDs use one range scan and zero point reads.
+
+## Final Validation
+
+Focused commands:
+
+- `cargo check -p dbsp-runtime -p dbsp-storage -p floe-executor`
+- `cargo test -p dbsp-storage storage::dictionary::tests::`
+- `cargo test -p dbsp-runtime collections::arrow_indexed_batch_zset::tests::`
+- `cargo test -p dbsp-runtime operators::incremental_aggregate::tests::`
+- `cargo test -p dbsp-runtime operators::top1::tests::`
+- `cargo test -p dbsp-runtime operators::range_join::tests::`
+- `cargo test -p dbsp-planner asof`
+- `cargo test -p floe-executor --test dbsp_graph_builder asof`
+
+Same-condition Nexmark regression checks versus `fc07b6b`:
+
+| Query | Baseline run | Baseline result-ready | Current run | Current result-ready | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| q4 | `1780303342783` | 14.056s | `1780304094303` | 13.988s | no regression |
+| q6 | `1780303136932` | 7.171s | `1780304297449` | 7.170s | no regression |
+| q7 | `1780302385671` | 2.168s | `1780304279194` | 2.188s | within noise |
+| q9 | `1780303166404` | 6.819s | `1780304330458` | 6.846s | within noise |
+| q17 | `1780304580013` | 21.761s | `1780304538595` | 21.451s | no regression |
+| q18 | `1780303194557` | 4.772s | `1780304360169` | 4.785s | within noise |
+
+Additional current-branch correctness/performance sanity:
+
+- q13 run `1780302185014`: ok, result-ready 3.248s, exact 1,000,000
+  result rows.
+- q20 run `1780302224626`: ok, result-ready 2.627s, exact 100,000 result
+  rows.

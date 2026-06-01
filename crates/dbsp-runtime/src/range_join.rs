@@ -13,7 +13,7 @@ use crate::algebra::AbelianGroup;
 use crate::collections::RangeKey;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::ZSetHandle;
-use crate::operators::range_join::RangeJoinOp;
+use crate::operators::range_join::{RangeJoinOp, RangeLookupMode};
 use crate::relation_state::RelationState;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
@@ -94,6 +94,7 @@ impl DbspRangeJoin {
             right_key,
             predicate,
             projector,
+            RangeLookupMode::All,
             error_handler,
         )
         .await
@@ -108,6 +109,7 @@ impl DbspRangeJoin {
         right_key: RK,
         predicate: P,
         projector: F,
+        range_lookup_mode: RangeLookupMode,
         error_handler: Option<RuntimeErrorHandler>,
     ) -> Result<Self>
     where
@@ -192,7 +194,7 @@ impl DbspRangeJoin {
             .await
             .context("restore committed right range-join index")?;
 
-        let range_join_op = Arc::new(AsyncMutex::new(RangeJoinOp::new_batch(
+        let range_join_op = Arc::new(AsyncMutex::new(RangeJoinOp::new_batch_with_lookup_mode(
             left_state,
             right_state,
             right_index,
@@ -203,6 +205,7 @@ impl DbspRangeJoin {
             table.clone(),
             output,
             None,
+            range_lookup_mode,
         )));
         let empty_handle = ZSetHandle {
             ns: output_ns.clone(),

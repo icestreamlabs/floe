@@ -217,14 +217,30 @@ impl DbspGraphBuilder {
 
         if limit == 1 && offset == 0 && partitioned {
             let key_parts_for_top1 = Arc::clone(&key_parts);
+            let order_parts_for_top1 = Arc::clone(&key_parts);
             let key_parts_batch =
                 move |delta_values: &[(Vec<u8>, i64)]| key_parts_for_top1.extract(delta_values);
-            let top1 = dbsp::DbspPartitionedTop1::new_with_batch_key_extractor::<
+            let order_bytes_batch = move |delta_values: &[(Vec<u8>, i64)]| {
+                order_parts_for_top1
+                    .extract(delta_values)
+                    .into_iter()
+                    .map(|(row, weight, _, order)| {
+                        (row, weight, order.map(|order| order.ordered_bytes()))
+                    })
+                    .collect()
+            };
+            let top1 = dbsp::DbspPartitionedTop1::new_with_batch_key_and_order_extractor::<
                 Vec<u8>,
                 Vec<u8>,
                 TopNKey,
                 _,
-            >(&upstream, key_parts_batch, Some(error_handler))
+                _,
+            >(
+                &upstream,
+                key_parts_batch,
+                order_bytes_batch,
+                Some(error_handler),
+            )
             .await
             .context("initialize DBSP partitioned top1")?;
             let top1_stream = top1.stream();

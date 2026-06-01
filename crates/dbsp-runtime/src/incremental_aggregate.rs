@@ -117,6 +117,44 @@ impl DbspIncrementalAggregate {
         V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
         FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
     {
+        Self::new_batch_with_append_only_input(
+            input,
+            row_evaluator,
+            slot_kinds,
+            false,
+            error_handler,
+        )
+        .await
+    }
+
+    pub async fn new_batch_with_append_only_input<K, V, FRow>(
+        input: &DeltaHandleStream,
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FRow: Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync + 'static,
+    {
         let table = input.table();
         let frontier = input.current_time();
         let horizon = input.semantic_horizon();
@@ -144,6 +182,13 @@ impl DbspIncrementalAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for incremental aggregate")?;
+        let has_retractable_extrema = !append_only_input
+            && slot_kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
+                )
+            });
         let distinct_index = slot_kinds
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
@@ -154,31 +199,33 @@ impl DbspIncrementalAggregate {
                     DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
                 )
             });
-        let input_index = slot_kinds
-            .iter()
-            .any(|kind| {
-                matches!(
-                    kind,
-                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
-                )
-            })
-            .then(|| {
-                IndexedBatchZSet::with_hot_key_compaction_threshold(
-                    table.clone(),
-                    format!("incremental_aggregate_index_{aggregate_id}"),
-                    DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
-                )
-            });
+        let extrema_index = has_retractable_extrema.then(|| {
+            IndexedBatchZSet::with_range_index(
+                table.clone(),
+                format!("incremental_aggregate_extrema_{aggregate_id}"),
+            )
+        });
+        if let Some(index) = extrema_index.as_ref() {
+            index
+                .restore_committed_checkpoint()
+                .await
+                .context("restore committed incremental aggregate extrema index")?;
+        }
 
-        let aggregate_op = Arc::new(AsyncMutex::new(IncrementalAggregateOp::new_batch(
+        let mut op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
             Arc::new(row_evaluator) as BatchRowEvaluator<V, K>,
             output,
             slot_kinds,
             distinct_index,
-            input_index,
-        )));
+            None,
+            extrema_index,
+        );
+        if append_only_input {
+            op.enable_append_only_input();
+        }
+        let aggregate_op = Arc::new(AsyncMutex::new(op));
 
         let handle_group: Arc<dyn AbelianGroup<ZSetHandle>> = Arc::new(ZSetHandleGroup {
             default: empty_handle.clone(),
@@ -315,6 +362,12 @@ where
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns)
             .await
             .context("create output zset for transient incremental aggregate")?;
+        let has_extrema = slot_kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
+            )
+        });
         let distinct_index = slot_kinds
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
@@ -324,20 +377,12 @@ where
                     format!("transient_incremental_aggregate_distinct_{aggregate_id}"),
                 )
             });
-        let input_index = slot_kinds
-            .iter()
-            .any(|kind| {
-                matches!(
-                    kind,
-                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
-                )
-            })
-            .then(|| {
-                IndexedBatchZSet::new_replayable(
-                    table.clone(),
-                    format!("transient_incremental_aggregate_index_{aggregate_id}"),
-                )
-            });
+        let input_index = has_extrema.then(|| {
+            IndexedBatchZSet::new_replayable(
+                table.clone(),
+                format!("transient_incremental_aggregate_index_{aggregate_id}"),
+            )
+        });
 
         let mut op = IncrementalAggregateOp::new_batch(
             state,
@@ -347,6 +392,7 @@ where
             slot_kinds,
             distinct_index,
             input_index,
+            None,
         );
         op.enable_live_output_replayable();
 

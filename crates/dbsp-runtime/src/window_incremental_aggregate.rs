@@ -276,6 +276,64 @@ impl DbspWindowIncrementalAggregate {
             + Sync
             + 'static,
     {
+        Self::new_batch_with_append_only_input(
+            input,
+            window_extractor,
+            row_evaluator,
+            slot_kinds,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+            false,
+            error_handler,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_batch_with_append_only_input<K, V, FWindow, FRow>(
+        input: &DeltaHandleStream,
+        window_extractor: FWindow,
+        row_evaluator: FRow,
+        slot_kinds: Vec<IncrementalAggregateSlotKind>,
+        window_size: i64,
+        window_slide: i64,
+        allowed_lateness_ms: i64,
+        watermark: Arc<AtomicI64>,
+        append_only_input: bool,
+        error_handler: Option<RuntimeErrorHandler>,
+    ) -> anyhow::Result<Self>
+    where
+        K: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        V: Archive
+            + Clone
+            + Eq
+            + Hash
+            + Send
+            + Sync
+            + 'static
+            + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+        V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+        FWindow: Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync + 'static,
+        FRow: Fn(
+                &[(WindowIncrementalInput<K, V>, i64)],
+            ) -> Vec<(
+                WindowIncrementalInput<K, V>,
+                IncrementalAggregateRow<WindowKey<K>>,
+                i64,
+            )> + Send
+            + Sync
+            + 'static,
+    {
         ensure!(window_size > 0, "window size must be positive");
         ensure!(window_slide > 0, "window slide must be positive");
         ensure!(
@@ -314,6 +372,13 @@ impl DbspWindowIncrementalAggregate {
         let output = VersionedZSet::new(output_dict, table.clone(), output_ns.clone())
             .await
             .context("create output zset for window incremental aggregate")?;
+        let has_retractable_extrema = !append_only_input
+            && slot_kinds.iter().any(|kind| {
+                matches!(
+                    kind,
+                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
+                )
+            });
         let distinct_index = slot_kinds
             .iter()
             .any(|kind| matches!(kind, IncrementalAggregateSlotKind::CountDistinct))
@@ -324,31 +389,32 @@ impl DbspWindowIncrementalAggregate {
                     DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
                 )
             });
-        let input_index = slot_kinds
-            .iter()
-            .any(|kind| {
-                matches!(
-                    kind,
-                    IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
-                )
-            })
-            .then(|| {
-                IndexedBatchZSet::with_hot_key_compaction_threshold(
-                    table.clone(),
-                    format!("window_incremental_aggregate_index_{aggregate_id}"),
-                    DEFAULT_HOT_KEY_COMPACTION_THRESHOLD,
-                )
-            });
+        let extrema_index = has_retractable_extrema.then(|| {
+            IndexedBatchZSet::with_range_index(
+                table.clone(),
+                format!("window_incremental_aggregate_extrema_{aggregate_id}"),
+            )
+        });
+        if let Some(index) = extrema_index.as_ref() {
+            index
+                .restore_committed_checkpoint()
+                .await
+                .context("restore committed window incremental aggregate extrema index")?;
+        }
 
-        let aggregate_op = IncrementalAggregateOp::new_batch(
+        let mut aggregate_op = IncrementalAggregateOp::new_batch(
             state,
             table.clone(),
             Arc::new(row_evaluator) as BatchWindowRowEvaluator<K, V>,
             output,
             slot_kinds,
             distinct_index,
-            input_index,
+            None,
+            extrema_index,
         );
+        if append_only_input {
+            aggregate_op.enable_append_only_input();
+        }
         let window_op = Arc::new(AsyncMutex::new(WindowIncrementalAggregateOp {
             table: table.clone(),
             dict_cache: HashMap::new(),
@@ -629,6 +695,10 @@ mod tests {
                 table.clone(),
                 "window_incremental_input_index",
                 2,
+            )),
+            Some(IndexedBatchZSet::with_range_index(
+                table.clone(),
+                "window_incremental_extrema_index",
             )),
         );
         let mut op = WindowIncrementalAggregateOp {

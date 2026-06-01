@@ -31,6 +31,12 @@ type LeftRangeDeltas<L, K> = HashMap<L, (K, K, i64)>;
 type RightKeyedDeltas<R, K> = HashMap<K, HashMap<R, i64>>;
 type LeftRangeCache<L, K> = HashMap<L, (K, K, i64)>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RangeLookupMode {
+    All,
+    First,
+}
+
 /// Incremental half-open range join.
 ///
 /// Each left row maps to a range `[lower, upper)` over right keys. For each
@@ -90,6 +96,7 @@ where
     dict_cache_left: HashMap<String, Arc<Dictionary<L>>>,
     dict_cache_right: HashMap<String, Arc<Dictionary<R>>>,
     left_cache: Option<LeftRangeCache<L, K>>,
+    range_lookup_mode: RangeLookupMode,
     logical_work: metrics::LogicalWorkCollector,
 }
 
@@ -147,6 +154,35 @@ where
         output: VersionedZSet<O>,
         integrated: Option<RelationState<O>>,
     ) -> Self {
+        Self::new_batch_with_lookup_mode(
+            left_state,
+            right_state,
+            right_index,
+            left_range,
+            right_key,
+            predicate,
+            projector,
+            table,
+            output,
+            integrated,
+            RangeLookupMode::All,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_batch_with_lookup_mode(
+        left_state: RelationState<L>,
+        right_state: RelationState<R>,
+        right_index: IndexedBatchZSet<K, R>,
+        left_range: BatchLeftRangeExtractor<L, K>,
+        right_key: BatchRightKeyExtractor<R, K>,
+        predicate: RangeJoinPredicate<L, R>,
+        projector: RangeJoinProjector<L, R, O>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<O>,
+        integrated: Option<RelationState<O>>,
+        range_lookup_mode: RangeLookupMode,
+    ) -> Self {
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
             left_state,
@@ -162,6 +198,7 @@ where
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
             left_cache: None,
+            range_lookup_mode,
             logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
@@ -312,12 +349,44 @@ where
         output_deltas: &mut HashMap<O, i64>,
         work: &mut metrics::LogicalWorkSnapshot,
     ) -> Result<()> {
+        if self.range_lookup_mode == RangeLookupMode::All {
+            for (left, (lower, upper, left_weight)) in left_ranges {
+                let right_entries = self
+                    .right_index
+                    .values_for_key_range(lower, upper)
+                    .await
+                    .context("range lookup right index for range join")?;
+                work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
+                work.right_state_rows_examined = work
+                    .right_state_rows_examined
+                    .saturating_add(right_entries.len() as u64);
+                work.state_scan_rows = work
+                    .state_scan_rows
+                    .saturating_add(right_entries.len() as u64);
+                for (_, right, right_weight) in right_entries {
+                    if let Some((out, weight)) = Self::join_pair(
+                        &self.predicate,
+                        &self.projector,
+                        left,
+                        *left_weight,
+                        &right,
+                        right_weight,
+                    ) {
+                        Self::add_output(output_deltas, out, weight);
+                        work.join_output_rows = work.join_output_rows.saturating_add(1);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         for (left, (lower, upper, left_weight)) in left_ranges {
-            let right_entries = self
+            let (right_entries, lookup_metrics) = self
                 .right_index
-                .values_for_key_range(lower, upper)
+                .first_values_for_key_range_with_metrics(lower, upper)
                 .await
-                .context("range lookup right index for range join")?;
+                .context("first range lookup right index for range join")?;
+            work.add_lookup_metrics(lookup_metrics);
             work.state_lookup_keys = work.state_lookup_keys.saturating_add(1);
             work.right_state_rows_examined = work
                 .right_state_rows_examined

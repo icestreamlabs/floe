@@ -97,6 +97,30 @@ impl TopNKey {
             tie_breaker,
         }
     }
+
+    fn ordered_bytes(&self) -> dbsp::collections::OrderedBytes {
+        let mut out = Vec::new();
+        for (idx, spec) in self.specs.iter().enumerate() {
+            let value = self.values.get(idx).unwrap_or(&TopNValue::Null);
+            match value {
+                TopNValue::Null => {
+                    out.push(if spec.nulls_first { 0 } else { 1 });
+                }
+                other => {
+                    out.push(if spec.nulls_first { 1 } else { 0 });
+                    let mut value_bytes = topn_value_order_bytes(other);
+                    if !spec.ascending {
+                        for byte in &mut value_bytes {
+                            *byte = !*byte;
+                        }
+                    }
+                    out.extend_from_slice(&value_bytes);
+                }
+            }
+        }
+        append_memcomparable_bytes(&self.tie_breaker, &mut out);
+        dbsp::collections::OrderedBytes::new(out)
+    }
 }
 
 impl Ord for TopNKey {
@@ -144,6 +168,33 @@ impl PartialOrd for TopNKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+fn topn_value_order_bytes(value: &TopNValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    match value {
+        TopNValue::Null => {}
+        TopNValue::Int64(value) | TopNValue::Timestamp(value) => {
+            let shifted = (*value as u64) ^ 0x8000_0000_0000_0000;
+            out.extend_from_slice(&shifted.to_be_bytes());
+        }
+        TopNValue::Utf8(value) => append_memcomparable_bytes(value.as_bytes(), &mut out),
+        TopNValue::Bool(value) => out.push(u8::from(*value)),
+    }
+    out
+}
+
+fn append_memcomparable_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    for &byte in bytes {
+        if byte == 0 {
+            out.push(0);
+            out.push(0xFF);
+        } else {
+            out.push(byte);
+        }
+    }
+    out.push(0);
+    out.push(0);
 }
 
 mod aggregate_window_phase;

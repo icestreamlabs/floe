@@ -1024,6 +1024,7 @@ impl DbspGraphBuilder {
             }
             DbspNodeKind::WindowAggregate(window) => {
                 let input_idx = first_input(node, "window aggregate")?;
+                let append_only_input = plan_node_output_append_only(plan, input_idx)?;
                 let upstream = self
                     .compile_node(
                         plan,
@@ -1038,7 +1039,7 @@ impl DbspGraphBuilder {
                         persistence_policy,
                     )
                     .await?;
-                self.compile_window_aggregate(window, upstream, task_events)
+                self.compile_window_aggregate(window, upstream, append_only_input, task_events)
                     .await?
             }
             DbspNodeKind::Union(union) => {

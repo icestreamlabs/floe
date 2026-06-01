@@ -73,7 +73,7 @@ pub use operators::incremental_aggregate::{
     IncrementalAggregateSlotState, IncrementalAggregateSlotUpdate,
 };
 pub use operators::join::{JoinInputRetention, JoinOp};
-pub use operators::range_join::RangeJoinOp;
+pub use operators::range_join::{RangeJoinOp, RangeLookupMode};
 pub use operators::top1::PartitionedTop1Op;
 pub use operators::topn::TopNOp;
 pub use operators::window::WindowKey;

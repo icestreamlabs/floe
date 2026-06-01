@@ -26,6 +26,26 @@ pub trait KeyValueTable: Send + Sync {
         options: &ScanOptions,
     ) -> Result<Vec<(Bytes, Bytes)>>;
 
+    async fn scan_range_bytes_until(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        should_continue_after_entry: &mut (
+                 dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<bool> + Send
+             ),
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let entries = self.scan_range_bytes(range, options).await?;
+        let mut output = Vec::new();
+        for (key, value) in entries {
+            let should_continue = should_continue_after_entry(key.as_ref(), value.as_ref())?;
+            output.push((key, value));
+            if !should_continue {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_bytes(key)
             .await
@@ -141,6 +161,31 @@ impl KeyValueTable for SlateTable {
         let mut entries = Vec::new();
         while let Some(kv) = iter.next().await.map_err(map_slate_err)? {
             entries.push((kv.key, kv.value));
+        }
+        Ok(entries)
+    }
+
+    async fn scan_range_bytes_until(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        should_continue_after_entry: &mut (
+                 dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<bool> + Send
+             ),
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut iter = self
+            .db
+            .scan_with_options(range, options)
+            .await
+            .map_err(map_slate_err)?;
+
+        let mut entries = Vec::new();
+        while let Some(kv) = iter.next().await.map_err(map_slate_err)? {
+            let should_continue = should_continue_after_entry(kv.key.as_ref(), kv.value.as_ref())?;
+            entries.push((kv.key, kv.value));
+            if !should_continue {
+                break;
+            }
         }
         Ok(entries)
     }

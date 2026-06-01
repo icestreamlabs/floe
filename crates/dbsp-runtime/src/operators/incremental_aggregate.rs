@@ -11,14 +11,14 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
+use crate::collections::{IndexedBatchZSet, OrderedBytes};
 use crate::handles::ZSetHandle;
 use crate::metrics;
 use crate::relation_state::RelationState;
 use crate::storage::KeyValueTable;
 use crate::storage::dictionary::Dictionary;
-use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
+use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
@@ -289,6 +289,59 @@ fn checked_add_i64_sum(left: i64, right: i128) -> Result<i64> {
         .ok_or_else(|| anyhow::anyhow!("incremental Int64 SUM overflow"))
 }
 
+fn aggregate_value_order_bytes(value: &AggregateValue, descending: bool) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match value {
+        AggregateValue::Null(_) => return None,
+        AggregateValue::Int64(value) | AggregateValue::TimestampMillis(value) => {
+            let shifted = (*value as u64) ^ 0x8000_0000_0000_0000;
+            out.extend_from_slice(&shifted.to_be_bytes());
+        }
+        AggregateValue::Utf8(value) => {
+            append_memcomparable_bytes(value.as_bytes(), &mut out);
+        }
+        AggregateValue::DateDays(value) => {
+            let shifted = (*value as u32) ^ 0x8000_0000;
+            out.extend_from_slice(&shifted.to_be_bytes());
+        }
+        AggregateValue::Decimal128(value) => {
+            let shifted = (*value as u128) ^ (1_u128 << 127);
+            out.extend_from_slice(&shifted.to_be_bytes());
+        }
+    }
+    if descending {
+        for byte in &mut out {
+            *byte = !*byte;
+        }
+    }
+    Some(out)
+}
+
+fn append_memcomparable_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    for &byte in bytes {
+        if byte == 0 {
+            out.push(0);
+            out.push(0xFF);
+        } else {
+            out.push(byte);
+        }
+    }
+    out.push(0);
+    out.push(0);
+}
+
+fn bytes_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut next = prefix.to_vec();
+    while let Some(byte) = next.last_mut() {
+        if *byte != 0xFF {
+            *byte += 1;
+            return Some(next);
+        }
+        next.pop();
+    }
+    None
+}
+
 type BatchRowEvaluator<V, K> =
     Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, IncrementalAggregateRow<K>, i64)> + Send + Sync>;
 
@@ -322,6 +375,7 @@ where
     slot_kinds: Vec<IncrementalAggregateSlotKind>,
     distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
     input_index: Option<IndexedBatchZSet<K, V>>,
+    extrema_index: Option<IndexedBatchZSet<OrderedBytes, V>>,
     append_only_input: bool,
     logical_work: metrics::LogicalWorkCollector,
 }
@@ -355,6 +409,7 @@ where
         slot_kinds: Vec<IncrementalAggregateSlotKind>,
         distinct_index: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
         input_index: Option<IndexedBatchZSet<K, V>>,
+        extrema_index: Option<IndexedBatchZSet<OrderedBytes, V>>,
     ) -> Self {
         Self {
             state,
@@ -366,6 +421,7 @@ where
             slot_kinds,
             distinct_index,
             input_index,
+            extrema_index,
             append_only_input: false,
             logical_work: metrics::LogicalWorkCollector::default(),
         }
@@ -489,6 +545,123 @@ where
             .apply_deltas(entries)
             .await
             .context("restore incremental aggregate input index")
+    }
+
+    fn extrema_index_key(
+        &self,
+        group_key: &K,
+        slot_idx: usize,
+        aggregate_value: &AggregateValue,
+        descending: bool,
+    ) -> Result<Option<OrderedBytes>> {
+        let Some(value_bytes) = aggregate_value_order_bytes(aggregate_value, descending) else {
+            return Ok(None);
+        };
+        let mut key = self.extrema_index_prefix(group_key, slot_idx)?;
+        key.extend_from_slice(&value_bytes);
+        Ok(Some(OrderedBytes::new(key)))
+    }
+
+    fn extrema_index_prefix(&self, group_key: &K, slot_idx: usize) -> Result<Vec<u8>> {
+        let slot_idx = u32::try_from(slot_idx)
+            .context("incremental aggregate extrema slot index exceeds u32")?;
+        let group_bytes = encoding::encode(group_key)
+            .context("encode incremental aggregate extrema group key")?;
+        let mut prefix = Vec::with_capacity(group_bytes.len() + 8);
+        append_memcomparable_bytes(&group_bytes, &mut prefix);
+        prefix.extend_from_slice(&slot_idx.to_be_bytes());
+        Ok(prefix)
+    }
+
+    async fn refresh_extrema_slots_from_index(
+        &self,
+        key: &K,
+        state: &mut GroupedIncrementalAggregateState,
+        mut logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
+    ) -> Result<()> {
+        for (slot_idx, slot_kind) in self.slot_kinds.iter().enumerate() {
+            let is_extrema = matches!(
+                slot_kind,
+                IncrementalAggregateSlotKind::Min(_) | IncrementalAggregateSlotKind::Max(_)
+            );
+            if !is_extrema {
+                continue;
+            }
+            let current = self
+                .lookup_extrema_slot_from_index(key, slot_idx, logical_work.as_deref_mut())
+                .await?;
+            match (&mut state.slots[slot_idx], slot_kind) {
+                (
+                    IncrementalAggregateSlotState::Min {
+                        current: slot_current,
+                    },
+                    IncrementalAggregateSlotKind::Min(_),
+                )
+                | (
+                    IncrementalAggregateSlotState::Max {
+                        current: slot_current,
+                    },
+                    IncrementalAggregateSlotKind::Max(_),
+                ) => {
+                    *slot_current = current;
+                }
+                (state_slot, slot_kind) => {
+                    tracing::warn!(
+                        slot_idx,
+                        ?state_slot,
+                        ?slot_kind,
+                        "incremental aggregate extrema index refresh saw mismatched slot"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn lookup_extrema_slot_from_index(
+        &self,
+        key: &K,
+        slot_idx: usize,
+        logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
+    ) -> Result<Option<AggregateValue>> {
+        let extrema_index = self
+            .extrema_index
+            .as_ref()
+            .context("incremental aggregate extrema index missing")?;
+        let lower = self.extrema_index_prefix(key, slot_idx)?;
+        let Some(upper) = bytes_prefix_successor(&lower) else {
+            return Ok(None);
+        };
+        let (rows, lookup_metrics) = extrema_index
+            .first_values_for_key_range_with_metrics(
+                &OrderedBytes::new(lower),
+                &OrderedBytes::new(upper),
+            )
+            .await
+            .context("lookup incremental aggregate extrema slot")?;
+        if let Some(work) = logical_work {
+            work.add_lookup_metrics(lookup_metrics);
+            work.extrema_rebuild_rows = work.extrema_rebuild_rows.saturating_add(rows.len() as u64);
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let row_inputs = rows
+            .into_iter()
+            .filter_map(|(_, value, weight)| (weight > 0).then_some((value, weight)))
+            .collect::<Vec<_>>();
+        for (_value, row_update, weight) in (self.row_evaluator)(&row_inputs) {
+            if weight <= 0 {
+                continue;
+            }
+            if let Some(IncrementalAggregateSlotUpdate::Value(Some(value))) =
+                row_update.slots.get(slot_idx)
+            {
+                return Ok(Some(value.clone()));
+            }
+        }
+        Ok(None)
     }
 
     fn coalesce_deltas(&self, deltas: Vec<(V, i64)>) -> HashMap<V, i64> {
@@ -731,10 +904,13 @@ where
         let mut distinct_deltas: HashMap<(DistinctGroupKey<K>, AggregateValue), i64> =
             HashMap::new();
         let mut index_updates = Vec::new();
+        let mut extrema_index_updates = Vec::new();
+        let mut extrema_refresh_keys = HashSet::new();
         let slot_kinds = &self.slot_kinds;
         let mut aggregated_updates_by_key: HashMap<K, AggregatedKeyUpdates> = HashMap::new();
 
         let has_extrema = self.has_extrema();
+        let use_ordered_extrema = self.extrema_index.is_some();
         let mut apply_value = |value: V,
                                row_update: IncrementalAggregateRow<K>,
                                weight: i64|
@@ -752,11 +928,31 @@ where
             }
             let key = row_update.key;
             let slots = row_update.slots;
-            if has_extrema && weight < 0 {
+            if has_extrema && weight < 0 && !use_ordered_extrema {
                 recompute_keys.insert(key.clone());
                 aggregated_updates_by_key.remove(&key);
             }
-            if self.input_index.is_some() {
+            if use_ordered_extrema {
+                if self.input_index.is_some() {
+                    index_updates.push((key.clone(), value.clone(), weight));
+                }
+                for (slot_idx, slot) in slots.iter().enumerate() {
+                    let descending = match self.slot_kinds[slot_idx] {
+                        IncrementalAggregateSlotKind::Min(_) => false,
+                        IncrementalAggregateSlotKind::Max(_) => true,
+                        _ => continue,
+                    };
+                    let IncrementalAggregateSlotUpdate::Value(Some(aggregate_value)) = slot else {
+                        continue;
+                    };
+                    if let Some(index_key) =
+                        self.extrema_index_key(&key, slot_idx, aggregate_value, descending)?
+                    {
+                        extrema_index_updates.push((index_key, value.clone(), weight));
+                        extrema_refresh_keys.insert(key.clone());
+                    }
+                }
+            } else if self.input_index.is_some() {
                 index_updates.push((key.clone(), value, weight));
             }
             for (slot_idx, slot) in slots.iter().enumerate() {
@@ -944,6 +1140,24 @@ where
                 "step",
                 "update_input_index",
                 input_index_start.elapsed().as_millis() as u64,
+            );
+        }
+        if let Some(extrema_index) = self.extrema_index.as_ref()
+            && !extrema_index_updates.is_empty()
+        {
+            let extrema_index_start = Instant::now();
+            if let Some(work) = logical_work.as_deref_mut() {
+                work.record_persisted_rows(extrema_index_updates.len());
+            }
+            extrema_index
+                .apply_deltas_with_range_only(extrema_index_updates)
+                .await
+                .context("update incremental aggregate extrema index")?;
+            metrics::observe_operator_phase_latency_ms(
+                "incremental_aggregate",
+                "step",
+                "update_extrema_index",
+                extrema_index_start.elapsed().as_millis() as u64,
             );
         }
 
@@ -1168,6 +1382,17 @@ where
                                 *count += *adjustment;
                             }
                         }
+                    }
+                    if use_ordered_extrema && extrema_refresh_keys.contains(&key) {
+                        self.refresh_extrema_slots_from_index(
+                            &key,
+                            &mut next,
+                            logical_work.as_deref_mut(),
+                        )
+                        .await
+                        .context(
+                            "refresh incremental aggregate extrema slots from ordered index",
+                        )?;
                     }
                     if next.is_present() { Some(next) } else { None }
                 };
@@ -1862,6 +2087,10 @@ mod tests {
                 table.clone(),
                 "incremental_aggregate_input_index".to_string(),
             )),
+            Some(IndexedBatchZSet::with_range_index(
+                table.clone(),
+                "incremental_aggregate_extrema_index".to_string(),
+            )),
         );
 
         let batch_one = stage_version(
@@ -1978,6 +2207,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_aggregate_extrema_delete_uses_ordered_index() {
+        let table = build_table("incremental-extrema-ordered-index").await;
+        let input_dict = Arc::new(
+            Dictionary::<AggregateRow>::with_table(
+                table.clone(),
+                "incremental_extrema_ordered_input".to_string(),
+                None,
+            )
+            .await
+            .expect("create input dictionary"),
+        );
+        let state = RelationState::<(i64, GroupedIncrementalAggregateState)>::empty(
+            table.clone(),
+            "incremental_extrema_ordered_state".to_string(),
+        )
+        .await
+        .expect("create incremental aggregate state");
+        let output_dict = Arc::new(
+            Dictionary::<(i64, Vec<AggregateValue>)>::with_table(
+                table.clone(),
+                "incremental_extrema_ordered_output".to_string(),
+                None,
+            )
+            .await
+            .expect("create output dictionary"),
+        );
+        let output = VersionedZSet::new(
+            output_dict,
+            table.clone(),
+            "incremental_extrema_ordered_output".to_string(),
+        )
+        .await
+        .expect("create output zset");
+
+        let mut op = IncrementalAggregateOp::new_batch(
+            state,
+            table.clone(),
+            incremental_batch_rows(|row: &AggregateRow| {
+                Some(IncrementalAggregateRow {
+                    key: row.group_key,
+                    slots: vec![
+                        IncrementalAggregateSlotUpdate::Count(1),
+                        IncrementalAggregateSlotUpdate::Value(row.price.map(AggregateValue::Int64)),
+                    ],
+                })
+            }),
+            output,
+            vec![
+                IncrementalAggregateSlotKind::Count,
+                IncrementalAggregateSlotKind::Min(AggregateValueType::Int64),
+            ],
+            None,
+            Some(IndexedBatchZSet::new(
+                table.clone(),
+                "incremental_extrema_ordered_input_index".to_string(),
+            )),
+            Some(IndexedBatchZSet::with_range_index(
+                table.clone(),
+                "incremental_extrema_ordered_extrema_index".to_string(),
+            )),
+        );
+
+        let seed = (0..100)
+            .map(|price| {
+                (
+                    AggregateRow {
+                        group_key: 1,
+                        price: Some(price),
+                        category: format!("c{price}"),
+                    },
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let batch_one = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "incremental_extrema_ordered_input",
+            &seed,
+        )
+        .await;
+        op.on_step(0, std::slice::from_ref(&batch_one))
+            .await
+            .expect("seed extrema aggregate");
+
+        let batch_two = stage_version(
+            input_dict,
+            table.clone(),
+            "incremental_extrema_ordered_input",
+            &[(
+                AggregateRow {
+                    group_key: 1,
+                    price: Some(0),
+                    category: "c0".to_string(),
+                },
+                -1,
+            )],
+        )
+        .await;
+        let out_two = op
+            .on_step(1, std::slice::from_ref(&batch_two))
+            .await
+            .expect("delete extrema row")
+            .expect("output handle");
+        let delta_two = materialize_zset_handle::<(i64, Vec<AggregateValue>)>(
+            table.clone(),
+            &mut HashMap::new(),
+            &out_two,
+        )
+        .await
+        .expect("materialize output");
+
+        assert_eq!(
+            delta_two.get(&(1, vec![AggregateValue::Int64(99), AggregateValue::Int64(1)])),
+            Some(&1)
+        );
+        assert_eq!(
+            op.last_logical_work().extrema_rebuild_rows,
+            1,
+            "ordered extrema refresh should examine only the next extrema row, not the whole group",
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_aggregate_tracks_decimal_sum_natively() {
         let table = build_table("incremental-decimal-sum").await;
         let input_dict = Arc::new(
@@ -2031,6 +2384,7 @@ mod tests {
                     scale: 2,
                 },
             )],
+            None,
             None,
             None,
         );
@@ -2163,6 +2517,7 @@ mod tests {
             vec![IncrementalAggregateSlotKind::CountDistinct],
             Some(distinct_index),
             None,
+            None,
         );
         op.enable_append_only_input();
 
@@ -2294,6 +2649,7 @@ mod tests {
             vec![IncrementalAggregateSlotKind::Count],
             None,
             None,
+            None,
         );
 
         let history = (0..history_rows)
@@ -2413,6 +2769,7 @@ mod tests {
                 table.clone(),
                 format!("incremental_count_distinct_history_{history_rows}_index"),
             )),
+            None,
             None,
         );
 

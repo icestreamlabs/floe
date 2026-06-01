@@ -1,10 +1,16 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use anyhow::Result;
+use async_trait::async_trait;
+use bytes::Bytes;
 use object_store::memory::InMemory;
 use slatedb::Db;
+use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
+use std::ops::Range;
 
-use crate::storage::SlateTable;
+use crate::storage::{KeyValueTable, SlateTable};
 
 use super::IndexedBatchZSet;
 
@@ -12,6 +18,74 @@ async fn build_table(namespace: &str) -> Arc<dyn crate::storage::KeyValueTable> 
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let db = Arc::new(Db::open(namespace, store).await.expect("open SlateDB"));
     Arc::new(SlateTable::new(db))
+}
+
+struct CountingTable {
+    inner: Arc<dyn KeyValueTable>,
+    scan_range_entries: AtomicUsize,
+    scan_until_entries: AtomicUsize,
+}
+
+impl CountingTable {
+    fn new(inner: Arc<dyn KeyValueTable>) -> Self {
+        Self {
+            inner,
+            scan_range_entries: AtomicUsize::new(0),
+            scan_until_entries: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.scan_range_entries.store(0, Ordering::Relaxed);
+        self.scan_until_entries.store(0, Ordering::Relaxed);
+    }
+
+    fn scan_range_entries(&self) -> usize {
+        self.scan_range_entries.load(Ordering::Relaxed)
+    }
+
+    fn scan_until_entries(&self) -> usize {
+        self.scan_until_entries.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl KeyValueTable for CountingTable {
+    async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get_bytes(key).await
+    }
+
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.inner.write_batch(batch).await
+    }
+
+    async fn scan_range_bytes(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let entries = self.inner.scan_range_bytes(range, options).await?;
+        self.scan_range_entries
+            .fetch_add(entries.len(), Ordering::Relaxed);
+        Ok(entries)
+    }
+
+    async fn scan_range_bytes_until(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        should_continue_after_entry: &mut (
+                 dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<bool> + Send
+             ),
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let entries = self
+            .inner
+            .scan_range_bytes_until(range, options, should_continue_after_entry)
+            .await?;
+        self.scan_until_entries
+            .fetch_add(entries.len(), Ordering::Relaxed);
+        Ok(entries)
+    }
 }
 
 #[tokio::test]
@@ -284,6 +358,73 @@ async fn arrow_indexed_range_scan_filters_keys() {
         .expect("range lookup");
     rows.sort_unstable();
     assert_eq!(rows, vec![(2, 20, 2), (3, 30, 3)]);
+}
+
+#[tokio::test]
+async fn arrow_indexed_range_only_writes_no_lookup_postings() {
+    let table = build_table("arrow-indexed-range-only").await;
+    let index =
+        IndexedBatchZSet::<i64, i64>::with_range_index(table.clone(), "arrow_indexed_range_only");
+    index
+        .apply_deltas_with_range_only(vec![(1, 10, 1), (2, 20, 1), (3, 30, 1)])
+        .await
+        .expect("apply range-only deltas");
+
+    let key_bytes = crate::storage::encoding::encode(&1_i64).expect("encode key");
+    let lookup_prefix = index
+        .index_prefix_for_key(&key_bytes)
+        .expect("build lookup postings prefix");
+    let lookup_entries = table
+        .scan_prefix(&lookup_prefix, &ScanOptions::default())
+        .await
+        .expect("scan lookup postings");
+    assert!(
+        lookup_entries.is_empty(),
+        "range-only index should not write point-lookup postings",
+    );
+
+    let mut rows = index
+        .values_for_key_range(&1, &3)
+        .await
+        .expect("range lookup");
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 10, 1), (2, 20, 1)]);
+}
+
+#[tokio::test]
+async fn arrow_indexed_first_range_lookup_stops_after_first_posting_group() {
+    let inner = build_table("arrow-indexed-first-range").await;
+    let counting = Arc::new(CountingTable::new(inner));
+    let table = counting.clone() as Arc<dyn KeyValueTable>;
+    let index = IndexedBatchZSet::<i64, i64>::with_range_index(table, "arrow_indexed_first_range");
+    index
+        .apply_deltas_with_range(vec![(1, 10, 1), (2, 20, 1), (3, 30, 1), (4, 40, 1)])
+        .await
+        .expect("apply deltas");
+
+    counting.reset();
+    let rows = index
+        .first_values_for_key_range(&1, &5)
+        .await
+        .expect("first range lookup");
+    assert_eq!(rows, vec![(1, 10, 1)]);
+    assert_eq!(
+        counting.scan_until_entries(),
+        2,
+        "first-key lookup should read the first posting group plus one boundary entry",
+    );
+
+    counting.reset();
+    let rows = index
+        .values_for_key_range(&1, &5)
+        .await
+        .expect("full range lookup");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        counting.scan_range_entries(),
+        4,
+        "full range lookup still materializes all postings in the requested range",
+    );
 }
 
 #[tokio::test]

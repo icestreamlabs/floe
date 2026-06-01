@@ -128,25 +128,21 @@ async fn strip_asof_precomputed_columns(
 fn asof_composite_key(prefix: &[u8], timestamp: i64) -> dbsp::collections::OrderedBytes {
     let mut encoded = Vec::with_capacity(prefix.len() + 8);
     encoded.extend_from_slice(prefix);
-    append_ordered_i64(timestamp, &mut encoded);
+    append_desc_ordered_i64(timestamp, &mut encoded);
     dbsp::collections::OrderedBytes::new(encoded)
 }
 
-fn asof_composite_upper_bound(prefix: &[u8], timestamp: i64) -> dbsp::collections::OrderedBytes {
+fn asof_composite_upper_bound(prefix: &[u8], _timestamp: i64) -> dbsp::collections::OrderedBytes {
     let mut encoded = Vec::with_capacity(prefix.len() + 9);
     encoded.extend_from_slice(prefix);
-    if timestamp == i64::MAX {
-        encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-        encoded.push(0xFF);
-    } else {
-        append_ordered_i64(timestamp + 1, &mut encoded);
-    }
+    encoded.extend_from_slice(&u64::MAX.to_be_bytes());
+    encoded.push(0xFF);
     dbsp::collections::OrderedBytes::new(encoded)
 }
 
-fn append_ordered_i64(value: i64, out: &mut Vec<u8>) {
+fn append_desc_ordered_i64(value: i64, out: &mut Vec<u8>) {
     let shifted = (value as u64) ^ 0x8000_0000_0000_0000;
-    out.extend_from_slice(&shifted.to_be_bytes());
+    out.extend_from_slice(&(!shifted).to_be_bytes());
 }
 
 fn asof_candidate_residual_schema(
@@ -363,7 +359,7 @@ impl DbspGraphBuilder {
                     continue;
                 };
                 out.push((
-                    asof_composite_key(&prefix, i64::MIN),
+                    asof_composite_key(&prefix, left_ts),
                     asof_composite_upper_bound(&prefix, left_ts),
                     row.clone(),
                     *weight,
@@ -441,6 +437,7 @@ impl DbspGraphBuilder {
             right_key,
             predicate,
             projector,
+            dbsp::RangeLookupMode::First,
             Some(range_error_handler),
         )
         .await
@@ -1006,6 +1003,7 @@ impl DbspGraphBuilder {
             right_key,
             predicate,
             projector,
+            dbsp::RangeLookupMode::All,
             Some(range_error_handler),
         )
         .await

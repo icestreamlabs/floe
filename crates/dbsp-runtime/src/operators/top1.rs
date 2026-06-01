@@ -10,8 +10,8 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
+use crate::collections::{IndexedBatchZSet, OrderedBytes};
 use crate::handles::ZSetHandle;
 use crate::metrics;
 use crate::storage::KeyValueTable;
@@ -22,6 +22,8 @@ use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch}
 
 type BatchKeyPartsFn<K, P, O> =
     Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<P>, Option<O>)> + Send + Sync>;
+type BatchOrderBytesFn<K> =
+    Arc<dyn Fn(&[(K, i64)]) -> Vec<(K, i64, Option<OrderedBytes>)> + Send + Sync>;
 
 /// Partition-local top-1 operator used for ROW_NUMBER() <= 1 style queries.
 ///
@@ -52,13 +54,16 @@ where
     O: Clone + Ord + Send + Sync + 'static,
 {
     pub input_index: IndexedBatchZSet<P, K>,
+    pub ordered_index: Option<IndexedBatchZSet<OrderedBytes, K>>,
     pub table: Arc<dyn KeyValueTable>,
     output: VersionedZSet<K>,
     dict_cache: HashMap<String, Arc<Dictionary<K>>>,
     partition_output_cache: BTreeMap<P, K>,
     partition_order_index: BTreeMap<P, BTreeMap<(O, K), i64>>,
     row_key_cache: HashMap<K, (Option<P>, Option<O>)>,
+    row_order_bytes_cache: HashMap<K, Option<OrderedBytes>>,
     key_parts: BatchKeyPartsFn<K, P, O>,
+    order_bytes: Option<BatchOrderBytesFn<K>>,
     logical_work: metrics::LogicalWorkCollector,
 }
 
@@ -92,15 +97,47 @@ where
         output: VersionedZSet<K>,
         key_parts: BatchKeyPartsFn<K, P, O>,
     ) -> Self {
+        Self::new_with_optional_order_index(input_index, None, table, output, key_parts, None)
+    }
+
+    pub fn new_with_batch_key_and_order_extractor(
+        input_index: IndexedBatchZSet<P, K>,
+        ordered_index: IndexedBatchZSet<OrderedBytes, K>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<K>,
+        key_parts: BatchKeyPartsFn<K, P, O>,
+        order_bytes: BatchOrderBytesFn<K>,
+    ) -> Self {
+        Self::new_with_optional_order_index(
+            input_index,
+            Some(ordered_index),
+            table,
+            output,
+            key_parts,
+            Some(order_bytes),
+        )
+    }
+
+    fn new_with_optional_order_index(
+        input_index: IndexedBatchZSet<P, K>,
+        ordered_index: Option<IndexedBatchZSet<OrderedBytes, K>>,
+        table: Arc<dyn KeyValueTable>,
+        output: VersionedZSet<K>,
+        key_parts: BatchKeyPartsFn<K, P, O>,
+        order_bytes: Option<BatchOrderBytesFn<K>>,
+    ) -> Self {
         Self {
             input_index,
+            ordered_index,
             table,
             output,
             dict_cache: HashMap::new(),
             partition_output_cache: BTreeMap::new(),
             partition_order_index: BTreeMap::new(),
             row_key_cache: HashMap::new(),
+            row_order_bytes_cache: HashMap::new(),
             key_parts,
+            order_bytes,
             logical_work: metrics::LogicalWorkCollector::default(),
         }
     }
@@ -143,6 +180,31 @@ where
         keyed
     }
 
+    fn order_bytes_for_delta_map(
+        &mut self,
+        rows: &HashMap<K, i64>,
+    ) -> HashMap<K, Option<OrderedBytes>> {
+        let Some(order_bytes) = self.order_bytes.as_ref() else {
+            return HashMap::new();
+        };
+
+        let mut missing = Vec::new();
+        let mut keyed = HashMap::new();
+        for (key, weight) in rows {
+            if let Some(cached) = self.row_order_bytes_cache.get(key) {
+                keyed.insert(key.clone(), cached.clone());
+            } else {
+                missing.push((key.clone(), *weight));
+            }
+        }
+        for (key, _, order_key) in order_bytes(&missing) {
+            self.row_order_bytes_cache
+                .insert(key.clone(), order_key.clone());
+            keyed.insert(key, order_key);
+        }
+        keyed
+    }
+
     #[cfg(test)]
     pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
         self.logical_work.last_tick()
@@ -154,6 +216,25 @@ where
         logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
     ) -> Result<()> {
         if self.partition_order_index.contains_key(partition_key) {
+            return Ok(());
+        }
+        if self.ordered_index.is_some() {
+            let top = self
+                .ordered_top_for_partition(partition_key, logical_work)
+                .await
+                .context("load top1 ordered partition winner")?;
+            let mut index = BTreeMap::new();
+            if let Some(row) = top {
+                self.partition_output_cache
+                    .insert(partition_key.clone(), row.clone());
+                if let (_, Some(order_key)) = self.keys_for(&row) {
+                    index.insert((order_key, row), 1);
+                }
+            } else {
+                self.partition_output_cache.remove(partition_key);
+            }
+            self.partition_order_index
+                .insert(partition_key.clone(), index);
             return Ok(());
         }
         let (values, lookup_metrics) = self
@@ -226,6 +307,57 @@ where
         self.partition_order_index
             .get(partition_key)
             .and_then(|index| index.keys().next().map(|(_, row)| row.clone()))
+    }
+
+    fn ordered_partition_prefix(&self, partition_key: &P) -> Result<Vec<u8>> {
+        let partition_bytes =
+            crate::storage::encoding::encode(partition_key).context("encode top1 partition key")?;
+        let mut prefix = Vec::new();
+        append_memcomparable_bytes(&partition_bytes, &mut prefix);
+        Ok(prefix)
+    }
+
+    fn ordered_index_key(
+        &self,
+        partition_key: &P,
+        order_bytes: &OrderedBytes,
+        row: &K,
+    ) -> Result<OrderedBytes> {
+        let mut key = self.ordered_partition_prefix(partition_key)?;
+        key.extend_from_slice(order_bytes.as_bytes());
+        let row_bytes = crate::storage::encoding::encode(row).context("encode top1 row key")?;
+        append_memcomparable_bytes(&row_bytes, &mut key);
+        Ok(OrderedBytes::new(key))
+    }
+
+    async fn ordered_top_for_partition(
+        &self,
+        partition_key: &P,
+        logical_work: Option<&mut metrics::LogicalWorkSnapshot>,
+    ) -> Result<Option<K>> {
+        let Some(ordered_index) = self.ordered_index.as_ref() else {
+            return Ok(None);
+        };
+        let lower = self.ordered_partition_prefix(partition_key)?;
+        let Some(upper) = bytes_prefix_successor(&lower) else {
+            return Ok(None);
+        };
+        let (rows, lookup_metrics) = ordered_index
+            .first_values_for_key_range_with_metrics(
+                &OrderedBytes::new(lower),
+                &OrderedBytes::new(upper),
+            )
+            .await
+            .context("lookup ordered top1 partition winner")?;
+        if let Some(work) = logical_work {
+            work.add_lookup_metrics(lookup_metrics);
+            work.partition_rows_examined = work
+                .partition_rows_examined
+                .saturating_add(rows.len() as u64);
+        }
+        Ok(rows
+            .into_iter()
+            .find_map(|(_, row, weight)| (weight > 0).then_some(row)))
     }
 
     async fn apply_deltas_to_versioned(
@@ -346,6 +478,7 @@ where
         let mut delta_map = HashMap::new();
         let mut affected_partitions = BTreeSet::new();
         let mut index_updates = Vec::new();
+        let mut ordered_updates = Vec::new();
         for (key, diff_weight) in delta_values.iter() {
             let entry = delta_map.entry(key.clone()).or_insert(0);
             *entry += *diff_weight;
@@ -358,11 +491,20 @@ where
             return Ok(Some(self.output.handle_for_version(0)));
         }
 
+        let order_bytes_by_key = self.order_bytes_for_delta_map(&delta_map);
         for (key, diff_weight, partition_key, _) in self.keys_for_delta_map(&delta_map) {
             let Some(partition_key) = partition_key else {
                 continue;
             };
             affected_partitions.insert(partition_key.clone());
+            if let Some(Some(order_bytes)) = order_bytes_by_key.get(&key)
+                && self.ordered_index.is_some()
+            {
+                let ordered_key = self
+                    .ordered_index_key(&partition_key, order_bytes, &key)
+                    .context("build top1 ordered index key")?;
+                ordered_updates.push((ordered_key, key.clone(), diff_weight));
+            }
             index_updates.push((partition_key, key, diff_weight));
         }
         if affected_partitions.is_empty() {
@@ -377,31 +519,56 @@ where
                 .context("seed top1 partition cache")?;
         }
 
-        let input_index_persist_start = std::time::Instant::now();
-        work.record_persisted_rows(index_updates.len());
-        self.input_index
-            .apply_deltas(index_updates.iter().cloned())
-            .await
-            .context("update top1 input index")?;
-        metrics::observe_operator_persistence_latency_ms(
-            "top1",
-            "input_index",
-            input_index_persist_start.elapsed().as_millis() as u64,
-        );
+        if self.ordered_index.is_none() {
+            let input_index_persist_start = std::time::Instant::now();
+            work.record_persisted_rows(index_updates.len());
+            self.input_index
+                .apply_deltas(index_updates.iter().cloned())
+                .await
+                .context("update top1 input index")?;
+            metrics::observe_operator_persistence_latency_ms(
+                "top1",
+                "input_index",
+                input_index_persist_start.elapsed().as_millis() as u64,
+            );
+        }
+        if let Some(ordered_index) = self.ordered_index.as_ref()
+            && !ordered_updates.is_empty()
+        {
+            let ordered_index_persist_start = std::time::Instant::now();
+            work.record_persisted_rows(ordered_updates.len());
+            ordered_index
+                .apply_deltas_with_range_only(ordered_updates)
+                .await
+                .context("update top1 ordered index")?;
+            metrics::observe_operator_persistence_latency_ms(
+                "top1",
+                "ordered_index",
+                ordered_index_persist_start.elapsed().as_millis() as u64,
+            );
+        }
 
-        for (partition_key, key, diff_weight) in &index_updates {
-            self.apply_partition_delta(partition_key, key, *diff_weight);
+        if self.ordered_index.is_none() {
+            for (partition_key, key, diff_weight) in &index_updates {
+                self.apply_partition_delta(partition_key, key, *diff_weight);
+            }
         }
 
         let mut output_delta = HashMap::new();
         for partition_key in affected_partitions {
             let old_top = self.partition_output_cache.get(&partition_key).cloned();
-            if let Some(partition_index) = self.partition_order_index.get(&partition_key) {
-                work.partition_rows_examined = work
-                    .partition_rows_examined
-                    .saturating_add(partition_index.len() as u64);
-            }
-            let new_top = self.cached_partition_top1(&partition_key);
+            let new_top = if self.ordered_index.is_some() {
+                self.ordered_top_for_partition(&partition_key, Some(&mut work))
+                    .await
+                    .context("refresh top1 winner from ordered index")?
+            } else {
+                if let Some(partition_index) = self.partition_order_index.get(&partition_key) {
+                    work.partition_rows_examined = work
+                        .partition_rows_examined
+                        .saturating_add(partition_index.len() as u64);
+                }
+                self.cached_partition_top1(&partition_key)
+            };
             if old_top == new_top {
                 continue;
             }
@@ -445,6 +612,31 @@ where
 
 fn bucket_for(id: u64) -> u16 {
     (id >> 48) as u16
+}
+
+fn append_memcomparable_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    for &byte in bytes {
+        if byte == 0 {
+            out.push(0);
+            out.push(0xFF);
+        } else {
+            out.push(byte);
+        }
+    }
+    out.push(0);
+    out.push(0);
+}
+
+fn bytes_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut next = prefix.to_vec();
+    while let Some(byte) = next.last_mut() {
+        if *byte != 0xFF {
+            *byte += 1;
+            return Some(next);
+        }
+        next.pop();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -604,6 +796,98 @@ mod tests {
         assert_eq!(rows.get(&11), Some(&-1));
         assert_eq!(rows.get(&12), Some(&1));
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn partitioned_top1_ordered_index_bounds_delete_repair() {
+        let table = build_table("partitioned-top1-ordered-index").await;
+        let input_dict = Arc::new(
+            Dictionary::<i64>::with_table(
+                table.clone(),
+                "input_top1_ordered_index".to_string(),
+                None,
+            )
+            .await
+            .expect("input dict"),
+        );
+        let output_dict = Arc::new(
+            Dictionary::<i64>::with_table(
+                table.clone(),
+                "output_top1_ordered_index".to_string(),
+                None,
+            )
+            .await
+            .expect("output dict"),
+        );
+        let output = VersionedZSet::new(
+            output_dict,
+            table.clone(),
+            "output_top1_ordered_index".to_string(),
+        )
+        .await
+        .expect("output zset");
+        let input_index = IndexedBatchZSet::new(table.clone(), "top1_ordered_input_index");
+        let ordered_index =
+            IndexedBatchZSet::with_range_index(table.clone(), "top1_ordered_repair_index");
+        let key_parts = Arc::new(|deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .map(|(key, weight)| (*key, *weight, Some(key / 100), Some(key % 100)))
+                .collect()
+        });
+        let order_bytes = Arc::new(|deltas: &[(i64, i64)]| {
+            deltas
+                .iter()
+                .map(|(key, weight)| {
+                    let order = (key % 100) as u64 ^ 0x8000_0000_0000_0000;
+                    (
+                        *key,
+                        *weight,
+                        Some(OrderedBytes::new(order.to_be_bytes().to_vec())),
+                    )
+                })
+                .collect()
+        });
+        let mut op = PartitionedTop1Op::new_with_batch_key_and_order_extractor(
+            input_index,
+            ordered_index,
+            table.clone(),
+            output,
+            key_parts,
+            order_bytes,
+        );
+
+        let seed = (100..200).map(|key| (key, 1)).collect::<Vec<_>>();
+        let first = stage_version(
+            input_dict.clone(),
+            table.clone(),
+            "input_top1_ordered_index",
+            &seed,
+        )
+        .await;
+        op.on_step(1, &[first]).await.expect("seed top1");
+
+        let second = stage_version(
+            input_dict,
+            table.clone(),
+            "input_top1_ordered_index",
+            &[(100, -1)],
+        )
+        .await;
+        let out = op
+            .on_step(2, &[second])
+            .await
+            .expect("delete current top")
+            .expect("output handle");
+        let rows = materialize_zset_handle::<i64>(table, &mut HashMap::new(), &out)
+            .await
+            .expect("materialize output");
+        assert_eq!(rows.get(&100), Some(&-1));
+        assert_eq!(rows.get(&101), Some(&1));
+        assert!(
+            op.last_logical_work().partition_rows_examined <= 2,
+            "ordered top1 repair should read old and new winners, not the whole partition"
+        );
     }
 
     async fn run_top1_history_probe(history_rows: i64) -> metrics::LogicalWorkSnapshot {

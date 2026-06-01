@@ -27,7 +27,7 @@ const K2ID_PREFIX: &[u8] = b"k2id/";
 const ID2K_PREFIX: &[u8] = b"id2k/";
 const META_NEXT_ID: &[u8] = b"meta/next_id";
 const RESOLVE_MANY_FETCH_CHUNK: usize = 256;
-const RESOLVE_MANY_RANGE_SCAN_MIN_IDS: usize = 512;
+const RESOLVE_MANY_RANGE_SCAN_MIN_IDS: usize = 2;
 
 enum LookupExistingResult {
     Existing(u64),

@@ -316,7 +316,31 @@ where
         if !self.range_enabled {
             return Err(anyhow!("range index not enabled"));
         }
-        self.apply_deltas_internal_with_range(deltas).await
+        self.apply_deltas_internal_with_range(deltas, true).await
+    }
+
+    pub async fn apply_deltas_with_range_only<I>(&self, deltas: I) -> Result<()>
+    where
+        K: RangeKey,
+        I: IntoIterator<Item = (K, V, i64)>,
+    {
+        self.apply_deltas_with_range_only_stats(deltas)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn apply_deltas_with_range_only_stats<I>(
+        &self,
+        deltas: I,
+    ) -> Result<ApplyDeltaMetrics>
+    where
+        K: RangeKey,
+        I: IntoIterator<Item = (K, V, i64)>,
+    {
+        if !self.range_enabled {
+            return Err(anyhow!("range index not enabled"));
+        }
+        self.apply_deltas_internal_with_range(deltas, false).await
     }
 
     async fn apply_deltas_internal<I>(&self, deltas: I) -> Result<ApplyDeltaMetrics>
@@ -443,7 +467,11 @@ where
         Ok(metrics)
     }
 
-    async fn apply_deltas_internal_with_range<I>(&self, deltas: I) -> Result<ApplyDeltaMetrics>
+    async fn apply_deltas_internal_with_range<I>(
+        &self,
+        deltas: I,
+        write_lookup_index: bool,
+    ) -> Result<ApplyDeltaMetrics>
     where
         K: RangeKey,
         I: IntoIterator<Item = (K, V, i64)>,
@@ -475,10 +503,12 @@ where
             let row_index = u32::try_from(encoded_rows.len())
                 .map_err(|_| anyhow!("row index overflow while indexing segment rows"))?;
 
-            key_postings
-                .entry(key_bytes.clone())
-                .or_default()
-                .push((row_index, delta));
+            if write_lookup_index {
+                key_postings
+                    .entry(key_bytes.clone())
+                    .or_default()
+                    .push((row_index, delta));
+            }
             range_postings
                 .entry((range_key_bytes, key_bytes.clone()))
                 .or_default()
@@ -490,8 +520,10 @@ where
                     .push((key_bytes.clone(), delta));
             }
 
-            let key_updates = touched_updates.entry(key_bytes.clone()).or_default();
-            *key_updates.entry(value_bytes.clone()).or_insert(0) += delta;
+            if write_lookup_index {
+                let key_updates = touched_updates.entry(key_bytes.clone()).or_default();
+                *key_updates.entry(value_bytes.clone()).or_insert(0) += delta;
+            }
 
             let key_hash = hash_bytes(&key_bytes);
             min_hash = min_hash.min(key_hash);
@@ -506,8 +538,10 @@ where
             return Ok(metrics);
         }
 
-        for updates in touched_updates.values_mut() {
-            updates.retain(|_, weight| *weight != 0);
+        if write_lookup_index {
+            for updates in touched_updates.values_mut() {
+                updates.retain(|_, weight| *weight != 0);
+            }
         }
 
         let batch = self.record_batch_from_rows(&encoded_rows)?;
@@ -524,7 +558,9 @@ where
             self.segment_sequence_key.clone(),
             segment_id.saturating_add(1).to_be_bytes(),
         );
-        write_batch.put(self.range_format_key.clone(), b"v2");
+        if write_lookup_index {
+            write_batch.put(self.range_format_key.clone(), b"v2");
+        }
 
         write_batch.put(
             self.segment_store.key_for_segment(segment_id),
@@ -570,7 +606,9 @@ where
                     .collect(),
             }),
         )?;
-        self.apply_lookup_cache_updates(&touched_updates)?;
+        if write_lookup_index {
+            self.apply_lookup_cache_updates(&touched_updates)?;
+        }
 
         metrics.coalesced_records = metrics.non_zero_input_records;
         metrics.persisted_records = encoded_rows.len();
@@ -808,6 +846,177 @@ where
         }
 
         Ok(output)
+    }
+
+    pub async fn first_values_for_key_range(&self, lower: &K, upper: &K) -> Result<Vec<(K, V, i64)>>
+    where
+        K: RangeKey,
+    {
+        self.first_values_for_key_range_with_metrics(lower, upper)
+            .await
+            .map(|(values, _)| values)
+    }
+
+    pub async fn first_values_for_key_range_with_metrics(
+        &self,
+        lower: &K,
+        upper: &K,
+    ) -> Result<(Vec<(K, V, i64)>, LookupMetrics)>
+    where
+        K: RangeKey,
+    {
+        if !self.range_enabled {
+            return Err(anyhow!("range index not enabled"));
+        }
+
+        let mut metrics = LookupMetrics {
+            lookup_keys: 1,
+            ..LookupMetrics::default()
+        };
+
+        let lower_bytes = lower.encode_range_key();
+        let upper_bytes = upper.encode_range_key();
+        if lower_bytes >= upper_bytes {
+            return Ok((Vec::new(), metrics));
+        }
+
+        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
+            let overlay_snapshot = self.overlay_snapshot_by_key()?;
+            let mut candidates = Vec::new();
+            for (key, overlay_values) in overlay_snapshot {
+                let range_key = key.encode_range_key();
+                if range_key < lower_bytes || range_key >= upper_bytes {
+                    continue;
+                }
+                let key_bytes = encode(&key).context("encode Arrow-index overlay range key")?;
+                candidates.push((range_key, key_bytes, key, overlay_values));
+            }
+            candidates
+                .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+            for (_, _, key, overlay_values) in candidates {
+                let output = overlay_values
+                    .into_iter()
+                    .filter_map(|(value, weight)| {
+                        (weight != 0).then_some((key.clone(), value, weight))
+                    })
+                    .collect::<Vec<_>>();
+                if !output.is_empty() {
+                    metrics.returned_rows = output.len();
+                    return Ok((output, metrics));
+                }
+            }
+            return Ok((Vec::new(), metrics));
+        }
+
+        self.ensure_range_layout()
+            .await
+            .context("validate Arrow-index range layout")?;
+
+        let full_range = self.range_bounds(&lower_bytes, &upper_bytes)?;
+        let range_end = full_range.end;
+        let mut scan_start = full_range.start;
+
+        while scan_start < range_end {
+            let mut first_group_prefix: Option<Vec<u8>> = None;
+            let mut first_key_bytes: Option<Vec<u8>> = None;
+            let mut should_continue = |entry_key: &[u8], _entry_value: &[u8]| -> Result<bool> {
+                let (range_key_bytes, key_bytes, _) = self
+                    .decode_range_components::<K>(entry_key)
+                    .context("decode Arrow-index range posting key")?;
+                let group_prefix = self
+                    .range_posting_prefix(&range_key_bytes, &key_bytes)
+                    .context("build Arrow-index range posting prefix")?;
+                if let Some(first_prefix) = &first_group_prefix {
+                    return Ok(&group_prefix == first_prefix);
+                }
+                first_key_bytes = Some(key_bytes);
+                first_group_prefix = Some(group_prefix);
+                Ok(true)
+            };
+            let entries = self
+                .table
+                .scan_range_bytes_until(
+                    scan_start.clone()..range_end.clone(),
+                    &ScanOptions::default(),
+                    &mut should_continue,
+                )
+                .await
+                .context("scan first Arrow-index range posting group")?;
+            let Some(group_prefix) = first_group_prefix else {
+                return Ok((Vec::new(), metrics));
+            };
+            let Some(key_bytes) = first_key_bytes else {
+                return Ok((Vec::new(), metrics));
+            };
+
+            let mut refs: FastMap<u64, SegmentPostings> = FastMap::default();
+            for (entry_key, entry_value) in entries {
+                let (range_key_bytes, candidate_key_bytes, segment_id) = self
+                    .decode_range_components::<K>(&entry_key)
+                    .context("decode Arrow-index range posting key")?;
+                let candidate_prefix = self
+                    .range_posting_prefix(&range_key_bytes, &candidate_key_bytes)
+                    .context("build Arrow-index range posting prefix")?;
+                if candidate_prefix != group_prefix {
+                    continue;
+                }
+                let postings = decode_index_postings(&entry_value)?;
+                metrics.index_segments_examined = metrics.index_segments_examined.saturating_add(1);
+                metrics.index_postings_examined = metrics
+                    .index_postings_examined
+                    .saturating_add(postings.len());
+                refs.entry(segment_id).or_default().extend(postings);
+            }
+
+            let mut aggregate: ValueWeightMap = FastMap::default();
+            for (segment_id, postings) in refs {
+                let segment = self
+                    .segment_for_id(segment_id)
+                    .await
+                    .with_context(|| format!("load cached Arrow-index segment {segment_id}"))?;
+                for (row_index, delta) in postings {
+                    let value_bytes = segment
+                        .value_bytes(row_index)
+                        .with_context(|| {
+                            format!("load row {row_index} from Arrow-index segment {segment_id}")
+                        })?
+                        .to_vec();
+                    let next = aggregate
+                        .get(&value_bytes)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(delta);
+                    if next == 0 {
+                        aggregate.remove(&value_bytes);
+                    } else {
+                        aggregate.insert(value_bytes, next);
+                    }
+                }
+            }
+
+            let values = self.decode_value_weights(aggregate)?;
+            if !values.is_empty() {
+                let key = decode::<K>(&key_bytes)
+                    .context("decode Arrow-index key for first range lookup rows")?;
+                let output = values
+                    .into_iter()
+                    .map(|(value, weight)| (key.clone(), value, weight))
+                    .collect::<Vec<_>>();
+                metrics.returned_rows = output.len();
+                return Ok((output, metrics));
+            }
+
+            let Some(next_start) = bytes_prefix_successor(&group_prefix) else {
+                return Ok((Vec::new(), metrics));
+            };
+            if next_start <= scan_start {
+                return Err(anyhow!("Arrow-index range cursor did not advance"));
+            }
+            scan_start = next_start;
+        }
+
+        Ok((Vec::new(), metrics))
     }
 
     pub async fn entries(&self) -> Result<Vec<(K, V, i64)>> {
@@ -1296,6 +1505,14 @@ where
         Ok(start..end)
     }
 
+    fn range_posting_prefix(&self, range_key_bytes: &[u8], key_bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut key = self.range_prefix.clone();
+        key.extend_from_slice(range_key_bytes);
+        key.extend_from_slice(&encode_len(key_bytes.len())?);
+        key.extend_from_slice(key_bytes);
+        Ok(key)
+    }
+
     fn decode_index_key(&self, key: &[u8]) -> Result<(Vec<u8>, u64)> {
         if !key.starts_with(&self.index_prefix) {
             return Err(anyhow!("Arrow-index key missing prefix"));
@@ -1390,6 +1607,73 @@ where
             key_bytes,
             u64::from_be_bytes(segment_bytes.try_into().unwrap()),
         ))
+    }
+
+    fn decode_range_components<T>(&self, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u64)>
+    where
+        T: RangeKey,
+    {
+        if !key.starts_with(&self.range_prefix) {
+            return Err(anyhow!("Arrow-index range key missing prefix"));
+        }
+        let mut cursor = self.range_prefix.len();
+        let range_len =
+            T::encoded_len(&key[cursor..]).context("decode Arrow-index range key length")?;
+        let range_end = cursor
+            .checked_add(range_len)
+            .ok_or_else(|| anyhow!("Arrow-index range key length overflow"))?;
+        let range_key_bytes = key
+            .get(cursor..range_end)
+            .ok_or_else(|| anyhow!("Arrow-index range key truncated"))?
+            .to_vec();
+        cursor = range_end;
+
+        let key_len = read_len(key, &mut cursor)?;
+        let key_end = cursor
+            .checked_add(key_len)
+            .ok_or_else(|| anyhow!("Arrow-index range payload length overflow"))?;
+        let key_bytes = key
+            .get(cursor..key_end)
+            .ok_or_else(|| anyhow!("Arrow-index range key payload truncated"))?
+            .to_vec();
+        cursor = key_end;
+
+        let segment_bytes = key
+            .get(cursor..cursor + 8)
+            .ok_or_else(|| anyhow!("Arrow-index range key missing segment id"))?;
+        cursor += 8;
+        if cursor != key.len() {
+            return Err(anyhow!("Arrow-index range key has trailing bytes"));
+        }
+
+        Ok((
+            range_key_bytes,
+            key_bytes,
+            u64::from_be_bytes(segment_bytes.try_into().unwrap()),
+        ))
+    }
+
+    async fn ensure_range_layout(&self) -> Result<()> {
+        let range_format = self
+            .table
+            .get_bytes(&self.range_format_key)
+            .await
+            .context("read Arrow-index range format marker")?;
+        if range_format.is_some() {
+            return Ok(());
+        }
+
+        let legacy_entries = self
+            .table
+            .scan_prefix(&self.index_prefix, &ScanOptions::default())
+            .await
+            .context("scan legacy Arrow-index key prefix for range compatibility")?;
+        if !legacy_entries.is_empty() {
+            return Err(anyhow!(
+                "range index namespace is on legacy layout; rebuild/replay is required"
+            ));
+        }
+        Ok(())
     }
 
     fn lookup_cache_for_key(&self, key_bytes: &[u8]) -> Result<Option<ValueWeightMap>> {
@@ -1698,6 +1982,18 @@ fn stable_namespace_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+fn bytes_prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut next = prefix.to_vec();
+    while let Some(byte) = next.last_mut() {
+        if *byte != 0xFF {
+            *byte += 1;
+            return Some(next);
+        }
+        next.pop();
+    }
+    None
 }
 
 fn encode_index_postings(postings: &[(u32, i64)]) -> Vec<u8> {
