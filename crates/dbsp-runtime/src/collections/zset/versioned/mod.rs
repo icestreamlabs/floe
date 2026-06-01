@@ -48,6 +48,12 @@ pub struct ZSetVersionManifest {
     pub reference_count: u64,
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy)]
+pub(crate) struct ZSetVersionState {
+    pub(crate) persisted_version: u64,
+    pub(crate) next_segment_id: SegmentId,
+}
+
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct VersionWritePlan {
@@ -79,6 +85,7 @@ where
     namespace: String,
     manifest_prefix: Vec<u8>,
     segment_prefix: Vec<u8>,
+    state_key: Vec<u8>,
     current_version: u64,
     persisted_version: u64,
     intent_key: Vec<u8>,

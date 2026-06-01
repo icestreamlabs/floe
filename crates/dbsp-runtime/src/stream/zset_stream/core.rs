@@ -703,7 +703,7 @@ fn version_write_key_count(plan: &VersionWritePlan) -> usize {
         .map(std::vec::Vec::len)
         .sum::<usize>()
         + usize::from(plan.manifest.base.is_some())
-        + 1
+        + 2
 }
 
 fn assert_flush_write_batch_bound(namespace: &str, has_overlay: bool, metrics: FlushWriteMetrics) {

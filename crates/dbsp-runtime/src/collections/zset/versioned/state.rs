@@ -109,6 +109,10 @@ where
         segment_prefix.extend_from_slice(namespace.as_bytes());
         segment_prefix.extend_from_slice(b"/seg_arrow/");
 
+        let mut state_key = ZSET_PREFIX.as_bytes().to_vec();
+        state_key.extend_from_slice(namespace.as_bytes());
+        state_key.extend_from_slice(b"/version_state/current");
+
         let mut intent_key = manifest_prefix.clone();
         intent_key.extend_from_slice(b"intent");
 
@@ -118,6 +122,7 @@ where
             namespace,
             manifest_prefix,
             segment_prefix,
+            state_key,
             current_version: 0,
             persisted_version: 0,
             intent_key,
@@ -221,6 +226,11 @@ where
     #[cfg(test)]
     pub(crate) fn intent_key_bytes(&self) -> &[u8] {
         &self.intent_key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state_key_bytes(&self) -> &[u8] {
+        &self.state_key
     }
 
     pub(crate) async fn adopt_persisted_version(&mut self, version: u64) -> Result<()> {

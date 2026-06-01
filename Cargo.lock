@@ -1863,6 +1863,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "dbsp-storage",
  "futures",
  "hashbrown 0.15.5",

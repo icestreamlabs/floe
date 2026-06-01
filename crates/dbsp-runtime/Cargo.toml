@@ -21,4 +21,5 @@ tracing = { workspace = true }
 prometheus = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 object_store = { workspace = true }

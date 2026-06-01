@@ -1,7 +1,11 @@
 use super::super::{SegmentRecord, VersionedZSet, h, prefix_bounds};
 use super::*;
+use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::handles::ZSetHandleView;
 use object_store::memory::InMemory;
@@ -10,6 +14,45 @@ use slatedb::WriteBatch;
 async fn build_db() -> Arc<Db> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     Arc::new(Db::open("test", store).await.expect("open SlateDB"))
+}
+
+#[derive(Clone)]
+struct CountingTable {
+    inner: Arc<dyn KeyValueTable>,
+    scan_range_calls: Arc<AtomicUsize>,
+}
+
+impl CountingTable {
+    fn new(inner: Arc<dyn KeyValueTable>) -> Self {
+        Self {
+            inner,
+            scan_range_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn scan_range_calls(&self) -> usize {
+        self.scan_range_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl KeyValueTable for CountingTable {
+    async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get_bytes(key).await
+    }
+
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.inner.write_batch(batch).await
+    }
+
+    async fn scan_range_bytes(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan_range_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.scan_range_bytes(range, options).await
+    }
 }
 
 #[tokio::test]
@@ -240,6 +283,198 @@ async fn versioned_zset_materializes_view() {
         .await
         .expect("materialize reopened view");
     assert_eq!(view.get("item"), Some(&7));
+}
+
+#[tokio::test]
+async fn versioned_zset_reopen_uses_state_metadata_without_manifest_scan() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "vz_state", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut versioned = VersionedZSet::new(dict.clone(), table.clone(), "vz_state".to_string())
+        .await
+        .expect("create versioned zset");
+
+    let first_id = dict
+        .intern(&"first".to_string())
+        .await
+        .expect("intern first");
+    versioned
+        .create_version(vec![SegmentRecord {
+            id: 1,
+            bucket: 0,
+            deltas: vec![(first_id, 1)],
+        }])
+        .await
+        .expect("create first version");
+
+    let second_id = dict
+        .intern(&"second".to_string())
+        .await
+        .expect("intern second");
+    versioned
+        .create_version(vec![SegmentRecord {
+            id: 2,
+            bucket: 0,
+            deltas: vec![(second_id, 2)],
+        }])
+        .await
+        .expect("create second version");
+
+    let counting = Arc::new(CountingTable::new(table.clone()));
+    let counted_table: Arc<dyn KeyValueTable> = counting.clone();
+    let reopened = VersionedZSet::new(dict.clone(), counted_table, "vz_state".to_string())
+        .await
+        .expect("reopen versioned zset");
+
+    assert_eq!(
+        counting.scan_range_calls(),
+        0,
+        "state metadata should avoid manifest-prefix scans on reopen"
+    );
+    let materialized = reopened.materialize().await.expect("materialize reopened");
+    assert_eq!(materialized.get("first"), Some(&1));
+    assert_eq!(materialized.get("second"), Some(&2));
+}
+
+#[tokio::test]
+async fn versioned_zset_missing_state_metadata_scans_once_and_repairs() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "vz_state_migrate", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut versioned =
+        VersionedZSet::new(dict.clone(), table.clone(), "vz_state_migrate".to_string())
+            .await
+            .expect("create versioned zset");
+    let id = dict
+        .intern(&"legacy".to_string())
+        .await
+        .expect("intern key");
+    versioned
+        .create_version(vec![SegmentRecord {
+            id: 1,
+            bucket: 0,
+            deltas: vec![(id, 11)],
+        }])
+        .await
+        .expect("create version");
+
+    let state_key = versioned.state_key_bytes().to_vec();
+    table
+        .delete(&state_key)
+        .await
+        .expect("delete state metadata to simulate legacy layout");
+
+    let counting = Arc::new(CountingTable::new(table.clone()));
+    let counted_table: Arc<dyn KeyValueTable> = counting.clone();
+    let reopened = VersionedZSet::new(dict.clone(), counted_table, "vz_state_migrate".to_string())
+        .await
+        .expect("reopen with missing state metadata");
+
+    assert_eq!(
+        counting.scan_range_calls(),
+        1,
+        "missing metadata should use one compatibility scan"
+    );
+    assert!(
+        table
+            .get(&state_key)
+            .await
+            .expect("get repaired state metadata")
+            .is_some(),
+        "compatibility scan should repair state metadata for future opens"
+    );
+    let materialized = reopened.materialize().await.expect("materialize reopened");
+    assert_eq!(materialized.get("legacy"), Some(&11));
+
+    let counting = Arc::new(CountingTable::new(table.clone()));
+    let counted_table: Arc<dyn KeyValueTable> = counting.clone();
+    VersionedZSet::new(dict, counted_table, "vz_state_migrate".to_string())
+        .await
+        .expect("reopen repaired state metadata");
+    assert_eq!(
+        counting.scan_range_calls(),
+        0,
+        "repaired metadata should avoid future manifest-prefix scans"
+    );
+}
+
+#[tokio::test]
+async fn versioned_zset_release_updates_state_without_manifest_scan() {
+    let db = build_db().await;
+    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
+    let dict = Arc::new(
+        Dictionary::with_table(table.clone(), "vz_state_release", None)
+            .await
+            .expect("build dictionary"),
+    );
+
+    let mut versioned =
+        VersionedZSet::new(dict.clone(), table.clone(), "vz_state_release".to_string())
+            .await
+            .expect("create versioned zset");
+    let base_id = dict.intern(&"base".to_string()).await.expect("intern base");
+    let base_version = versioned
+        .create_version(vec![SegmentRecord {
+            id: 1,
+            bucket: 0,
+            deltas: vec![(base_id, 5)],
+        }])
+        .await
+        .expect("create base version");
+    let child_id = dict
+        .intern(&"child".to_string())
+        .await
+        .expect("intern child");
+    let child_version = versioned
+        .create_version(vec![SegmentRecord {
+            id: 2,
+            bucket: 0,
+            deltas: vec![(child_id, 7)],
+        }])
+        .await
+        .expect("create child version");
+
+    let counting = Arc::new(CountingTable::new(table.clone()));
+    let counted_table: Arc<dyn KeyValueTable> = counting.clone();
+    let mut reopened =
+        VersionedZSet::new(dict.clone(), counted_table, "vz_state_release".to_string())
+            .await
+            .expect("reopen versioned zset");
+    assert_eq!(
+        counting.scan_range_calls(),
+        0,
+        "reopen should use version-state metadata"
+    );
+
+    reopened
+        .release_version(child_version)
+        .await
+        .expect("release current child version");
+    assert_eq!(
+        counting.scan_range_calls(),
+        0,
+        "release should update version-state metadata without refreshing by scan"
+    );
+    assert_eq!(
+        reopened
+            .current_handle()
+            .expect("base version should become current")
+            .version,
+        base_version
+    );
+    let materialized = reopened.materialize().await.expect("materialize base");
+    assert_eq!(materialized.get("base"), Some(&5));
+    assert_eq!(materialized.get("child"), None);
 }
 
 #[tokio::test]

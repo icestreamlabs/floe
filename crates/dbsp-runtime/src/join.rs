@@ -931,11 +931,17 @@ where
             span.record("right_version", right.version);
         }
     }
+    let emit_empty_progress = transient_inputs.is_some();
     let mut op_guard = op.lock().await;
-    if let Some(batch) = op_guard
+    let batch = op_guard
         .on_step_transient_with_inputs(ts, &handles, transient_inputs)
-        .await?
-    {
+        .await?;
+    let batch = match batch {
+        Some(batch) => Some(batch),
+        None if emit_empty_progress => Some(Arc::new(Vec::new())),
+        None => None,
+    };
+    if let Some(batch) = batch {
         let version = observer_version_override.unwrap_or_else(|| {
             let version = output_version
                 .fetch_add(1, Ordering::Relaxed)

@@ -24,7 +24,7 @@ use crate::stream::util::{publish_transient_zset_batch, transient_zset_batch};
 use super::super::prefix_bounds;
 use super::{
     SegmentId, SegmentRecord, VersionChainStats, VersionWritePlan, VersionedZSet,
-    ZSetVersionManifest,
+    ZSetVersionManifest, ZSetVersionState,
 };
 
 #[allow(dead_code)]
@@ -130,6 +130,7 @@ where
             .next_segment_id
             .max(highest_id.saturating_add(1))
             .max(1);
+        self.enqueue_version_state(next_version, self.next_segment_id, batch)?;
 
         Ok(VersionWritePlan {
             version: next_version,
@@ -420,7 +421,11 @@ where
         }
 
         let mut stack = vec![version];
-        let mut needs_refresh = false;
+        let mut batch = WriteBatch::new();
+        let mut touched = false;
+        let mut removed_persisted_head = false;
+        let mut replacement_head = None;
+        let mut updated_current_manifest = None;
 
         while let Some(current) = stack.pop() {
             if current == 0 {
@@ -434,32 +439,63 @@ where
 
             manifest.reference_count -= 1;
             if manifest.reference_count > 0 {
-                self.store_manifest(current, &manifest).await?;
-                needs_refresh = true;
+                let manifest_bytes = encode_manifest(&manifest)?;
+                batch.put(self.manifest_key(current), manifest_bytes);
+                touched = true;
+                if current == self.persisted_version {
+                    updated_current_manifest = Some(manifest.clone());
+                }
+                if removed_persisted_head {
+                    replacement_head = Some((current, manifest.clone()));
+                }
                 break;
             }
 
-            let mut batch = WriteBatch::new();
+            touched = true;
+            if current == self.persisted_version {
+                removed_persisted_head = true;
+            }
             for (bucket, segments) in &manifest.buckets {
                 for segment_id in segments {
                     batch.delete(self.segment_key(*bucket, *segment_id));
                 }
             }
             batch.delete(self.manifest_key(current));
-            self.table
-                .write_batch(batch)
-                .await
-                .context("remove manifest and segments")?;
 
             if let Some(base_version) = manifest.base {
                 stack.push(base_version);
             }
-
-            needs_refresh = true;
         }
 
-        if needs_refresh {
-            self.refresh_state().await?;
+        if !touched {
+            return Ok(());
+        }
+
+        if removed_persisted_head {
+            let replacement_version = replacement_head
+                .as_ref()
+                .map(|(version, _)| *version)
+                .unwrap_or(0);
+            self.enqueue_version_state(replacement_version, self.next_segment_id, &mut batch)?;
+        }
+
+        self.table
+            .write_batch(batch)
+            .await
+            .context("release versioned ZSet manifest")?;
+
+        if removed_persisted_head {
+            if let Some((version, manifest)) = replacement_head {
+                self.current_version = version;
+                self.persisted_version = version;
+                self.manifest = Some(manifest);
+            } else {
+                self.current_version = 0;
+                self.persisted_version = 0;
+                self.manifest = None;
+            }
+        } else if let Some(manifest) = updated_current_manifest {
+            self.manifest = Some(manifest);
         }
 
         Ok(())
@@ -475,6 +511,37 @@ where
                 .context("clear stale versioned intent")?;
         }
 
+        let mut repair_empty_state = false;
+        if let Some(state) = self.load_version_state().await? {
+            if state.persisted_version == 0 {
+                self.current_version = 0;
+                self.persisted_version = 0;
+                self.manifest = None;
+                self.next_segment_id = state.next_segment_id.max(1);
+                return Ok(());
+            }
+
+            if let Some(manifest) = self.load_manifest_optional(state.persisted_version).await? {
+                self.current_version = state.persisted_version;
+                self.persisted_version = state.persisted_version;
+                self.manifest = Some(manifest);
+                self.next_segment_id = state.next_segment_id.max(1);
+                return Ok(());
+            }
+
+            tracing::warn!(
+                namespace = %self.namespace,
+                version = state.persisted_version,
+                "versioned ZSet state metadata referenced a missing manifest; falling back to manifest scan"
+            );
+            repair_empty_state = true;
+        }
+
+        self.refresh_state_from_manifest_scan(repair_empty_state)
+            .await
+    }
+
+    async fn refresh_state_from_manifest_scan(&mut self, repair_empty_state: bool) -> Result<()> {
         let entries = self
             .table
             .scan_range_bytes(
@@ -515,6 +582,16 @@ where
         self.persisted_version = max_version;
         self.manifest = current;
         self.next_segment_id = max_segment_id.saturating_add(1).max(1);
+
+        if max_version != 0 || repair_empty_state {
+            let mut batch = WriteBatch::new();
+            self.enqueue_version_state(max_version, self.next_segment_id, &mut batch)?;
+            self.table
+                .write_batch(batch)
+                .await
+                .context("persist migrated versioned ZSet state")?;
+        }
+
         Ok(())
     }
 
@@ -637,13 +714,9 @@ where
     }
 
     pub(super) async fn load_manifest_record(&self, version: u64) -> Result<ZSetVersionManifest> {
-        let key = self.manifest_key(version);
-        let bytes = self
-            .table
-            .get_bytes(&key)
+        self.load_manifest_optional(version)
             .await?
-            .ok_or_else(|| anyhow!("manifest version {version} not found"))?;
-        decode_manifest(bytes.as_ref())
+            .ok_or_else(|| anyhow!("manifest version {version} not found"))
     }
 
     async fn store_manifest(&self, version: u64, manifest: &ZSetVersionManifest) -> Result<()> {
@@ -653,6 +726,36 @@ where
             .put(&key, &encoded)
             .await
             .context("store manifest")
+    }
+
+    async fn load_manifest_optional(&self, version: u64) -> Result<Option<ZSetVersionManifest>> {
+        let key = self.manifest_key(version);
+        let Some(bytes) = self.table.get_bytes(&key).await? else {
+            return Ok(None);
+        };
+        decode_manifest(bytes.as_ref()).map(Some)
+    }
+
+    async fn load_version_state(&self) -> Result<Option<ZSetVersionState>> {
+        let Some(bytes) = self.table.get_bytes(&self.state_key).await? else {
+            return Ok(None);
+        };
+        decode_version_state(bytes.as_ref()).map(Some)
+    }
+
+    fn enqueue_version_state(
+        &self,
+        persisted_version: u64,
+        next_segment_id: SegmentId,
+        batch: &mut WriteBatch,
+    ) -> Result<()> {
+        let state = ZSetVersionState {
+            persisted_version,
+            next_segment_id: next_segment_id.max(1),
+        };
+        let encoded = encode_version_state(&state)?;
+        batch.put(self.state_key.clone(), encoded);
+        Ok(())
     }
 
     fn manifest_key(&self, version: u64) -> Vec<u8> {
@@ -676,6 +779,14 @@ fn encode_manifest(manifest: &ZSetVersionManifest) -> Result<Vec<u8>> {
 
 fn decode_manifest(bytes: &[u8]) -> Result<ZSetVersionManifest> {
     encoding::decode(bytes).context("decode ZSet manifest")
+}
+
+fn encode_version_state(state: &ZSetVersionState) -> Result<Vec<u8>> {
+    encoding::encode(state).context("encode ZSet version state")
+}
+
+fn decode_version_state(bytes: &[u8]) -> Result<ZSetVersionState> {
+    encoding::decode(bytes).context("decode ZSet version state")
 }
 
 fn segment_delta_schema() -> SchemaRef {
