@@ -19,7 +19,7 @@ pub(super) fn build_tick_commit_for_checkpoint(
 }
 
 pub(super) type VectorizedSourceJournalTransientBatch = (usize, Option<i64>, Vec<RecordBatch>);
-type VectorizedSourceJournalCommitBatch = (String, Option<i64>, Vec<RecordBatch>);
+pub(super) type VectorizedSourceJournalCommitBatch = (String, Option<i64>, Vec<RecordBatch>);
 
 pub(super) fn build_vectorized_source_journal_commit_batches(
     source_names_by_id: &[String],

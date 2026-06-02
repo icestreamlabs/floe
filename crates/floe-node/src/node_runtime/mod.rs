@@ -11,10 +11,10 @@ use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchemaRef;
+use dbsp::CompactionSchedulerConfig;
 use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::{KeyValueTable, SlateTable};
-use dbsp::{CompactionSchedulerConfig, StreamRetention};
 use floe_cdc::CdcTableStore;
 use floe_cdc_core::{
     CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, ChangeBatch,
