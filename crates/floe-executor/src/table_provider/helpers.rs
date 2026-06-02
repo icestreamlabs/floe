@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, UInt64Array, UInt64Builder};
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
-
-use crate::encoded_batch::{
-    VirtualU64Column, append_virtual_u64_field, build_expanded_batches_from_encoded_rows,
-    project_schema as project_arrow_schema,
-};
 
 use super::MV_VERSION_COLUMN;
 
@@ -22,39 +17,34 @@ pub(super) fn append_mv_version_field(schema: &SchemaRef) -> SchemaRef {
     append_virtual_u64_field(schema, MV_VERSION_COLUMN)
 }
 
+fn append_virtual_u64_field(schema: &SchemaRef, name: &str) -> SchemaRef {
+    let mut fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|field| (**field).clone())
+        .collect();
+    fields.push(Field::new(name, DataType::UInt64, false));
+    Arc::new(Schema::new(fields))
+}
+
 pub(super) fn project_schema(
     schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
 ) -> DFResult<(SchemaRef, Vec<usize>)> {
-    project_arrow_schema(schema, projection).map_err(to_datafusion_error)
-}
-
-pub(super) fn build_batches_from_encoded_snapshot<I>(
-    snapshot: I,
-    schema: SchemaRef,
-    projection: Option<&Vec<usize>>,
-    limit: Option<usize>,
-    mv_version: Option<u64>,
-) -> DFResult<(SchemaRef, Vec<RecordBatch>)>
-where
-    I: IntoIterator<Item = (Vec<u8>, i64)>,
-{
-    let virtual_version = mv_version.map(|value| VirtualU64Column {
-        name: MV_VERSION_COLUMN,
-        value,
-    });
-    let (projected_schema, batches) = build_expanded_batches_from_encoded_rows(
-        snapshot,
-        schema,
-        projection,
-        limit,
-        virtual_version,
-    )
-    .map_err(to_datafusion_error)?;
-    Ok((
-        projected_schema,
-        batches.into_iter().map(|batch| batch.batch).collect(),
-    ))
+    let indices = projection
+        .cloned()
+        .unwrap_or_else(|| (0..schema.fields().len()).collect());
+    let mut fields = Vec::with_capacity(indices.len());
+    for index in &indices {
+        let Some(field) = schema.fields().get(*index) else {
+            return Err(DataFusionError::Execution(format!(
+                "projection index {index} out of bounds for schema with {} columns",
+                schema.fields().len()
+            )));
+        };
+        fields.push((**field).clone());
+    }
+    Ok((Arc::new(Schema::new(fields)), indices))
 }
 
 pub(super) fn build_batches_from_arrow_snapshot(

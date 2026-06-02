@@ -29,10 +29,8 @@ pub struct VersionChainStats {
     pub max_bucket_segment_count: usize,
 }
 
-#[allow(dead_code)]
 pub type SegmentId = u64;
 
-#[allow(dead_code)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
 pub struct SegmentRecord {
     pub id: SegmentId,
@@ -40,7 +38,6 @@ pub struct SegmentRecord {
     pub deltas: Vec<(u64, i64)>,
 }
 
-#[allow(dead_code)]
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
 pub struct ZSetVersionManifest {
     pub base: Option<u64>,
@@ -54,7 +51,6 @@ pub(crate) struct ZSetVersionState {
     pub(crate) next_segment_id: SegmentId,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct VersionWritePlan {
     pub(crate) version: u64,
@@ -67,7 +63,6 @@ pub enum VersionedZSetPersistence {
     Replayable,
 }
 
-#[allow(dead_code)]
 pub struct VersionedZSet<K>
 where
     K: Archive

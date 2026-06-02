@@ -19,7 +19,6 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use dbsp::StreamRetention;
 use dbsp::handles::ZSetHandle;
-use dbsp::storage::SlateTable;
 use dbsp_semantic::ZSet;
 use floe_executor::GraphTaskError;
 use floe_executor::dbsp_bridge::DbspBridge;
@@ -33,7 +32,6 @@ use floe_executor::dbsp_plan::{
 use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
 use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
-use floe_executor::source_journal::SourceBatchJournal;
 use object_store::memory::InMemory;
 use regex::Regex;
 use slatedb::Db;
@@ -395,7 +393,8 @@ async fn filter_and_projection_materializes_mv() {
     let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -470,7 +469,8 @@ async fn planned_mv_records_delta_work_for_retractions_and_consolidation() {
         arrow_schema(vec![Field::new("price", DataType::Int64, true)]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
@@ -595,7 +595,8 @@ async fn unrelated_source_delta_only_advances_affected_materialized_view() {
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
     mv_registry.register(bid_view);
     mv_registry.register(auction_view);
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     builder
         .build(BuildInputs {
@@ -684,114 +685,6 @@ async fn unrelated_source_delta_only_advances_affected_materialized_view() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn source_batch_journal_replay_recovers_overlay_view() {
-    let db = test_db("source-batch-journal-replay").await;
-    let view_name = "mv_source_batch_journal";
-    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-
-    let plan = {
-        let schema = nexmark_bid_schema();
-        let logical = table_scan(Some("nexmark_bid"), &schema, None)
-            .expect("scan")
-            .project(vec![col("price")])
-            .expect("project")
-            .build()
-            .expect("build logical");
-        let planner = DbspPlanBuilder::new(nexmark_config());
-        planner.build(&logical).expect("circuit plan")
-    };
-
-    let available_sources = ["nexmark_bid"]
-        .into_iter()
-        .map(|name| name.to_string())
-        .collect::<BTreeSet<_>>();
-    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
-        .expect("validate plan")
-        .required_sources;
-
-    let mut registry =
-        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
-            .await
-            .expect("outer streams");
-    registry.set_durable_enabled("nexmark_bid", false);
-
-    let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    mv_registry.register(view_name);
-    let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
-    mv_registry.set_schema(view_name, arrow_schema.clone());
-
-    let journal = SourceBatchJournal::new(Arc::new(SlateTable::new(Arc::clone(&db))));
-    let replay_deltas = vec![
-        (encoded_bid_row(1, 42, 99), 1_i64),
-        (encoded_bid_row(2, 7, 50), 1_i64),
-    ];
-    journal
-        .append("nexmark_bid", 1, None, &replay_deltas)
-        .await
-        .expect("append source journal");
-    drop(registry);
-
-    let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
-        .await
-        .expect("restarted bridge");
-    let mut restarted_registry =
-        OuterStreamRegistry::from_validated_sources(&required_sources, &mut restarted_bridge)
-            .await
-            .expect("restarted outer streams");
-    restarted_registry.set_durable_enabled("nexmark_bid", false);
-
-    let restarted_mv_registry = Arc::new(MaterializedViewRegistry::new());
-    restarted_mv_registry.register(view_name);
-    restarted_mv_registry.set_schema(view_name, arrow_schema);
-
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
-    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
-    let restarted_handle_streams = gather_handle_streams(&restarted_registry, &source_refs);
-    let restarted_transient_streams = gather_transient_streams(&restarted_registry, &source_refs);
-    let mut restarted_builder = DbspGraphBuilder::new(Arc::clone(&db))
-        .await
-        .expect("restarted builder");
-    restarted_builder
-        .build(BuildInputs {
-            graph_id: view_name,
-            view_name,
-            plan: &plan,
-            cancel: CancellationToken::new(),
-            task_events: task_tx,
-            mv_registry: Arc::clone(&restarted_mv_registry),
-            outer_handle_streams: &restarted_handle_streams,
-            outer_transient_streams: &restarted_transient_streams,
-            enable_source_batch_journal: true,
-            restore_transient_helper_state: false,
-            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
-            watermark: Arc::new(AtomicI64::new(-1)),
-        })
-        .await
-        .expect("rebuild graph");
-    tokio::task::yield_now().await;
-
-    let replayed = journal
-        .replay_committed_entries_up_to(&mut restarted_registry, 1, &required_sources)
-        .await
-        .expect("replay source journal");
-    assert_eq!(replayed, 1, "expected one persisted source-journal entry");
-    wait_for_visible_row_count(&restarted_mv_registry, view_name, 2).await;
-
-    let mut restarted_rows = visible_rows(&restarted_mv_registry, view_name).await;
-    sort_rows_by_first_column(&mut restarted_rows);
-    assert_eq!(restarted_rows, vec![int_row(&[50]), int_row(&[99])]);
-    let work = restarted_mv_registry
-        .get(view_name)
-        .expect("restarted view")
-        .logical_work_for(1)
-        .expect("source-journal replay logical work");
-    assert_eq!(work.input_delta_rows, 2);
-    assert_eq!(work.output_delta_rows, 2);
-    assert_eq!(work.state_full_scan_count, 0);
-}
-
-#[tokio::test]
-#[serial_test::serial]
 async fn inner_join_materializes_mv() {
     let db = test_db("inner-join").await;
     let view_name = "mv_join";
@@ -863,7 +756,8 @@ async fn inner_join_materializes_mv() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1009,7 +903,8 @@ async fn three_way_join_materializes_through_binary_composition() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1112,7 +1007,8 @@ async fn range_join_materializes_half_open_matches() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1212,7 +1108,8 @@ async fn asof_join_materializes_latest_prior_match() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1282,7 +1179,8 @@ async fn sql_left_asof_join_null_extends_and_retracts_unmatched_rows() {
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1439,7 +1337,8 @@ async fn sql_asof_join_applies_residual_with_precomputed_key_and_timestamp_expre
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1542,7 +1441,8 @@ async fn left_semi_join_materializes_retained_left_rows() {
         arrow_schema(vec![Field::new("id", DataType::Int64, true)]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1642,7 +1542,8 @@ async fn right_anti_join_materializes_retained_right_rows() {
         arrow_schema(vec![Field::new("id", DataType::Int64, true)]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -1734,7 +1635,8 @@ async fn pushed_join_filter_keeps_advancing_with_static_build_side() {
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -1911,7 +1813,8 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -1996,209 +1899,6 @@ async fn pushed_join_filter_preserves_rows_with_source_journal_fast_path() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn pushed_join_filter_source_journal_replay_recovers_with_static_build_side() {
-    let db = test_db("join-filter-transient-join-inputs-replay").await;
-    let view_name = "mv_join_filter_transient_inputs_replay";
-    let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-
-    let plan = {
-        let bid_schema = nexmark_bid_schema();
-        let auction_schema = nexmark_auction_schema();
-        let logical = table_scan(Some("nexmark_bid"), &bid_schema, None)
-            .expect("bid scan")
-            .join(
-                table_scan(Some("nexmark_auction"), &auction_schema, None)
-                    .expect("auction scan")
-                    .build()
-                    .expect("auction plan"),
-                JoinType::Inner,
-                (
-                    vec![Column::from_name("auction")],
-                    vec![Column::from_name("id")],
-                ),
-                None,
-            )
-            .expect("join")
-            .filter(col("category").eq(lit(10i64)))
-            .expect("filter")
-            .project(vec![
-                col("auction"),
-                col("bidder"),
-                col("price").alias("projected_price"),
-                col("seller"),
-            ])
-            .expect("project")
-            .build()
-            .expect("build logical");
-        let planner = DbspPlanBuilder::new(nexmark_config());
-        planner.build(&logical).expect("circuit plan")
-    };
-
-    let available_sources = ["nexmark_bid", "nexmark_auction"]
-        .into_iter()
-        .map(|name| name.to_string())
-        .collect::<BTreeSet<_>>();
-    let required_sources = validate_dbsp_plan(&plan, &available_sources, view_name)
-        .expect("validate plan")
-        .required_sources;
-
-    let mut registry =
-        OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
-            .await
-            .expect("outer streams");
-    registry.set_durable_enabled("nexmark_bid", false);
-    registry.set_durable_enabled("nexmark_auction", false);
-
-    let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    mv_registry.register(view_name);
-    let arrow_schema = arrow_schema(vec![
-        Field::new("auction", DataType::Int64, true),
-        Field::new("bidder", DataType::Int64, true),
-        Field::new("projected_price", DataType::Int64, true),
-        Field::new("seller", DataType::Int64, true),
-    ]);
-    mv_registry.set_schema(view_name, arrow_schema.clone());
-
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
-        .await
-        .expect("builder");
-    let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
-    let handle_streams = gather_handle_streams(&registry, &source_refs);
-    let transient_streams = gather_transient_streams(&registry, &source_refs);
-    builder
-        .build(BuildInputs {
-            graph_id: view_name,
-            view_name,
-            plan: &plan,
-            cancel: CancellationToken::new(),
-            task_events: task_tx.clone(),
-            mv_registry: Arc::clone(&mv_registry),
-            outer_handle_streams: &handle_streams,
-            outer_transient_streams: &transient_streams,
-            enable_source_batch_journal: true,
-            restore_transient_helper_state: false,
-            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
-            watermark: Arc::new(AtomicI64::new(-1)),
-        })
-        .await
-        .expect("build graph");
-
-    let journal = SourceBatchJournal::new(Arc::new(SlateTable::new(Arc::clone(&db))));
-
-    {
-        let auction_writer = registry
-            .writer_mut("nexmark_auction")
-            .expect("auction writer");
-        auction_writer
-            .append_encoded(encoded_auction_row_with_category(1, 100, 10), 1)
-            .expect("append matching auction");
-        auction_writer
-            .append_encoded(encoded_auction_row_with_category(2, 200, 5), 1)
-            .expect("append filtered auction");
-        let batch = auction_writer
-            .pending_transient_batch(1)
-            .expect("pending transient auction batch");
-        journal
-            .append("nexmark_auction", 1, None, &batch.deltas)
-            .await
-            .expect("append auction source journal");
-    }
-    registry
-        .tick_all_with_version(1)
-        .await
-        .expect("tick auction setup");
-
-    let expected_rows = 8usize;
-    let output_version = i64::try_from(expected_rows).expect("output version");
-    let max_version = i64::try_from(expected_rows + 1).expect("max version");
-    let max_version_u64 = u64::try_from(max_version).expect("max version u64");
-    for idx in 0..expected_rows {
-        let version = i64::try_from(idx + 2).expect("version");
-        {
-            let bid_writer = registry.writer_mut("nexmark_bid").expect("bid writer");
-            bid_writer
-                .append_encoded(encoded_bid_row(1, 1_000 + idx as i64, 10 + idx as i64), 1)
-                .expect("append matching bid");
-            bid_writer
-                .append_encoded(encoded_bid_row(2, 2_000 + idx as i64, 20 + idx as i64), 1)
-                .expect("append filtered bid");
-            let batch = bid_writer
-                .pending_transient_batch(version)
-                .expect("pending transient bid batch");
-            journal
-                .append(
-                    "nexmark_bid",
-                    u64::try_from(version).expect("bid version u64"),
-                    None,
-                    &batch.deltas,
-                )
-                .await
-                .expect("append bid source journal");
-        }
-        registry
-            .tick_all_with_version(version)
-            .await
-            .expect("tick bid batch");
-    }
-
-    wait_for_logical_version(&mv_registry, view_name, output_version).await;
-    wait_for_visible_row_count(&mv_registry, view_name, expected_rows).await;
-
-    let mut rows = visible_rows(&mv_registry, view_name).await;
-    rows.sort_by_key(|row| scalar_i64(row.get(1)));
-
-    let mut restarted_bridge = DbspBridge::new(Arc::clone(&db))
-        .await
-        .expect("restarted bridge");
-    let mut restarted_registry =
-        OuterStreamRegistry::from_validated_sources(&required_sources, &mut restarted_bridge)
-            .await
-            .expect("restarted outer streams");
-    restarted_registry.set_durable_enabled("nexmark_bid", false);
-    restarted_registry.set_durable_enabled("nexmark_auction", false);
-
-    let restarted_mv_registry = Arc::new(MaterializedViewRegistry::new());
-    restarted_mv_registry.register(view_name);
-    restarted_mv_registry.set_schema(view_name, arrow_schema);
-
-    let restarted_handle_streams = gather_handle_streams(&restarted_registry, &source_refs);
-    let restarted_transient_streams = gather_transient_streams(&restarted_registry, &source_refs);
-    let mut restarted_builder = DbspGraphBuilder::new(Arc::clone(&db))
-        .await
-        .expect("restarted builder");
-    restarted_builder
-        .build(BuildInputs {
-            graph_id: view_name,
-            view_name,
-            plan: &plan,
-            cancel: CancellationToken::new(),
-            task_events: task_tx,
-            mv_registry: Arc::clone(&restarted_mv_registry),
-            outer_handle_streams: &restarted_handle_streams,
-            outer_transient_streams: &restarted_transient_streams,
-            enable_source_batch_journal: true,
-            restore_transient_helper_state: false,
-            mv_retention: StreamRetention::KeepLast { keep_last: 1 },
-            watermark: Arc::new(AtomicI64::new(-1)),
-        })
-        .await
-        .expect("rebuild graph");
-
-    journal
-        .replay_committed_entries_up_to(&mut restarted_registry, max_version_u64, &required_sources)
-        .await
-        .expect("replay source journal");
-    wait_for_logical_version(&restarted_mv_registry, view_name, output_version).await;
-    wait_for_visible_row_count(&restarted_mv_registry, view_name, expected_rows).await;
-
-    let mut restarted_rows = visible_rows(&restarted_mv_registry, view_name).await;
-    restarted_rows.sort_by_key(|row| scalar_i64(row.get(1)));
-    assert_eq!(restarted_rows, rows);
-}
-
-#[tokio::test]
-#[serial_test::serial]
 async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
     let db = test_db("inner-join-transient-root").await;
     let view_name = "mv_join_transient_root";
@@ -2270,7 +1970,8 @@ async fn inner_join_materializes_mv_with_transient_join_root_fast_path() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -2377,7 +2078,8 @@ async fn left_outer_join_materializes_null_extended_rows() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -2467,7 +2169,8 @@ async fn left_outer_join_live_updates_preserve_logical_versions_on_noop_ticks() 
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -2600,7 +2303,8 @@ async fn aggregate_materializes_mv() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -2740,7 +2444,8 @@ async fn topn_materializes_mv() {
     let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -2810,7 +2515,8 @@ async fn topn_materializes_mv_from_transient_source_journal() {
     let arrow_schema = arrow_schema(vec![Field::new("price", DataType::Int64, true)]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -2923,7 +2629,8 @@ async fn row_number_topn_with_post_projection_materializes_from_transient_source
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3048,7 +2755,8 @@ async fn row_number_topn_append_only_source_journal_updates_boundary_across_tick
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3167,7 +2875,8 @@ async fn row_number_top1_with_post_projection_recomputes_from_transient_source_j
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3292,7 +3001,8 @@ async fn row_number_top1_with_two_order_keys_prefers_descending_primary_key() {
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3405,7 +3115,8 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3536,7 +3247,8 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3691,7 +3403,8 @@ async fn join_aggregate_pipeline_recomputes_from_transient_source_journal_retrac
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3806,7 +3519,8 @@ async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -3946,7 +3660,8 @@ async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recom
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -4097,7 +3812,8 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
         ]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
@@ -4195,7 +3911,8 @@ async fn source_projection_with_proctime_materializes_mv() {
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4295,7 +4012,8 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4403,7 +4121,8 @@ async fn source_projection_with_regexp_extract_materializes_from_transient_sourc
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4521,7 +4240,8 @@ async fn source_projection_with_split_index_materializes_from_transient_source_j
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4633,7 +4353,8 @@ async fn distinct_materializes_unique_rows() {
         arrow_schema(vec![Field::new("bidder", DataType::Int64, true)]),
     );
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4763,7 +4484,8 @@ async fn count_distinct_aggregate_materializes_mv() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4885,7 +4607,8 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -4999,7 +4722,8 @@ async fn q16_style_aggregate_keeps_single_group_across_transient_ticks() {
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -5169,7 +4893,8 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
     ]);
     mv_registry.set_schema(view_name, arrow_schema);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -5313,7 +5038,8 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
         ]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -5434,7 +5160,8 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
         arrow_schema(vec![Field::new("count", DataType::Int64, true)]),
     );
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -5538,7 +5265,8 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     {
         let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
@@ -5625,7 +5353,8 @@ async fn cancel_stops_materialized_view_updates() {
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
     let view_handle = mv_registry.register(view_name);
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
@@ -5713,7 +5442,8 @@ async fn graph_task_error_is_reported() {
             .await
             .expect("outer streams");
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
 
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
@@ -5888,7 +5618,8 @@ async fn tumbling_window_max_recomputes_from_transient_source_journal_retraction
     mv_registry.register(view_name);
     mv_registry.set_schema(view_name, root_arrow_schema(&plan));
 
-    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, mut task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -6214,7 +5945,8 @@ async fn build_window_plan_rows_with_durable_source(
     mv_registry.register(view_name);
     mv_registry.set_schema(view_name, root_arrow_schema(plan));
 
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");
@@ -6324,7 +6056,7 @@ async fn wait_for_logical_version_or_task_error(
     registry: &MaterializedViewRegistry,
     view_name: &str,
     target_version: i64,
-    task_rx: &mut mpsc::UnboundedReceiver<GraphTaskError>,
+    task_rx: &mut mpsc::Receiver<GraphTaskError>,
 ) {
     let handle = registry.get(view_name).expect("view registered");
     if handle.latest_version().unwrap_or(-1) >= target_version {

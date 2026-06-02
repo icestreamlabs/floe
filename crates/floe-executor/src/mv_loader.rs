@@ -160,7 +160,7 @@ mod tests {
     async fn errors_when_schema_unavailable() {
         let db = test_db("mv-loader-error").await;
         let schema = test_schema();
-        let _ = seed_view(
+        seed_view(
             Arc::clone(&db),
             &[encoded_i64_row(5)],
             Arc::clone(&schema),

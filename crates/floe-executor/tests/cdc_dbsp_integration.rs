@@ -74,7 +74,7 @@ async fn cdc_apply_deltas_drive_mv_insert_update_and_delete() {
         .collect::<Vec<_>>();
     let handle_streams = gather_handle_streams(&outer_streams, &source_refs);
     let transient_streams = gather_transient_streams(&outer_streams, &source_refs);
-    let (task_tx, _task_rx) = mpsc::unbounded_channel();
+    let (task_tx, _task_rx) = mpsc::channel(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
         .await
         .expect("builder");

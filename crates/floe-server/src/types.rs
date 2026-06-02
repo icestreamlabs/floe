@@ -1,18 +1,21 @@
+#[cfg(test)]
 use std::sync::Arc;
 
 use arrow_pg::datatypes::field_into_pg_type;
 use arrow_pg::encoder::encode_value as encode_arrow_pg_value;
 use datafusion::arrow::array::{Array, ArrayRef, Decimal256Array};
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+#[cfg(test)]
 use datafusion::arrow::record_batch::RecordBatch;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::PgWireResult;
+#[cfg(test)]
 use pgwire::messages::data::DataRow;
 use postgres_types::Type;
 
 use super::user_error;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn encode_stream_row(
     batch: &RecordBatch,
     row_idx: usize,

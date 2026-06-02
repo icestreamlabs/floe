@@ -16,7 +16,6 @@ pub(super) struct Cache {
 }
 
 impl Cache {
-    #[allow(dead_code)]
     pub(super) fn new() -> Self {
         let key_to_id_capacity =
             NonZeroUsize::new(KEY_TO_ID_CACHE_CAPACITY).expect("non-zero cache size");

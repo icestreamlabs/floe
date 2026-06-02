@@ -35,7 +35,7 @@ pub(super) async fn run_kafka_sink(
     queue_capacity: usize,
     batch_policy: BatchPolicy,
     retry_policy: RetryPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
     transactional_id: Option<String>,
     checkpoint_topic: Option<String>,
     checkpoint_partition: Option<i32>,
@@ -136,7 +136,7 @@ pub(super) async fn run_kafka_worker(
     tracker: Arc<SinkQueueTracker>,
     batch_policy: BatchPolicy,
     retry_policy: RetryPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
     kafka_eos: Option<KafkaEosConfig>,
 ) -> Result<()> {
     let mut buffer = Vec::new();
@@ -214,7 +214,7 @@ pub(super) async fn flush_kafka_buffer(
     retry_policy: RetryPolicy,
     tracker: &SinkQueueTracker,
     flush_version: Option<i64>,
-    checkpoint_tx: &Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: &Option<SinkCheckpointSender>,
     kafka_eos: Option<&KafkaEosConfig>,
 ) -> Result<()> {
     let flush_start = std::time::Instant::now();
@@ -257,7 +257,8 @@ pub(super) async fn flush_kafka_buffer(
                 last_emitted_mv_version: flushed_version,
                 row_index: None,
             },
-        );
+        )
+        .await?;
     }
     let flush_seq = KAFKA_SINK_FLUSH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
     if flush_seq < 16 || flush_seq.is_multiple_of(KAFKA_SINK_FLUSH_LOG_EVERY) {

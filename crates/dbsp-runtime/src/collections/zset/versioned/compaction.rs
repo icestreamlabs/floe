@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use rkyv::Archive;
@@ -7,11 +8,11 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
+use crate::metrics;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::{SegmentRecord, VersionedZSet};
 
-#[allow(dead_code)]
 impl<K> VersionedZSet<K>
 where
     K: Archive
@@ -28,6 +29,7 @@ where
     where
         K: Clone,
     {
+        let compaction_start = Instant::now();
         let previous_version = self.persisted_version;
         let new_version = self
             .compact_current_detached()
@@ -40,6 +42,9 @@ where
                 .context("release previous version during compaction")?;
         }
 
+        metrics::observe_foreground_compaction_latency_ms(
+            compaction_start.elapsed().as_millis() as u64
+        );
         Ok(new_version)
     }
 

@@ -11,7 +11,7 @@ pub(super) async fn run_http_sink(
     queue_capacity: usize,
     batch_policy: BatchPolicy,
     retry_policy: RetryPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
     if queue_capacity == 0 {
         bail!("sink queue_capacity must be greater than zero");
@@ -67,7 +67,7 @@ pub(super) async fn run_http_worker(
     tracker: Arc<SinkQueueTracker>,
     batch_policy: BatchPolicy,
     retry_policy: RetryPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
     let mut buffer = Vec::new();
     let mut buffer_bytes = 0usize;
@@ -141,7 +141,7 @@ pub(super) async fn flush_http_buffer(
     retry_policy: RetryPolicy,
     tracker: &SinkQueueTracker,
     flush_version: Option<i64>,
-    checkpoint_tx: &Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: &Option<SinkCheckpointSender>,
 ) -> Result<()> {
     if buffer.is_empty() {
         if let Some(version) = flush_version {
@@ -154,7 +154,8 @@ pub(super) async fn flush_http_buffer(
                     last_emitted_mv_version: version,
                     row_index: None,
                 },
-            );
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -176,7 +177,8 @@ pub(super) async fn flush_http_buffer(
                 last_emitted_mv_version: flushed_version,
                 row_index: None,
             },
-        );
+        )
+        .await?;
     }
     Ok(())
 }

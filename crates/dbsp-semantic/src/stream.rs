@@ -536,7 +536,6 @@ where
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     pub(crate) fn plan(&self) -> StreamPlan {
         StreamPlan::from_root(self.inner.plan.clone())
     }

@@ -45,7 +45,7 @@ pub(super) async fn run_postgres_sink(
     with_snapshot: bool,
     as_of: Option<i64>,
     retry_policy: RetryPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
     let mode = PostgresSinkMode::parse(mode)?;
     let mut stream = execute_mv_changelog(
@@ -79,7 +79,8 @@ pub(super) async fn run_postgres_sink(
                 last_emitted_mv_version: batch.version,
                 row_index: None,
             },
-        );
+        )
+        .await?;
     }
 
     Ok(())

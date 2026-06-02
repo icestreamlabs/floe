@@ -2026,7 +2026,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let service_cancel = CancellationToken::new();
     let shutdown_signal = CancellationToken::new();
     let runtime_failure = Arc::new(StdMutex::new(None::<String>));
-    let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_event_tx, mut task_event_rx) =
+        mpsc::channel::<GraphTaskError>(GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel_for_monitor = runtime_cancel.clone();
     let failure_for_monitor = Arc::clone(&runtime_failure);
     let task_monitor: JoinHandle<()> = tokio::spawn(async move {
@@ -2332,7 +2333,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let (cdc_transaction_sender, cdc_transaction_receiver) =
         mpsc::channel::<QueuedCdcTransaction>(queue_capacity);
     let pending_event_counter = core_source::PendingAppendIngestEventCounter::default();
-    let (sink_checkpoint_tx, sink_checkpoint_rx) = mpsc::unbounded_channel::<SinkCursor>();
+    let (sink_checkpoint_tx, sink_checkpoint_rx) =
+        mpsc::channel::<SinkCursor>(sinks::SINK_CHECKPOINT_CHANNEL_CAPACITY);
     let sink_resume_cursors: HashMap<String, SinkCursor> = initial_sink_cursors
         .iter()
         .cloned()
@@ -3348,16 +3350,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                     let checkpoint_write_start = Instant::now();
                     let checkpoint_result = if let Some(staged_writes) = cdc_staged_writes {
                         checkpoint_manager
-                            .persist_tick_commit_with_source_batches_and_staged_writes(
-                                tick_commit,
-                                &[],
-                                staged_writes,
-                            )
+                            .persist_tick_commit_with_staged_writes(tick_commit, staged_writes)
                             .await
                     } else {
-                        checkpoint_manager
-                            .persist_tick_commit_with_source_batches(tick_commit, &[])
-                            .await
+                        checkpoint_manager.persist_tick_commit(tick_commit).await
                     };
                     if let Err(err) = checkpoint_result {
                         metrics::observe_tick_phase_latency_ms(
@@ -3720,18 +3716,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 Err(err)
             } else if let Some(staged_writes) = staged_writes_for_checkpoint {
                 checkpoint_manager
-                    .persist_tick_commit_with_source_batches_kafka_metadata_and_staged_writes(
+                    .persist_tick_commit_with_kafka_metadata_and_staged_writes(
                         tick_commit,
-                        &[],
                         &kafka_metadata_journal_batches,
                         staged_writes,
                     )
                     .await
             } else {
                 checkpoint_manager
-                    .persist_tick_commit_with_source_batches_and_kafka_metadata(
+                    .persist_tick_commit_with_kafka_metadata(
                         tick_commit,
-                        &[],
                         &kafka_metadata_journal_batches,
                     )
                     .await

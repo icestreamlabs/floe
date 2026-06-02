@@ -49,6 +49,7 @@ const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 5_000;
 const DEFAULT_KAFKA_CHECKPOINT_PARTITION: i32 = 0;
 const DEFAULT_KAFKA_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHANGELOG_BATCH_LOG_SAMPLE_EVERY: u64 = 256;
+pub(crate) const SINK_CHECKPOINT_CHANNEL_CAPACITY: usize = 1024;
 static CHANGELOG_BATCH_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 mod file_backend;
@@ -60,6 +61,8 @@ use file_backend::*;
 use http_backend::*;
 use kafka_backend::*;
 use postgres_backend::*;
+
+type SinkCheckpointSender = mpsc::Sender<SinkCursor>;
 
 #[derive(Clone, Copy)]
 struct BatchPolicy {
@@ -215,7 +218,7 @@ pub fn spawn_sinks(
     sinks: Vec<SinkSpec>,
     registry: Arc<MaterializedViewRegistry>,
     resume_cursors: HashMap<String, SinkCursor>,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
     changelog_cancel: CancellationToken,
     runtime_cancel: CancellationToken,
     runtime_failure: Arc<StdMutex<Option<String>>>,
@@ -267,7 +270,7 @@ async fn run_sink(
     sink: SinkSpec,
     registry: Arc<MaterializedViewRegistry>,
     resume_cursor: Option<SinkCursor>,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let resume_as_of = resume_cursor
@@ -615,13 +618,17 @@ fn encode_changelog_batch_as_debezium(
     Ok(rows)
 }
 
-fn publish_sink_cursor(
-    checkpoint_tx: &Option<mpsc::UnboundedSender<SinkCursor>>,
+async fn publish_sink_cursor(
+    checkpoint_tx: &Option<SinkCheckpointSender>,
     cursor: SinkCursor,
-) {
+) -> Result<()> {
     if let Some(sender) = checkpoint_tx {
-        let _ = sender.send(cursor);
+        sender
+            .send(cursor)
+            .await
+            .context("publish sink checkpoint cursor")?;
     }
+    Ok(())
 }
 
 fn current_unix_time_ms() -> u64 {

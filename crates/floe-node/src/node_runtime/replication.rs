@@ -426,7 +426,6 @@ impl ReplicationPipelineRuntime {
         Ok(delivered)
     }
 
-    #[allow(dead_code)]
     pub(super) async fn status_snapshots(
         &self,
         storage: &SlateCatalog,

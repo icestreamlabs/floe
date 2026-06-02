@@ -4,7 +4,6 @@ mod helpers;
 mod materialized_view;
 mod scan_exec;
 mod slate;
-mod source;
 
 #[cfg(test)]
 mod tests;
@@ -15,4 +14,3 @@ pub use dynamic_state::{DynamicStateExec, DynamicStateTableProvider};
 pub use materialized_view::MaterializedViewTableProvider;
 pub use scan_exec::SnapshotScanExec;
 pub use slate::SlateTableProvider;
-pub use source::SourceTableProvider;

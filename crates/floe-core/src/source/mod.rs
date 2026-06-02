@@ -202,7 +202,6 @@ pub struct AppendIngestEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppendIngestPayload {
     Json(Value),
-    PreencodedRowKey(Vec<u8>),
     Empty,
 }
 
@@ -243,7 +242,7 @@ impl Serialize for AppendIngestEvent {
             source: self.source.clone(),
             payload: match &self.payload {
                 AppendIngestPayload::Json(payload) => Some(payload.clone()),
-                AppendIngestPayload::PreencodedRowKey(_) | AppendIngestPayload::Empty => None,
+                AppendIngestPayload::Empty => None,
             },
             resume_token: self.metadata.resume_token.clone(),
             event_time_ms: self.metadata.event_time_ms,
@@ -322,25 +321,6 @@ impl AppendIngestEvent {
         }
     }
 
-    pub fn preencoded(source: impl Into<String>, preencoded_row_key: Vec<u8>) -> Self {
-        Self {
-            source: source.into(),
-            payload: AppendIngestPayload::PreencodedRowKey(preencoded_row_key),
-            metadata: AppendIngestMetadata::default(),
-        }
-    }
-
-    pub fn preencoded_for_source_id(source_id: usize, preencoded_row_key: Vec<u8>) -> Self {
-        Self {
-            source: String::new(),
-            payload: AppendIngestPayload::PreencodedRowKey(preencoded_row_key),
-            metadata: AppendIngestMetadata {
-                source_id: Some(source_id),
-                ..AppendIngestMetadata::default()
-            },
-        }
-    }
-
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -356,7 +336,7 @@ impl AppendIngestEvent {
     pub fn payload(&self) -> Option<&Value> {
         match &self.payload {
             AppendIngestPayload::Json(payload) => Some(payload),
-            AppendIngestPayload::PreencodedRowKey(_) | AppendIngestPayload::Empty => None,
+            AppendIngestPayload::Empty => None,
         }
     }
 
@@ -397,32 +377,10 @@ impl AppendIngestEvent {
         self
     }
 
-    pub fn preencoded_row_key(&self) -> Option<&[u8]> {
-        match &self.payload {
-            AppendIngestPayload::PreencodedRowKey(row_key) => Some(row_key.as_slice()),
-            AppendIngestPayload::Json(_) | AppendIngestPayload::Empty => None,
-        }
-    }
-
-    pub fn with_preencoded_row_key(mut self, preencoded_row_key: Vec<u8>) -> Self {
-        self.payload = AppendIngestPayload::PreencodedRowKey(preencoded_row_key);
-        self
-    }
-
-    pub fn take_preencoded_row_key(&mut self) -> Option<Vec<u8>> {
-        match std::mem::replace(&mut self.payload, AppendIngestPayload::Empty) {
-            AppendIngestPayload::PreencodedRowKey(row_key) => Some(row_key),
-            other => {
-                self.payload = other;
-                None
-            }
-        }
-    }
-
     pub fn into_payload(self) -> Option<Value> {
         match self.payload {
             AppendIngestPayload::Json(payload) => Some(payload),
-            AppendIngestPayload::PreencodedRowKey(_) | AppendIngestPayload::Empty => None,
+            AppendIngestPayload::Empty => None,
         }
     }
 
@@ -493,18 +451,16 @@ mod tests {
     }
 
     #[test]
-    fn append_ingest_payload_separates_json_and_preencoded_rows() {
+    fn append_ingest_payload_separates_json_and_empty_events() {
         let json_event = AppendIngestEvent::new("orders", json!({"id": 7}));
         assert_eq!(json_event.payload(), Some(&json!({"id": 7})));
-        assert!(json_event.preencoded_row_key().is_none());
+        assert_eq!(json_event.into_payload(), Some(json!({"id": 7})));
 
-        let mut preencoded = AppendIngestEvent::preencoded_for_source_id(3, vec![1, 2, 3]);
-        assert_eq!(preencoded.source_id(), Some(3));
-        assert!(preencoded.payload().is_none());
-        assert_eq!(preencoded.preencoded_row_key(), Some(&[1, 2, 3][..]));
-        assert_eq!(preencoded.take_preencoded_row_key(), Some(vec![1, 2, 3]));
-        assert!(preencoded.preencoded_row_key().is_none());
-        assert!(preencoded.into_payload().is_none());
+        let empty_event: AppendIngestEvent =
+            serde_json::from_value(json!({"source": "orders"})).expect("empty append event");
+        assert_eq!(empty_event.source(), "orders");
+        assert!(empty_event.payload().is_none());
+        assert!(empty_event.into_payload().is_none());
     }
 
     #[test]

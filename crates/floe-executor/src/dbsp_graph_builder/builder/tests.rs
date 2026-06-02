@@ -1638,7 +1638,8 @@ async fn benchmark_join_child_transforms_match_pruned_source_handle_outputs() {
     let mut mv_latest = HashMap::new();
     let mut built = HashMap::new();
     let cancel = CancellationToken::new();
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(crate::task_events::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let left_stream = builder
         .compile_node(
             &plan,
@@ -1854,7 +1855,8 @@ async fn benchmark_large_bid_batch_transform_matches_pruned_source_handle_output
     let mut mv_latest = HashMap::new();
     let mut built = HashMap::new();
     let cancel = CancellationToken::new();
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(crate::task_events::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let left_stream = builder
         .compile_node(
             &plan,
@@ -2046,7 +2048,8 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
     let mut mv_latest = HashMap::new();
     let mut built = HashMap::new();
     let cancel = CancellationToken::new();
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(crate::task_events::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let left_stream = builder
         .compile_node(
             &plan,
@@ -2173,10 +2176,9 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         .await
         .expect("initial canonical join snapshot");
 
-    let (observer_tx, mut observer_rx) =
-        mpsc::unbounded_channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>();
+    let (observer_tx, mut observer_rx) = mpsc::channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>(1024);
     let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
-        let _ = observer_tx.send((version, deltas));
+        let _ = observer_tx.try_send((version, deltas));
     });
     let (left_transient_tx, left_transient_rx) =
         mpsc::channel::<TransientJoinInputBatch<Vec<u8>, Vec<u8>>>(
@@ -2479,7 +2481,8 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
     let mut mv_latest = HashMap::new();
     let mut built = HashMap::new();
     let cancel = CancellationToken::new();
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(crate::task_events::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let left_stream = builder
         .compile_node(
             &plan,
@@ -2628,10 +2631,9 @@ async fn benchmark_transient_source_task_join_inputs_match_canonical_join_output
         .await
         .expect("initial canonical join snapshot");
 
-    let (observer_tx, mut observer_rx) =
-        mpsc::unbounded_channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>();
+    let (observer_tx, mut observer_rx) = mpsc::channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>(1024);
     let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
-        let _ = observer_tx.send((version, deltas));
+        let _ = observer_tx.try_send((version, deltas));
     });
     DbspJoin::spawn_transient_with_inputs::<Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, _, _, _, _>(
         &left_stream,

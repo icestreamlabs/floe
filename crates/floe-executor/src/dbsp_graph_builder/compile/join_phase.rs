@@ -1,7 +1,7 @@
 use super::*;
 use crate::dbsp_graph_builder::materialize::DeltaTransformFn;
 use crate::dbsp_graph_builder::materialize::{
-    TransientMaterializeBatch, TransientMaterializeSender,
+    TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY, TransientMaterializeBatch, TransientMaterializeSender,
 };
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 use crate::encoding::{
@@ -2494,7 +2494,9 @@ impl DbspGraphBuilder {
         let observer_events = task_events.clone();
         let observer_label = format!("transient-join-post-filter:{graph_id}");
         let (observer_filter_tx, mut observer_filter_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>();
+            tokio::sync::mpsc::channel::<(i64, Arc<Vec<(Vec<u8>, i64)>>)>(
+                TRANSIENT_MATERIALIZE_CHANNEL_CAPACITY,
+            );
         let observer_output_tx = output_tx.clone();
         let observer_filter_graph_id = observer_graph_id.clone();
         let observer_filter_events = observer_events.clone();
@@ -2538,9 +2540,33 @@ impl DbspGraphBuilder {
                     .await;
             }
         });
-        let observer = Arc::new(move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| {
-            let _ = observer_filter_tx.send((version, deltas));
-        });
+        let observer_send_graph_id = observer_graph_id.clone();
+        let observer_send_events = observer_events.clone();
+        let observer_send_label = observer_label.clone();
+        let observer =
+            Arc::new(
+                move |version: i64, deltas: Arc<Vec<(Vec<u8>, i64)>>| match observer_filter_tx
+                    .try_send((version, deltas))
+                {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        report_graph_task_error(
+                            &observer_send_events,
+                            &observer_send_graph_id,
+                            observer_send_label.clone(),
+                            anyhow!("transient join post-filter channel full"),
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        report_graph_task_error(
+                            &observer_send_events,
+                            &observer_send_graph_id,
+                            observer_send_label.clone(),
+                            anyhow!("transient join post-filter channel closed"),
+                        );
+                    }
+                },
+            );
 
         let left_key_error_handler = Arc::clone(&join_error_handler);
         let left_key = move |delta_values: &[(Vec<u8>, i64)]| match left_key_extractor

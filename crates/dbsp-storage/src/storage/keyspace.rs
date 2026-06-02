@@ -1,5 +1,4 @@
 /// Canonical keyspace prefixes used across DBSP storage layouts.
-#[allow(dead_code)]
 pub mod prefix {
     pub const STREAM: &str = "stream/";
     pub const ZSET: &str = "zset/";

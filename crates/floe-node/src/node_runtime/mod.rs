@@ -49,10 +49,10 @@ use floe_executor::source_journal::{
     update_kafka_source_journal_checksum,
 };
 use floe_executor::{
-    DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError, MaterializedViewRegistry,
-    MaterializedViewTableProvider, MvFlushCoalescingConfig, OuterStreamRegistry,
-    OverlaySnapshotConfig, PersistencePolicyConfig, SourceArrowBatchBuilder,
-    SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
+    DbspBridge, DbspGraphBuilder, FloeQueryContext, GRAPH_TASK_EVENT_CHANNEL_CAPACITY,
+    GraphTaskError, MaterializedViewRegistry, MaterializedViewTableProvider,
+    MvFlushCoalescingConfig, OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig,
+    SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
     VectorizedMaterializedViewPlan, source_batch_journal_root_sources_with_config,
     validate_dbsp_plan, weighted_batch_from_diffs,
 };

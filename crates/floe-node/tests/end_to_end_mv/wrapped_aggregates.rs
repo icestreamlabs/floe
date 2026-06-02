@@ -139,7 +139,8 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
     let source_refs: Vec<&str> = required_sources.iter().map(String::as_str).collect();
     let handle_streams = gather_handle_streams(&outer, &source_refs);
     let transient_streams = gather_transient_streams(&outer, &source_refs);
-    let (task_tx, _task_rx) = mpsc::unbounded_channel::<GraphTaskError>();
+    let (task_tx, _task_rx) =
+        mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
 
     graph_builder
         .build(BuildInputs {

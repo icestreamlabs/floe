@@ -187,7 +187,6 @@ impl LogicalWorkCollector {
         self.last_tick
     }
 
-    #[allow(dead_code)]
     pub fn cumulative(&self) -> LogicalWorkSnapshot {
         self.cumulative
     }
@@ -279,7 +278,6 @@ pub(crate) fn observe_flush_write_metrics(metrics: FlushWriteMetrics) {
     DBSP_FLUSH_KEYS_WRITTEN.observe(metrics.keys_written as f64);
 }
 
-#[allow(dead_code)]
 pub(crate) fn observe_foreground_compaction_latency_ms(latency_ms: u64) {
     DBSP_FOREGROUND_COMPACTION_LATENCY_MS.observe(latency_ms as f64);
 }

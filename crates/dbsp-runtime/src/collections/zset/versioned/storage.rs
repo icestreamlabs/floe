@@ -27,7 +27,6 @@ use super::{
     ZSetVersionManifest, ZSetVersionState,
 };
 
-#[allow(dead_code)]
 impl<K> VersionedZSet<K>
 where
     K: Archive

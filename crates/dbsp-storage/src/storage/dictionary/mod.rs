@@ -19,7 +19,6 @@ pub use core::Dictionary;
 
 type HashFn = Arc<dyn Fn(&[u8]) -> u64 + Send + Sync + 'static>;
 
-#[allow(dead_code)]
 #[async_trait]
 pub trait KeyIntern<K>: Send + Sync
 where

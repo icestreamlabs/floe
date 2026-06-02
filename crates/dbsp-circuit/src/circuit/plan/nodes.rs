@@ -165,7 +165,6 @@ pub enum DbspJoinType {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct DbspJoinKey {
     left: DbspExpression,
     right: DbspExpression,
@@ -600,7 +599,6 @@ impl DbspAggregateFunction {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct DbspAggregateExpr {
     function: DbspAggregateFunction,
     expression: Option<DbspExpression>,
@@ -742,7 +740,6 @@ type AggregateSpec = (
 );
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct DbspAggregateNode {
     input_schema: Arc<RowSchema>,
     group_keys: Vec<GroupKeyExpr>,
@@ -874,7 +871,6 @@ pub struct DbspWindowAggregateNode {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct OrderExpr {
     expression: DbspExpression,
     ascending: bool,
@@ -913,7 +909,6 @@ impl OrderExpr {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct DbspTopNNode {
     input_schema: Arc<RowSchema>,
     partition_by: Vec<DbspExpression>,
@@ -975,9 +970,7 @@ impl DbspTopNNode {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct DbspUnionNode {
-    input_schemas: Vec<Arc<RowSchema>>,
     output_schema: Arc<RowSchema>,
 }
 
@@ -993,7 +986,6 @@ impl DbspUnionNode {
             }
         }
         Ok(Self {
-            input_schemas,
             output_schema: first,
         })
     }

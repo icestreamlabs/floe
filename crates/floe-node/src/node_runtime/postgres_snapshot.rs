@@ -32,7 +32,7 @@ struct SnapshotWorkerControl {
     ready_tx: tokio::sync::oneshot::Sender<()>,
     start_rx: watch::Receiver<bool>,
     scan_limiter: Arc<SnapshotScanLimiter>,
-    scan_observation_tx: Option<mpsc::UnboundedSender<SnapshotScanObservation>>,
+    scan_observation_tx: Option<watch::Sender<Option<SnapshotScanObservation>>>,
 }
 
 struct SnapshotScanLimiter {
@@ -73,7 +73,7 @@ struct SnapshotScanObservation {
 
 struct SnapshotAdaptiveConcurrencyRuntime {
     scan_limiter: Arc<SnapshotScanLimiter>,
-    scan_observation_tx: Option<mpsc::UnboundedSender<SnapshotScanObservation>>,
+    scan_observation_tx: Option<watch::Sender<Option<SnapshotScanObservation>>>,
     wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
     cancel: Option<CancellationToken>,
     task: Option<JoinHandle<()>>,
@@ -216,7 +216,7 @@ impl SnapshotAdaptiveConcurrencyRuntime {
             };
         }
 
-        let (scan_observation_tx, scan_observation_rx) = mpsc::unbounded_channel();
+        let (scan_observation_tx, scan_observation_rx) = watch::channel(None);
         let (wal_pressure_tx, wal_pressure_rx) =
             watch::channel(SnapshotWalBufferPressure::default());
         let cancel = parent_cancel.child_token();
@@ -264,7 +264,7 @@ impl SnapshotAdaptiveConcurrencyRuntime {
         Arc::clone(&self.scan_limiter)
     }
 
-    fn scan_observation_tx(&self) -> Option<mpsc::UnboundedSender<SnapshotScanObservation>> {
+    fn scan_observation_tx(&self) -> Option<watch::Sender<Option<SnapshotScanObservation>>> {
         self.scan_observation_tx.clone()
     }
 
@@ -317,7 +317,7 @@ async fn run_snapshot_adaptive_concurrency_controller(
     scan_limiter: Arc<SnapshotScanLimiter>,
     cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     mut wal_pressure_rx: watch::Receiver<SnapshotWalBufferPressure>,
-    mut scan_observation_rx: mpsc::UnboundedReceiver<SnapshotScanObservation>,
+    mut scan_observation_rx: watch::Receiver<Option<SnapshotScanObservation>>,
     cancel: CancellationToken,
 ) {
     let mut latest_scan_observation = None;
@@ -326,11 +326,11 @@ async fn run_snapshot_adaptive_concurrency_controller(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            maybe_observation = scan_observation_rx.recv() => {
-                match maybe_observation {
-                    Some(observation) => latest_scan_observation = Some(observation),
-                    None => break,
+            changed = scan_observation_rx.changed() => {
+                if changed.is_err() {
+                    break;
                 }
+                latest_scan_observation = *scan_observation_rx.borrow_and_update();
             }
             changed = wal_pressure_rx.changed() => {
                 if changed.is_err() {
@@ -2108,14 +2108,14 @@ async fn snapshot_table_change_batches_from_exported_snapshot(
         let snapshot =
             snapshot_table_change_batches_for_chunk(&transaction, schema, chunk, settings).await;
         if let (Some((_, Some(scan_observation_tx))), Ok(snapshot)) = (&scan_permit, &snapshot) {
-            let _ = scan_observation_tx.send(SnapshotScanObservation {
+            let _ = scan_observation_tx.send(Some(SnapshotScanObservation {
                 elapsed_ms: scan_started_at
                     .elapsed()
                     .as_millis()
                     .try_into()
                     .unwrap_or(u64::MAX),
                 rows: snapshot.row_count,
-            });
+            }));
         }
         transaction
             .commit()

@@ -49,7 +49,6 @@ impl Default for CompactionPolicy {
     }
 }
 
-#[allow(dead_code)]
 impl<K> VersionedZSet<K>
 where
     K: Archive
@@ -196,11 +195,6 @@ where
     #[cfg(test)]
     pub(crate) fn segment_prefix_bytes(&self) -> &[u8] {
         &self.segment_prefix
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn manifest_record(&self, version: u64) -> Result<ZSetVersionManifest> {
-        self.load_manifest_record(version).await
     }
 
     #[cfg(test)]

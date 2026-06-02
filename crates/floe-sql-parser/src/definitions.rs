@@ -456,17 +456,14 @@ impl MaterializedViewDefinition {
         }
     }
 
-    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    #[allow(dead_code)]
     pub fn query(&self) -> &str {
         &self.query
     }
 
-    #[allow(dead_code)]
     pub fn if_not_exists(&self) -> bool {
         self.if_not_exists
     }

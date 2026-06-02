@@ -34,7 +34,6 @@ enum LookupExistingResult {
     Missing { first_free_slot: u16 },
 }
 
-#[allow(dead_code)]
 pub struct Dictionary<K>
 where
     K: Archive + Clone + Send + Sync + 'static + for<'rk> RkyvSerialize<RkyvSerializer<'rk>>,
@@ -57,13 +56,11 @@ where
     K: Archive + Clone + Send + Sync + 'static + for<'rk> RkyvSerialize<RkyvSerializer<'rk>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'rk> CheckBytes<RkyvValidator<'rk>>,
 {
-    #[allow(dead_code)]
     pub async fn new(db: Arc<Db>, namespace: impl Into<String>) -> Result<Self> {
         let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db));
         Self::with_table(table, namespace, None).await
     }
 
-    #[allow(dead_code)]
     pub async fn with_table(
         table: Arc<dyn KeyValueTable>,
         namespace: impl Into<String>,
@@ -104,7 +101,6 @@ where
         })
     }
 
-    #[allow(dead_code)]
     pub fn batch(&self) -> DictionaryBatch<'_, K> {
         DictionaryBatch {
             dict: self,

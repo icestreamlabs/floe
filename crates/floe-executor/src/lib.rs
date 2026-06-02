@@ -21,7 +21,6 @@ pub mod dbsp_plan;
 pub mod dbsp_table_environment;
 pub mod delta_batch;
 pub mod delta_consolidation;
-mod encoded_batch;
 pub mod encoding;
 pub mod materialized_view;
 mod metrics;
@@ -61,8 +60,10 @@ pub use outer_stream::OuterStreamRegistry;
 pub use source_decoder::{SourceArrowBatchBuilder, SourceRowDecoder};
 pub use stream_types::{Diff, Timestamp};
 pub use subscribe::SubscribeExecutionConfig;
-pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider, SourceTableProvider};
-pub use task_events::{GraphTaskError, GraphTaskReceiver, GraphTaskSender};
+pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
+pub use task_events::{
+    GRAPH_TASK_EVENT_CHANNEL_CAPACITY, GraphTaskError, GraphTaskReceiver, GraphTaskSender,
+};
 pub use vectorized_keys::{
     build_delta_batch, build_source_delta_batch, source_primary_key_columns,
 };

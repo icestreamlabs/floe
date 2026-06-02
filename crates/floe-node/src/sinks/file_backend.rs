@@ -11,7 +11,7 @@ pub(super) async fn run_file_sink(
     append: bool,
     queue_capacity: usize,
     batch_policy: BatchPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
     if queue_capacity == 0 {
         bail!("sink queue_capacity must be greater than zero");
@@ -64,7 +64,7 @@ pub(super) async fn run_file_worker(
     mut rx: mpsc::Receiver<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
     batch_policy: BatchPolicy,
-    checkpoint_tx: Option<mpsc::UnboundedSender<SinkCursor>>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -105,7 +105,8 @@ pub(super) async fn run_file_worker(
                                     last_emitted_mv_version: flushed_version,
                                     row_index: None,
                                 },
-                            );
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -128,7 +129,8 @@ pub(super) async fn run_file_worker(
                         last_emitted_mv_version: version,
                         row_index: None,
                     },
-                );
+                )
+                .await?;
             }
         }
     }
@@ -144,7 +146,8 @@ pub(super) async fn run_file_worker(
                 last_emitted_mv_version: final_version,
                 row_index: None,
             },
-        );
+        )
+        .await?;
     }
     Ok(())
 }

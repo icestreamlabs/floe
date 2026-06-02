@@ -836,7 +836,6 @@ impl TransientTopNProcessor {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(super) fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
         let retain_count = self.offset.saturating_add(self.limit);
         if retain_count == 0 {
@@ -978,19 +977,6 @@ impl TransientAppendOnlyTopNProcessor {
         }
 
         Ok(output_deltas)
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
-        self.partitions
-            .values()
-            .flat_map(|state| {
-                state.visible_rows.iter().filter_map(|(order_key, weight)| {
-                    (*weight > 0).then_some((order_key.tie_breaker.clone(), *weight))
-                })
-            })
-            .collect()
     }
 
     fn apply_positive_delta(
@@ -1139,19 +1125,14 @@ impl TransientTop1Processor {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(super) fn snapshot_deltas(&self) -> Vec<(Vec<u8>, i64)> {
-        self.partition_output_cache
-            .iter()
-            .filter_map(|(partition_key, row_key)| {
-                let weight = self.order_index.get(partition_key)?.iter().find_map(
-                    |((_order_key, candidate_row), weight)| {
-                        (candidate_row == row_key).then_some(weight)
-                    },
-                )?;
-                (*weight > 0).then_some((row_key.clone(), 1))
-            })
-            .collect()
+        let mut snapshot = self
+            .partition_output_cache
+            .values()
+            .map(|row_key| (row_key.clone(), 1))
+            .collect::<Vec<_>>();
+        snapshot.sort();
+        snapshot
     }
 }
 

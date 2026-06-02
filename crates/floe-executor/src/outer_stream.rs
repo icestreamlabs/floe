@@ -38,16 +38,18 @@ pub struct TransientSourceBatch {
     pub deltas: EncodedDeltaBatch,
 }
 
+const TRANSIENT_SOURCE_SUBSCRIBER_CHANNEL_CAPACITY: usize = 1024;
+
 #[derive(Clone)]
 pub struct TransientSourceHandleStream {
-    subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
+    subscribers: Arc<Mutex<Vec<mpsc::Sender<TransientSourceBatch>>>>,
     durable_enabled: bool,
     recoverable: bool,
 }
 
 impl TransientSourceHandleStream {
-    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<TransientSourceBatch> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn subscribe(&self) -> mpsc::Receiver<TransientSourceBatch> {
+        let (tx, rx) = mpsc::channel(TRANSIENT_SOURCE_SUBSCRIBER_CHANNEL_CAPACITY);
         self.subscribers
             .lock()
             .expect("transient source subscribers lock poisoned")
@@ -75,7 +77,7 @@ pub struct OuterStreamWriter {
     pending_transient_deltas: EncodedDeltaBatch,
     pending_transient_bytes: usize,
     pending_encode_us: u64,
-    transient_subscribers: Arc<Mutex<Vec<mpsc::UnboundedSender<TransientSourceBatch>>>>,
+    transient_subscribers: Arc<Mutex<Vec<mpsc::Sender<TransientSourceBatch>>>>,
 }
 
 static TRANSIENT_SOURCE_BATCH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -250,7 +252,7 @@ impl OuterStreamWriter {
         })
     }
 
-    pub fn replay_transient_batch(
+    pub async fn replay_transient_batch(
         &mut self,
         version: i64,
         deltas: Vec<EncodedDelta>,
@@ -260,7 +262,8 @@ impl OuterStreamWriter {
             source: self.source.clone(),
             version,
             deltas: Arc::new(deltas),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -285,7 +288,7 @@ impl OuterStreamWriter {
             let encode_us = self.pending_encode_us;
             self.pending_transient_bytes = 0;
             self.pending_encode_us = 0;
-            self.publish_batch(batch.clone());
+            self.publish_batch(batch.clone()).await;
             if TRANSIENT_SOURCE_BATCH_LOG_COUNTER
                 .fetch_add(1, Ordering::Relaxed)
                 .is_multiple_of(TRANSIENT_SOURCE_BATCH_LOG_SAMPLE_EVERY)
@@ -315,7 +318,8 @@ impl OuterStreamWriter {
                 source: self.source.clone(),
                 version: publish_version,
                 deltas: Arc::new(Vec::new()),
-            });
+            })
+            .await;
         }
         if self.durable_enabled {
             Ok(self.stream.flush().await?.version)
@@ -332,12 +336,19 @@ impl OuterStreamWriter {
             .is_empty()
     }
 
-    fn publish_batch(&mut self, batch: TransientSourceBatch) {
-        let mut subscribers = self
+    async fn publish_batch(&mut self, batch: TransientSourceBatch) {
+        let subscribers = self
             .transient_subscribers
             .lock()
-            .expect("transient source subscribers lock poisoned");
-        subscribers.retain(|sender| sender.send(batch.clone()).is_ok());
+            .expect("transient source subscribers lock poisoned")
+            .clone();
+        for sender in subscribers {
+            let _ = sender.send(batch.clone()).await;
+        }
+        self.transient_subscribers
+            .lock()
+            .expect("transient source subscribers lock poisoned")
+            .retain(|sender| !sender.is_closed());
     }
 }
 
@@ -449,14 +460,14 @@ impl OuterStreamRegistry {
         Ok(handles)
     }
 
-    pub fn replay_transient_batch(
+    pub async fn replay_transient_batch(
         &mut self,
         source: &str,
         version: i64,
         deltas: Vec<EncodedDelta>,
     ) -> Result<()> {
         if let Some(writer) = self.writers.get_mut(source) {
-            writer.replay_transient_batch(version, deltas)?;
+            writer.replay_transient_batch(version, deltas).await?;
         }
         Ok(())
     }

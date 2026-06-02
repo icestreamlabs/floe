@@ -241,9 +241,6 @@ impl SourceArrowBatchBuilder {
                 self.definition.name()
             );
         }
-        if event.preencoded_row_key().is_some() {
-            bail!("preencoded row ingest is not accepted by the vectorized source batch builder");
-        }
         let payload = AppendIngestEvent::payload(event)
             .require_payload("source payload must be present for vectorized events")?;
         let object = payload

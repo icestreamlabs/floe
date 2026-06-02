@@ -7,7 +7,6 @@ use crate::http_ingest;
 
 use super::{current_unix_time_ms, encoding};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::node_runtime) struct ReplicationPipelineStatusSnapshot {
     pub(super) pipeline_name: String,
@@ -36,7 +35,6 @@ pub(in crate::node_runtime) struct ReplicationPipelineStatusSnapshot {
     pub(super) last_error: Option<String>,
 }
 
-#[allow(dead_code)]
 impl ReplicationPipelineStatusSnapshot {
     pub(super) fn pipeline_name(&self) -> &str {
         &self.pipeline_name
