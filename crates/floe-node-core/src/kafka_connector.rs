@@ -44,7 +44,6 @@ pub struct KafkaConnectorConfig {
     pub topics: Vec<String>,
     pub group_id: String,
     pub default_source: Option<String>,
-    pub default_source_id: Option<usize>,
     pub poll_timeout: Duration,
     pub max_messages_per_tick: usize,
     pub message_format: Option<String>,

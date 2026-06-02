@@ -13,7 +13,6 @@ use floe_core::RowValue;
 use floe_core::catalog::TableDefinition;
 use floe_storage::SlateCatalog;
 
-use super::filters::parse_mv_version_expr;
 use super::helpers::to_datafusion_error;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 
@@ -62,13 +61,7 @@ impl TableProvider for SlateTableProvider {
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(|expr| {
-                if parse_mv_version_expr(expr).is_some() {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
+            .map(|_| TableProviderFilterPushDown::Unsupported)
             .collect())
     }
 

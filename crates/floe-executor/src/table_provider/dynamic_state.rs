@@ -95,9 +95,17 @@ impl TableProvider for DynamicStateTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let mut exec: Arc<dyn ExecutionPlan> = self.exec();
+        let mut exec: Arc<dyn ExecutionPlan> = if limit.is_some() {
+            Arc::new(DynamicStateExec::new_with_limit(
+                Arc::clone(&self.schema),
+                Arc::clone(&self.state),
+                limit,
+            ))
+        } else {
+            self.exec()
+        };
 
         if let Some(projection) = projection {
             let exprs = projection
@@ -121,11 +129,20 @@ impl TableProvider for DynamicStateTableProvider {
 pub struct DynamicStateExec {
     schema: SchemaRef,
     state: Arc<ArcSwap<Vec<RecordBatch>>>,
+    limit: Option<usize>,
     cache: PlanProperties,
 }
 
 impl DynamicStateExec {
     pub fn new(schema: SchemaRef, state: Arc<ArcSwap<Vec<RecordBatch>>>) -> Self {
+        Self::new_with_limit(schema, state, None)
+    }
+
+    fn new_with_limit(
+        schema: SchemaRef,
+        state: Arc<ArcSwap<Vec<RecordBatch>>>,
+        limit: Option<usize>,
+    ) -> Self {
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::RoundRobinBatch(1),
@@ -137,12 +154,39 @@ impl DynamicStateExec {
         Self {
             schema,
             state,
+            limit,
             cache,
         }
     }
 
     fn snapshot_batches(&self) -> Arc<Vec<RecordBatch>> {
         self.state.load_full()
+    }
+
+    fn limited_snapshot_batches(&self) -> Vec<RecordBatch> {
+        let snapshot = self.snapshot_batches();
+        let Some(limit) = self.limit else {
+            return snapshot.iter().cloned().collect();
+        };
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut batches = Vec::new();
+        let mut remaining = limit;
+        for batch in snapshot.iter() {
+            if remaining == 0 {
+                break;
+            }
+            if batch.num_rows() <= remaining {
+                batches.push(batch.clone());
+                remaining -= batch.num_rows();
+            } else {
+                batches.push(batch.slice(0, remaining));
+                break;
+            }
+        }
+        batches
     }
 }
 
@@ -194,8 +238,7 @@ impl ExecutionPlan for DynamicStateExec {
             return internal_err!("Invalid partition {partition} for DynamicStateExec");
         }
 
-        let snapshot = self.snapshot_batches();
-        let batches = snapshot.iter().cloned().collect::<Vec<_>>();
+        let batches = self.limited_snapshot_batches();
         let stream = MemoryStream::try_new(batches, Arc::clone(&self.schema), None)?;
         Ok(Box::pin(stream))
     }
@@ -207,10 +250,9 @@ impl ExecutionPlan for DynamicStateExec {
             return internal_err!("Invalid partition index {idx} for DynamicStateExec");
         }
 
-        let snapshot = self.snapshot_batches();
         let mut rows = 0usize;
         let mut bytes = 0usize;
-        for batch in snapshot.iter() {
+        for batch in self.limited_snapshot_batches() {
             rows = rows.saturating_add(batch.num_rows());
             bytes = bytes.saturating_add(batch.get_array_memory_size());
         }

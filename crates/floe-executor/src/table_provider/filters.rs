@@ -8,10 +8,16 @@ pub(super) fn extract_mv_version_filter(filters: &[Expr]) -> (Option<u64>, Vec<E
     let mut retained = Vec::with_capacity(filters.len());
     for expr in filters {
         if let Some(version) = parse_mv_version_expr(expr) {
-            if as_of_version.is_none() {
-                as_of_version = Some(version);
+            match as_of_version {
+                None => {
+                    as_of_version = Some(version);
+                    continue;
+                }
+                Some(pushed_version) if pushed_version == version => {
+                    continue;
+                }
+                Some(_) => {}
             }
-            continue;
         }
         retained.push(expr.clone());
     }

@@ -157,12 +157,7 @@ async fn replay_kafka_source_journal_entry_as_arrow(
 ) -> anyhow::Result<Vec<(String, RecordBatch)>> {
     let mut batches = Vec::new();
     for range in entry.ranges {
-        let config = kafka_replay_connector_config(
-            connector_specs,
-            run_args,
-            &range.topic,
-            source_id_by_name,
-        )?;
+        let config = kafka_replay_connector_config(connector_specs, run_args, &range.topic)?;
         let replay_range = KafkaReplayRange {
             source: entry.source.clone(),
             tick_id: entry.tick_id,
@@ -204,10 +199,7 @@ async fn replay_kafka_source_journal_entry_as_arrow(
         let mut row_count = 0u64;
         let mut checksum = kafka_source_journal_initial_checksum();
         for event in replayed.events {
-            let Some(event_source_id) = event
-                .source_id()
-                .or_else(|| source_id_by_name.get(event.source()).copied())
-            else {
+            let Some(event_source_id) = source_id_by_name.get(event.source()).copied() else {
                 continue;
             };
             if event_source_id != source_id {
@@ -277,7 +269,6 @@ fn kafka_replay_connector_config(
     connector_specs: &[config::ConnectorSpec],
     run_args: &cli::RunArgs,
     topic: &str,
-    source_id_by_name: &HashMap<String, usize>,
 ) -> anyhow::Result<KafkaConnectorConfig> {
     for connector in connector_specs {
         let ConnectorConfig::Kafka {
@@ -299,15 +290,11 @@ fn kafka_replay_connector_config(
         let group_id = group_id
             .clone()
             .unwrap_or_else(|| run_args.kafka_group_id.clone());
-        let default_source_id = default_source
-            .as_deref()
-            .and_then(|source| source_id_by_name.get(source).copied());
         return Ok(KafkaConnectorConfig {
             brokers: brokers.clone(),
             topics: topics.clone(),
             group_id,
             default_source: default_source.clone(),
-            default_source_id,
             poll_timeout: Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms)),
             max_messages_per_tick: max_messages_per_tick.unwrap_or(run_args.kafka_max_messages),
             message_format: format.clone(),
@@ -2463,9 +2450,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 let poll_timeout = Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms));
                 let max_messages_per_tick =
                     max_messages_per_tick.unwrap_or(run_args.kafka_max_messages);
-                let default_source_id = default_source
-                    .as_deref()
-                    .and_then(|source| source_id_by_name.get(source).copied());
                 let connector_has_recovered_offsets = recovered_kafka_offsets
                     .iter()
                     .any(|offset| topics.iter().any(|topic| topic == &offset.topic));
@@ -2497,7 +2481,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         topics,
                         group_id,
                         default_source,
-                        default_source_id,
                         poll_timeout,
                         max_messages_per_tick,
                         message_format: format,

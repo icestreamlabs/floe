@@ -52,7 +52,6 @@ async fn kafka_connector_ingests_messages() {
         topics: vec![topic],
         group_id,
         default_source: None,
-        default_source_id: None,
         poll_timeout: Duration::from_millis(200),
         max_messages_per_tick: 16,
         message_format: None,

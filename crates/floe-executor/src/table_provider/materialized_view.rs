@@ -205,16 +205,23 @@ impl TableProvider for MaterializedViewTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|expr| {
-                if parse_mv_version_expr(expr).is_some() {
+        let mut pushed_version = None;
+        let mut pushdown = Vec::with_capacity(filters.len());
+        for expr in filters {
+            let filter_pushdown = match parse_mv_version_expr(expr) {
+                Some(version)
+                    if pushed_version
+                        .map(|pushed| pushed == version)
+                        .unwrap_or(true) =>
+                {
+                    pushed_version = Some(version);
                     TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
                 }
-            })
-            .collect())
+                Some(_) | None => TableProviderFilterPushDown::Unsupported,
+            };
+            pushdown.push(filter_pushdown);
+        }
+        Ok(pushdown)
     }
 
     async fn scan(

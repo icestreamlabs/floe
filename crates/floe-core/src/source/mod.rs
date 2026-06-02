@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::catalog::ColumnType;
 
@@ -200,21 +200,20 @@ pub struct AppendIngestEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AppendIngestPayload {
+enum AppendIngestPayload {
     Json(Value),
     Empty,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct AppendIngestMetadata {
-    source_id: Option<usize>,
+struct AppendIngestMetadata {
     resume_token: Option<AppendIngestResumeToken>,
     event_time_ms: Option<u64>,
     connector_position: Option<AppendIngestConnectorPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AppendIngestConnectorPosition {
+enum AppendIngestConnectorPosition {
     Kafka {
         topic: Arc<str>,
         partition: i32,
@@ -266,7 +265,7 @@ impl<'de> Deserialize<'de> for AppendIngestEvent {
             metadata: AppendIngestMetadata {
                 resume_token: decoded.resume_token,
                 event_time_ms: decoded.event_time_ms,
-                ..AppendIngestMetadata::default()
+                connector_position: None,
             },
         })
     }
@@ -291,24 +290,6 @@ pub enum AppendIngestResumeToken {
     },
 }
 
-impl AppendIngestMetadata {
-    pub fn source_id(&self) -> Option<usize> {
-        self.source_id
-    }
-
-    pub fn resume_token(&self) -> Option<&AppendIngestResumeToken> {
-        self.resume_token.as_ref()
-    }
-
-    pub fn event_time_ms(&self) -> Option<u64> {
-        self.event_time_ms
-    }
-
-    pub fn connector_position(&self) -> Option<&AppendIngestConnectorPosition> {
-        self.connector_position.as_ref()
-    }
-}
-
 /// Append-style row ingest envelope for file, object-store, generator, Kafka,
 /// HTTP, and connector-SDK inputs. Native CDC paths use transaction/change
 /// batches instead of this type.
@@ -323,14 +304,6 @@ impl AppendIngestEvent {
 
     pub fn source(&self) -> &str {
         &self.source
-    }
-
-    pub fn source_id(&self) -> Option<usize> {
-        self.metadata.source_id
-    }
-
-    pub fn metadata(&self) -> &AppendIngestMetadata {
-        &self.metadata
     }
 
     pub fn payload(&self) -> Option<&Value> {
@@ -383,22 +356,12 @@ impl AppendIngestEvent {
             AppendIngestPayload::Empty => None,
         }
     }
-
-    pub fn to_json_value(&self) -> Value {
-        json!({
-            "source": self.source,
-            "data": self.payload().cloned().unwrap_or(Value::Null),
-        })
-    }
-
-    pub fn to_json_string(&self) -> serde_json::Result<String> {
-        serde_json::to_string(&self.to_json_value())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn source_definition_builds_arrow_schema() {
@@ -443,7 +406,7 @@ mod tests {
     #[test]
     fn append_ingest_event_serializes_to_json() {
         let event = AppendIngestEvent::new("nexmark_person", json!({"id": 42}));
-        let serialized = event.to_json_string().expect("json serialization");
+        let serialized = serde_json::to_string(&event).expect("json serialization");
 
         assert!(serialized.contains("nexmark_person"));
         assert!(serialized.contains("id"));

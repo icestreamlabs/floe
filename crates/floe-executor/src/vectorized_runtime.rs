@@ -42,12 +42,6 @@ impl VectorizedMaterializedViewPlan {
     }
 }
 
-#[derive(Debug)]
-pub struct VectorizedSourceDelta {
-    pub source_name: String,
-    pub batch: RecordBatch,
-}
-
 #[derive(Clone)]
 struct VectorizedSourceState {
     schema: SchemaRef,
@@ -153,18 +147,6 @@ impl VectorizedExecutionRuntime {
             materialized_views: mv_states,
             registry,
         })
-    }
-
-    pub fn source_schema(&self, source_name: &str) -> Option<SchemaRef> {
-        self.sources
-            .get(source_name)
-            .map(|source| Arc::clone(&source.schema))
-    }
-
-    pub fn source_provider(&self, source_name: &str) -> Option<Arc<DynamicStateTableProvider>> {
-        self.sources
-            .get(source_name)
-            .map(|source| Arc::clone(&source.provider))
     }
 
     pub fn table_providers(&self) -> Vec<(String, Arc<dyn TableProvider>)> {

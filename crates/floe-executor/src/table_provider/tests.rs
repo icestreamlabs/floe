@@ -6,11 +6,11 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Column;
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, lit};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::physical_plan::collect;
 
 use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
-use crate::table_provider::MaterializedViewTableProvider;
+use crate::table_provider::{DynamicStateTableProvider, MaterializedViewTableProvider};
 
 use super::MV_VERSION_COLUMN;
 use super::filters::extract_mv_version_filter;
@@ -199,6 +199,45 @@ async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
     assert_eq!(batches[0].num_columns(), 1);
+}
+
+#[tokio::test]
+async fn dynamic_state_provider_applies_scan_limit() {
+    let schema = id_schema(true);
+    let provider = DynamicStateTableProvider::new(Arc::clone(&schema));
+    provider.set_batches(vec![
+        arrow_i64_batch(Arc::clone(&schema), &[1, 2]),
+        arrow_i64_batch(Arc::clone(&schema), &[3, 4]),
+    ]);
+
+    let session = SessionContext::new();
+    let state = session.state();
+    let plan = provider
+        .scan(&state, None, &[], Some(3))
+        .await
+        .expect("scan dynamic provider with limit");
+    let batches = collect(plan, session.state().task_ctx())
+        .await
+        .expect("collect dynamic provider batches");
+
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        3
+    );
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id array");
+            (0..values.len())
+                .map(|idx| values.value(idx))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![1, 2, 3]);
 }
 
 #[tokio::test]
@@ -586,6 +625,47 @@ fn mv_version_filter_is_extracted() {
     assert!(none_version.is_none());
     assert_eq!(unchanged, vec![other_filter.clone()]);
 
-    let (first_version, _) = extract_mv_version_filter(&[mv_filter.clone(), mv_filter.clone()]);
+    let (first_version, retained_duplicates) =
+        extract_mv_version_filter(&[mv_filter.clone(), mv_filter.clone()]);
     assert_eq!(first_version, Some(7));
+    assert!(retained_duplicates.is_empty());
+
+    let conflicting_filter = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name(MV_VERSION_COLUMN))),
+        Operator::Eq,
+        Box::new(lit(8_u64)),
+    ));
+    let (first_version, retained_conflict) =
+        extract_mv_version_filter(&[mv_filter.clone(), conflicting_filter.clone()]);
+    assert_eq!(first_version, Some(7));
+    assert_eq!(retained_conflict, vec![conflicting_filter]);
+}
+
+#[test]
+fn mv_version_pushdown_is_conflict_aware() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let provider = MaterializedViewTableProvider::new(registry, "mv_pushdown", id_schema(true));
+    let version_seven = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name(MV_VERSION_COLUMN))),
+        Operator::Eq,
+        Box::new(lit(7_u64)),
+    ));
+    let version_eight = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name(MV_VERSION_COLUMN))),
+        Operator::Eq,
+        Box::new(lit(8_u64)),
+    ));
+    let filter_refs = [&version_seven, &version_seven, &version_eight];
+
+    let pushdown = provider
+        .supports_filters_pushdown(&filter_refs)
+        .expect("pushdown support");
+    assert_eq!(
+        pushdown,
+        vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Unsupported,
+        ]
+    );
 }

@@ -411,10 +411,7 @@ pub(super) fn build_batch(
             let Some(queued) = queue.pending.pop_front() else {
                 break;
             };
-            let source_id = queued
-                .event
-                .source_id()
-                .or_else(|| source_id_by_name.get(queued.event.source()).copied());
+            let source_id = source_id_by_name.get(queued.event.source()).copied();
             let count = if let Some(source_id) = source_id {
                 &mut per_source_counts[source_id]
             } else {

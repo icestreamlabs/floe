@@ -68,6 +68,5 @@ pub use vectorized_keys::{
     build_delta_batch, build_source_delta_batch, source_primary_key_columns,
 };
 pub use vectorized_runtime::{
-    VectorizedExecutionRuntime, VectorizedMaterializedViewPlan, VectorizedSourceDelta,
-    weighted_batch_from_diffs,
+    VectorizedExecutionRuntime, VectorizedMaterializedViewPlan, weighted_batch_from_diffs,
 };

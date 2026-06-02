@@ -59,14 +59,6 @@ impl DbspHandleRecord {
         Self::new(handle_kinds::OPERATOR_STATE, name, namespace, version)
     }
 
-    pub fn join_output(
-        name: impl Into<String>,
-        namespace: impl Into<String>,
-        version: u64,
-    ) -> Self {
-        Self::new(handle_kinds::JOIN_OUTPUT, name, namespace, version)
-    }
-
     pub fn materialized_view(
         name: impl Into<String>,
         namespace: impl Into<String>,
@@ -76,23 +68,9 @@ impl DbspHandleRecord {
     }
 }
 
-pub fn record_if_nonzero(
-    kind: &str,
-    name: &str,
-    ns: &str,
-    version: u64,
-) -> Option<DbspHandleRecord> {
-    if version > 0 {
-        Some(DbspHandleRecord::new(kind, name, ns, version))
-    } else {
-        None
-    }
-}
-
 pub mod handle_kinds {
     pub const SOURCE: &str = "source";
     pub const OPERATOR_STATE: &str = "operator_state";
-    pub const JOIN_OUTPUT: &str = "join_output";
     pub const MATERIALIZED_VIEW: &str = "mv";
 }
 
