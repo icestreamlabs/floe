@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::metrics;
+use crate::{metrics, runtime_failure};
 use floe_config::{SinkConfig, SinkSpec};
 
 const DEFAULT_SINK_QUEUE_CAPACITY: usize = 1024;
@@ -259,11 +259,7 @@ pub fn spawn_sinks(
 }
 
 fn record_runtime_failure(state: &Arc<StdMutex<Option<String>>>, message: String) {
-    metrics::inc_runtime_error("sink");
-    let mut guard = state.lock().expect("runtime failure lock poisoned");
-    if guard.is_none() {
-        *guard = Some(message);
-    }
+    runtime_failure::record_runtime_failure("sink", state, message);
 }
 
 async fn run_sink(

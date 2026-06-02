@@ -305,6 +305,24 @@ fn runtime_failure_records_first_error_only() {
 }
 
 #[test]
+fn runtime_failure_recovers_poisoned_state_lock() {
+    let state = Arc::new(StdMutex::new(None::<String>));
+    let poisoned_state = Arc::clone(&state);
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoned_state.lock().expect("lock runtime failure state");
+        panic!("poison runtime failure state");
+    })
+    .join();
+
+    record_runtime_failure(&state, "after poison".to_string());
+
+    let guard = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(guard.as_deref(), Some("after poison"));
+}
+
+#[test]
 fn collect_mv_versions_for_commit_uses_logical_overlay_versions() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let handle = registry.register("mv_overlay".to_string());

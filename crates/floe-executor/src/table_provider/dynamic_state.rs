@@ -133,6 +133,13 @@ pub struct DynamicStateExec {
     cache: PlanProperties,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SnapshotStatistics {
+    rows: usize,
+    bytes: usize,
+    exact_bytes: bool,
+}
+
 impl DynamicStateExec {
     pub fn new(schema: SchemaRef, state: Arc<ArcSwap<Vec<RecordBatch>>>) -> Self {
         Self::new_with_limit(schema, state, None)
@@ -187,6 +194,45 @@ impl DynamicStateExec {
             }
         }
         batches
+    }
+
+    fn snapshot_statistics(&self) -> SnapshotStatistics {
+        let snapshot = self.snapshot_batches();
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        let mut exact_bytes = true;
+        let mut remaining = self.limit.unwrap_or(usize::MAX);
+
+        for batch in snapshot.iter() {
+            if remaining == 0 {
+                break;
+            }
+
+            let batch_rows = batch.num_rows();
+            let batch_bytes = batch.get_array_memory_size();
+            if batch_rows <= remaining {
+                rows = rows.saturating_add(batch_rows);
+                bytes = bytes.saturating_add(batch_bytes);
+                remaining = remaining.saturating_sub(batch_rows);
+            } else {
+                rows = rows.saturating_add(remaining);
+                if batch_rows > 0 {
+                    let partial_bytes = batch_bytes
+                        .saturating_mul(remaining)
+                        .checked_div(batch_rows)
+                        .unwrap_or(0);
+                    bytes = bytes.saturating_add(partial_bytes);
+                }
+                exact_bytes = false;
+                break;
+            }
+        }
+
+        SnapshotStatistics {
+            rows,
+            bytes,
+            exact_bytes,
+        }
     }
 }
 
@@ -250,15 +296,15 @@ impl ExecutionPlan for DynamicStateExec {
             return internal_err!("Invalid partition index {idx} for DynamicStateExec");
         }
 
-        let mut rows = 0usize;
-        let mut bytes = 0usize;
-        for batch in self.limited_snapshot_batches() {
-            rows = rows.saturating_add(batch.num_rows());
-            bytes = bytes.saturating_add(batch.get_array_memory_size());
-        }
+        let stats = self.snapshot_statistics();
+        let byte_size = if stats.exact_bytes {
+            Precision::Exact(stats.bytes)
+        } else {
+            Precision::Inexact(stats.bytes)
+        };
 
         Ok(Statistics::new_unknown(self.schema.as_ref())
-            .with_num_rows(Precision::Exact(rows))
-            .with_total_byte_size(Precision::Exact(bytes)))
+            .with_num_rows(Precision::Exact(stats.rows))
+            .with_total_byte_size(byte_size))
     }
 }

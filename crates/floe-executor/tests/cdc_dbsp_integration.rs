@@ -15,13 +15,13 @@ use floe_cdc_core::{
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
+use floe_executor::MaterializedViewRegistry;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
 use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
-use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use floe_executor::source_decoder::SourceRowDecoder;
 use floe_executor::stream_types::EncodedDelta;

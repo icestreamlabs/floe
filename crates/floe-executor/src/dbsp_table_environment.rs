@@ -23,7 +23,6 @@ pub struct DbspTableEnvironment {
     pub auction: ZSetStream<Vec<u8>>,
     /// Stream backing `nexmark_bid`.
     pub bid: ZSetStream<Vec<u8>>,
-    table: Arc<dyn KeyValueTable>,
 }
 
 impl DbspTableEnvironment {
@@ -55,7 +54,6 @@ impl DbspTableEnvironment {
             person,
             auction,
             bid,
-            table,
         })
     }
 
@@ -124,10 +122,6 @@ impl DbspTableEnvironment {
             TableKind::Auction => Some(&self.auction),
             TableKind::Bid => Some(&self.bid),
         }
-    }
-
-    pub fn table(&self) -> Arc<dyn KeyValueTable> {
-        self.table.clone()
     }
 }
 

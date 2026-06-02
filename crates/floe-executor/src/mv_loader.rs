@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use datafusion::execution::context::SessionContext;
 
 use crate::dbsp_bridge::DbspBridge;
-use crate::materialized_view::MaterializedViewRegistry;
+use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::MaterializedViewTableProvider;
 
 pub async fn load_or_register_mv(

@@ -5,11 +5,12 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::common::Column;
+use datafusion::common::stats::Precision;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::physical_plan::collect;
 
-use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
+use crate::mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::table_provider::{DynamicStateTableProvider, MaterializedViewTableProvider};
 
 use super::MV_VERSION_COLUMN;
@@ -238,6 +239,29 @@ async fn dynamic_state_provider_applies_scan_limit() {
         })
         .collect::<Vec<_>>();
     assert_eq!(values, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn dynamic_state_provider_statistics_respect_scan_limit() {
+    let schema = id_schema(true);
+    let provider = DynamicStateTableProvider::new(Arc::clone(&schema));
+    provider.set_batches(vec![
+        arrow_i64_batch(Arc::clone(&schema), &[1, 2]),
+        arrow_i64_batch(Arc::clone(&schema), &[3, 4]),
+    ]);
+
+    let session = SessionContext::new();
+    let state = session.state();
+    let plan = provider
+        .scan(&state, None, &[], Some(3))
+        .await
+        .expect("scan dynamic provider with limit");
+    let stats = plan
+        .partition_statistics(None)
+        .expect("dynamic provider statistics");
+
+    assert_eq!(stats.num_rows, Precision::Exact(3));
+    assert!(matches!(stats.total_byte_size, Precision::Inexact(_)));
 }
 
 #[tokio::test]

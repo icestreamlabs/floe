@@ -13,6 +13,7 @@ mod cli;
 mod http_ingest;
 mod metrics;
 mod node_runtime;
+mod runtime_failure;
 mod sinks;
 
 #[cfg(all(feature = "allocator-mimalloc", feature = "allocator-jemalloc"))]

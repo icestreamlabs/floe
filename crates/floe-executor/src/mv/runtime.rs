@@ -143,7 +143,7 @@ impl MaterializedView for MaterializedViewHandle {
 
 fn resolve_dbsp_version(
     view: &MaterializedViewHandle,
-    state: &crate::materialized_view::DbspPersistedState,
+    state: &crate::mv::registry::DbspPersistedState,
     target_version: u64,
 ) -> Option<u64> {
     let target_version_i64 = i64::try_from(target_version).ok()?;
@@ -167,7 +167,7 @@ fn resolve_dbsp_version(
 }
 
 async fn materialize_dbsp_version(
-    state: &crate::materialized_view::DbspPersistedState,
+    state: &crate::mv::registry::DbspPersistedState,
     version: u64,
 ) -> Result<HashMap<Vec<u8>, i64>> {
     ZSetHandleView::new(

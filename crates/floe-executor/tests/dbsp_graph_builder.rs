@@ -21,6 +21,7 @@ use dbsp::StreamRetention;
 use dbsp::handles::ZSetHandle;
 use dbsp_semantic::ZSet;
 use floe_executor::GraphTaskError;
+use floe_executor::MaterializedViewRegistry;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{
     BuildInputs, DbspGraphBuilder, source_batch_journal_root_sources,
@@ -30,7 +31,6 @@ use floe_executor::dbsp_plan::{
     nexmark_person_table, validate_dbsp_plan,
 };
 use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
-use floe_executor::materialized_view::MaterializedViewRegistry;
 use floe_executor::outer_stream::OuterStreamRegistry;
 use object_store::memory::InMemory;
 use regex::Regex;

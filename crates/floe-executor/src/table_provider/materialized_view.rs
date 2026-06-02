@@ -9,7 +9,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::materialized_view::MaterializedViewRegistry;
+use crate::mv::registry::MaterializedViewRegistry;
 
 use super::MV_VERSION_COLUMN;
 use super::SnapshotScanExec;

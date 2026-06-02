@@ -31,7 +31,7 @@ use crate::encoding::{
     EncodedRowProjectionColumn, EncodedRowProjectionSource, concat_encoded_rows,
     extract_encoded_row_columns,
 };
-use crate::materialized_view::MaterializedViewRegistry;
+use crate::mv::registry::MaterializedViewRegistry;
 use crate::outer_stream::TransientSourceHandleStream;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 use crate::vectorized_keys::{VectorizedEncodedKeyExtractor, VectorizedKeyedTimeBatch};

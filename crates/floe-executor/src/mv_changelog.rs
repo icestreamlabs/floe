@@ -14,8 +14,8 @@ use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::metrics;
+use crate::mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::mv::runtime::MaterializedView;
 
 pub type MvChangelogResult<T> = Result<T>;

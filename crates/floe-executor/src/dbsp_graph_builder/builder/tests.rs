@@ -44,7 +44,7 @@ use crate::dbsp_plan::{
     DbspSourceNode, ProjectItem, nexmark_auction_alias_table, nexmark_auction_table,
     nexmark_bid_alias_table, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
-use crate::materialized_view::MaterializedViewRegistry;
+use crate::mv::registry::MaterializedViewRegistry;
 use crate::outer_stream::OuterStreamRegistry;
 use crate::source_decoder::SourceRowDecoder;
 

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use slatedb::WriteBatch;
 
 use crate::dbsp_bridge::DbspBridge;
-use crate::materialized_view::{DbspPersistedState, MaterializedViewRegistry};
+use crate::mv::registry::{DbspPersistedState, MaterializedViewRegistry};
 use crate::operator_state::OperatorStateHandle;
 use crate::outer_stream::{OuterStreamCheckpoint, OuterStreamRegistry};
 use crate::source_journal::{KafkaSourceJournalRange, append_kafka_source_metadata_entry_to_batch};

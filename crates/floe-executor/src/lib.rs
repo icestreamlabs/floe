@@ -18,11 +18,11 @@ pub mod context;
 pub mod dbsp_bridge;
 pub mod dbsp_graph_builder;
 pub mod dbsp_plan;
-pub mod dbsp_table_environment;
+#[cfg(test)]
+mod dbsp_table_environment;
 pub mod delta_batch;
 pub mod delta_consolidation;
 pub mod encoding;
-pub mod materialized_view;
 mod metrics;
 pub mod mv;
 pub mod mv_changelog;
@@ -49,10 +49,9 @@ pub use dbsp_graph_builder::{
     source_batch_journal_root_sources_with_config, transient_source_root_requirements,
 };
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
-pub use dbsp_table_environment::DbspTableEnvironment;
 pub use delta_batch::{DeltaBatchBuffer, DeltaBatchConfig, FlushReason};
 pub use floe_core::source::SourceRegistry;
-pub use materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
+pub use mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 pub use mv::runtime::MaterializedView;
 pub use mv_loader::load_or_register_mv;
 pub use operator_state::OperatorStateHandle;
@@ -63,9 +62,6 @@ pub use subscribe::SubscribeExecutionConfig;
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
 pub use task_events::{
     GRAPH_TASK_EVENT_CHANNEL_CAPACITY, GraphTaskError, GraphTaskReceiver, GraphTaskSender,
-};
-pub use vectorized_keys::{
-    build_delta_batch, build_source_delta_batch, source_primary_key_columns,
 };
 pub use vectorized_runtime::{
     VectorizedExecutionRuntime, VectorizedMaterializedViewPlan, weighted_batch_from_diffs,

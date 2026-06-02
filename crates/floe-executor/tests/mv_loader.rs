@@ -4,8 +4,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::materialized_view::{MaterializedViewHandle, MaterializedViewRegistry};
-use floe_executor::{FloeQueryContext, load_or_register_mv};
+use floe_executor::{
+    FloeQueryContext, MaterializedViewHandle, MaterializedViewRegistry, load_or_register_mv,
+};
 use floe_storage::SlateCatalog;
 use object_store::{ObjectStore, memory::InMemory};
 use slatedb::Db;

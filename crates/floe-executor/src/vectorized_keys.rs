@@ -8,6 +8,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+#[cfg(test)]
 use dbsp::{
     TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table,
     nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
@@ -16,11 +17,13 @@ use dbsp::{
 use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
 use crate::stream_types::Diff;
 
-pub fn source_primary_key_columns(source_name: &str) -> Option<Vec<usize>> {
+#[cfg(test)]
+fn source_primary_key_columns(source_name: &str) -> Option<Vec<usize>> {
     source_table(source_name).map(|table| table.primary_key().columns().to_vec())
 }
 
-pub fn build_source_delta_batch(
+#[cfg(test)]
+fn build_source_delta_batch(
     source_name: &str,
     base_schema: SchemaRef,
     rows: impl IntoIterator<Item = (Vec<u8>, Diff)>,
@@ -29,7 +32,8 @@ pub fn build_source_delta_batch(
     build_delta_batch(base_schema, rows, key_columns.as_deref())
 }
 
-pub fn build_delta_batch(
+#[cfg(test)]
+fn build_delta_batch(
     base_schema: SchemaRef,
     rows: impl IntoIterator<Item = (Vec<u8>, Diff)>,
     key_columns: Option<&[usize]>,
@@ -108,14 +112,14 @@ impl VectorizedEncodedKeyExtractor {
             },
         )?;
         let mut staged_rows = Vec::with_capacity(rows.len());
-        for (row, diff) in rows {
+        for (row_idx, (row, diff)) in rows.iter().enumerate() {
             if *diff == 0 {
                 continue;
             }
             if buffer.push_ref(row, *diff, None)?.is_some() {
                 bail!("unbounded vectorized key extractor flushed before manual flush");
             }
-            staged_rows.push((row.clone(), *diff));
+            staged_rows.push((row_idx, *diff));
         }
 
         let Some(batch) = buffer.flush_manual()? else {
@@ -132,10 +136,15 @@ impl VectorizedEncodedKeyExtractor {
             for column_idx in 0..self.key_columns.len() {
                 append_arrow_key_value(batch.column(column_idx).as_ref(), row_idx, &mut key)?;
             }
-            let (row, diff) = staged_rows
+            let (source_idx, diff) = staged_rows
                 .get(row_idx)
                 .ok_or_else(|| anyhow!("vectorized key extractor row index out of bounds"))?;
-            output.push((key, row.clone(), *diff));
+            let row = rows
+                .get(*source_idx)
+                .ok_or_else(|| anyhow!("vectorized key extractor source index out of bounds"))?
+                .0
+                .clone();
+            output.push((key, row, *diff));
         }
         Ok(output)
     }
@@ -211,14 +220,14 @@ impl VectorizedEncodedKeyExtractor {
             },
         )?;
         let mut staged_rows = Vec::with_capacity(rows.len());
-        for (row, diff) in rows {
+        for (row_idx, (row, diff)) in rows.iter().enumerate() {
             if *diff == 0 {
                 continue;
             }
             if buffer.push_ref(row, *diff, None)?.is_some() {
                 bail!("unbounded vectorized key extractor flushed before manual flush");
             }
-            staged_rows.push((row.clone(), *diff));
+            staged_rows.push((row_idx, *diff));
         }
 
         let Some(batch) = buffer.flush_manual()? else {
@@ -239,11 +248,16 @@ impl VectorizedEncodedKeyExtractor {
             for column_idx in 0..self.key_columns.len() {
                 append_arrow_key_value(batch.column(column_idx).as_ref(), row_idx, &mut key)?;
             }
-            let (row, diff) = staged_rows
+            let (source_idx, diff) = staged_rows
                 .get(row_idx)
                 .ok_or_else(|| anyhow!("vectorized key extractor row index out of bounds"))?;
+            let row = rows
+                .get(*source_idx)
+                .ok_or_else(|| anyhow!("vectorized key extractor source index out of bounds"))?
+                .0
+                .clone();
             deltas.push(VectorizedKeyedTimeDelta {
-                row: row.clone(),
+                row,
                 diff: *diff,
                 key,
                 event_ts,
@@ -355,6 +369,7 @@ fn append_arrow_key_value(array: &dyn Array, row_idx: usize, encoded: &mut Vec<u
     Ok(())
 }
 
+#[cfg(test)]
 fn source_table(source_name: &str) -> Option<&'static TableDescriptor> {
     match source_name {
         "nexmark_person" => Some(nexmark_person_table()),

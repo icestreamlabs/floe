@@ -16,10 +16,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbsp_bridge::{DbspBridge, DbspView};
-use crate::materialized_view::{
-    DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry,
-};
 use crate::metrics;
+use crate::mv::registry::{DbspPersistedState, MaterializedViewHandle, MaterializedViewRegistry};
 use crate::outer_stream::{TransientSourceBatch, TransientSourceHandleStream};
 use crate::stream_types::EncodedDeltaBatch;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};

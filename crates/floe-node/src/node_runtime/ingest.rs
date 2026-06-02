@@ -10,11 +10,7 @@ pub(super) fn should_sample(counter: &AtomicU64, every: u64) -> bool {
 }
 
 pub(super) fn record_runtime_failure(state: &Arc<StdMutex<Option<String>>>, message: String) {
-    metrics::inc_runtime_error("runtime");
-    let mut guard = state.lock().expect("runtime failure lock poisoned");
-    if guard.is_none() {
-        *guard = Some(message);
-    }
+    crate::runtime_failure::record_runtime_failure("runtime", state, message);
 }
 
 pub(super) fn collect_mv_versions_for_commit(

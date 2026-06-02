@@ -25,7 +25,6 @@ object_store = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "rt", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-nexmark = { workspace = true }
 prometheus = { workspace = true }
 regex = "1.11"
 
@@ -35,6 +34,7 @@ arrow-schema = { workspace = true }
 dbsp-semantic = { path = "../dbsp-semantic" }
 floe-cdc = { path = "../floe-cdc" }
 floe-cdc-core = { path = "../floe-cdc-core" }
+nexmark = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 proptest = "1.5"
 serial_test = "3"
