@@ -178,11 +178,9 @@ pub(super) fn compose_delta_transforms(
 }
 
 pub(super) fn identity_delta_transform() -> Arc<DeltaTransformFn> {
-    Arc::new(
-        |deltas: Arc<Vec<(Vec<u8>, i64)>>| -> BoxFuture<'static, Result<Vec<(Vec<u8>, i64)>>> {
-            Box::pin(async move { Ok(deltas.as_ref().clone()) })
-        },
-    )
+    Arc::new(|deltas: Arc<Vec<(Vec<u8>, i64)>>| {
+        Box::pin(async move { Ok(deltas.as_ref().clone()) })
+    })
 }
 
 pub(super) fn compose_optional_delta_transform(

@@ -9,7 +9,7 @@ use floe_executor::{
     DbspBridge, FloeQueryContext, MaterializedViewRegistry, OuterStreamRegistry,
     load_or_register_mv,
 };
-use floe_node::generator::BID_SOURCE_NAME;
+use floe_node_core::generator::BID_SOURCE_NAME;
 use floe_storage::SlateCatalog;
 use slatedb::object_store::ObjectStore;
 use slatedb::object_store::memory::InMemory;

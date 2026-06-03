@@ -1,5 +1,12 @@
 use super::*;
 
+type WindowAggregateInputDelta = ((Vec<u8>, Vec<u8>), i64);
+type PreparedWindowAggregateRows = (
+    Vec<WindowAggregateInputDelta>,
+    PrecomputedWindowAggregateRows,
+    Vec<(Vec<u8>, i64)>,
+);
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_window_count_star_receiver(
     graph_id: &str,
@@ -160,12 +167,11 @@ pub(super) async fn build_transient_window_count_star_receiver_from_batches(
                     } else {
                         input_deltas
                     };
-                    if !compact_count_state {
-                        if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                    if !compact_count_state
+                        && let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
-                    }
                     let updates = match apply_transient_window_count_star_deltas(
                         input_deltas,
                         window_key_extractor.as_ref(),
@@ -240,11 +246,7 @@ pub(super) fn build_transient_window_incremental_batches(
     window_slide: i64,
     cutoff: Option<i64>,
     persist_inputs: bool,
-) -> Result<(
-    Vec<((Vec<u8>, Vec<u8>), i64)>,
-    PrecomputedWindowAggregateRows,
-    Vec<(Vec<u8>, i64)>,
-)> {
+) -> Result<PreparedWindowAggregateRows> {
     let mut windowed_deltas = Vec::new();
     let mut precomputed_rows = PrecomputedWindowAggregateRows::new();
     let mut persisted_window_rows = Vec::new();
@@ -445,7 +447,7 @@ pub(super) async fn build_transient_window_incremental_receiver_from_batches(
             {
                 let prekeyed_evaluator = Arc::clone(&prekeyed_evaluator);
                 let precomputed_rows = Arc::clone(&precomputed_rows);
-                move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]| {
+                move |delta_values: &[WindowAggregateInputDelta]| {
                     let mut evaluated = Vec::with_capacity(delta_values.len());
                     let mut misses = Vec::new();
                     match precomputed_rows.lock() {
@@ -582,12 +584,11 @@ pub(super) async fn build_transient_window_incremental_receiver_from_batches(
                             },
                             None => (Vec::new(), PrecomputedWindowAggregateRows::new(), Vec::new()),
                         };
-                    if !compact_source_state {
-                        if let Err(err) = persistent_state.apply_deltas(&persisted_window_rows).await {
+                    if !compact_source_state
+                        && let Err(err) = persistent_state.apply_deltas(&persisted_window_rows).await {
                             report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                             break;
                         }
-                    }
                     let use_precomputed_rows =
                         windowed_deltas.iter().all(|(_, weight)| *weight >= 0);
                     if let Ok(mut precomputed) = precomputed_rows.lock() {

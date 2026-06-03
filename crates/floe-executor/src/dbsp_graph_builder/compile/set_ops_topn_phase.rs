@@ -10,6 +10,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
+type ExtractedTopNRow = (Vec<u8>, i64, Option<Vec<u8>>, Option<TopNKey>);
+
 impl DbspGraphBuilder {
     pub(crate) async fn compile_union(
         &mut self,
@@ -417,10 +419,7 @@ impl VectorizedTopNKeyParts {
         }
     }
 
-    fn extract(
-        &self,
-        delta_values: &[(Vec<u8>, i64)],
-    ) -> Vec<(Vec<u8>, i64, Option<Vec<u8>>, Option<TopNKey>)> {
+    fn extract(&self, delta_values: &[(Vec<u8>, i64)]) -> Vec<ExtractedTopNRow> {
         match self.try_extract(delta_values) {
             Ok(extracted) => extracted,
             Err(err) => {
@@ -439,10 +438,7 @@ impl VectorizedTopNKeyParts {
         }
     }
 
-    fn try_extract(
-        &self,
-        delta_values: &[(Vec<u8>, i64)],
-    ) -> Result<Vec<(Vec<u8>, i64, Option<Vec<u8>>, Option<TopNKey>)>> {
+    fn try_extract(&self, delta_values: &[(Vec<u8>, i64)]) -> Result<Vec<ExtractedTopNRow>> {
         if delta_values.is_empty() {
             return Ok(Vec::new());
         }

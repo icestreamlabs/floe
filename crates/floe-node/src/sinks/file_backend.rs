@@ -63,12 +63,12 @@ pub(super) async fn run_file_worker(
     mv_name: &str,
     path: &str,
     append: bool,
-    mut rx: mpsc::Receiver<SinkEvent>,
+    rx: mpsc::Receiver<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
     batch_policy: BatchPolicy,
     checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .append(append)
@@ -77,81 +77,58 @@ pub(super) async fn run_file_worker(
         .await
         .with_context(|| format!("open sink file {path}"))?;
 
-    let mut buffer = Vec::new();
-    let mut buffer_bytes = 0usize;
+    let backend = FileSinkBackend {
+        sink_name,
+        mv_name,
+        file,
+        tracker: Arc::clone(&tracker),
+        checkpoint_tx,
+    };
+    run_buffered_sink_worker(rx, tracker, batch_policy, backend).await
+}
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            SinkEvent::Rows(rows) => {
-                tracker.on_dequeue_many(rows.len());
-                for row in rows {
-                    buffer_bytes += row.byte_len;
-                    buffer.push(row);
-                    if batch_policy.should_flush(buffer.len(), buffer_bytes) {
-                        let flushed_version =
-                            buffer.iter().map(|entry| entry.version).max().unwrap_or(-1);
-                        flush_file_buffer(
-                            &mut file,
-                            &mut buffer,
-                            &mut buffer_bytes,
-                            &tracker,
-                            None,
-                        )
-                        .await?;
-                        if flushed_version >= 0 {
-                            publish_sink_cursor(
-                                &checkpoint_tx,
-                                SinkCursor {
-                                    sink: sink_name.to_string(),
-                                    mv_name: mv_name.to_string(),
-                                    last_emitted_mv_version: flushed_version,
-                                    row_index: None,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-            SinkEvent::Flush { version } => {
-                tracker.on_dequeue();
-                flush_file_buffer(
-                    &mut file,
-                    &mut buffer,
-                    &mut buffer_bytes,
-                    &tracker,
-                    Some(version),
-                )
-                .await?;
-                publish_sink_cursor(
-                    &checkpoint_tx,
-                    SinkCursor {
-                        sink: sink_name.to_string(),
-                        mv_name: mv_name.to_string(),
-                        last_emitted_mv_version: version,
-                        row_index: None,
-                    },
-                )
-                .await?;
-            }
-        }
-    }
+struct FileSinkBackend<'a> {
+    sink_name: &'a str,
+    mv_name: &'a str,
+    file: tokio::fs::File,
+    tracker: Arc<SinkQueueTracker>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
+}
 
-    let final_version = buffer.iter().map(|entry| entry.version).max().unwrap_or(-1);
-    flush_file_buffer(&mut file, &mut buffer, &mut buffer_bytes, &tracker, None).await?;
-    if final_version >= 0 {
-        publish_sink_cursor(
-            &checkpoint_tx,
-            SinkCursor {
-                sink: sink_name.to_string(),
-                mv_name: mv_name.to_string(),
-                last_emitted_mv_version: final_version,
-                row_index: None,
-            },
+impl BufferedSinkBackend for FileSinkBackend<'_> {
+    async fn flush(
+        &mut self,
+        buffer: &mut Vec<SinkRecord>,
+        buffer_bytes: &mut usize,
+        flush_version: Option<i64>,
+    ) -> Result<()> {
+        let flushed_version = buffer
+            .iter()
+            .map(|entry| entry.version)
+            .max()
+            .unwrap_or_else(|| flush_version.unwrap_or(-1));
+        flush_file_buffer(
+            &mut self.file,
+            buffer,
+            buffer_bytes,
+            &self.tracker,
+            flush_version,
         )
         .await?;
+        if flushed_version >= 0 {
+            publish_sink_cursor(
+                &self.checkpoint_tx,
+                SinkCursor {
+                    sink: self.sink_name.to_string(),
+                    mv_name: self.mv_name.to_string(),
+                    last_emitted_mv_version: flushed_version,
+                    row_index: None,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) async fn flush_file_buffer(

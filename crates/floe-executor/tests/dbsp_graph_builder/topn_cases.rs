@@ -107,11 +107,6 @@ async fn aggregate_materializes_mv() {
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
-    assert_eq!(
-        zset_from_rows(&rows),
-        zset_from_rows(&expected),
-        "full aggregate MV graph should match ZSet reference semantics after insertions"
-    );
 
     bid_writer
         .append_encoded(encoded_bid_row(2, 42, 30), -1)
@@ -131,11 +126,6 @@ async fn aggregate_materializes_mv() {
     ];
     sort_rows_by_first_column(&mut expected);
     assert_eq!(rows, expected);
-    assert_eq!(
-        zset_from_rows(&rows),
-        zset_from_rows(&expected),
-        "full aggregate MV graph should match ZSet reference semantics after retraction"
-    );
 }
 
 #[tokio::test]

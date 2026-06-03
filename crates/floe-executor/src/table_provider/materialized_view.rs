@@ -68,26 +68,26 @@ impl MaterializedViewTableProvider {
             || mv_version_index.is_some_and(|index| {
                 !projected_indices.is_empty() && projected_indices.iter().all(|idx| *idx == index)
             });
-        if fast_count_eligible {
-            if let Some((row_count, version)) = self.fast_count_batches(as_of_version, limit)? {
-                if projected_indices.is_empty() {
-                    let options = datafusion::arrow::record_batch::RecordBatchOptions::new()
-                        .with_row_count(Some(row_count));
-                    let batch = datafusion::arrow::record_batch::RecordBatch::try_new_with_options(
-                        Arc::clone(&projected_schema),
-                        vec![],
-                        &options,
-                    )
-                    .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-                    return Ok((projected_schema, vec![batch]));
-                }
-                let batches = build_constant_u64_projection_batches(
+        if fast_count_eligible
+            && let Some((row_count, version)) = self.fast_count_batches(as_of_version, limit)?
+        {
+            if projected_indices.is_empty() {
+                let options = datafusion::arrow::record_batch::RecordBatchOptions::new()
+                    .with_row_count(Some(row_count));
+                let batch = datafusion::arrow::record_batch::RecordBatch::try_new_with_options(
                     Arc::clone(&projected_schema),
-                    version,
-                    row_count,
-                )?;
-                return Ok((projected_schema, batches));
+                    vec![],
+                    &options,
+                )
+                .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+                return Ok((projected_schema, vec![batch]));
             }
+            let batches = build_constant_u64_projection_batches(
+                Arc::clone(&projected_schema),
+                version,
+                row_count,
+            )?;
+            return Ok((projected_schema, batches));
         }
         if let Some((snapshot, version)) = self.load_arrow_snapshot(as_of_version)? {
             return build_batches_from_arrow_snapshot(

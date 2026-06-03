@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,10 +11,30 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::LogicalWorkSnapshot;
 use dbsp::handles::ZSetHandle;
-use dbsp::storage::KeyValueTable;
-use dbsp::storage::dictionary::Dictionary;
 use tokio::sync::watch;
 use tracing::field;
+
+pub use super::dbsp_state::DbspPersistedState;
+
+fn read_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(%label, "rwlock read was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn write_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(%label, "rwlock write was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct MaterializedViewRegistry {
@@ -37,7 +57,7 @@ impl MaterializedViewRegistry {
     }
 
     pub fn register(&self, name: impl Into<String>) -> Arc<MaterializedViewHandle> {
-        let mut guard = self.views.write().expect("mutex poisoned");
+        let mut guard = write_lock(&self.views, "materialized view registry views");
         let name = name.into();
         guard
             .entry(name.clone())
@@ -48,46 +68,35 @@ impl MaterializedViewRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<MaterializedViewHandle>> {
-        self.views
-            .read()
-            .expect("mutex poisoned")
+        read_lock(&self.views, "materialized view registry views")
             .get(name)
             .cloned()
     }
 
     pub fn handles(&self) -> Vec<Arc<MaterializedViewHandle>> {
-        self.views
-            .read()
-            .expect("mutex poisoned")
+        read_lock(&self.views, "materialized view registry views")
             .values()
             .cloned()
             .collect()
     }
 
     pub fn update_watermark_all(&self, watermark: Timestamp) {
-        let views: Vec<Arc<MaterializedViewHandle>> = self
-            .views
-            .read()
-            .expect("mutex poisoned")
-            .values()
-            .cloned()
-            .collect();
+        let views: Vec<Arc<MaterializedViewHandle>> =
+            read_lock(&self.views, "materialized view registry views")
+                .values()
+                .cloned()
+                .collect();
         for view in views {
             view.update_watermark(watermark);
         }
     }
 
     pub fn set_schema(&self, name: impl Into<String>, schema: SchemaRef) {
-        self.schemas
-            .write()
-            .expect("mutex poisoned")
-            .insert(name.into(), schema);
+        write_lock(&self.schemas, "materialized view registry schemas").insert(name.into(), schema);
     }
 
     pub fn schema(&self, name: &str) -> Option<SchemaRef> {
-        self.schemas
-            .read()
-            .expect("mutex poisoned")
+        read_lock(&self.schemas, "materialized view registry schemas")
             .get(name)
             .cloned()
     }
@@ -117,6 +126,7 @@ pub struct MaterializedViewHandle {
 }
 
 pub type EncodedStateMap = AHashMap<EncodedRow, Diff>;
+type EncodedOverlayRows = Vec<(Vec<u8>, i64)>;
 
 impl MaterializedViewHandle {
     fn new(name: String, retention_keep_last: Option<usize>) -> Self {
@@ -158,8 +168,8 @@ impl MaterializedViewHandle {
             return;
         }
 
-        let mut guard = self.state.write().expect("mutex poisoned");
-        let mut row_count = self.state_row_count.write().expect("mutex poisoned");
+        let mut guard = write_lock(&self.state, "materialized view encoded state");
+        let mut row_count = write_lock(&self.state_row_count, "materialized view row count");
         Self::apply_encoded_locked(&mut guard, &mut row_count, key, diff);
     }
 
@@ -191,32 +201,42 @@ impl MaterializedViewHandle {
     }
 
     pub fn update_watermark(&self, watermark: Timestamp) {
-        *self.watermark.write().expect("mutex poisoned") = Some(watermark);
+        *write_lock(&self.watermark, "materialized view watermark") = Some(watermark);
     }
 
     pub fn watermark(&self) -> Option<Timestamp> {
-        *self.watermark.read().expect("mutex poisoned")
+        *read_lock(&self.watermark, "materialized view watermark")
     }
 
     pub fn snapshot_encoded(&self) -> EncodedStateMap {
-        self.state.read().expect("mutex poisoned").clone()
+        read_lock(&self.state, "materialized view encoded state").clone()
     }
 
     pub fn mark_state_authoritative(&self) {
-        *self.state_authoritative.write().expect("mutex poisoned") = true;
+        *write_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) = true;
     }
 
     pub fn mark_state_non_authoritative(&self) {
-        *self.state_authoritative.write().expect("mutex poisoned") = false;
-        self.staged_row_count_versions
-            .write()
-            .expect("mutex poisoned")
-            .clear();
-        *self.published_row_count.write().expect("mutex poisoned") = 0;
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = None;
+        *write_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) = false;
+        write_lock(
+            &self.staged_row_count_versions,
+            "materialized view staged row count versions",
+        )
+        .clear();
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = 0;
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = None;
     }
 
     pub fn seed_authoritative_row_count_if_latest(&self, version: u64, row_count: usize) -> bool {
@@ -227,17 +247,24 @@ impl MaterializedViewHandle {
             return false;
         }
         let row_count = i64::try_from(row_count).unwrap_or(i64::MAX);
-        *self.state_row_count.write().expect("mutex poisoned") = row_count;
-        *self.published_row_count.write().expect("mutex poisoned") = row_count;
-        self.staged_row_count_versions
-            .write()
-            .expect("mutex poisoned")
-            .retain(|candidate, _| *candidate > version);
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = Some(version);
-        *self.state_authoritative.write().expect("mutex poisoned") = true;
+        *write_lock(&self.state_row_count, "materialized view row count") = row_count;
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = row_count;
+        write_lock(
+            &self.staged_row_count_versions,
+            "materialized view staged row count versions",
+        )
+        .retain(|candidate, _| *candidate > version);
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = Some(version);
+        *write_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) = true;
         true
     }
 
@@ -249,61 +276,85 @@ impl MaterializedViewHandle {
             return false;
         }
         let row_count = i64::try_from(row_count).unwrap_or(i64::MAX);
-        *self.state_row_count.write().expect("mutex poisoned") = row_count;
-        *self.published_row_count.write().expect("mutex poisoned") = row_count;
-        self.staged_row_count_versions
-            .write()
-            .expect("mutex poisoned")
-            .retain(|candidate, _| *candidate > version);
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = Some(version);
+        *write_lock(&self.state_row_count, "materialized view row count") = row_count;
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = row_count;
+        write_lock(
+            &self.staged_row_count_versions,
+            "materialized view staged row count versions",
+        )
+        .retain(|candidate, _| *candidate > version);
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = Some(version);
         true
     }
 
     pub fn authoritative_row_count(&self) -> Option<usize> {
-        if !*self.state_authoritative.read().expect("mutex poisoned") {
+        if !*read_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) {
             return None;
         }
-        Some(usize::try_from(*self.state_row_count.read().expect("mutex poisoned")).unwrap_or(0))
+        Some(
+            usize::try_from(*read_lock(
+                &self.state_row_count,
+                "materialized view row count",
+            ))
+            .unwrap_or(0),
+        )
     }
 
     pub fn authoritative_row_count_for(&self, version: u64) -> Option<usize> {
         let Ok(version) = i64::try_from(version) else {
             return None;
         };
-        if self
-            .state_row_count_version
-            .read()
-            .expect("mutex poisoned")
-            .as_ref()
+        if read_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        )
+        .as_ref()
             != Some(&version)
         {
             return None;
         }
         Some(
-            usize::try_from(*self.published_row_count.read().expect("mutex poisoned")).unwrap_or(0),
+            usize::try_from(*read_lock(
+                &self.published_row_count,
+                "materialized view published row count",
+            ))
+            .unwrap_or(0),
         )
     }
 
     pub fn advance_authoritative_row_count_version(&self, version: u64) {
-        if !*self.state_authoritative.read().expect("mutex poisoned") {
+        if !*read_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) {
             return;
         }
         let Ok(version) = i64::try_from(version) else {
             return;
         };
-        let row_count = *self.state_row_count.read().expect("mutex poisoned");
-        *self.published_row_count.write().expect("mutex poisoned") = row_count;
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = Some(version);
-        self.staged_row_count_versions
-            .write()
-            .expect("mutex poisoned")
-            .retain(|candidate, _| *candidate > version);
+        let row_count = *read_lock(&self.state_row_count, "materialized view row count");
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = row_count;
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = Some(version);
+        write_lock(
+            &self.staged_row_count_versions,
+            "materialized view staged row count versions",
+        )
+        .retain(|candidate, _| *candidate > version);
     }
 
     pub fn apply_encoded_state_batch(&self, version: u64, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
@@ -324,12 +375,15 @@ impl MaterializedViewHandle {
         deltas: &[(Vec<u8>, i64)],
         deltas_consolidated: bool,
     ) -> Result<()> {
-        if !*self.state_authoritative.read().expect("mutex poisoned") {
+        if !*read_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) {
             return Ok(());
         }
         {
-            let mut state = self.state.write().expect("mutex poisoned");
-            let mut row_count = self.state_row_count.write().expect("mutex poisoned");
+            let mut state = write_lock(&self.state, "materialized view encoded state");
+            let mut row_count = write_lock(&self.state_row_count, "materialized view row count");
             if deltas_consolidated {
                 for (key, diff) in deltas {
                     Self::apply_encoded_locked(&mut state, &mut row_count, key, *diff);
@@ -351,17 +405,21 @@ impl MaterializedViewHandle {
     }
 
     pub fn stage_authoritative_row_count_version(&self, version: u64) {
-        if !*self.state_authoritative.read().expect("mutex poisoned") {
+        if !*read_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) {
             return;
         }
         let Ok(version) = i64::try_from(version) else {
             return;
         };
-        let row_count = *self.state_row_count.read().expect("mutex poisoned");
-        self.staged_row_count_versions
-            .write()
-            .expect("mutex poisoned")
-            .insert(version, row_count);
+        let row_count = *read_lock(&self.state_row_count, "materialized view row count");
+        write_lock(
+            &self.staged_row_count_versions,
+            "materialized view staged row count versions",
+        )
+        .insert(version, row_count);
         self.promote_staged_row_count_if_visible(version);
     }
 
@@ -378,19 +436,23 @@ impl MaterializedViewHandle {
             .try_into()
             .unwrap_or(i64::MAX);
         {
-            let mut snapshots = self.arrow_snapshots.write().expect("mutex poisoned");
+            let mut snapshots =
+                write_lock(&self.arrow_snapshots, "materialized view arrow snapshots");
             snapshots.insert(version, Arc::new(snapshot));
         }
         {
-            let mut deltas = self.arrow_deltas.write().expect("mutex poisoned");
+            let mut deltas = write_lock(&self.arrow_deltas, "materialized view arrow deltas");
             deltas.insert(version, Arc::new(delta));
         }
-        *self.state_row_count.write().expect("mutex poisoned") = row_count;
-        *self.published_row_count.write().expect("mutex poisoned") = row_count;
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = Some(version);
+        *write_lock(&self.state_row_count, "materialized view row count") = row_count;
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = row_count;
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = Some(version);
         self.record_latest_version(version);
         self.prune_versions();
         self.prune_arrow_versions();
@@ -403,26 +465,20 @@ impl MaterializedViewHandle {
     }
 
     pub fn arrow_snapshot_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
-        self.arrow_snapshots
-            .read()
-            .expect("mutex poisoned")
+        read_lock(&self.arrow_snapshots, "materialized view arrow snapshots")
             .get(&version)
             .cloned()
     }
 
     pub fn latest_arrow_snapshot(&self) -> Option<(i64, Arc<Vec<RecordBatch>>)> {
-        self.arrow_snapshots
-            .read()
-            .expect("mutex poisoned")
+        read_lock(&self.arrow_snapshots, "materialized view arrow snapshots")
             .iter()
             .next_back()
             .map(|(version, batches)| (*version, Arc::clone(batches)))
     }
 
     pub fn arrow_delta_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
-        self.arrow_deltas
-            .read()
-            .expect("mutex poisoned")
+        read_lock(&self.arrow_deltas, "materialized view arrow deltas")
             .get(&version)
             .cloned()
     }
@@ -442,18 +498,19 @@ impl MaterializedViewHandle {
         let _enter = span.enter();
         span.record("version", state.version());
         tracing::debug!("materialized view DBSP state updated");
-        *self.dbsp_state.write().expect("mutex poisoned") = Some(state);
+        *write_lock(&self.dbsp_state, "materialized view DBSP state") = Some(state);
     }
 
     pub fn dbsp_state(&self) -> Option<DbspPersistedState> {
-        self.dbsp_state.read().expect("mutex poisoned").clone()
+        read_lock(&self.dbsp_state, "materialized view DBSP state").clone()
     }
 
     pub fn has_encoded_overlay(&self) -> bool {
-        self.encoded_overlay_state
-            .read()
-            .expect("mutex poisoned")
-            .is_some()
+        read_lock(
+            &self.encoded_overlay_state,
+            "materialized view encoded overlay state",
+        )
+        .is_some()
     }
 
     pub fn append_shared_encoded_overlay_batch(
@@ -468,7 +525,10 @@ impl MaterializedViewHandle {
             .filter(|(_, diff)| *diff != 0)
             .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
             .sum();
-        let mut guard = self.encoded_overlay_state.write().expect("mutex poisoned");
+        let mut guard = write_lock(
+            &self.encoded_overlay_state,
+            "materialized view encoded overlay state",
+        );
         let state = guard.get_or_insert_with(|| EncodedOverlayState {
             base_version: self
                 .dbsp_state()
@@ -507,8 +567,11 @@ impl MaterializedViewHandle {
     pub fn encoded_overlay_batches(
         &self,
         as_of_version: Option<u64>,
-    ) -> Option<(u64, u64, Vec<(Vec<u8>, i64)>)> {
-        let guard = self.encoded_overlay_state.read().expect("mutex poisoned");
+    ) -> Option<(u64, u64, EncodedOverlayRows)> {
+        let guard = read_lock(
+            &self.encoded_overlay_state,
+            "materialized view encoded overlay state",
+        );
         let state = guard.as_ref()?;
         let target_version = as_of_version.unwrap_or(state.latest_version);
         if target_version < state.base_version {
@@ -528,7 +591,10 @@ impl MaterializedViewHandle {
         &self,
         as_of_version: Option<u64>,
     ) -> Option<(u64, u64, HashMap<Vec<u8>, i64>)> {
-        let guard = self.encoded_overlay_state.read().expect("mutex poisoned");
+        let guard = read_lock(
+            &self.encoded_overlay_state,
+            "materialized view encoded overlay state",
+        );
         let state = guard.as_ref()?;
         let target_version = as_of_version.unwrap_or(state.latest_version);
         if target_version < state.base_version {
@@ -554,7 +620,10 @@ impl MaterializedViewHandle {
     }
 
     pub fn encoded_overlay_batch(&self, version: u64) -> Option<Vec<(Vec<u8>, i64)>> {
-        let guard = self.encoded_overlay_state.read().expect("mutex poisoned");
+        let guard = read_lock(
+            &self.encoded_overlay_state,
+            "materialized view encoded overlay state",
+        );
         let state = guard.as_ref()?;
         state
             .batches
@@ -566,7 +635,10 @@ impl MaterializedViewHandle {
         &self,
         base_version: u64,
     ) -> EncodedOverlayCompactionStats {
-        let mut guard = self.encoded_overlay_state.write().expect("mutex poisoned");
+        let mut guard = write_lock(
+            &self.encoded_overlay_state,
+            "materialized view encoded overlay state",
+        );
         let Some(state) = guard.as_mut() else {
             return EncodedOverlayCompactionStats::default();
         };
@@ -596,10 +668,7 @@ impl MaterializedViewHandle {
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
         let namespace = handle.ns.clone();
         {
-            let mut guard = self
-                .versions
-                .write()
-                .expect("materialized view versions lock poisoned");
+            let mut guard = write_lock(&self.versions, "materialized view versions");
             guard.insert(version, handle);
         }
         self.record_latest_version(version);
@@ -624,42 +693,36 @@ impl MaterializedViewHandle {
     }
 
     pub fn latest_version(&self) -> Option<i64> {
-        *self
-            .latest_version
-            .read()
-            .expect("materialized view version lock poisoned")
+        *read_lock(&self.latest_version, "materialized view latest version")
     }
 
     pub fn next_version_after(&self, version: i64) -> Option<i64> {
-        self.published_versions
-            .read()
-            .expect("materialized view versions lock poisoned")
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate > version)
-            .min()
+        read_lock(
+            &self.published_versions,
+            "materialized view published versions",
+        )
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate > version)
+        .min()
     }
 
     pub fn is_version_published(&self, version: i64) -> bool {
-        self.published_versions
-            .read()
-            .expect("materialized view versions lock poisoned")
-            .contains(&version)
+        read_lock(
+            &self.published_versions,
+            "materialized view published versions",
+        )
+        .contains(&version)
     }
 
     pub fn version_time(&self, version: i64) -> Option<i64> {
-        self.version_times
-            .read()
-            .expect("materialized view version lock poisoned")
+        read_lock(&self.version_times, "materialized view version times")
             .get(&version)
             .copied()
     }
 
     pub fn record_logical_work(&self, version: i64, work: LogicalWorkSnapshot) {
-        let mut guard = self
-            .logical_work
-            .write()
-            .expect("materialized view logical work lock poisoned");
+        let mut guard = write_lock(&self.logical_work, "materialized view logical work");
         guard.insert(version, work);
         if let Some(keep_last) = self.retention_keep_last
             && keep_last > 0
@@ -674,17 +737,13 @@ impl MaterializedViewHandle {
     }
 
     pub fn logical_work_for(&self, version: i64) -> Option<LogicalWorkSnapshot> {
-        self.logical_work
-            .read()
-            .expect("materialized view logical work lock poisoned")
+        read_lock(&self.logical_work, "materialized view logical work")
             .get(&version)
             .copied()
     }
 
     pub fn latest_logical_work(&self) -> Option<(i64, LogicalWorkSnapshot)> {
-        self.logical_work
-            .read()
-            .expect("materialized view logical work lock poisoned")
+        read_lock(&self.logical_work, "materialized view logical work")
             .iter()
             .next_back()
             .map(|(version, work)| (*version, *work))
@@ -695,31 +754,27 @@ impl MaterializedViewHandle {
     }
 
     pub fn set_commit_visibility_barrier_enabled(&self, enabled: bool) {
-        *self
-            .commit_visibility_barrier
-            .write()
-            .expect("materialized view visibility barrier lock poisoned") = enabled;
+        *write_lock(
+            &self.commit_visibility_barrier,
+            "materialized view visibility barrier",
+        ) = enabled;
     }
 
     pub fn commit_visibility_barrier_enabled(&self) -> bool {
-        *self
-            .commit_visibility_barrier
-            .read()
-            .expect("materialized view visibility barrier lock poisoned")
+        *read_lock(
+            &self.commit_visibility_barrier,
+            "materialized view visibility barrier",
+        )
     }
 
     pub fn handle_for_version(&self, version: i64) -> Option<ZSetHandle> {
-        self.versions
-            .read()
-            .expect("materialized view versions lock poisoned")
+        read_lock(&self.versions, "materialized view versions")
             .get(&version)
             .cloned()
     }
 
     pub fn handle_at_or_before_version(&self, version: i64) -> Option<ZSetHandle> {
-        self.versions
-            .read()
-            .expect("materialized view versions lock poisoned")
+        read_lock(&self.versions, "materialized view versions")
             .iter()
             .filter(|(candidate, _)| **candidate <= version)
             .max_by_key(|(candidate, _)| *candidate)
@@ -733,10 +788,7 @@ impl MaterializedViewHandle {
         if keep_last == 0 {
             return;
         }
-        let mut guard = self
-            .versions
-            .write()
-            .expect("materialized view versions lock poisoned");
+        let mut guard = write_lock(&self.versions, "materialized view versions");
         if guard.len() <= keep_last {
             return;
         }
@@ -746,17 +798,11 @@ impl MaterializedViewHandle {
         if remove_count == 0 {
             return;
         }
-        let mut times = self
-            .version_times
-            .write()
-            .expect("materialized view versions lock poisoned");
+        let mut times = write_lock(&self.version_times, "materialized view version times");
         for version in versions.into_iter().take(remove_count) {
             guard.remove(&version);
             times.remove(&version);
-            self.logical_work
-                .write()
-                .expect("materialized view logical work lock poisoned")
-                .remove(&version);
+            write_lock(&self.logical_work, "materialized view logical work").remove(&version);
         }
     }
 
@@ -768,11 +814,11 @@ impl MaterializedViewHandle {
             return;
         }
         prune_btree_to_last_n(
-            &mut self.arrow_snapshots.write().expect("mutex poisoned"),
+            &mut write_lock(&self.arrow_snapshots, "materialized view arrow snapshots"),
             keep_last,
         );
         prune_btree_to_last_n(
-            &mut self.arrow_deltas.write().expect("mutex poisoned"),
+            &mut write_lock(&self.arrow_deltas, "materialized view arrow deltas"),
             keep_last,
         );
     }
@@ -783,52 +829,52 @@ impl MaterializedViewHandle {
             .map(watermark_to_micros)
             .unwrap_or_else(current_time_micros);
         {
-            let mut guard = self
-                .published_versions
-                .write()
-                .expect("materialized view versions lock poisoned");
+            let mut guard = write_lock(
+                &self.published_versions,
+                "materialized view published versions",
+            );
             guard.insert(version);
         }
         {
-            let mut guard = self
-                .version_times
-                .write()
-                .expect("materialized view versions lock poisoned");
+            let mut guard = write_lock(&self.version_times, "materialized view version times");
             guard.insert(version, version_time);
         }
         {
-            let mut guard = self
-                .latest_version
-                .write()
-                .expect("materialized view version lock poisoned");
+            let mut guard = write_lock(&self.latest_version, "materialized view latest version");
             *guard = Some(version);
         }
         let _ = self.version_watch.send_replace(Some(version));
     }
 
     fn promote_staged_row_count_if_visible(&self, version: i64) {
-        if !*self.state_authoritative.read().expect("mutex poisoned") {
+        if !*read_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) {
             return;
         }
         if self.latest_version() != Some(version) {
             return;
         }
         let row_count = {
-            let mut staged = self
-                .staged_row_count_versions
-                .write()
-                .expect("mutex poisoned");
+            let mut staged = write_lock(
+                &self.staged_row_count_versions,
+                "materialized view staged row count versions",
+            );
             let Some(row_count) = staged.get(&version).copied() else {
                 return;
             };
             staged.retain(|candidate, _| *candidate > version);
             row_count
         };
-        *self.published_row_count.write().expect("mutex poisoned") = row_count;
-        *self
-            .state_row_count_version
-            .write()
-            .expect("mutex poisoned") = Some(version);
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = row_count;
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = Some(version);
     }
 }
 
@@ -879,77 +925,13 @@ fn prune_btree_to_last_n<T>(map: &mut BTreeMap<i64, T>, keep_last: usize) {
 
 impl fmt::Debug for MaterializedViewHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state_len = self.state.read().map(|state| state.len()).unwrap_or(0);
-        let latest = *self
-            .latest_version
-            .read()
-            .expect("materialized view version lock poisoned");
+        let state_len = read_lock(&self.state, "materialized view encoded state").len();
+        let latest = *read_lock(&self.latest_version, "materialized view latest version");
         f.debug_struct("MaterializedViewHandle")
             .field("name", &self.name)
             .field("state_len", &state_len)
             .field("latest_version", &latest)
             .finish()
-    }
-}
-
-#[derive(Clone)]
-pub struct DbspPersistedState {
-    dictionary: Arc<Dictionary<Vec<u8>>>,
-    table: Arc<dyn KeyValueTable>,
-    namespace: String,
-    version: u64,
-    logical_version: u64,
-}
-
-impl std::fmt::Debug for DbspPersistedState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DbspPersistedState")
-            .field("namespace", &self.namespace)
-            .field("version", &self.version)
-            .field("logical_version", &self.logical_version)
-            .finish()
-    }
-}
-
-impl DbspPersistedState {
-    pub fn new(
-        dictionary: Arc<Dictionary<Vec<u8>>>,
-        table: Arc<dyn KeyValueTable>,
-        namespace: String,
-        version: u64,
-    ) -> Self {
-        Self {
-            dictionary,
-            table,
-            namespace,
-            version,
-            logical_version: version,
-        }
-    }
-
-    pub fn dictionary(&self) -> Arc<Dictionary<Vec<u8>>> {
-        Arc::clone(&self.dictionary)
-    }
-
-    pub fn table(&self) -> Arc<dyn KeyValueTable> {
-        self.table.clone()
-    }
-
-    pub fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
-    pub fn with_logical_version(mut self, logical_version: u64) -> Self {
-        self.logical_version = logical_version;
-        self
-    }
-
-    pub fn logical_version(&self) -> u64 {
-        self.logical_version
     }
 }
 

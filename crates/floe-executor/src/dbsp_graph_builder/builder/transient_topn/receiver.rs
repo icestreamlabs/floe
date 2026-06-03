@@ -104,12 +104,11 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from
                             break;
                         };
                         let input_deltas = batch.deltas.as_ref().clone();
-                        if !compact_append_only_state {
-                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        if !compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -117,12 +116,11 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from
                                 break;
                             }
                         };
-                        if compact_append_only_state {
-                            if let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
+                        if compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let output_deltas = match output_projection.as_ref() {
                             Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
@@ -305,12 +303,11 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from
                         } else {
                             input_deltas
                         };
-                        if !compact_append_only_state {
-                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        if !compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -318,12 +315,11 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from
                                 break;
                             }
                         };
-                        if compact_append_only_state {
-                            if let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
+                        if compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let output_deltas = match output_projection.as_ref() {
                             Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,
@@ -406,12 +402,11 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from
                         } else {
                             input_deltas
                         };
-                        if !compact_append_only_state {
-                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        if !compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let output_deltas = match processor.apply_deltas(input_deltas) {
                             Ok(deltas) => deltas,
                             Err(err) => {
@@ -419,12 +414,11 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from
                                 break;
                             }
                         };
-                        if compact_append_only_state {
-                            if let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
+                        if compact_append_only_state
+                            && let Err(err) = persistent_state.apply_deltas(&output_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let output_deltas = match output_projection.as_ref() {
                             Some(columns) => match project_encoded_deltas(&output_deltas, columns.as_ref(), Arc::clone(&output_projection_schema)) {
                                 Ok(deltas) => deltas,

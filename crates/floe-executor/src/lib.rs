@@ -1,16 +1,3 @@
-#![allow(
-    clippy::collapsible_if,
-    clippy::collapsible_else_if,
-    clippy::collapsible_match,
-    clippy::match_like_matches_macro,
-    clippy::needless_borrow,
-    clippy::nonminimal_bool,
-    clippy::overly_complex_bool_expr,
-    clippy::ptr_arg,
-    clippy::type_complexity,
-    clippy::unused_enumerate_index
-)]
-
 pub mod checkpoint;
 pub mod codec;
 pub mod context;

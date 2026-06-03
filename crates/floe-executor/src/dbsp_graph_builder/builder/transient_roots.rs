@@ -265,7 +265,7 @@ pub(super) fn try_build_transient_source_root_materialization(
     root_idx: usize,
 ) -> Result<Option<TransientSourceRootMaterialization>> {
     if let Some(shape) = find_transient_source_root_shape(plan, root_idx)? {
-        let source_name = canonical_source_name(shape.source_name());
+        let source_name = shape.source_name().to_string();
         let optimized_nodes = match &shape {
             TransientSourceRootShape::Source {
                 optimized_nodes, ..
@@ -366,15 +366,6 @@ pub(super) fn try_build_transient_source_root_materialization(
             Ok(Some(shape))
         }
         _ => Ok(None),
-    }
-}
-
-pub(super) fn canonical_source_name(source_name: &str) -> String {
-    match source_name {
-        "person" => "nexmark_person".to_string(),
-        "auction" => "nexmark_auction".to_string(),
-        "bid" => "nexmark_bid".to_string(),
-        _ => source_name.to_string(),
     }
 }
 

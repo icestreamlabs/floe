@@ -17,7 +17,10 @@ use checkpointing::{
     record_postgres_cdc_lsn_progress,
 };
 use connectors::{SpawnConnectorTasksConfig, SpawnedConnectorTasks, spawn_connector_tasks};
-use executor_task::{ExecutorTaskContext, spawn_executor_task};
+use executor_task::{
+    ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
+    ExecutorRuntimeContext, ExecutorSourceContext, ExecutorTaskContext, spawn_executor_task,
+};
 use postgres_runtime::{
     insert_catalog_source_definition, insert_replication_pipeline_definition,
     insert_source_backed_table_definition, postgres_schema_evolution_policy_from_catalog,
@@ -484,7 +487,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let initial_sink_cursors = checkpoint_manager.snapshot_sink_cursors();
     let recovered_tick_commit = checkpoint_manager.latest_tick_commit().cloned();
     if let Some(tick_commit) = recovered_tick_commit.as_ref() {
-        dbsp::install_operator_state_restore(
+        dbsp::install_operator_state_restore_for_graph(
+            CHECKPOINT_GRAPH_ID,
             tick_commit
                 .operator_states
                 .iter()
@@ -501,7 +505,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .collect(),
         );
     } else {
-        dbsp::install_operator_state_restore(Vec::new());
+        dbsp::install_operator_state_restore_for_graph(CHECKPOINT_GRAPH_ID, Vec::new());
     }
     if let Some(tick_commit) = checkpoint_manager.latest_tick_commit() {
         metrics::record_last_committed_tick(tick_commit.tick_id);
@@ -586,7 +590,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             CompactionSchedulerConfig {
                 failure_backoff_ticks: stream_compaction.scheduler_backoff_ticks,
                 max_concurrent_jobs: stream_compaction.scheduler_max_concurrent_jobs,
-                ..Default::default()
             },
         )
         .await;
@@ -819,25 +822,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             if handle.latest_version().unwrap_or(-1) >= mv_version.version as i64 {
                 continue;
             }
-            let mut rx = handle.version_watch();
             let target_version = mv_version.version as i64;
-            tokio::time::timeout(Duration::from_secs(5), async move {
-                loop {
-                    if rx.borrow().unwrap_or(-1) >= target_version {
-                        break;
-                    }
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "wait for replayed materialized view '{}' to reach version {}",
-                    mv_version.view, mv_version.version
-                )
-            })?;
+            wait_for_materialized_view_visible(&handle, target_version, &runtime_cancel)
+                .await
+                .with_context(|| {
+                    format!(
+                        "wait for replayed materialized view '{}' to reach version {}",
+                        mv_version.view, mv_version.version
+                    )
+                })?;
         }
     }
 
@@ -870,52 +863,64 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     drop(connector_sender);
     drop(cdc_transaction_sender);
     let executor_handle = spawn_executor_task(ExecutorTaskContext {
-        outer_registry: Arc::clone(&outer_registry),
-        cdc_table_store: cdc_table_store.clone(),
-        cdc_schemas_by_source_id: Arc::clone(&runtime_source_indexes.cdc_schemas_by_source_id),
-        cdc_stateful_table_ids_by_source_id: Arc::clone(
-            &runtime_source_indexes.cdc_stateful_table_ids_by_source_id,
-        ),
-        active_source_definitions_by_id: Arc::clone(
-            &runtime_source_indexes.active_source_definitions_by_id,
-        ),
-        materialized_source_ids: Arc::clone(&runtime_source_indexes.materialized_source_ids),
-        source_names_by_id: Arc::clone(&runtime_source_indexes.source_names_by_id),
-        event_watermark: Arc::clone(&event_watermark),
-        mv_registry: Arc::clone(&mv_registry),
-        kafka_commit_senders,
-        postgres_cdc_commit_senders,
-        sink_checkpoint_rx,
-        watermark_debug: Arc::clone(&watermark_debug),
-        cdc_replication_debug: Arc::clone(&cdc_replication_debug),
-        executor_running: Arc::clone(&executor_running),
-        runtime_failure: Arc::clone(&runtime_failure),
-        kafka_metadata_journal_source_ids: Arc::clone(
-            &runtime_source_indexes.kafka_metadata_journal_source_ids,
-        ),
-        source_journal_required_sources_for_task: Arc::clone(
-            &runtime_source_indexes.source_journal_required_sources_for_task,
-        ),
-        source_id_by_name,
-        storage: storage.clone(),
-        replication_pipeline_runtime: Arc::clone(&replication_pipeline_runtime),
-        connector_receiver,
-        cdc_transaction_receiver,
-        vectorized_runtime,
-        tracked_mv_names: planned_materialized_views
-            .iter()
-            .map(|plan| plan.definition().name().to_string())
-            .collect(),
-        runtime_cancel: runtime_cancel.clone(),
-        connector_queues,
-        checkpoint_manager,
-        definitions,
-        max_batch,
-        max_batch_per_source,
-        max_batch_per_connector,
-        pending_event_counter,
-        watermark_idle_source_ms,
-        pre_tick_commit_delay_ms,
+        runtime: ExecutorRuntimeContext {
+            outer_registry: Arc::clone(&outer_registry),
+            event_watermark: Arc::clone(&event_watermark),
+            mv_registry: Arc::clone(&mv_registry),
+            vectorized_runtime,
+            runtime_cancel: runtime_cancel.clone(),
+            executor_running: Arc::clone(&executor_running),
+            runtime_failure: Arc::clone(&runtime_failure),
+        },
+        sources: ExecutorSourceContext {
+            active_source_definitions_by_id: Arc::clone(
+                &runtime_source_indexes.active_source_definitions_by_id,
+            ),
+            materialized_source_ids: Arc::clone(&runtime_source_indexes.materialized_source_ids),
+            source_names_by_id: Arc::clone(&runtime_source_indexes.source_names_by_id),
+            source_id_by_name,
+            definitions,
+            kafka_metadata_journal_source_ids: Arc::clone(
+                &runtime_source_indexes.kafka_metadata_journal_source_ids,
+            ),
+            source_journal_required_sources: Arc::clone(
+                &runtime_source_indexes.source_journal_required_sources_for_task,
+            ),
+        },
+        cdc: ExecutorCdcContext {
+            cdc_table_store: cdc_table_store.clone(),
+            cdc_schemas_by_source_id: Arc::clone(&runtime_source_indexes.cdc_schemas_by_source_id),
+            cdc_stateful_table_ids_by_source_id: Arc::clone(
+                &runtime_source_indexes.cdc_stateful_table_ids_by_source_id,
+            ),
+            cdc_transaction_receiver,
+            cdc_replication_debug: Arc::clone(&cdc_replication_debug),
+            postgres_cdc_commit_senders,
+            storage: storage.clone(),
+            replication_pipeline_runtime: Arc::clone(&replication_pipeline_runtime),
+        },
+        ingest: ExecutorIngestContext {
+            connector_receiver,
+            connector_queues,
+            kafka_commit_senders,
+            pending_event_counter,
+        },
+        checkpoint: ExecutorCheckpointContext {
+            sink_checkpoint_rx,
+            checkpoint_manager,
+            tracked_mv_names: planned_materialized_views
+                .iter()
+                .map(|plan| plan.definition().name().to_string())
+                .collect(),
+            watermark_debug: Arc::clone(&watermark_debug),
+            watermark_idle_source_ms,
+            pre_tick_commit_delay_ms,
+        },
+        limits: ExecutorBatchLimits {
+            max_batch,
+            max_batch_per_source,
+            max_batch_per_connector,
+        },
     });
     let query = FloeQueryContext::new(storage);
     query
@@ -935,7 +940,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .await
         .context("register materialized view tables")?;
     runtime_ready.store(true, Ordering::Relaxed);
-
     let sink_handles = sinks::spawn_sinks(
         sink_specs,
         Arc::clone(&mv_registry),
@@ -945,7 +949,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         runtime_cancel.clone(),
         Arc::clone(&runtime_failure),
     );
-
     let signal_handle = spawn_signal_handler(
         runtime_cancel.clone(),
         ingest_cancel.clone(),

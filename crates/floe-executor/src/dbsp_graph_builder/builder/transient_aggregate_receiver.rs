@@ -217,12 +217,11 @@ pub(super) async fn build_transient_aggregate_receiver_from_batches(
                         } else {
                             input_deltas
                         };
-                        if !compact_source_state {
-                            if let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
+                        if !compact_source_state
+                            && let Err(err) = persistent_state.apply_deltas(&input_deltas).await {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                        }
                         let aggregate_deltas = match aggregate_processor.apply_deltas(input_deltas).await {
                             Ok(deltas) => deltas,
                             Err(err) => {

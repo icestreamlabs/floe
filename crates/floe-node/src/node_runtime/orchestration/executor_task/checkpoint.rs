@@ -404,7 +404,7 @@ pub(super) async fn wait_for_tick_materialized_views(
         Ok(waited_views) => {
             let visibility_latency_ms = visibility_start.elapsed().as_millis() as u64;
             metrics::observe_tick_phase_latency_ms("mv_visibility", visibility_latency_ms);
-            if waited_views > 0 && (epoch <= 8 || epoch % 128 == 0) {
+            if waited_views > 0 && (epoch <= 8 || epoch.is_multiple_of(128)) {
                 tracing::info!(
                     epoch,
                     waited_views,

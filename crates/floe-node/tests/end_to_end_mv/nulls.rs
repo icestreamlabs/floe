@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use floe_node::generator::BID_SOURCE_NAME;
+use floe_node_core::generator::BID_SOURCE_NAME;
 
 use crate::harness::MvTestHarness;
 use crate::helpers::{

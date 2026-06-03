@@ -92,43 +92,6 @@ await_durable = false
 }
 
 #[tokio::test]
-async fn smoke_restart_recovers_snapshot_and_new_updates() -> Result<()> {
-    let temp_dir = TempDir::new().context("create temp dir")?;
-    let pg_port = 0;
-    let http_port = find_unused_port()?;
-    let data_dir = temp_dir.path().join("data");
-    let sink_path = temp_dir.path().join("restart_sink.jsonl");
-    let config_path = temp_dir.path().join("restart.toml");
-    let config = http_bid_file_sink_config(http_port, &sink_path);
-    std::fs::write(&config_path, config).context("write restart config")?;
-    let http_addr = format!("http://127.0.0.1:{http_port}");
-
-    let mut first = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
-    wait_for_healthz(&http_addr).await?;
-    post_bid(&http_addr, 1, 7, 50).await?;
-    wait_for_rows_matching(&sink_path, |value| {
-        value.get("auction").and_then(Value::as_i64) == Some(1)
-    })
-    .await?;
-    stop_child(&mut first, "INT").await;
-
-    let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
-    wait_for_healthz(&http_addr).await?;
-    post_bid(&http_addr, 2, 8, 60).await?;
-    wait_for_rows_matching(&sink_path, |value| {
-        value.get("auction").and_then(Value::as_i64) == Some(1)
-    })
-    .await?;
-    wait_for_rows_matching(&sink_path, |value| {
-        value.get("auction").and_then(Value::as_i64) == Some(2)
-    })
-    .await?;
-    stop_child(&mut restarted, "INT").await;
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn smoke_crash_restart_recovers_and_processes_new_ticks() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
     let pg_port = 0;

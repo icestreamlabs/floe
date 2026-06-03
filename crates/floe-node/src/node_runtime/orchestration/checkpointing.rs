@@ -57,7 +57,7 @@ fn checkpoint_kafka_offsets(
 }
 
 fn checkpoint_operator_states() -> Vec<floe_executor::checkpoint::DbspHandleRecord> {
-    dbsp::snapshot_operator_states()
+    dbsp::snapshot_operator_states_for_graph(CHECKPOINT_GRAPH_ID)
         .into_iter()
         .map(|handle| {
             floe_executor::checkpoint::DbspHandleRecord::operator_state(

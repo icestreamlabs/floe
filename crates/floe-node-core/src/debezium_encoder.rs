@@ -697,5 +697,4 @@ fn current_unix_time_ms() -> i64 {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests;

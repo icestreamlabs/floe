@@ -8,6 +8,7 @@ use crate::circuit::types::DbspScalarType;
 #[derive(Debug, Clone)]
 pub struct TableDescriptor {
     pub name: &'static str,
+    source_name: &'static str,
     schema: Arc<RowSchema>,
     primary_key: PrimaryKey,
 }
@@ -22,6 +23,7 @@ impl TableDescriptor {
         let primary_key = PrimaryKey::new(schema.clone(), primary_key_columns)?;
         Ok(Self {
             name,
+            source_name: name,
             schema,
             primary_key,
         })
@@ -51,6 +53,10 @@ impl TableDescriptor {
         &self.schema
     }
 
+    pub fn source_name(&self) -> &str {
+        self.source_name
+    }
+
     pub fn primary_key(&self) -> &PrimaryKey {
         &self.primary_key
     }
@@ -73,6 +79,7 @@ static NEXMARK_PERSON_TABLE: Lazy<TableDescriptor> = Lazy::new(|| {
 
     TableDescriptor {
         name: "nexmark_person",
+        source_name: "nexmark_person",
         schema,
         primary_key,
     }
@@ -95,6 +102,7 @@ static NEXMARK_PERSON_ALIAS_TABLE: Lazy<TableDescriptor> = Lazy::new(|| {
 
     TableDescriptor {
         name: "person",
+        source_name: "nexmark_person",
         schema,
         primary_key,
     }
@@ -119,6 +127,7 @@ static NEXMARK_AUCTION_TABLE: Lazy<TableDescriptor> = Lazy::new(|| {
 
     TableDescriptor {
         name: "nexmark_auction",
+        source_name: "nexmark_auction",
         schema,
         primary_key,
     }
@@ -143,6 +152,7 @@ static NEXMARK_AUCTION_ALIAS_TABLE: Lazy<TableDescriptor> = Lazy::new(|| {
 
     TableDescriptor {
         name: "auction",
+        source_name: "nexmark_auction",
         schema,
         primary_key,
     }
@@ -165,6 +175,7 @@ static NEXMARK_BID_TABLE: Lazy<TableDescriptor> = Lazy::new(|| {
 
     TableDescriptor {
         name: "nexmark_bid",
+        source_name: "nexmark_bid",
         schema,
         primary_key,
     }
@@ -187,6 +198,7 @@ static NEXMARK_BID_ALIAS_TABLE: Lazy<TableDescriptor> = Lazy::new(|| {
 
     TableDescriptor {
         name: "bid",
+        source_name: "nexmark_bid",
         schema,
         primary_key,
     }
@@ -224,9 +236,15 @@ mod tests {
     fn table_descriptors_are_available() {
         assert_eq!(nexmark_person_table().name, "nexmark_person");
         assert_eq!(nexmark_person_alias_table().name, "person");
+        assert_eq!(nexmark_person_alias_table().source_name(), "nexmark_person");
         assert_eq!(nexmark_auction_table().primary_key().columns(), &[0]);
         assert_eq!(nexmark_auction_alias_table().name, "auction");
+        assert_eq!(
+            nexmark_auction_alias_table().source_name(),
+            "nexmark_auction"
+        );
         assert_eq!(nexmark_bid_table().primary_key().columns().len(), 4);
         assert_eq!(nexmark_bid_alias_table().name, "bid");
+        assert_eq!(nexmark_bid_alias_table().source_name(), "nexmark_bid");
     }
 }

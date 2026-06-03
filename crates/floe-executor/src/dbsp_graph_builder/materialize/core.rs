@@ -116,8 +116,8 @@ impl DbspGraphBuilder {
                 .await
                 .with_context(|| format!("apply delta for view '{view_name}' at {ts}"))?;
                 pending.record(ts, &apply);
-                if let Some(trigger) = pending.trigger(flush_cfg, Instant::now()) {
-                    if let Some(flush) = Self::flush_pending_view(
+                if let Some(trigger) = pending.trigger(flush_cfg, Instant::now())
+                    && let Some(flush) = Self::flush_pending_view(
                         &mut view,
                         &graph_id,
                         &view_namespace,
@@ -126,31 +126,6 @@ impl DbspGraphBuilder {
                     )
                     .await
                     .context("flush pending materialized view updates (catchup)")?
-                    {
-                        let logical_version =
-                            u64::try_from(flush.published_ts.max(0)).unwrap_or(u64::MAX);
-                        let state = self
-                            .state_from_handle(&flush.handle)
-                            .await?
-                            .with_logical_version(logical_version);
-                        registry_handle.set_dbsp_state(state);
-                        registry_handle.publish_version(flush.published_ts, flush.handle.clone());
-                        mv_latest.insert(view_name.to_string(), (flush.published_ts, flush.handle));
-                        metrics::observe_mv_update_latency_ms(flush.latency_ms);
-                        metrics::inc_mv_updates();
-                    }
-                }
-            }
-            if flush_cfg.flush_on_catchup_boundary {
-                if let Some(flush) = Self::flush_pending_view(
-                    &mut view,
-                    &graph_id,
-                    &view_namespace,
-                    &mut pending,
-                    FlushTrigger::CatchupBoundary,
-                )
-                .await
-                .context("flush pending materialized view updates at catchup boundary")?
                 {
                     let logical_version =
                         u64::try_from(flush.published_ts.max(0)).unwrap_or(u64::MAX);
@@ -164,6 +139,28 @@ impl DbspGraphBuilder {
                     metrics::observe_mv_update_latency_ms(flush.latency_ms);
                     metrics::inc_mv_updates();
                 }
+            }
+            if flush_cfg.flush_on_catchup_boundary
+                && let Some(flush) = Self::flush_pending_view(
+                    &mut view,
+                    &graph_id,
+                    &view_namespace,
+                    &mut pending,
+                    FlushTrigger::CatchupBoundary,
+                )
+                .await
+                .context("flush pending materialized view updates at catchup boundary")?
+            {
+                let logical_version = u64::try_from(flush.published_ts.max(0)).unwrap_or(u64::MAX);
+                let state = self
+                    .state_from_handle(&flush.handle)
+                    .await?
+                    .with_logical_version(logical_version);
+                registry_handle.set_dbsp_state(state);
+                registry_handle.publish_version(flush.published_ts, flush.handle.clone());
+                mv_latest.insert(view_name.to_string(), (flush.published_ts, flush.handle));
+                metrics::observe_mv_update_latency_ms(flush.latency_ms);
+                metrics::inc_mv_updates();
             }
         }
 
@@ -184,8 +181,8 @@ impl DbspGraphBuilder {
                 if let Some(delay_remaining) = delay_remaining {
                     tokio::select! {
                         _ = cancel.cancelled() => {
-                            if flush_cfg.flush_on_shutdown {
-                                if let Err(err) = Self::publish_pending_view(
+                            if flush_cfg.flush_on_shutdown
+                                && let Err(err) = Self::publish_pending_view(
                                     &mut view,
                                     &bridge_clone,
                                     &registry_clone,
@@ -204,7 +201,6 @@ impl DbspGraphBuilder {
                                         err,
                                     );
                                 }
-                            }
                             break;
                         }
                         _ = tokio::time::sleep(delay_remaining) => {
@@ -248,8 +244,8 @@ impl DbspGraphBuilder {
                 } else {
                     tokio::select! {
                         _ = cancel.cancelled() => {
-                            if flush_cfg.flush_on_shutdown {
-                                if let Err(err) = Self::publish_pending_view(
+                            if flush_cfg.flush_on_shutdown
+                                && let Err(err) = Self::publish_pending_view(
                                     &mut view,
                                     &bridge_clone,
                                     &registry_clone,
@@ -268,7 +264,6 @@ impl DbspGraphBuilder {
                                         err,
                                     );
                                 }
-                            }
                             break;
                         }
                         result = cursor.next() => {

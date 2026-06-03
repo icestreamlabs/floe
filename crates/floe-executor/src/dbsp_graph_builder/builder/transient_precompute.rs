@@ -1,12 +1,14 @@
 use super::*;
 
-pub(super) fn build_transient_aggregate_precompute(
-    aggregate: &DbspAggregateNode,
-) -> Result<(
+type TransientPrecomputePlan = (
     Option<Arc<VectorizedFilterProjectEvaluator>>,
     Arc<RowSchema>,
     Arc<HashMap<String, usize>>,
-)> {
+);
+
+pub(super) fn build_transient_aggregate_precompute(
+    aggregate: &DbspAggregateNode,
+) -> Result<TransientPrecomputePlan> {
     let input_schema = Arc::clone(aggregate.input_schema());
     let mut expressions = Vec::new();
     expressions.extend(
@@ -82,11 +84,7 @@ pub(super) fn build_transient_aggregate_precompute(
 
 pub(super) fn build_transient_window_count_star_precompute(
     window: &dbsp::DbspWindowAggregateNode,
-) -> Result<(
-    Option<Arc<VectorizedFilterProjectEvaluator>>,
-    Arc<RowSchema>,
-    Arc<HashMap<String, usize>>,
-)> {
+) -> Result<TransientPrecomputePlan> {
     let input_schema = Arc::clone(window.aggregate.input_schema());
     let mut expressions = Vec::new();
     expressions.extend(
@@ -102,11 +100,7 @@ pub(super) fn build_transient_window_count_star_precompute(
 
 pub(super) fn build_transient_window_aggregate_precompute(
     window: &dbsp::DbspWindowAggregateNode,
-) -> Result<(
-    Option<Arc<VectorizedFilterProjectEvaluator>>,
-    Arc<RowSchema>,
-    Arc<HashMap<String, usize>>,
-)> {
+) -> Result<TransientPrecomputePlan> {
     let input_schema = Arc::clone(window.aggregate.input_schema());
     let mut expressions = Vec::new();
     expressions.extend(
@@ -136,11 +130,7 @@ pub(super) fn build_transient_expression_precompute(
     input_schema: Arc<RowSchema>,
     expressions: Vec<DbspExpression>,
     alias_prefix: &str,
-) -> Result<(
-    Option<Arc<VectorizedFilterProjectEvaluator>>,
-    Arc<RowSchema>,
-    Arc<HashMap<String, usize>>,
-)> {
+) -> Result<TransientPrecomputePlan> {
     let mut direct_input_columns = BTreeSet::new();
     let mut seen = HashSet::new();
     let mut non_direct_expressions = Vec::new();

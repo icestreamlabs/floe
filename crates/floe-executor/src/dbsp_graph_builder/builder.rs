@@ -370,35 +370,33 @@ impl DbspGraphBuilder {
             }
             if let Some(transient_root) =
                 try_build_transient_source_root_materialization(inputs.plan, inputs.plan.root)?
-            {
-                if let Some(upstream) = inputs
+                && let Some(upstream) = inputs
                     .outer_transient_streams
                     .get(&transient_root.source_name)
                     .cloned()
-                {
-                    tracing::info!(
-                        graph_id = %self.graph_id(),
-                        view = %inputs.view_name,
-                        source = %transient_root.source_name,
-                        optimized_nodes = ?transient_root.optimized_nodes,
-                        "using transient source root materialization with source batch journal"
-                    );
-                    self.materialize_view_from_transient_source_overlay(
-                        inputs.view_name,
-                        Arc::clone(&root_node.output_schema),
-                        upstream,
-                        transient_root.transform,
-                        &inputs.cancel,
-                        &inputs.task_events,
-                        &inputs.mv_registry,
-                    )
-                    .await?;
-                    return Ok(BuildOutputs {
-                        node_streams: built,
-                        mv_latest,
-                        required_sources,
-                    });
-                }
+            {
+                tracing::info!(
+                    graph_id = %self.graph_id(),
+                    view = %inputs.view_name,
+                    source = %transient_root.source_name,
+                    optimized_nodes = ?transient_root.optimized_nodes,
+                    "using transient source root materialization with source batch journal"
+                );
+                self.materialize_view_from_transient_source_overlay(
+                    inputs.view_name,
+                    Arc::clone(&root_node.output_schema),
+                    upstream,
+                    transient_root.transform,
+                    &inputs.cancel,
+                    &inputs.task_events,
+                    &inputs.mv_registry,
+                )
+                .await?;
+                return Ok(BuildOutputs {
+                    node_streams: built,
+                    mv_latest,
+                    required_sources,
+                });
             }
             if let Some(transient_join_pipeline_root) =
                 try_build_transient_join_pipeline_root_materialization(

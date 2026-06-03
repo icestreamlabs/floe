@@ -16,10 +16,10 @@ use floe_executor::{
     MaterializedViewRegistry, OuterStreamRegistry, ValidatedPlan, load_or_register_mv,
     validate_dbsp_plan,
 };
-use floe_node::executor::{available_sources_from_registry, build_dataflows};
-use floe_node::generator;
-use floe_node::planner::plan_materialized_views;
-use floe_node::source::SourceRegistry;
+use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
+use floe_node_core::generator;
+use floe_node_core::planner::plan_materialized_views;
+use floe_node_core::source::SourceRegistry;
 use floe_sql_parser::parse_materialized_view;
 use floe_storage::SlateCatalog;
 use slatedb::object_store::ObjectStore;
