@@ -19,14 +19,16 @@ use datafusion::physical_plan::{
 pub struct SnapshotScanExec {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    partition_count: usize,
     cache: PlanProperties,
 }
 
 impl SnapshotScanExec {
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        let partition_count = batches.len().max(1);
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::RoundRobinBatch(1),
+            Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
@@ -34,6 +36,7 @@ impl SnapshotScanExec {
         Self {
             schema,
             batches,
+            partition_count,
             cache,
         }
     }
@@ -43,7 +46,7 @@ impl DisplayAs for SnapshotScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "SnapshotScanExec: partitions=1")
+                write!(f, "SnapshotScanExec: partitions={}", self.partition_count)
             }
             DisplayFormatType::TreeRender => write!(f, ""),
         }
@@ -83,22 +86,35 @@ impl ExecutionPlan for SnapshotScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        if partition > 0 {
+        if partition >= self.partition_count {
             return internal_err!("invalid partition {partition} for SnapshotScanExec");
         }
-        let stream = MemoryStream::try_new(self.batches.clone(), Arc::clone(&self.schema), None)?;
+        let batches = self
+            .batches
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, batch)| {
+                (idx % self.partition_count == partition).then_some(batch.clone())
+            })
+            .collect::<Vec<_>>();
+        let stream = MemoryStream::try_new(batches, Arc::clone(&self.schema), None)?;
         Ok(Box::pin(stream))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
         if let Some(idx) = partition
-            && idx != 0
+            && idx >= self.partition_count
         {
             return internal_err!("invalid partition index {idx} for SnapshotScanExec");
         }
         let mut rows = 0usize;
         let mut bytes = 0usize;
-        for batch in &self.batches {
+        for (idx, batch) in self.batches.iter().enumerate() {
+            if let Some(partition) = partition
+                && idx % self.partition_count != partition
+            {
+                continue;
+            }
             rows = rows.saturating_add(batch.num_rows());
             bytes = bytes.saturating_add(batch.get_array_memory_size());
         }

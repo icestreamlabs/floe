@@ -59,7 +59,7 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -160,7 +160,7 @@ async fn source_projection_with_proctime_materializes_mv() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -261,7 +261,7 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -370,7 +370,7 @@ async fn source_projection_with_regexp_extract_materializes_from_transient_sourc
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -489,7 +489,7 @@ async fn source_projection_with_split_index_materializes_from_transient_source_j
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

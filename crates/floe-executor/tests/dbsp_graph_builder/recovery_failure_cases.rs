@@ -68,7 +68,7 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -214,7 +214,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
     let transient_streams = gather_transient_streams(&registry, &source_refs);
 
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: ingest_view_name,
             view_name: ingest_view_name,
             plan: &ingest_plan,
@@ -232,7 +232,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
         .expect("build ingest graph");
 
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: result_view_name,
             view_name: result_view_name,
             plan: &result_plan,
@@ -335,7 +335,7 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -439,7 +439,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
             .await
             .expect("builder");
         let outputs = builder
-            .build(BuildInputs {
+            .build_legacy_for_harness(BuildInputs {
                 graph_id: view_name,
                 view_name,
                 plan: &plan,
@@ -464,7 +464,7 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
 
     let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
     let outputs = builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -529,7 +529,7 @@ async fn cancel_stops_materialized_view_updates() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -619,7 +619,7 @@ async fn graph_task_error_is_reported() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

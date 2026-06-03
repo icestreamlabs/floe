@@ -50,7 +50,7 @@ async fn distinct_materializes_unique_rows() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -176,7 +176,7 @@ async fn count_distinct_aggregate_materializes_mv() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -299,7 +299,7 @@ async fn count_distinct_aggregate_materializes_from_transient_source_journal() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -414,7 +414,7 @@ async fn q16_style_aggregate_keeps_single_group_across_transient_ticks() {
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

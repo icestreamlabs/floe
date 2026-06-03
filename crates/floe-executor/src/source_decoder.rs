@@ -299,6 +299,36 @@ impl SourceArrowBatchBuilder {
     }
 }
 
+pub fn mask_arrow_batch_for_required_columns(
+    definition: &SourceDefinition,
+    batch: &RecordBatch,
+    required_columns: Option<&Arc<[bool]>>,
+) -> Result<RecordBatch> {
+    let Some(required_columns) = required_columns else {
+        return Ok(batch.clone());
+    };
+    if required_columns.iter().all(|required| *required) {
+        return Ok(batch.clone());
+    }
+    if batch.schema().as_ref() != definition.to_arrow_schema().as_ref() {
+        bail!(
+            "Arrow batch schema does not match definition '{}'",
+            definition.name()
+        );
+    }
+
+    let row_count = batch.num_rows();
+    let mut columns = Vec::with_capacity(definition.columns().len());
+    for (idx, column) in definition.columns().iter().enumerate() {
+        if required_columns.get(idx).copied().unwrap_or(true) {
+            columns.push(Arc::clone(batch.column(idx)));
+            continue;
+        }
+        columns.push(skipped_arrow_column(column, row_count)?);
+    }
+    Ok(RecordBatch::try_new(definition.to_arrow_schema(), columns)?)
+}
+
 enum SourceArrowColumnBuilder {
     Int64(Int64Builder),
     Bool(BooleanBuilder),
@@ -307,6 +337,14 @@ enum SourceArrowColumnBuilder {
     DateDays(Date32Builder),
     Decimal128(Decimal128Builder),
     Numeric(StringBuilder),
+}
+
+fn skipped_arrow_column(column: &SourceColumn, row_count: usize) -> Result<ArrayRef> {
+    let mut builder = SourceArrowColumnBuilder::new(column.data_type(), row_count);
+    for _ in 0..row_count {
+        builder.append_skipped_value(column)?;
+    }
+    builder.finish()
 }
 
 impl SourceArrowColumnBuilder {

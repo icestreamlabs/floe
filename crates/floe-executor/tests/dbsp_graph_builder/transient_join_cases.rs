@@ -58,7 +58,7 @@ async fn row_number_top1_join_q9_shape_preserves_order_and_bid_alias_projection(
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -190,7 +190,7 @@ async fn join_top1_aggregate_q6_shape_materializes_from_transient_source_journal
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -346,7 +346,7 @@ async fn join_aggregate_pipeline_recomputes_from_transient_source_journal_retrac
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -462,7 +462,7 @@ async fn join_with_proctime_q13_shape_materializes_from_transient_source_journal
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -603,7 +603,7 @@ async fn row_number_top1_with_two_int64_partition_keys_and_timestamp_order_recom
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

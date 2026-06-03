@@ -14,6 +14,82 @@ pub(in crate::node_runtime) struct InitialPostgresSnapshotConfig<'a> {
     pub(in crate::node_runtime) cancel: &'a CancellationToken,
 }
 
+pub(super) struct FinishLoadedPostgresSnapshotConfig<'a> {
+    pub(super) slot: &'a str,
+    pub(super) publication: &'a str,
+    pub(super) runtime_plan: &'a PostgresCdcRuntimePlan,
+    pub(super) table_store: &'a CdcTableStore,
+    pub(super) sender: &'a mpsc::Sender<QueuedCdcTransaction>,
+    pub(super) commit_lsn_rx: Option<&'a mut watch::Receiver<PostgresCdcCommit>>,
+    pub(super) cancel: &'a CancellationToken,
+    pub(super) snapshot: PostgresSnapshot,
+}
+
+pub(super) struct LoadPostgresInitialSnapshotConfig<'a> {
+    connection_string: &'a str,
+    slot: &'a str,
+    publication: &'a str,
+    runtime_plan: &'a PostgresCdcRuntimePlan,
+    cdc_replication_debug: &'a Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    settings: PostgresCdcSnapshotConfig,
+    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
+}
+
+pub(super) struct LoadPostgresInitialSnapshotFromClientConfig<'a> {
+    connection_string: &'a str,
+    slot: &'a str,
+    client: &'a mut tokio_postgres::Client,
+    publication: &'a str,
+    source_id: &'a CdcSourceId,
+    schemas: &'a HashMap<CdcTableId, CdcTableSchema>,
+    runtime_plan: &'a PostgresCdcRuntimePlan,
+    cdc_replication_debug: &'a Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    settings: PostgresCdcSnapshotConfig,
+    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
+}
+
+pub(super) struct LoadExportedSlotPostgresInitialSnapshotFromClientConfig<'a> {
+    connection_string: &'a str,
+    slot: &'a str,
+    client: &'a mut tokio_postgres::Client,
+    publication: &'a str,
+    source_id: &'a CdcSourceId,
+    runtime_plan: &'a PostgresCdcRuntimePlan,
+    cdc_replication_debug: &'a Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    sorted_schemas: Vec<&'a CdcTableSchema>,
+    max_workers: usize,
+    settings: PostgresCdcSnapshotConfig,
+    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
+}
+
+pub(super) struct StartBufferedPostgresWalStreamConfig<'a> {
+    connection_string: &'a str,
+    slot: &'a str,
+    publication: &'a str,
+    runtime_plan: &'a PostgresCdcRuntimePlan,
+    snapshot_lsn: PostgresLsn,
+    cdc_replication_debug: &'a Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
+    commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    cancel: CancellationToken,
+}
+
+pub(super) struct BufferPostgresWalStreamConfig {
+    replication: PostgresReplicationClient,
+    runtime_plan: PostgresCdcRuntimePlan,
+    slot: String,
+    snapshot_lsn: PostgresLsn,
+    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
+    commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
+    release_feedback_rx: watch::Receiver<bool>,
+    sender: mpsc::Sender<QueuedCdcTransaction>,
+    cancel: CancellationToken,
+}
+
 pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
     mut config: InitialPostgresSnapshotConfig<'_>,
 ) -> Result<InitialPostgresSnapshot> {
@@ -47,7 +123,7 @@ pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
     }
 
     let wal_commit_lsn_rx = commit_lsn_rx.as_ref().map(|receiver| (**receiver).clone());
-    let snapshot = load_postgres_initial_snapshot(
+    let snapshot = load_postgres_initial_snapshot(LoadPostgresInitialSnapshotConfig {
         connection_string,
         slot,
         publication,
@@ -55,33 +131,35 @@ pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
         cdc_replication_debug,
         settings,
         wal_commit_lsn_rx,
-        cancel.clone(),
-    )
+        cancel: cancel.clone(),
+    })
     .await?;
-    finish_loaded_postgres_snapshot(
+    finish_loaded_postgres_snapshot(FinishLoadedPostgresSnapshotConfig {
         slot,
         publication,
         runtime_plan,
         table_store,
         sender,
-        commit_lsn_rx.as_deref_mut(),
+        commit_lsn_rx: commit_lsn_rx.as_deref_mut(),
         cancel,
         snapshot,
-    )
+    })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_loaded_postgres_snapshot(
-    slot: &str,
-    publication: &str,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    table_store: &CdcTableStore,
-    sender: &mpsc::Sender<QueuedCdcTransaction>,
-    commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
-    cancel: &CancellationToken,
-    snapshot: PostgresSnapshot,
+    config: FinishLoadedPostgresSnapshotConfig<'_>,
 ) -> Result<InitialPostgresSnapshot> {
+    let FinishLoadedPostgresSnapshotConfig {
+        slot,
+        publication,
+        runtime_plan,
+        table_store,
+        sender,
+        commit_lsn_rx,
+        cancel,
+        snapshot,
+    } = config;
     let lsn = snapshot.lsn;
     let row_count = snapshot.row_count;
     let mut wal_stream = snapshot.wal_stream;
@@ -135,17 +213,19 @@ pub(super) async fn finish_loaded_postgres_snapshot(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_postgres_initial_snapshot(
-    connection_string: &str,
-    slot: &str,
-    publication: &str,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    settings: PostgresCdcSnapshotConfig,
-    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
-    cancel: CancellationToken,
+    config: LoadPostgresInitialSnapshotConfig<'_>,
 ) -> Result<PostgresSnapshot> {
+    let LoadPostgresInitialSnapshotConfig {
+        connection_string,
+        slot,
+        publication,
+        runtime_plan,
+        cdc_replication_debug,
+        settings,
+        wal_commit_lsn_rx,
+        cancel,
+    } = config;
     let (mut client, connection) =
         tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
             .await
@@ -156,39 +236,42 @@ pub(super) async fn load_postgres_initial_snapshot(
         }
     });
 
-    let snapshot = load_postgres_initial_snapshot_from_client(
-        connection_string,
-        slot,
-        &mut client,
-        publication,
-        &runtime_plan.source_id,
-        &runtime_plan.schemas,
-        runtime_plan,
-        cdc_replication_debug,
-        settings,
-        wal_commit_lsn_rx,
-        cancel,
-    )
-    .await;
+    let snapshot =
+        load_postgres_initial_snapshot_from_client(LoadPostgresInitialSnapshotFromClientConfig {
+            connection_string,
+            slot,
+            client: &mut client,
+            publication,
+            source_id: &runtime_plan.source_id,
+            schemas: &runtime_plan.schemas,
+            runtime_plan,
+            cdc_replication_debug,
+            settings,
+            wal_commit_lsn_rx,
+            cancel,
+        })
+        .await;
     drop(client);
     connection_task.abort();
     snapshot
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_postgres_initial_snapshot_from_client(
-    connection_string: &str,
-    slot: &str,
-    client: &mut tokio_postgres::Client,
-    publication: &str,
-    source_id: &CdcSourceId,
-    schemas: &HashMap<CdcTableId, CdcTableSchema>,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    settings: PostgresCdcSnapshotConfig,
-    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
-    cancel: CancellationToken,
+    config: LoadPostgresInitialSnapshotFromClientConfig<'_>,
 ) -> Result<PostgresSnapshot> {
+    let LoadPostgresInitialSnapshotFromClientConfig {
+        connection_string,
+        slot,
+        client,
+        publication,
+        source_id,
+        schemas,
+        runtime_plan,
+        cdc_replication_debug,
+        settings,
+        wal_commit_lsn_rx,
+        cancel,
+    } = config;
     let sorted_schemas = sorted_snapshot_schemas(schemas);
     let max_workers = settings.max_workers.max(1);
     match postgres_replication_slot_plugin(client, slot).await? {
@@ -204,39 +287,43 @@ pub(super) async fn load_postgres_initial_snapshot_from_client(
         }
         None => {
             return load_exported_slot_postgres_initial_snapshot_from_client(
-                connection_string,
-                slot,
-                client,
-                publication,
-                source_id,
-                runtime_plan,
-                cdc_replication_debug,
-                sorted_schemas,
-                max_workers,
-                settings,
-                wal_commit_lsn_rx,
-                cancel,
+                LoadExportedSlotPostgresInitialSnapshotFromClientConfig {
+                    connection_string,
+                    slot,
+                    client,
+                    publication,
+                    source_id,
+                    runtime_plan,
+                    cdc_replication_debug,
+                    sorted_schemas,
+                    max_workers,
+                    settings,
+                    wal_commit_lsn_rx,
+                    cancel,
+                },
             )
             .await;
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
-    connection_string: &str,
-    slot: &str,
-    client: &mut tokio_postgres::Client,
-    publication: &str,
-    source_id: &CdcSourceId,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    sorted_schemas: Vec<&CdcTableSchema>,
-    max_workers: usize,
-    settings: PostgresCdcSnapshotConfig,
-    wal_commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
-    cancel: CancellationToken,
+    config: LoadExportedSlotPostgresInitialSnapshotFromClientConfig<'_>,
 ) -> Result<PostgresSnapshot> {
+    let LoadExportedSlotPostgresInitialSnapshotFromClientConfig {
+        connection_string,
+        slot,
+        client,
+        publication,
+        source_id,
+        runtime_plan,
+        cdc_replication_debug,
+        sorted_schemas,
+        max_workers,
+        settings,
+        wal_commit_lsn_rx,
+        cancel,
+    } = config;
     let replication_config = replication_config_from_connection_string(
         connection_string,
         slot,
@@ -339,17 +426,17 @@ pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
         }
         drop(exported_slot);
 
-        match start_buffered_postgres_wal_stream(
+        match start_buffered_postgres_wal_stream(StartBufferedPostgresWalStreamConfig {
             connection_string,
             slot,
             publication,
             runtime_plan,
             snapshot_lsn,
             cdc_replication_debug,
-            adaptive_concurrency.wal_pressure_tx(),
-            wal_commit_lsn_rx,
+            wal_pressure_tx: adaptive_concurrency.wal_pressure_tx(),
+            commit_lsn_rx: wal_commit_lsn_rx,
             cancel,
-        )
+        })
         .await
         {
             Ok(stream) => {
@@ -392,17 +479,17 @@ pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
         }
     } else {
         drop(exported_slot);
-        let stream = start_buffered_postgres_wal_stream(
+        let stream = start_buffered_postgres_wal_stream(StartBufferedPostgresWalStreamConfig {
             connection_string,
             slot,
             publication,
             runtime_plan,
             snapshot_lsn,
             cdc_replication_debug,
-            None,
-            wal_commit_lsn_rx,
+            wal_pressure_tx: None,
+            commit_lsn_rx: wal_commit_lsn_rx,
             cancel,
-        )
+        })
         .await?;
 
         let scan_result = async {
@@ -461,18 +548,20 @@ pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn start_buffered_postgres_wal_stream(
-    connection_string: &str,
-    slot: &str,
-    publication: &str,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    snapshot_lsn: PostgresLsn,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
-    commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
-    cancel: CancellationToken,
+    config: StartBufferedPostgresWalStreamConfig<'_>,
 ) -> Result<BufferedPostgresWalStream> {
+    let StartBufferedPostgresWalStreamConfig {
+        connection_string,
+        slot,
+        publication,
+        runtime_plan,
+        snapshot_lsn,
+        cdc_replication_debug,
+        wal_pressure_tx,
+        commit_lsn_rx,
+        cancel,
+    } = config;
     let replication_config = replication_config_from_connection_string(
         connection_string,
         slot,
@@ -491,18 +580,18 @@ pub(super) async fn start_buffered_postgres_wal_stream(
     let task_slot = slot.clone();
     let task_cdc_replication_debug = Arc::clone(cdc_replication_debug);
     let task = tokio::spawn(async move {
-        buffer_postgres_wal_stream(
+        buffer_postgres_wal_stream(BufferPostgresWalStreamConfig {
             replication,
-            task_runtime_plan,
-            task_slot,
+            runtime_plan: task_runtime_plan,
+            slot: task_slot,
             snapshot_lsn,
-            task_cdc_replication_debug,
+            cdc_replication_debug: task_cdc_replication_debug,
             wal_pressure_tx,
             commit_lsn_rx,
             release_feedback_rx,
             sender,
             cancel,
-        )
+        })
         .await
     });
     tracing::info!(
@@ -547,19 +636,21 @@ pub(super) async fn connect_postgres_replication_client_with_retry(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn buffer_postgres_wal_stream(
-    mut replication: PostgresReplicationClient,
-    runtime_plan: PostgresCdcRuntimePlan,
-    slot: String,
-    snapshot_lsn: PostgresLsn,
-    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    wal_pressure_tx: Option<watch::Sender<SnapshotWalBufferPressure>>,
-    mut commit_lsn_rx: Option<watch::Receiver<PostgresCdcCommit>>,
-    mut release_feedback_rx: watch::Receiver<bool>,
-    sender: mpsc::Sender<QueuedCdcTransaction>,
-    cancel: CancellationToken,
+    config: BufferPostgresWalStreamConfig,
 ) -> Result<()> {
+    let BufferPostgresWalStreamConfig {
+        mut replication,
+        runtime_plan,
+        slot,
+        snapshot_lsn,
+        cdc_replication_debug,
+        wal_pressure_tx,
+        mut commit_lsn_rx,
+        mut release_feedback_rx,
+        sender,
+        cancel,
+    } = config;
     let router = PostgresTableRouter::from_schemas(runtime_plan.schemas.values());
     let mut assembler = PostgresTransactionAssembler::with_schemas(
         runtime_plan.source_id.clone(),

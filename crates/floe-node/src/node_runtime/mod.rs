@@ -53,8 +53,9 @@ use floe_executor::{
     GraphTaskError, MaterializedViewRegistry, MaterializedViewTableProvider,
     MvFlushCoalescingConfig, OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig,
     SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
-    VectorizedMaterializedViewPlan, plan_source_requirements,
-    source_batch_journal_root_sources_with_config, validate_dbsp_plan, weighted_batch_from_diffs,
+    VectorizedMaterializedViewPlan, mask_arrow_batch_for_required_columns,
+    plan_source_requirements, source_batch_journal_root_sources_with_config, validate_dbsp_plan,
+    weighted_batch_from_diffs,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};

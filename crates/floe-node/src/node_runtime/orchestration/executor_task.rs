@@ -3,13 +3,14 @@ use super::*;
 mod buffers;
 mod checkpoint;
 mod context;
+mod event_wait;
 
 use buffers::ExecutorTickBuffers;
 use checkpoint::{
-    CdcOnlyTickCommit, ExecutorCheckpointState, FinalCheckpoint, IngestMetrics,
+    CdcOnlyTickCommit, ExecutorCheckpointState, IngestMetrics, PersistExecutorFinalCheckpoint,
     PersistTickCheckpoint, apply_decoded_source_batches, build_kafka_metadata_journal_batches,
     build_source_journal_batches, drain_sink_checkpoint_updates, notify_kafka_commit_senders,
-    persist_cdc_only_tick_commit, persist_final_checkpoint_unless_failed, persist_tick_checkpoint,
+    persist_cdc_only_tick_commit, persist_executor_final_checkpoint, persist_tick_checkpoint,
     publish_watermark_debug_state, record_fatal_source_batch_failure, record_fatal_tick_failure,
     record_ingest_queue_metrics, update_checkpoint_source_offsets,
     wait_for_tick_materialized_views,
@@ -18,6 +19,7 @@ pub(super) use context::{
     ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
     ExecutorRuntimeContext, ExecutorSourceContext, ExecutorTaskContext,
 };
+use event_wait::wait_for_ready_events;
 
 pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()> {
     let ExecutorTaskContext {
@@ -135,57 +137,17 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             if connector_queues.is_empty() && cdc_transaction_queue.is_empty() {
                 break;
             }
-            if connector_queues
-                .iter()
-                .all(|queue| queue.pending.is_empty())
-                && cdc_transaction_queue.is_empty()
+            if !wait_for_ready_events(
+                &executor_cancel,
+                &mut connector_receiver_for_task,
+                &mut connector_queues,
+                !cdc_schemas_by_source_id_for_task.is_empty(),
+                &mut cdc_transaction_receiver_for_task,
+                &mut cdc_transaction_queue,
+            )
+            .await
             {
-                let has_events = loop {
-                    let connector_receiver_active = !connector_receiver_for_task.is_closed();
-                    let cdc_receiver_active = !cdc_schemas_by_source_id_for_task.is_empty()
-                        && !cdc_transaction_receiver_for_task.is_closed();
-                    match (connector_receiver_active, cdc_receiver_active) {
-                        (false, false) => break false,
-                        (true, false) => {
-                            break tokio::select! {
-                                _ = executor_cancel.cancelled() => false,
-                                has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
-                            };
-                        }
-                        (false, true) => {
-                            break tokio::select! {
-                                _ = executor_cancel.cancelled() => false,
-                                has_events = recv_cdc_from_ready(
-                                    &mut cdc_transaction_receiver_for_task,
-                                    &mut cdc_transaction_queue,
-                                ) => has_events,
-                            };
-                        }
-                        (true, true) => {
-                            let has_events = tokio::select! {
-                                _ = executor_cancel.cancelled() => false,
-                                has_events = recv_cdc_from_ready(
-                                    &mut cdc_transaction_receiver_for_task,
-                                    &mut cdc_transaction_queue,
-                                ) => has_events,
-                                has_events = recv_from_ready(&mut connector_receiver_for_task, &mut connector_queues) => has_events,
-                            };
-                            if has_events {
-                                break true;
-                            }
-                        }
-                    }
-                };
-                if !has_events {
-                    break;
-                }
-            }
-            drain_ready(&mut connector_receiver_for_task, &mut connector_queues);
-            if !cdc_schemas_by_source_id_for_task.is_empty() {
-                drain_cdc_ready(
-                    &mut cdc_transaction_receiver_for_task,
-                    &mut cdc_transaction_queue,
-                );
+                break;
             }
 
             let pending_epoch = checkpoint_state.epoch.saturating_add(1);
@@ -202,6 +164,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             let tick_postgres_table_lsns = &mut tick_buffers.tick_postgres_table_lsns;
             let tick_source_max_event_ts = &mut tick_buffers.tick_source_max_event_ts;
             let arrow_batches_by_source = &mut tick_buffers.arrow_batches_by_source;
+            let execution_arrow_batches_by_source =
+                &mut tick_buffers.execution_arrow_batches_by_source;
             let weighted_arrow_batches_by_source =
                 &mut tick_buffers.weighted_arrow_batches_by_source;
             let vectorized_source_journal_batches =
@@ -608,7 +572,49 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     };
                     match builder.finish() {
                         Ok(Some(batch)) => {
+                            let Some(definition) = definitions.get(source_id) else {
+                                let source_name = source_names_by_id_for_task[source_id].as_str();
+                                record_fatal_source_batch_failure(
+                                    commit_acks_by_source,
+                                    &failure_for_executor,
+                                    &executor_cancel,
+                                    format!(
+                                        "failed to finish Arrow ingest batch for unknown source '{source_name}'"
+                                    ),
+                                )
+                                .await;
+                                break 'executor;
+                            };
+                            let execution_batch = match mask_arrow_batch_for_required_columns(
+                                definition,
+                                &batch,
+                                required_columns_by_source_id_for_task
+                                    .get(source_id)
+                                    .and_then(Option::as_ref),
+                            ) {
+                                Ok(batch) => batch,
+                                Err(err) => {
+                                    let source_name =
+                                        source_names_by_id_for_task[source_id].as_str();
+                                    tracing::error!(
+                                        source = %source_name,
+                                        error = %err,
+                                        "failed to build execution Arrow ingest batch"
+                                    );
+                                    record_fatal_source_batch_failure(
+                                        commit_acks_by_source,
+                                        &failure_for_executor,
+                                        &executor_cancel,
+                                        format!(
+                                            "failed to build execution Arrow ingest batch for '{source_name}': {err}"
+                                        ),
+                                    )
+                                    .await;
+                                    break 'executor;
+                                }
+                            };
                             decoded_rows_len = decoded_rows_len.saturating_add(batch.num_rows());
+                            execution_arrow_batches_by_source[source_id].push(execution_batch);
                             arrow_batches_by_source[source_id].push(batch);
                         }
                         Ok(None) => {}
@@ -690,6 +696,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             let changed = match apply_decoded_source_batches(
                 &mut vectorized_runtime_for_task,
                 &source_names_by_id_for_task,
+                execution_arrow_batches_by_source,
                 arrow_batches_by_source,
                 weighted_arrow_batches_by_source,
                 commit_acks_by_source,
@@ -978,14 +985,9 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 tick_latency_ms,
             });
         }
-        let final_frontier = watermark_for_task
-            .load(Ordering::Relaxed)
-            .max(0)
-            .try_into()
-            .unwrap_or(0_u64);
-        persist_final_checkpoint_unless_failed(FinalCheckpoint {
+        persist_executor_final_checkpoint(PersistExecutorFinalCheckpoint {
             checkpoint_manager: &mut checkpoint_manager,
-            final_frontier,
+            watermark: &watermark_for_task,
             mv_registry: &mv_for_task,
             outer_registry: &outer_for_task,
             runtime_failure: &failure_for_executor,

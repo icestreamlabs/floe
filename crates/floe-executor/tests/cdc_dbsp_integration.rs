@@ -79,7 +79,7 @@ async fn cdc_apply_deltas_drive_mv_insert_update_and_delete() {
         .await
         .expect("builder");
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: VIEW_NAME,
             view_name: VIEW_NAME,
             plan: &plan,

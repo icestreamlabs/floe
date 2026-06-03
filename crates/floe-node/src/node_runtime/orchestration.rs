@@ -4,11 +4,13 @@ mod checkpointing;
 mod connectors;
 mod executor_task;
 mod postgres_runtime;
+mod query_runtime;
 mod runtime_services;
 mod runtime_shutdown;
 mod runtime_sources;
 mod runtime_tasks;
 mod source_replay;
+mod source_requirements;
 mod wal_stream;
 
 use checkpointing::{
@@ -30,6 +32,7 @@ pub(super) use postgres_runtime::{
     merge_catalog_source_connectors, postgres_cdc_runtime_plan,
     validate_materialized_views_do_not_query_raw_cdc_sources,
 };
+use query_runtime::{RuntimeFrontendServices, StartRuntimeFrontendServicesConfig};
 use runtime_services::{RuntimeServicesConfig, start_runtime_services};
 use runtime_shutdown::{RuntimeShutdownContext, shutdown_runtime};
 use runtime_sources::build_runtime_source_indexes;
@@ -41,6 +44,7 @@ use source_replay::{
 pub(super) use source_replay::{
     kafka_metadata_journal_required_sources, source_journal_required_sources,
 };
+use source_requirements::required_column_masks_by_source_id;
 #[cfg(test)]
 pub(super) use wal_stream::PostgresCdcRuntimeReconnectPolicy;
 use wal_stream::{NativePostgresCdcConnectorConfig, run_native_postgres_cdc_connector};
@@ -809,9 +813,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 run_args: &run_args,
                 definitions: &definitions,
                 source_id_by_name: &source_id_by_name,
-                required_columns_by_source_id: runtime_source_indexes
-                    .required_columns_by_source_id
-                    .as_slice(),
             },
         )
         .await
@@ -939,55 +940,31 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             max_batch_per_connector,
         },
     });
-    let query = FloeQueryContext::new(storage);
-    query
-        .preload_tables()
-        .await
-        .context("failed to register tables with DataFusion")?;
-    {
-        let session = query.session();
-        for (name, provider) in vectorized_source_table_providers {
-            let _ = session.deregister_table(&name);
-            session
-                .register_table(&name, provider)
-                .with_context(|| format!("register vectorized source table {name}"))?;
-        }
-    }
-    register_materialized_view_tables(&query, &planned_materialized_views, &mv_registry)
-        .await
-        .context("register materialized view tables")?;
-    runtime_ready.store(true, Ordering::Relaxed);
-    let sink_handles = sinks::spawn_sinks(
+    let RuntimeFrontendServices {
+        query,
+        sink_handles,
+        signal_handle,
+        server_handle,
+    } = query_runtime::start_runtime_frontend_services(StartRuntimeFrontendServicesConfig {
+        storage: storage.clone(),
+        vectorized_source_table_providers,
+        planned_materialized_views: &planned_materialized_views,
+        mv_registry: &mv_registry,
         sink_specs,
-        Arc::clone(&mv_registry),
         sink_resume_cursors,
-        Some(sink_checkpoint_tx),
-        sink_cancel.clone(),
-        runtime_cancel.clone(),
-        Arc::clone(&runtime_failure),
-    );
-    let signal_handle = spawn_signal_handler(
-        runtime_cancel.clone(),
-        ingest_cancel.clone(),
-        shutdown_signal.clone(),
-    );
-
-    let pgwire_addr = run_args
-        .pgwire_addr
-        .clone()
-        .unwrap_or_else(|| DEFAULT_PGWIRE_ADDR.to_string());
-    let server_handle = spawn_pgwire_server(
-        query.clone(),
-        Arc::clone(&mv_registry),
-        service_cancel.clone(),
-        runtime_cancel.clone(),
-        Arc::clone(&runtime_failure),
-        !run_args.disable_pgwire,
-        pgwire_addr,
-        server::ServerRuntimeConfig {
-            subscribe: subscribe_execution_config,
-        },
-    );
+        sink_checkpoint_tx,
+        sink_cancel: sink_cancel.clone(),
+        runtime_cancel: runtime_cancel.clone(),
+        ingest_cancel: ingest_cancel.clone(),
+        shutdown_signal: shutdown_signal.clone(),
+        service_cancel: service_cancel.clone(),
+        runtime_failure: Arc::clone(&runtime_failure),
+        pgwire_addr: run_args.pgwire_addr.clone(),
+        pgwire_enabled: !run_args.disable_pgwire,
+        subscribe_execution_config,
+    })
+    .await?;
+    runtime_ready.store(true, Ordering::Relaxed);
 
     shutdown_runtime(RuntimeShutdownContext {
         runtime_cancel,
@@ -1013,102 +990,4 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         runtime_failure,
     })
     .await
-}
-
-fn required_column_masks_by_source_id(
-    definitions: &[SourceDefinition],
-    all_required_sources: &BTreeSet<String>,
-    circuit_plans: &[CircuitPlan],
-    plan_required_sources: &[BTreeSet<String>],
-    full_width_sources: &BTreeSet<String>,
-) -> anyhow::Result<Vec<Option<Arc<[bool]>>>> {
-    let source_id_by_name = definitions
-        .iter()
-        .enumerate()
-        .map(|(idx, definition)| (definition.name().to_string(), idx))
-        .collect::<HashMap<_, _>>();
-    let mut force_all_columns = vec![false; definitions.len()];
-    mark_required_sources_full_width(
-        &source_id_by_name,
-        &mut force_all_columns,
-        full_width_sources,
-    );
-    let mut masks = definitions
-        .iter()
-        .map(|definition| {
-            all_required_sources
-                .contains(definition.name())
-                .then(|| vec![false; definition.columns().len()])
-        })
-        .collect::<Vec<_>>();
-
-    for (plan, required_sources) in circuit_plans.iter().zip(plan_required_sources) {
-        let Some(requirements) = plan_source_requirements(plan)? else {
-            mark_required_sources_full_width(
-                &source_id_by_name,
-                &mut force_all_columns,
-                required_sources,
-            );
-            continue;
-        };
-        let mut exact_sources = HashSet::new();
-        for requirement in requirements {
-            exact_sources.insert(requirement.source_name.clone());
-            let Some(source_id) = source_id_by_name.get(&requirement.source_name).copied() else {
-                return Err(anyhow!(
-                    "plan referenced unknown source '{}'",
-                    requirement.source_name
-                ));
-            };
-            let Some(mask) = masks[source_id].as_mut() else {
-                continue;
-            };
-            for column_idx in requirement.required_columns {
-                let Some(required) = mask.get_mut(column_idx) else {
-                    return Err(anyhow!(
-                        "plan required column {column_idx} outside source '{}' schema",
-                        requirement.source_name
-                    ));
-                };
-                *required = true;
-            }
-        }
-        let missing_exact_sources = required_sources
-            .iter()
-            .filter(|source| !exact_sources.contains(source.as_str()))
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        mark_required_sources_full_width(
-            &source_id_by_name,
-            &mut force_all_columns,
-            &missing_exact_sources,
-        );
-    }
-
-    Ok(masks
-        .into_iter()
-        .enumerate()
-        .map(|(source_id, mask)| {
-            mask.map(|mut mask| {
-                if force_all_columns[source_id] {
-                    mask.fill(true);
-                }
-                Arc::from(mask)
-            })
-        })
-        .collect())
-}
-
-fn mark_required_sources_full_width(
-    source_id_by_name: &HashMap<String, usize>,
-    force_all_columns: &mut [bool],
-    sources: &BTreeSet<String>,
-) {
-    for source in sources {
-        if let Some(source_id) = source_id_by_name.get(source).copied()
-            && let Some(force_all) = force_all_columns.get_mut(source_id)
-        {
-            *force_all = true;
-        }
-    }
 }
