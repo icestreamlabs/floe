@@ -61,6 +61,11 @@ fn retention_prunes_old_versions() {
     assert!(view.handle_for_version(1).is_none());
     assert!(view.handle_for_version(2).is_some());
     assert!(view.handle_for_version(3).is_some());
+    assert!(!view.is_version_published(1));
+    assert!(view.is_version_published(2));
+    assert!(view.is_version_published(3));
+    assert_eq!(view.next_version_after(0), Some(2));
+    assert_eq!(view.version_time(1), None);
 }
 
 #[test]

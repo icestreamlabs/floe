@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -115,18 +116,88 @@ pub struct MaterializedViewHandle {
     arrow_deltas: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
     encoded_overlay_state: RwLock<Option<EncodedOverlayState>>,
-    published_versions: RwLock<BTreeSet<i64>>,
+    published_versions: PublishedVersionIndex,
     versions: RwLock<HashMap<i64, ZSetHandle>>,
-    version_times: RwLock<HashMap<i64, i64>>,
     logical_work: RwLock<BTreeMap<i64, LogicalWorkSnapshot>>,
-    latest_version: RwLock<Option<i64>>,
-    version_watch: watch::Sender<Option<i64>>,
     commit_visibility_barrier: RwLock<bool>,
     retention_keep_last: Option<usize>,
 }
 
 pub type EncodedStateMap = AHashMap<EncodedRow, Diff>;
 type EncodedOverlayRows = Vec<(Vec<u8>, i64)>;
+
+#[derive(Debug)]
+struct PublishedVersionIndex {
+    versions: RwLock<BTreeSet<i64>>,
+    version_times: RwLock<HashMap<i64, i64>>,
+    latest_version: RwLock<Option<i64>>,
+    version_watch: watch::Sender<Option<i64>>,
+}
+
+impl PublishedVersionIndex {
+    fn new(version_watch: watch::Sender<Option<i64>>) -> Self {
+        Self {
+            versions: RwLock::new(BTreeSet::new()),
+            version_times: RwLock::new(HashMap::new()),
+            latest_version: RwLock::new(None),
+            version_watch,
+        }
+    }
+
+    fn record(&self, version: i64, version_time: i64) {
+        write_lock(&self.versions, "materialized view published versions").insert(version);
+        write_lock(&self.version_times, "materialized view version times")
+            .insert(version, version_time);
+        *write_lock(&self.latest_version, "materialized view latest version") = Some(version);
+        let _ = self.version_watch.send_replace(Some(version));
+    }
+
+    fn latest(&self) -> Option<i64> {
+        *read_lock(&self.latest_version, "materialized view latest version")
+    }
+
+    fn next_after(&self, version: i64) -> Option<i64> {
+        read_lock(&self.versions, "materialized view published versions")
+            .range((Excluded(version), Unbounded))
+            .next()
+            .copied()
+    }
+
+    fn contains(&self, version: i64) -> bool {
+        read_lock(&self.versions, "materialized view published versions").contains(&version)
+    }
+
+    fn version_time(&self, version: i64) -> Option<i64> {
+        read_lock(&self.version_times, "materialized view version times")
+            .get(&version)
+            .copied()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Option<i64>> {
+        self.version_watch.subscribe()
+    }
+
+    fn prune_to_last(&self, keep_last: usize) -> Vec<i64> {
+        let mut versions = write_lock(&self.versions, "materialized view published versions");
+        if versions.len() <= keep_last {
+            return Vec::new();
+        }
+        let remove_count = versions.len().saturating_sub(keep_last);
+        let remove_versions = versions
+            .iter()
+            .copied()
+            .take(remove_count)
+            .collect::<Vec<_>>();
+        for version in &remove_versions {
+            versions.remove(version);
+        }
+        let mut times = write_lock(&self.version_times, "materialized view version times");
+        for version in &remove_versions {
+            times.remove(version);
+        }
+        remove_versions
+    }
+}
 
 impl MaterializedViewHandle {
     fn new(name: String, retention_keep_last: Option<usize>) -> Self {
@@ -144,12 +215,9 @@ impl MaterializedViewHandle {
             arrow_deltas: RwLock::new(BTreeMap::new()),
             dbsp_state: RwLock::new(None),
             encoded_overlay_state: RwLock::new(None),
-            published_versions: RwLock::new(BTreeSet::new()),
+            published_versions: PublishedVersionIndex::new(tx),
             versions: RwLock::new(HashMap::new()),
-            version_times: RwLock::new(HashMap::new()),
             logical_work: RwLock::new(BTreeMap::new()),
-            latest_version: RwLock::new(None),
-            version_watch: tx,
             commit_visibility_barrier: RwLock::new(true),
             retention_keep_last,
         }
@@ -454,8 +522,7 @@ impl MaterializedViewHandle {
             "materialized view state row count version",
         ) = Some(version);
         self.record_latest_version(version);
-        self.prune_versions();
-        self.prune_arrow_versions();
+        self.prune_retained_versions();
         tracing::debug!(
             view = %self.name,
             version,
@@ -673,7 +740,7 @@ impl MaterializedViewHandle {
         }
         self.record_latest_version(version);
         self.promote_staged_row_count_if_visible(version);
-        self.prune_versions();
+        self.prune_retained_versions();
         tracing::debug!(
             view = %self.name,
             version,
@@ -685,6 +752,7 @@ impl MaterializedViewHandle {
     pub fn publish_logical_version(&self, version: i64) {
         self.record_latest_version(version);
         self.promote_staged_row_count_if_visible(version);
+        self.prune_retained_versions();
         tracing::debug!(
             view = %self.name,
             version,
@@ -693,32 +761,19 @@ impl MaterializedViewHandle {
     }
 
     pub fn latest_version(&self) -> Option<i64> {
-        *read_lock(&self.latest_version, "materialized view latest version")
+        self.published_versions.latest()
     }
 
     pub fn next_version_after(&self, version: i64) -> Option<i64> {
-        read_lock(
-            &self.published_versions,
-            "materialized view published versions",
-        )
-        .iter()
-        .copied()
-        .filter(|candidate| *candidate > version)
-        .min()
+        self.published_versions.next_after(version)
     }
 
     pub fn is_version_published(&self, version: i64) -> bool {
-        read_lock(
-            &self.published_versions,
-            "materialized view published versions",
-        )
-        .contains(&version)
+        self.published_versions.contains(version)
     }
 
     pub fn version_time(&self, version: i64) -> Option<i64> {
-        read_lock(&self.version_times, "materialized view version times")
-            .get(&version)
-            .copied()
+        self.published_versions.version_time(version)
     }
 
     pub fn record_logical_work(&self, version: i64, work: LogicalWorkSnapshot) {
@@ -750,7 +805,7 @@ impl MaterializedViewHandle {
     }
 
     pub fn version_watch(&self) -> watch::Receiver<Option<i64>> {
-        self.version_watch.subscribe()
+        self.published_versions.subscribe()
     }
 
     pub fn set_commit_visibility_barrier_enabled(&self, enabled: bool) {
@@ -781,46 +836,27 @@ impl MaterializedViewHandle {
             .map(|(_, handle)| handle.clone())
     }
 
-    fn prune_versions(&self) {
+    fn prune_retained_versions(&self) {
         let Some(keep_last) = self.retention_keep_last else {
             return;
         };
         if keep_last == 0 {
             return;
         }
-        let mut guard = write_lock(&self.versions, "materialized view versions");
-        if guard.len() <= keep_last {
+        let removed_versions = self.published_versions.prune_to_last(keep_last);
+        if removed_versions.is_empty() {
             return;
         }
-        let mut versions: Vec<i64> = guard.keys().copied().collect();
-        versions.sort_unstable();
-        let remove_count = versions.len().saturating_sub(keep_last);
-        if remove_count == 0 {
-            return;
+        let mut handles = write_lock(&self.versions, "materialized view versions");
+        let mut logical_work = write_lock(&self.logical_work, "materialized view logical work");
+        let mut snapshots = write_lock(&self.arrow_snapshots, "materialized view arrow snapshots");
+        let mut deltas = write_lock(&self.arrow_deltas, "materialized view arrow deltas");
+        for version in removed_versions {
+            handles.remove(&version);
+            logical_work.remove(&version);
+            snapshots.remove(&version);
+            deltas.remove(&version);
         }
-        let mut times = write_lock(&self.version_times, "materialized view version times");
-        for version in versions.into_iter().take(remove_count) {
-            guard.remove(&version);
-            times.remove(&version);
-            write_lock(&self.logical_work, "materialized view logical work").remove(&version);
-        }
-    }
-
-    fn prune_arrow_versions(&self) {
-        let Some(keep_last) = self.retention_keep_last else {
-            return;
-        };
-        if keep_last == 0 {
-            return;
-        }
-        prune_btree_to_last_n(
-            &mut write_lock(&self.arrow_snapshots, "materialized view arrow snapshots"),
-            keep_last,
-        );
-        prune_btree_to_last_n(
-            &mut write_lock(&self.arrow_deltas, "materialized view arrow deltas"),
-            keep_last,
-        );
     }
 
     fn record_latest_version(&self, version: i64) {
@@ -828,22 +864,7 @@ impl MaterializedViewHandle {
             .watermark()
             .map(watermark_to_micros)
             .unwrap_or_else(current_time_micros);
-        {
-            let mut guard = write_lock(
-                &self.published_versions,
-                "materialized view published versions",
-            );
-            guard.insert(version);
-        }
-        {
-            let mut guard = write_lock(&self.version_times, "materialized view version times");
-            guard.insert(version, version_time);
-        }
-        {
-            let mut guard = write_lock(&self.latest_version, "materialized view latest version");
-            *guard = Some(version);
-        }
-        let _ = self.version_watch.send_replace(Some(version));
+        self.published_versions.record(version, version_time);
     }
 
     fn promote_staged_row_count_if_visible(&self, version: i64) {
@@ -912,21 +933,10 @@ fn watermark_to_micros(watermark: Timestamp) -> i64 {
     i64::try_from(micros).unwrap_or(i64::MAX)
 }
 
-fn prune_btree_to_last_n<T>(map: &mut BTreeMap<i64, T>, keep_last: usize) {
-    if map.len() <= keep_last {
-        return;
-    }
-    let remove_count = map.len().saturating_sub(keep_last);
-    let remove_versions = map.keys().copied().take(remove_count).collect::<Vec<_>>();
-    for version in remove_versions {
-        map.remove(&version);
-    }
-}
-
 impl fmt::Debug for MaterializedViewHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state_len = read_lock(&self.state, "materialized view encoded state").len();
-        let latest = *read_lock(&self.latest_version, "materialized view latest version");
+        let latest = self.latest_version();
         f.debug_struct("MaterializedViewHandle")
             .field("name", &self.name)
             .field("state_len", &state_len)

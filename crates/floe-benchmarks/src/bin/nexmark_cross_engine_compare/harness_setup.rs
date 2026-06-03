@@ -160,7 +160,8 @@ impl Harness {
         )
         .context("start redpanda")?;
 
-        for _ in 0..90 {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
             if command_success(
                 "docker",
                 [
@@ -174,7 +175,7 @@ impl Harness {
             )? {
                 return Ok(());
             }
-            thread::sleep(Duration::from_secs(1));
+            wait_before_retry(deadline, Duration::from_secs(1));
         }
 
         let logs = run_capture("docker", ["logs", &self.config.redpanda_container], None)

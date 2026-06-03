@@ -22,7 +22,8 @@ mod source_requirements;
 pub mod stream_types;
 pub mod subscribe;
 pub mod table_provider;
-pub mod vectorized_keys;
+#[cfg(test)]
+mod vectorized_keys;
 pub mod vectorized_runtime;
 mod vectorized_source_delta;
 

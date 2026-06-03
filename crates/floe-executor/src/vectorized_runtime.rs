@@ -80,20 +80,21 @@ struct IncrementalMaterializedViewState {
 
 impl IncrementalMaterializedViewState {
     fn set_delta_batches(&self, batches: &[RecordBatch]) -> Result<()> {
-        self.source_provider.set_batches(batches.to_vec());
+        self.source_provider.set_batches(batches.to_vec())?;
         if let (Some(alias_schema), Some(alias_provider)) =
             (self.alias_schema.as_ref(), self.alias_provider.as_ref())
         {
-            alias_provider.set_batches(rename_batches(batches, alias_schema)?);
+            alias_provider.set_batches(rename_batches(batches, alias_schema)?)?;
         }
         Ok(())
     }
 
-    fn clear_delta_batches(&self) {
-        self.source_provider.set_batches(Vec::new());
+    fn clear_delta_batches(&self) -> Result<()> {
+        self.source_provider.set_batches(Vec::new())?;
         if let Some(alias_provider) = self.alias_provider.as_ref() {
-            alias_provider.set_batches(Vec::new());
+            alias_provider.set_batches(Vec::new())?;
         }
+        Ok(())
     }
 }
 
@@ -341,18 +342,18 @@ impl VectorizedExecutionRuntime {
             )
             .await
             .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
-            state.provider.set_batches(next.clone());
-            state.query_provider.set_batches(query_next.clone());
+            state.provider.set_batches(next.clone())?;
+            state.query_provider.set_batches(query_next.clone())?;
             if let (Some(alias_schema), Some(alias_provider)) =
                 (state.alias_schema.as_ref(), state.alias_provider.as_ref())
             {
-                alias_provider.set_batches(rename_batches(&next, alias_schema)?);
+                alias_provider.set_batches(rename_batches(&next, alias_schema)?)?;
             }
             if let (Some(alias_schema), Some(alias_provider)) = (
                 state.alias_schema.as_ref(),
                 state.query_alias_provider.as_ref(),
             ) {
-                alias_provider.set_batches(rename_batches(&query_next, alias_schema)?);
+                alias_provider.set_batches(rename_batches(&query_next, alias_schema)?)?;
             }
             return Ok(());
         }
@@ -424,18 +425,18 @@ impl VectorizedExecutionRuntime {
         if execution_batches.is_empty() && query_batches.is_empty() {
             return Ok(());
         }
-        state.provider.append_batches(execution_batches.clone());
-        state.query_provider.append_batches(query_batches.clone());
+        state.provider.append_batches(execution_batches.clone())?;
+        state.query_provider.append_batches(query_batches.clone())?;
         if let (Some(alias_schema), Some(alias_provider)) =
             (state.alias_schema.as_ref(), state.alias_provider.as_ref())
         {
-            alias_provider.append_batches(rename_batches(&execution_batches, alias_schema)?);
+            alias_provider.append_batches(rename_batches(&execution_batches, alias_schema)?)?;
         }
         if let (Some(alias_schema), Some(alias_provider)) = (
             state.alias_schema.as_ref(),
             state.query_alias_provider.as_ref(),
         ) {
-            alias_provider.append_batches(rename_batches(&query_batches, alias_schema)?);
+            alias_provider.append_batches(rename_batches(&query_batches, alias_schema)?)?;
         }
         if let Some(weighted_batches) = self.current_weighted_delta_batches.get_mut(source_name) {
             let weighted_schema =
@@ -566,7 +567,7 @@ async fn run_incremental_materialized_view_tick(
     let delta = if let Some(source_batches) = insert_batches.get(source_name) {
         incremental.set_delta_batches(source_batches)?;
         let collected = collect(Arc::clone(&incremental.plan), incremental.ctx.task_ctx()).await;
-        incremental.clear_delta_batches();
+        incremental.clear_delta_batches()?;
         normalize_batches(
             collected.with_context(|| {
                 format!(
@@ -691,7 +692,7 @@ async fn collect_incremental_output(
     }
     incremental.set_delta_batches(source_batches)?;
     let collected = collect(Arc::clone(&incremental.plan), incremental.ctx.task_ctx()).await;
-    incremental.clear_delta_batches();
+    incremental.clear_delta_batches()?;
     normalize_batches(
         collected.context("execute signed incremental vectorized materialized view")?,
         output_schema,

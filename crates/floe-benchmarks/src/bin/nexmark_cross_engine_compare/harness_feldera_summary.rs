@@ -83,26 +83,30 @@ impl Harness {
     }
 
     pub(super) fn poll_feldera_program_success(&self, pipeline: &str) -> Result<()> {
-        for _ in 0..240 {
+        let deadline = Instant::now() + Duration::from_secs(480);
+        while Instant::now() < deadline {
             let status = self.feldera_pipeline_field(pipeline, "program_status")?;
             match status.as_str() {
                 "Success" => return Ok(()),
                 "SqlError" | "RustError" | "SystemError" => {
                     bail!("Feldera program failed with status {status}");
                 }
-                _ => thread::sleep(Duration::from_secs(2)),
+                _ => {
+                    wait_before_retry(deadline, Duration::from_secs(2));
+                }
             }
         }
         bail!("Feldera program did not compile before timeout")
     }
 
     pub(super) fn poll_feldera_running(&self, pipeline: &str) -> Result<()> {
-        for _ in 0..120 {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
             let status = self.feldera_pipeline_field(pipeline, "deployment_status")?;
             if status == "Running" {
                 return Ok(());
             }
-            thread::sleep(Duration::from_secs(1));
+            wait_before_retry(deadline, Duration::from_secs(1));
         }
         bail!("Feldera pipeline did not reach Running before timeout")
     }
@@ -126,9 +130,9 @@ impl Harness {
         pipeline: &str,
         specs: &[RelationSpec],
     ) -> Result<()> {
-        let start = Instant::now();
+        let deadline = Instant::now() + self.config.poll_timeout;
         loop {
-            if start.elapsed() >= self.config.poll_timeout {
+            if Instant::now() >= deadline {
                 bail!("Feldera source counts did not reach targets before timeout");
             }
             let mut ready = true;
@@ -143,7 +147,7 @@ impl Harness {
             if ready {
                 return Ok(());
             }
-            thread::sleep(self.config.poll_interval);
+            wait_before_retry(deadline, self.config.poll_interval);
         }
     }
 
@@ -152,9 +156,9 @@ impl Harness {
         pipeline: &str,
         expected_rows: u64,
     ) -> Result<()> {
-        let start = Instant::now();
+        let deadline = Instant::now() + self.config.poll_timeout;
         loop {
-            if start.elapsed() >= self.config.poll_timeout {
+            if Instant::now() >= deadline {
                 bail!("Feldera result rows did not reach {expected_rows} before timeout");
             }
             let rows = self
@@ -166,7 +170,7 @@ impl Harness {
             if rows == Some(expected_rows) {
                 return Ok(());
             }
-            thread::sleep(self.config.poll_interval);
+            wait_before_retry(deadline, self.config.poll_interval);
         }
     }
 
@@ -336,11 +340,12 @@ impl Harness {
         if let Some(mut child) = self.floe_child.take() {
             let pid = child.id().to_string();
             let _ = run_status("kill", ["-INT", &pid], None);
-            for _ in 0..50 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
                 if child.try_wait().ok().flatten().is_some() {
                     return;
                 }
-                thread::sleep(Duration::from_millis(100));
+                wait_before_retry(deadline, Duration::from_millis(100));
             }
             let _ = child.kill();
             let _ = child.wait();

@@ -126,11 +126,12 @@ impl Harness {
             "http://127.0.0.1:{}/v0/pipelines",
             self.config.feldera_http_port
         );
-        for _ in 0..90 {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
             if command_success("curl", ["-fsS", &url], None)? {
                 return Ok(());
             }
-            thread::sleep(Duration::from_secs(1));
+            wait_before_retry(deadline, Duration::from_secs(1));
         }
         bail!("Feldera HTTP API did not become ready")
     }

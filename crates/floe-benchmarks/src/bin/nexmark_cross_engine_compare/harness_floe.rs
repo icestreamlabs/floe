@@ -192,7 +192,8 @@ impl Harness {
     }
 
     pub(super) fn wait_for_floe_pg(&mut self, artifact_dir: &Path) -> Result<()> {
-        for _ in 0..180 {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while Instant::now() < deadline {
             if let Some(child) = self.floe_child.as_mut()
                 && let Some(status) = child.try_wait().context("poll floe-node")?
             {
@@ -214,7 +215,7 @@ impl Harness {
             {
                 return Ok(());
             }
-            thread::sleep(Duration::from_secs(1));
+            wait_before_retry(deadline, Duration::from_secs(1));
         }
         print_tail(artifact_dir.join("floe-node.stderr.log"), 120);
         bail!("floe pgwire did not become ready")
@@ -311,11 +312,11 @@ impl Harness {
         relation: &str,
         stable_polls_required: u64,
     ) -> Result<()> {
-        let start = Instant::now();
+        let deadline = Instant::now() + self.config.poll_timeout;
         let mut previous = None;
         let mut stable_polls = 0;
         loop {
-            if start.elapsed() >= self.config.poll_timeout {
+            if Instant::now() >= deadline {
                 bail!("{relation} __mv_version did not become stable before timeout");
             }
             let sql = format!("SELECT COALESCE(MAX(__mv_version)::BIGINT, 0) FROM {relation}");
@@ -337,7 +338,7 @@ impl Harness {
             if stable_polls >= stable_polls_required {
                 return Ok(());
             }
-            thread::sleep(self.config.poll_interval);
+            wait_before_retry(deadline, self.config.poll_interval);
         }
     }
 
@@ -348,6 +349,7 @@ impl Harness {
     ) -> Result<ContentFingerprint> {
         let attempts = self.config.strict_content_retry_attempts.max(1);
         let delay = Duration::from_secs(self.config.strict_content_retry_delay_seconds);
+        let deadline = Instant::now() + self.config.poll_timeout;
         let mut last_error = None;
         for attempt in 1..=attempts {
             match self.compute_floe_result_content_hash(
@@ -360,8 +362,8 @@ impl Harness {
                 Ok(fingerprint) => return Ok(fingerprint),
                 Err(err) => last_error = Some(err),
             }
-            if attempt < attempts && !delay.is_zero() {
-                thread::sleep(delay);
+            if attempt < attempts && !delay.is_zero() && !wait_before_retry(deadline, delay) {
+                break;
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("failed to compute Floe content hash")))
@@ -375,6 +377,7 @@ impl Harness {
     ) -> Result<ContentFingerprint> {
         let attempts = self.config.strict_content_retry_attempts.max(1);
         let delay = Duration::from_secs(self.config.strict_content_retry_delay_seconds);
+        let deadline = Instant::now() + self.config.poll_timeout;
         let mut last = None;
         for attempt in 1..=attempts {
             self.poll_pg_relation_max_mv_version_stable(target, "benchmark_result", 8)?;
@@ -389,8 +392,8 @@ impl Harness {
                 return Ok(observed);
             }
             last = Some(observed);
-            if attempt < attempts && !delay.is_zero() {
-                thread::sleep(delay);
+            if attempt < attempts && !delay.is_zero() && !wait_before_retry(deadline, delay) {
+                break;
             }
         }
         Ok(last.unwrap_or_else(|| ContentFingerprint {

@@ -508,5 +508,14 @@ mod tests {
         assert_eq!(keyed_time[0].0, row);
         assert_eq!(keyed_time[0].1, 1);
         assert_eq!(keyed_time[0].3, 1_700_000);
+
+        let keyed_batch = extractor
+            .extract_keyed_time_batch_with_columns(&[(row, 1)], 2, &[1])
+            .expect("extract keyed time batch")
+            .expect("batch");
+        assert_eq!(keyed_batch.batch.num_rows(), 1);
+        assert_eq!(keyed_batch.input_positions.get(&2), Some(&1));
+        assert_eq!(keyed_batch.input_positions.get(&1), Some(&2));
+        assert_eq!(keyed_batch.deltas[0].batch_row, 0);
     }
 }
