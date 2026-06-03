@@ -179,9 +179,9 @@ impl DeltaBatchBuffer {
             return Ok(None);
         }
         if let Some(input_columns) = self.input_columns.as_ref() {
-            decode_encoded_row_scalars_into(&row, input_columns, &mut self.decode_scratch)?;
+            decode_encoded_row_scalars_into(row, input_columns, &mut self.decode_scratch)?;
         } else {
-            decode_all_encoded_row_scalars_into(&row, &mut self.decode_scratch)?;
+            decode_all_encoded_row_scalars_into(row, &mut self.decode_scratch)?;
         }
         if self.decode_scratch.len() != self.base_schema.fields().len() {
             return Err(anyhow!(
@@ -247,8 +247,7 @@ impl DeltaBatchBuffer {
         let mut arrays: Vec<ArrayRef> = self
             .columns
             .iter_mut()
-            .enumerate()
-            .map(|(_idx, col)| Ok(col.finish_array()))
+            .map(|col| Ok(col.finish_array()))
             .collect::<Result<_>>()?;
 
         if let Some(keys) = self.keys.as_mut() {

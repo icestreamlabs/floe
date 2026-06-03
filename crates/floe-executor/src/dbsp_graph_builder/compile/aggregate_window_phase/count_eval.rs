@@ -15,6 +15,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::Expr;
 use std::collections::BTreeSet;
 
+type WindowCountInputDelta = (dbsp::WindowCountInput<Vec<u8>, Vec<u8>>, i64);
+type WindowCountOutputDelta = (
+    dbsp::CountAggregateRow<dbsp::WindowKey<Vec<u8>>, Vec<u8>>,
+    i64,
+);
+type CountAggregateOutputDelta = (dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>, i64);
+
 pub(crate) fn build_count_aggregate_slot_kinds(
     aggregates: &[DbspAggregateExpr],
 ) -> Vec<dbsp::CountAggregateSlotKind> {
@@ -50,21 +57,14 @@ pub(crate) fn build_window_count_batch_row_evaluator(
     expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
-) -> impl Fn(
-    &[(dbsp::WindowCountInput<Vec<u8>, Vec<u8>>, i64)],
-) -> Vec<(
-    dbsp::CountAggregateRow<dbsp::WindowKey<Vec<u8>>, Vec<u8>>,
-    i64,
-)> + Send
-+ Sync
-+ 'static {
+) -> impl Fn(&[WindowCountInputDelta]) -> Vec<WindowCountOutputDelta> + Send + Sync + 'static {
     let layout = Arc::new(build_count_eval_layout(
         &aggregates,
         input_schema.as_ref(),
         expression_columns.as_ref(),
     ));
     let vectorized_aggregates = aggregates.clone();
-    move |delta_values: &[(dbsp::WindowCountInput<Vec<u8>, Vec<u8>>, i64)]| {
+    move |delta_values: &[WindowCountInputDelta]| {
         let input_rows = delta_values
             .iter()
             .map(|(row, weight)| (row.value.clone(), *weight))
@@ -102,10 +102,7 @@ pub(crate) fn build_count_batch_row_evaluator(
     expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
-) -> impl Fn(&[(Vec<u8>, i64)]) -> Vec<(dbsp::CountAggregateRow<Vec<u8>, Vec<u8>>, i64)>
-+ Send
-+ Sync
-+ 'static {
+) -> impl Fn(&[(Vec<u8>, i64)]) -> Vec<CountAggregateOutputDelta> + Send + Sync + 'static {
     let layout = Arc::new(build_count_eval_layout(
         &aggregates,
         input_schema.as_ref(),

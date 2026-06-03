@@ -56,11 +56,13 @@ mod file_backend;
 mod http_backend;
 mod kafka_backend;
 mod postgres_backend;
+mod worker;
 
 use file_backend::*;
 use http_backend::*;
 use kafka_backend::*;
 use postgres_backend::*;
+use worker::*;
 
 type SinkCheckpointSender = mpsc::Sender<SinkCursor>;
 
@@ -957,6 +959,5 @@ fn format_decimal128(value: i128, scale: i8) -> String {
     let fraction = magnitude % factor;
     format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
 }
-#[cfg(test)]
 #[cfg(test)]
 mod tests;

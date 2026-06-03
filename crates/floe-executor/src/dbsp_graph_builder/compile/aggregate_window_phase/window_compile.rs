@@ -9,6 +9,14 @@ use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use std::collections::HashSet;
 
+type EncodedPairDelta = ((Vec<u8>, Vec<u8>), i64);
+type CountValuesDelta = ((Vec<u8>, Vec<i64>), i64);
+type WindowCountValuesDelta = ((WindowKey<Vec<u8>>, Vec<i64>), i64);
+type WindowAggregateValuesDelta = ((WindowKey<Vec<u8>>, Vec<dbsp::AggregateValue>), i64);
+type WindowEncodedValueDelta = ((WindowKey<Vec<u8>>, Vec<u8>), i64);
+type WindowCountStarDelta = ((WindowKey<Vec<u8>>, i64), i64);
+type AggregateValuesDelta = ((Vec<u8>, Vec<dbsp::AggregateValue>), i64);
+
 impl DbspGraphBuilder {
     pub(super) async fn precompute_aggregate_window_expressions(
         &mut self,
@@ -97,10 +105,10 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[((Vec<u8>, Vec<u8>), i64)]|
-              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-            Ok(project_encoded_delta_batch(delta_values, &projector))
-        };
+        let transform =
+            move |delta_values: &[EncodedPairDelta]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                Ok(project_encoded_delta_batch(delta_values, &projector))
+            };
 
         let mapped = DbspFilterMap::new_batch::<(Vec<u8>, Vec<u8>), Vec<u8>, _>(
             aggregate_stream,
@@ -156,10 +164,10 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[((Vec<u8>, Vec<i64>), i64)]|
-              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-            Ok(project_encoded_delta_batch(delta_values, &projector))
-        };
+        let transform =
+            move |delta_values: &[CountValuesDelta]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                Ok(project_encoded_delta_batch(delta_values, &projector))
+            };
 
         let mapped = DbspFilterMap::new_batch::<(Vec<u8>, Vec<i64>), Vec<u8>, _>(
             aggregate_stream,
@@ -237,10 +245,10 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[((WindowKey<Vec<u8>>, Vec<i64>), i64)]|
-              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-            Ok(project_encoded_delta_batch(delta_values, &projector))
-        };
+        let transform =
+            move |delta_values: &[WindowCountValuesDelta]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                Ok(project_encoded_delta_batch(delta_values, &projector))
+            };
 
         let mapped = DbspFilterMap::new_batch::<(WindowKey<Vec<u8>>, Vec<i64>), Vec<u8>, _>(
             aggregate_stream,
@@ -318,10 +326,7 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[(
-            (WindowKey<Vec<u8>>, Vec<dbsp::AggregateValue>),
-            i64,
-        )]|
+        let transform = move |delta_values: &[WindowAggregateValuesDelta]|
               -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
             Ok(project_encoded_delta_batch(delta_values, &projector))
         };
@@ -391,10 +396,10 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[((WindowKey<Vec<u8>>, Vec<u8>), i64)]|
-              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-            Ok(project_encoded_delta_batch(delta_values, &projector))
-        };
+        let transform =
+            move |delta_values: &[WindowEncodedValueDelta]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                Ok(project_encoded_delta_batch(delta_values, &projector))
+            };
 
         let mapped = DbspFilterMap::new_batch::<(WindowKey<Vec<u8>>, Vec<u8>), Vec<u8>, _>(
             aggregate_stream,
@@ -472,10 +477,10 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[((WindowKey<Vec<u8>>, i64), i64)]|
-              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-            Ok(project_encoded_delta_batch(delta_values, &projector))
-        };
+        let transform =
+            move |delta_values: &[WindowCountStarDelta]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                Ok(project_encoded_delta_batch(delta_values, &projector))
+            };
 
         let mapped = DbspFilterMap::new_batch::<(WindowKey<Vec<u8>>, i64), Vec<u8>, _>(
             aggregate_stream,
@@ -531,10 +536,10 @@ impl DbspGraphBuilder {
             }
         };
 
-        let transform = move |delta_values: &[((Vec<u8>, Vec<dbsp::AggregateValue>), i64)]|
-              -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
-            Ok(project_encoded_delta_batch(delta_values, &projector))
-        };
+        let transform =
+            move |delta_values: &[AggregateValuesDelta]| -> anyhow::Result<Vec<(Vec<u8>, i64)>> {
+                Ok(project_encoded_delta_batch(delta_values, &projector))
+            };
 
         let mapped = DbspFilterMap::new_batch::<(Vec<u8>, Vec<dbsp::AggregateValue>), Vec<u8>, _>(
             aggregate_stream,

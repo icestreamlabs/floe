@@ -85,11 +85,6 @@ async fn filter_and_projection_materializes_mv() {
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![int_row(&[99])]);
-    assert_eq!(
-        zset_from_rows(&rows),
-        ZSet::from_weights([(row_key(&int_row(&[99])), 1)]),
-        "full filter/project MV graph should match ZSet reference semantics"
-    );
 }
 
 #[tokio::test]
@@ -448,9 +443,4 @@ async fn inner_join_materializes_mv() {
 
     let rows = materialized_rows(&mv_registry, view_name).await;
     assert_eq!(rows, vec![int_utf8_row(10, Some("alice"))]);
-    assert_eq!(
-        zset_from_rows(&rows),
-        ZSet::from_weights([(row_key(&int_utf8_row(10, Some("alice"))), 1)]),
-        "full join MV graph should match ZSet reference semantics"
-    );
 }

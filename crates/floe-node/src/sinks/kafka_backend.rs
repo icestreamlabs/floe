@@ -134,76 +134,59 @@ pub(super) async fn run_kafka_worker(
     mv_name: &str,
     producer: &FutureProducer,
     topic: &str,
-    mut rx: mpsc::Receiver<SinkEvent>,
+    rx: mpsc::Receiver<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
     batch_policy: BatchPolicy,
     retry_policy: RetryPolicy,
     checkpoint_tx: Option<SinkCheckpointSender>,
     kafka_eos: Option<KafkaEosConfig>,
 ) -> Result<()> {
-    let mut buffer = Vec::new();
-    let mut buffer_bytes = 0usize;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            SinkEvent::Rows(rows) => {
-                tracker.on_dequeue_many(rows.len());
-                for row in rows {
-                    buffer_bytes += row.byte_len;
-                    buffer.push(row);
-                    if batch_policy.should_flush(buffer.len(), buffer_bytes) {
-                        flush_kafka_buffer(
-                            sink_name,
-                            mv_name,
-                            producer,
-                            topic,
-                            &mut buffer,
-                            &mut buffer_bytes,
-                            retry_policy,
-                            &tracker,
-                            None,
-                            &checkpoint_tx,
-                            kafka_eos.as_ref(),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            SinkEvent::Flush { version } => {
-                tracker.on_dequeue();
-                flush_kafka_buffer(
-                    sink_name,
-                    mv_name,
-                    producer,
-                    topic,
-                    &mut buffer,
-                    &mut buffer_bytes,
-                    retry_policy,
-                    &tracker,
-                    Some(version),
-                    &checkpoint_tx,
-                    kafka_eos.as_ref(),
-                )
-                .await?;
-            }
-        }
-    }
-
-    flush_kafka_buffer(
+    let backend = KafkaSinkBackend {
         sink_name,
         mv_name,
         producer,
         topic,
-        &mut buffer,
-        &mut buffer_bytes,
         retry_policy,
-        &tracker,
-        None,
-        &checkpoint_tx,
-        kafka_eos.as_ref(),
-    )
-    .await?;
-    Ok(())
+        tracker: Arc::clone(&tracker),
+        checkpoint_tx,
+        kafka_eos,
+    };
+    run_buffered_sink_worker(rx, tracker, batch_policy, backend).await
+}
+
+struct KafkaSinkBackend<'a> {
+    sink_name: &'a str,
+    mv_name: &'a str,
+    producer: &'a FutureProducer,
+    topic: &'a str,
+    retry_policy: RetryPolicy,
+    tracker: Arc<SinkQueueTracker>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
+    kafka_eos: Option<KafkaEosConfig>,
+}
+
+impl BufferedSinkBackend for KafkaSinkBackend<'_> {
+    async fn flush(
+        &mut self,
+        buffer: &mut Vec<SinkRecord>,
+        buffer_bytes: &mut usize,
+        flush_version: Option<i64>,
+    ) -> Result<()> {
+        flush_kafka_buffer(
+            self.sink_name,
+            self.mv_name,
+            self.producer,
+            self.topic,
+            buffer,
+            buffer_bytes,
+            self.retry_policy,
+            &self.tracker,
+            flush_version,
+            &self.checkpoint_tx,
+            self.kafka_eos.as_ref(),
+        )
+        .await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -383,7 +366,7 @@ pub(super) async fn load_latest_kafka_checkpoint(
         .set("bootstrap.servers", brokers)
         .set(
             "group.id",
-            &format!("floe-sink-cursor-reader-{}", current_unix_time_ms()),
+            format!("floe-sink-cursor-reader-{}", current_unix_time_ms()),
         )
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest");

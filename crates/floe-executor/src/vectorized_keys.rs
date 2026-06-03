@@ -17,6 +17,9 @@ use dbsp::{
 use crate::delta_batch::{DeltaBatchBuffer, DeltaBatchConfig};
 use crate::stream_types::Diff;
 
+type KeyedDelta = (Vec<u8>, Vec<u8>, Diff);
+type KeyedTimeDelta = (Vec<u8>, Diff, Vec<u8>, i64);
+
 #[cfg(test)]
 fn source_primary_key_columns(source_name: &str) -> Option<Vec<usize>> {
     source_table(source_name).map(|table| table.primary_key().columns().to_vec())
@@ -93,10 +96,7 @@ impl VectorizedEncodedKeyExtractor {
         })
     }
 
-    pub fn extract_keyed_deltas(
-        &self,
-        rows: &[(Vec<u8>, Diff)],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, Diff)>> {
+    pub fn extract_keyed_deltas(&self, rows: &[(Vec<u8>, Diff)]) -> Result<Vec<KeyedDelta>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -153,7 +153,7 @@ impl VectorizedEncodedKeyExtractor {
         &self,
         rows: &[(Vec<u8>, Diff)],
         time_column: usize,
-    ) -> Result<Vec<(Vec<u8>, Diff, Vec<u8>, i64)>> {
+    ) -> Result<Vec<KeyedTimeDelta>> {
         Ok(self
             .extract_keyed_time_batch_with_columns(rows, time_column, &[])?
             .map(|batch| {

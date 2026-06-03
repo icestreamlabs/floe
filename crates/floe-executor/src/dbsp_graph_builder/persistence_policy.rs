@@ -112,8 +112,7 @@ impl PersistencePolicy {
             };
             let single_consumer = has_single_consumer(plan, current_idx);
             if built.contains_key(&current_idx)
-                || (!single_consumer
-                    && !(allow_terminal_without_consumer && segment_nodes.is_empty()))
+                || !(single_consumer || allow_terminal_without_consumer && segment_nodes.is_empty())
             {
                 return Ok(None);
             }

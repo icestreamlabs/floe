@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::handles::ZSetHandle;
 
 const UNCHECKPOINTED_OPERATOR_STATE_PREFIX: &str = "__uncheckpointed_operator_state/";
+const LEGACY_OPERATOR_STATE_GRAPH: &str = "__legacy_operator_state_graph";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperatorStateHandle {
@@ -42,8 +43,8 @@ pub fn is_checkpointed_operator_state_namespace(namespace: &str) -> bool {
 
 #[derive(Default)]
 struct OperatorStateRegistry {
-    live: HashMap<String, OperatorStateHandle>,
-    restore: HashMap<String, OperatorStateHandle>,
+    live_by_graph: HashMap<String, HashMap<String, OperatorStateHandle>>,
+    restore_by_graph: HashMap<String, HashMap<String, OperatorStateHandle>>,
 }
 
 static REGISTRY: OnceLock<Mutex<OperatorStateRegistry>> = OnceLock::new();
@@ -52,58 +53,116 @@ fn registry() -> &'static Mutex<OperatorStateRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(OperatorStateRegistry::default()))
 }
 
+fn registry_guard() -> MutexGuard<'static, OperatorStateRegistry> {
+    match registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("operator state registry lock was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn graph_id_for_namespace(namespace: &str) -> &str {
+    namespace
+        .strip_prefix("op/")
+        .and_then(|suffix| suffix.split('/').next())
+        .filter(|graph_id| !graph_id.is_empty())
+        .unwrap_or(LEGACY_OPERATOR_STATE_GRAPH)
+}
+
 pub fn record_operator_state(name: impl Into<String>, handle: ZSetHandle) {
     if !is_checkpointed_operator_state_namespace(&handle.ns) {
         return;
     }
     let handle = OperatorStateHandle::new(name, handle.ns.clone(), handle.version);
-    let mut guard = registry()
-        .lock()
-        .expect("operator state registry lock poisoned");
-    guard.live.insert(handle.namespace.clone(), handle);
+    let graph_id = graph_id_for_namespace(&handle.namespace).to_string();
+    let mut guard = registry_guard();
+    guard
+        .live_by_graph
+        .entry(graph_id)
+        .or_default()
+        .insert(handle.namespace.clone(), handle);
 }
 
 pub fn snapshot_operator_states() -> Vec<OperatorStateHandle> {
-    let guard = registry()
-        .lock()
-        .expect("operator state registry lock poisoned");
-    let mut handles = guard.live.values().cloned().collect::<Vec<_>>();
+    let guard = registry_guard();
+    let mut handles = guard
+        .live_by_graph
+        .values()
+        .flat_map(|handles| handles.values().cloned())
+        .collect::<Vec<_>>();
+    sort_operator_state_handles(&mut handles);
+    handles
+}
+
+pub fn snapshot_operator_states_for_graph(graph_id: &str) -> Vec<OperatorStateHandle> {
+    let guard = registry_guard();
+    let mut handles = guard
+        .live_by_graph
+        .get(graph_id)
+        .into_iter()
+        .flat_map(|handles| handles.values().cloned())
+        .collect::<Vec<_>>();
+    sort_operator_state_handles(&mut handles);
+    handles
+}
+
+fn sort_operator_state_handles(handles: &mut [OperatorStateHandle]) {
     handles.sort_by(|left, right| {
         left.namespace
             .cmp(&right.namespace)
             .then(left.name.cmp(&right.name))
     });
-    handles
 }
 
 pub fn install_operator_state_restore(handles: Vec<OperatorStateHandle>) {
-    let mut guard = registry()
-        .lock()
-        .expect("operator state registry lock poisoned");
-    guard.restore = handles
+    let mut restore_by_graph: HashMap<String, HashMap<String, OperatorStateHandle>> =
+        HashMap::new();
+    for handle in handles {
+        if !is_checkpointed_operator_state_namespace(&handle.namespace) {
+            continue;
+        }
+        let graph_id = graph_id_for_namespace(&handle.namespace).to_string();
+        restore_by_graph
+            .entry(graph_id)
+            .or_default()
+            .insert(handle.namespace.clone(), handle);
+    }
+    let mut guard = registry_guard();
+    guard.restore_by_graph = restore_by_graph;
+    guard.live_by_graph.clear();
+}
+
+pub fn install_operator_state_restore_for_graph(graph_id: &str, handles: Vec<OperatorStateHandle>) {
+    let restore = handles
         .into_iter()
+        .filter(|handle| is_checkpointed_operator_state_namespace(&handle.namespace))
         .map(|handle| (handle.namespace.clone(), handle))
         .collect();
-    guard.live.clear();
+    let mut guard = registry_guard();
+    guard.restore_by_graph.insert(graph_id.to_string(), restore);
+    guard.live_by_graph.remove(graph_id);
 }
 
 pub fn restored_operator_state(namespace: &str) -> Option<OperatorStateHandle> {
     if !is_checkpointed_operator_state_namespace(namespace) {
         return None;
     }
-    let guard = registry()
-        .lock()
-        .expect("operator state registry lock poisoned");
-    guard.restore.get(namespace).cloned()
+    let graph_id = graph_id_for_namespace(namespace);
+    let guard = registry_guard();
+    guard
+        .restore_by_graph
+        .get(graph_id)
+        .and_then(|handles| handles.get(namespace))
+        .cloned()
 }
 
 #[cfg(test)]
 pub fn clear_operator_state_registry() {
-    let mut guard = registry()
-        .lock()
-        .expect("operator state registry lock poisoned");
-    guard.live.clear();
-    guard.restore.clear();
+    let mut guard = registry_guard();
+    guard.live_by_graph.clear();
+    guard.restore_by_graph.clear();
 }
 
 #[cfg(test)]
@@ -135,6 +194,42 @@ mod tests {
             restored_operator_state("stable_namespace"),
             Some(checkpointed)
         );
+
+        clear_operator_state_registry();
+    }
+
+    #[test]
+    fn graph_scoped_snapshot_and_restore_do_not_bleed_between_graphs() {
+        clear_operator_state_registry();
+
+        record_operator_state(
+            "left",
+            ZSetHandle {
+                ns: "op/graph_a/1/left".to_string(),
+                version: 2,
+            },
+        );
+        record_operator_state(
+            "left",
+            ZSetHandle {
+                ns: "op/graph_b/1/left".to_string(),
+                version: 5,
+            },
+        );
+
+        assert_eq!(snapshot_operator_states_for_graph("graph_a").len(), 1);
+        assert_eq!(snapshot_operator_states_for_graph("graph_b").len(), 1);
+
+        install_operator_state_restore_for_graph(
+            "graph_a",
+            vec![OperatorStateHandle::new("left", "op/graph_a/1/left", 2)],
+        );
+
+        assert_eq!(
+            restored_operator_state("op/graph_a/1/left"),
+            Some(OperatorStateHandle::new("left", "op/graph_a/1/left", 2))
+        );
+        assert!(restored_operator_state("op/graph_b/1/left").is_none());
 
         clear_operator_state_registry();
     }

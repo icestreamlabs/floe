@@ -150,10 +150,20 @@ where
     {
         let mut merged = HashMap::new();
         for (row, weight) in deltas {
-            let entry = merged.entry(row.clone()).or_insert(0);
-            *entry += weight;
-            if *entry == 0 {
-                merged.remove(&row);
+            match merged.entry(row) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let next = *entry.get() + weight;
+                    if next == 0 {
+                        entry.remove();
+                    } else {
+                        *entry.get_mut() = next;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    if weight != 0 {
+                        entry.insert(weight);
+                    }
+                }
             }
         }
         merged

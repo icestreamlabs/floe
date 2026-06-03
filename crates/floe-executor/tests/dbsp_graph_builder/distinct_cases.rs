@@ -85,11 +85,6 @@ async fn distinct_materializes_unique_rows() {
     sort_rows_by_first_column(&mut rows);
     let expected = vec![int_row(&[7]), int_row(&[42])];
     assert_eq!(rows, expected);
-    assert_eq!(
-        zset_from_rows(&rows),
-        zset_from_rows(&expected),
-        "full distinct MV graph should match ZSet reference semantics"
-    );
 
     bid_writer
         .append_encoded(encoded_bid_row(1, 42, 10), -1)

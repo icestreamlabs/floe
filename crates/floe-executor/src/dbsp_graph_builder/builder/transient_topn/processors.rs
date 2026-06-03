@@ -6,6 +6,8 @@ use super::shared::{accumulate_single_weight_delta, accumulate_weight_deltas};
 use super::*;
 use std::time::Instant;
 
+type PartitionedTop1OrderIndex = HashMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>;
+
 pub(in crate::dbsp_graph_builder::builder) struct TransientTopNProcessor {
     graph_id: String,
     key_extractor: TransientTopNKeyExtractor,
@@ -19,7 +21,7 @@ pub(in crate::dbsp_graph_builder::builder) struct TransientTopNProcessor {
 
 pub(in crate::dbsp_graph_builder::builder) struct TransientTop1Processor {
     key_extractor: TransientTopNKeyExtractor,
-    order_index: HashMap<Vec<u8>, BTreeMap<(TransientTopNKey, Vec<u8>), i64>>,
+    order_index: PartitionedTop1OrderIndex,
     partition_output_cache: HashMap<Vec<u8>, Vec<u8>>,
 }
 

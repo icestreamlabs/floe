@@ -50,7 +50,8 @@ pub use incremental_aggregate::{
 pub use join::DbspJoin;
 pub use metrics::{LogicalWorkCollector, LogicalWorkSnapshot};
 pub use operator_state_registry::{
-    OperatorStateHandle, install_operator_state_restore, snapshot_operator_states,
+    OperatorStateHandle, install_operator_state_restore, install_operator_state_restore_for_graph,
+    snapshot_operator_states, snapshot_operator_states_for_graph,
 };
 pub use operators::aggregate::{AggregateOp, AggregateSpec};
 pub use operators::count_aggregate::{

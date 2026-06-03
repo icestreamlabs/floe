@@ -23,6 +23,13 @@ const INCREMENTAL_AGGREGATE_SLOT_MIN_TAG: u8 = 5;
 const INCREMENTAL_AGGREGATE_SLOT_MAX_TAG: u8 = 6;
 const INCREMENTAL_AGGREGATE_SLOT_DECIMAL_SUM_TAG: u8 = 7;
 
+type WindowAggregateInputPair = (Vec<u8>, Vec<u8>);
+type WindowIncrementalAggregateSnapshot =
+    dbsp::TransientIncrementalAggregateSnapshot<Vec<u8>, WindowAggregateInputPair>;
+type CountAggregateOutputDelta = ((Vec<u8>, Vec<i64>), i64);
+type IncrementalAggregateOutputRow = (Vec<u8>, Vec<dbsp::AggregateValue>);
+type IncrementalAggregateOutputDelta = (IncrementalAggregateOutputRow, i64);
+
 pub(super) fn encode_transient_count_aggregate_snapshot(
     snapshot: dbsp::TransientCountAggregateSnapshot<Vec<u8>, Vec<u8>>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
@@ -243,7 +250,7 @@ pub(super) fn encode_transient_window_incremental_aggregate_snapshot(
 
 pub(super) fn decode_transient_window_incremental_aggregate_snapshot(
     rows: Vec<(Vec<u8>, i64)>,
-) -> Result<dbsp::TransientIncrementalAggregateSnapshot<Vec<u8>, (Vec<u8>, Vec<u8>)>> {
+) -> Result<WindowIncrementalAggregateSnapshot> {
     let snapshot = decode_transient_incremental_aggregate_snapshot(rows)?;
     let input = snapshot
         .input
@@ -537,7 +544,7 @@ pub(super) fn read_i128_le(bytes: &[u8], cursor: &mut usize) -> Result<i128> {
 }
 
 pub(super) fn encode_count_aggregate_output_deltas(
-    deltas: Vec<((Vec<u8>, Vec<i64>), i64)>,
+    deltas: Vec<CountAggregateOutputDelta>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
     let mut encoded = Vec::with_capacity(deltas.len());
     for ((key, values), diff) in deltas {
@@ -552,7 +559,7 @@ pub(super) fn encode_count_aggregate_output_deltas(
 }
 
 pub(super) fn encode_incremental_aggregate_output_deltas(
-    deltas: Vec<((Vec<u8>, Vec<dbsp::AggregateValue>), i64)>,
+    deltas: Vec<IncrementalAggregateOutputDelta>,
 ) -> Result<Vec<(Vec<u8>, i64)>> {
     let mut encoded = Vec::with_capacity(deltas.len());
     for ((key, values), diff) in deltas {
@@ -567,8 +574,8 @@ pub(super) fn encode_incremental_aggregate_output_deltas(
 }
 
 pub(super) fn merge_incremental_aggregate_output_deltas(
-    target: &mut Vec<((Vec<u8>, Vec<dbsp::AggregateValue>), i64)>,
-    updates: Vec<((Vec<u8>, Vec<dbsp::AggregateValue>), i64)>,
+    target: &mut Vec<IncrementalAggregateOutputDelta>,
+    updates: Vec<IncrementalAggregateOutputDelta>,
 ) {
     if updates.is_empty() {
         return;

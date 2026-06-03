@@ -166,8 +166,8 @@ impl DbspGraphBuilder {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                            if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
-                                if let Some(request) = pending_snapshot.take_request("background_threshold")
+                            if pending_snapshot.should_flush(snapshot_cfg, Instant::now())
+                                && let Some(request) = pending_snapshot.take_request("background_threshold")
                                     && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
@@ -178,7 +178,6 @@ impl DbspGraphBuilder {
                                     );
                                     break;
                                 }
-                            }
                         }
                     }
                 } else {
@@ -202,8 +201,8 @@ impl DbspGraphBuilder {
                                 report_graph_task_error(&task_events, &graph_id, task_label.clone(), err);
                                 break;
                             }
-                            if pending_snapshot.should_flush(snapshot_cfg, Instant::now()) {
-                                if let Some(request) = pending_snapshot.take_request("background_threshold")
+                            if pending_snapshot.should_flush(snapshot_cfg, Instant::now())
+                                && let Some(request) = pending_snapshot.take_request("background_threshold")
                                     && flush_tx.send(request).await.is_err()
                                 {
                                     report_graph_task_error(
@@ -214,7 +213,6 @@ impl DbspGraphBuilder {
                                     );
                                     break;
                                 }
-                            }
                         }
                     }
                 }

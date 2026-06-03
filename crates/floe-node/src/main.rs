@@ -1,13 +1,3 @@
-#![allow(
-    clippy::collapsible_if,
-    clippy::field_reassign_with_default,
-    clippy::manual_is_multiple_of,
-    clippy::needless_borrow,
-    clippy::needless_borrows_for_generic_args,
-    clippy::needless_update,
-    clippy::while_let_loop
-)]
-
 mod cli;
 mod http_ingest;
 mod metrics;

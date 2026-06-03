@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
-use floe_node::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
+use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
 use tokio::time::{Duration, timeout};
 
 use crate::rows::{auction_row, bid_row};

@@ -7,6 +7,8 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field as ArrowField, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 
+type MaterializedTopNKeyBatch = (RecordBatch, Vec<(Vec<u8>, i64)>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct TransientTopNSortSpec {
     ascending: bool,
@@ -297,7 +299,7 @@ impl TransientTopNKeyExtractor {
     fn materialize_key_batch(
         &self,
         deltas: &[(Vec<u8>, i64)],
-    ) -> Result<Option<(RecordBatch, Vec<(Vec<u8>, i64)>)>> {
+    ) -> Result<Option<MaterializedTopNKeyBatch>> {
         if deltas.is_empty() {
             return Ok(None);
         }

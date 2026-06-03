@@ -181,41 +181,6 @@ pub(super) fn int_utf8_row(id: i64, label: Option<&str>) -> TestRow {
     ]
 }
 
-pub(super) fn row_key(row: &TestRow) -> String {
-    format!("{row:?}")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ZSet<T> {
-    weights: std::collections::BTreeMap<T, i64>,
-}
-
-impl<T: Ord> ZSet<T> {
-    pub(super) fn from_weights(weights: impl IntoIterator<Item = (T, i64)>) -> Self {
-        let mut merged = std::collections::BTreeMap::new();
-        for (row, weight) in weights {
-            if weight == 0 {
-                continue;
-            }
-            let next = merged
-                .get(&row)
-                .copied()
-                .unwrap_or(0_i64)
-                .saturating_add(weight);
-            if next == 0 {
-                merged.remove(&row);
-            } else {
-                merged.insert(row, next);
-            }
-        }
-        Self { weights: merged }
-    }
-}
-
-pub(super) fn zset_from_rows(rows: &[TestRow]) -> ZSet<String> {
-    ZSet::from_weights(rows.iter().map(|row| (row_key(row), 1)))
-}
-
 pub(super) fn int_and_null_timestamp_row(id: i64) -> TestRow {
     vec![Some(EncodedRowScalar::Int64(id)), None]
 }

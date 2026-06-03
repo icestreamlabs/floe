@@ -243,12 +243,9 @@ async fn run_native_postgres_cdc_wal_stream_once(
         .with_context(|| format!("load Postgres logical slot '{slot}' start LSN"))?;
     let replication_config =
         replication_config_from_connection_string(connection_string, slot, publication, start_lsn)?;
-    let replication_config = config_with_stored_cdc_checkpoint(
-        replication_config,
-        &table_store,
-        &runtime_plan.source_id,
-    )
-    .await?;
+    let replication_config =
+        config_with_stored_cdc_checkpoint(replication_config, table_store, &runtime_plan.source_id)
+            .await?;
     tracing::info!(
         source = %runtime_plan.source_id.as_str(),
         slot = %slot,
@@ -305,13 +302,13 @@ async fn run_native_postgres_cdc_wal_stream_once(
             if let Some(frontier_lsn) = postgres_replication_event_frontier_lsn(&event) {
                 metrics::record_postgres_cdc_upstream_lsn(
                     runtime_plan.source_id.as_str(),
-                    &slot,
+                    slot,
                     frontier_lsn.as_u64(),
                 );
                 record_postgres_cdc_debug_lsn(
-                    &cdc_replication_debug,
+                    cdc_replication_debug,
                     runtime_plan.source_id.as_str(),
-                    &slot,
+                    slot,
                     Some(frontier_lsn.as_u64()),
                     None,
                 );
@@ -324,7 +321,7 @@ async fn run_native_postgres_cdc_wal_stream_once(
                     let observations = assembler.drain_schema_evolution_observations();
                     if !observations.is_empty() {
                         record_postgres_schema_evolution_observations(
-                            &cdc_replication_debug,
+                            cdc_replication_debug,
                             &runtime_plan.source_id,
                             observations,
                         )
@@ -336,7 +333,7 @@ async fn run_native_postgres_cdc_wal_stream_once(
                     let observations = assembler.drain_schema_evolution_observations();
                     if !observations.is_empty() {
                         record_postgres_schema_evolution_observations(
-                            &cdc_replication_debug,
+                            cdc_replication_debug,
                             &runtime_plan.source_id,
                             observations,
                         )

@@ -89,35 +89,51 @@ pub(super) async fn wait_for_materialized_views_visible(
         }
 
         waited_views = waited_views.saturating_add(1);
-        let mut version_rx = view.version_watch();
-        loop {
-            if version_rx
-                .borrow()
-                .is_some_and(|version| version >= target_version)
-            {
-                break;
-            }
-
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err(anyhow!(
-                        "runtime cancelled while waiting for materialized view '{}' to publish version {target_version}",
-                        view.name()
-                    ));
-                }
-                changed = version_rx.changed() => {
-                    changed.with_context(|| {
-                        format!(
-                            "wait for materialized view '{}' to publish version {target_version}",
-                            view.name()
-                        )
-                    })?;
-                }
-            }
-        }
+        wait_for_materialized_view_visible(&view, target_version, cancel).await?;
     }
 
     Ok(waited_views)
+}
+
+pub(super) async fn wait_for_materialized_view_visible(
+    view: &floe_executor::MaterializedViewHandle,
+    target_version: i64,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    if target_version < 0
+        || view
+            .latest_version()
+            .is_some_and(|version| version >= target_version)
+    {
+        return Ok(());
+    }
+
+    let mut version_rx = view.version_watch();
+    loop {
+        if version_rx
+            .borrow()
+            .is_some_and(|version| version >= target_version)
+        {
+            return Ok(());
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(anyhow!(
+                    "runtime cancelled while waiting for materialized view '{}' to publish version {target_version}",
+                    view.name()
+                ));
+            }
+            changed = version_rx.changed() => {
+                changed.with_context(|| {
+                    format!(
+                        "wait for materialized view '{}' to publish version {target_version}",
+                        view.name()
+                    )
+                })?;
+            }
+        }
+    }
 }
 
 pub(super) fn event_resume_offset(
@@ -347,11 +363,8 @@ pub(super) fn drain_cdc_ready(
     receiver: &mut mpsc::Receiver<QueuedCdcTransaction>,
     queue: &mut VecDeque<QueuedCdcTransaction>,
 ) {
-    loop {
-        match receiver.try_recv() {
-            Ok(transaction) => queue.push_back(transaction),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-        }
+    while let Ok(transaction) = receiver.try_recv() {
+        queue.push_back(transaction);
     }
 }
 
@@ -359,19 +372,17 @@ pub(super) fn drain_ready(
     receiver: &mut core_source::RoutedAppendIngestEventReceiver,
     queues: &mut [ConnectorQueue],
 ) {
-    loop {
-        match receiver.try_recv() {
-            Ok(batch) => {
-                if let Some(queue) = queues.get_mut(batch.connector_id) {
-                    queue.pending.extend(batch.events.into_iter().map(|event| {
-                        QueuedAppendIngestEvent {
-                            event,
-                            commit_ack: batch.commit_ack.clone(),
-                        }
-                    }));
-                }
-            }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+    while let Ok(batch) = receiver.try_recv() {
+        if let Some(queue) = queues.get_mut(batch.connector_id) {
+            queue.pending.extend(
+                batch
+                    .events
+                    .into_iter()
+                    .map(|event| QueuedAppendIngestEvent {
+                        event,
+                        commit_ack: batch.commit_ack.clone(),
+                    }),
+            );
         }
     }
 }

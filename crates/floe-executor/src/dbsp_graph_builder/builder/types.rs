@@ -292,7 +292,7 @@ impl TransientSourceRootShape {
             Self::Source { source, .. }
             | Self::Select { source, .. }
             | Self::Project { source, .. }
-            | Self::FilterMap { source, .. } => &source.table.name,
+            | Self::FilterMap { source, .. } => source.table.source_name(),
         }
     }
 }

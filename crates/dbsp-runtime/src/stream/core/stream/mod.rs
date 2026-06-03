@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -123,6 +123,37 @@ pub(crate) enum StreamEvaluatorDescriptor {
 static STREAM_EVALUATOR_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn stream_evaluator_registry_guard()
+-> MutexGuard<'static, HashMap<String, Arc<dyn Any + Send + Sync>>> {
+    match STREAM_EVALUATOR_REGISTRY.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("stream evaluator registry lock was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn read_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(%label, "stream rwlock read was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn write_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(%label, "stream rwlock write was poisoned; recovering inner state");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn register_stream_evaluator<T>(namespace: &str, evaluator: Arc<dyn StreamEvaluator<T>>)
 where
     T: Archive
@@ -135,10 +166,7 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     let erased: Arc<dyn Any + Send + Sync> = Arc::new(evaluator);
-    STREAM_EVALUATOR_REGISTRY
-        .lock()
-        .expect("stream evaluator registry lock poisoned")
-        .insert(namespace.to_string(), erased);
+    stream_evaluator_registry_guard().insert(namespace.to_string(), erased);
 }
 
 fn registered_stream_evaluator<T>(namespace: &str) -> Option<Arc<dyn StreamEvaluator<T>>>
@@ -152,11 +180,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    let erased = STREAM_EVALUATOR_REGISTRY
-        .lock()
-        .expect("stream evaluator registry lock poisoned")
-        .get(namespace)
-        .cloned()?;
+    let erased = stream_evaluator_registry_guard().get(namespace).cloned()?;
     let typed = Arc::downcast::<Arc<dyn StreamEvaluator<T>>>(erased).ok()?;
     Some(typed.as_ref().clone())
 }
@@ -215,11 +239,11 @@ where
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     fn read_state(&self) -> std::sync::RwLockReadGuard<'_, StreamState<T>> {
-        self.core.state.read().expect("stream state poisoned")
+        read_lock(&self.core.state, "stream state")
     }
 
     fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, StreamState<T>> {
-        self.core.state.write().expect("stream state poisoned")
+        write_lock(&self.core.state, "stream state")
     }
 
     fn notify_committed_frontier(&self, ts: i64) {

@@ -1,8 +1,10 @@
 use super::*;
 
+mod buffers;
 mod checkpoint;
 mod context;
 
+use buffers::ExecutorTickBuffers;
 use checkpoint::{
     CdcOnlyTickCommit, ExecutorCheckpointState, FinalCheckpoint, IngestMetrics,
     PersistTickCheckpoint, apply_decoded_source_batches, build_kafka_metadata_journal_batches,
@@ -11,46 +13,67 @@ use checkpoint::{
     record_fatal_source_batch_failure, record_fatal_tick_failure, record_ingest_queue_metrics,
     update_checkpoint_source_offsets, wait_for_tick_materialized_views,
 };
-pub(super) use context::ExecutorTaskContext;
+pub(super) use context::{
+    ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
+    ExecutorRuntimeContext, ExecutorSourceContext, ExecutorTaskContext,
+};
 
 pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()> {
     let ExecutorTaskContext {
+        runtime,
+        sources,
+        cdc,
+        ingest,
+        checkpoint,
+        limits,
+    } = context;
+    let ExecutorRuntimeContext {
         outer_registry,
-        cdc_table_store,
-        cdc_schemas_by_source_id,
-        cdc_stateful_table_ids_by_source_id,
+        event_watermark,
+        mv_registry,
+        vectorized_runtime,
+        runtime_cancel,
+        executor_running,
+        runtime_failure,
+    } = runtime;
+    let ExecutorSourceContext {
         active_source_definitions_by_id,
         materialized_source_ids,
         source_names_by_id,
-        event_watermark,
-        mv_registry,
-        kafka_commit_senders,
-        postgres_cdc_commit_senders,
-        sink_checkpoint_rx,
-        watermark_debug,
-        cdc_replication_debug,
-        executor_running,
-        runtime_failure,
-        kafka_metadata_journal_source_ids,
-        source_journal_required_sources_for_task,
         source_id_by_name,
+        definitions,
+        kafka_metadata_journal_source_ids,
+        source_journal_required_sources,
+    } = sources;
+    let ExecutorCdcContext {
+        cdc_table_store,
+        cdc_schemas_by_source_id,
+        cdc_stateful_table_ids_by_source_id,
+        cdc_transaction_receiver,
+        cdc_replication_debug,
+        postgres_cdc_commit_senders,
         storage,
         replication_pipeline_runtime,
+    } = cdc;
+    let ExecutorIngestContext {
         connector_receiver,
-        cdc_transaction_receiver,
-        vectorized_runtime,
-        tracked_mv_names,
-        runtime_cancel,
         connector_queues,
+        kafka_commit_senders,
+        pending_event_counter,
+    } = ingest;
+    let ExecutorCheckpointContext {
+        sink_checkpoint_rx,
         checkpoint_manager,
-        definitions,
+        tracked_mv_names,
+        watermark_debug,
+        watermark_idle_source_ms,
+        pre_tick_commit_delay_ms,
+    } = checkpoint;
+    let ExecutorBatchLimits {
         max_batch,
         max_batch_per_source,
         max_batch_per_connector,
-        pending_event_counter,
-        watermark_idle_source_ms,
-        pre_tick_commit_delay_ms,
-    } = context;
+    } = limits;
 
     let outer_for_task = Arc::clone(&outer_registry);
     let cdc_table_store_for_task = cdc_table_store.clone();
@@ -71,8 +94,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
     let executor_running_for_task = Arc::clone(&executor_running);
     let failure_for_executor = Arc::clone(&runtime_failure);
     let kafka_metadata_journal_source_ids_for_task = Arc::clone(&kafka_metadata_journal_source_ids);
-    let source_journal_required_sources_for_task =
-        Arc::clone(&source_journal_required_sources_for_task);
+    let source_journal_required_sources_for_task = Arc::clone(&source_journal_required_sources);
     let source_id_by_name_for_task = source_id_by_name;
     let storage_for_replication_task = storage.clone();
     let replication_pipeline_runtime_for_task = Arc::clone(&replication_pipeline_runtime);
@@ -92,6 +114,10 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         let executor_loop_started = Instant::now();
         let mut first_nonempty_decode_logged = false;
         let mut first_tick_commit_logged = false;
+        let mut tick_buffers = ExecutorTickBuffers::new(
+            active_source_definitions_by_id_for_task.as_slice(),
+            max_batch_per_source,
+        );
         checkpoint_state.restore_latest_commit(&checkpoint_manager, &watermark_for_task);
         'executor: loop {
             for _ in 0..MAX_SINK_CURSOR_UPDATES_PER_ITER {
@@ -171,31 +197,22 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             let source_count = source_names_by_id_for_task.len();
             let decode_start = Instant::now();
             let mut tick_commit_acks = Vec::new();
-            let mut decoded_counts = vec![0usize; source_count];
-            let mut tick_source_offsets = vec![None::<HashMap<u32, u64>>; source_count];
-            let mut tick_kafka_offsets: HashMap<(Arc<str>, i32), i64> = HashMap::new();
-            let mut tick_kafka_source_ranges =
-                vec![
-                    None::<HashMap<(Arc<str>, i32), KafkaSourceJournalRangeAccumulator>>;
-                    source_count
-                ];
-            let mut tick_postgres_lsns: HashMap<String, (u64, String)> = HashMap::new();
-            let mut tick_postgres_sources: HashMap<String, String> = HashMap::new();
-            let mut tick_postgres_table_lsns: Vec<(String, String, String, u64)> = Vec::new();
-            let mut tick_source_max_event_ts = vec![None::<i64>; source_count];
-            let mut arrow_batches_by_source = vec![Vec::new(); source_count];
-            let mut weighted_arrow_batches_by_source = vec![Vec::new(); source_count];
-            let mut vectorized_source_journal_batches =
-                Vec::<VectorizedSourceJournalTransientBatch>::new();
-            let mut arrow_builders_by_source = active_source_definitions_by_id_for_task
-                .iter()
-                .map(|definition| {
-                    definition.as_ref().map(|definition| {
-                        SourceArrowBatchBuilder::new(definition.clone(), max_batch_per_source)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mut commit_acks_by_source = vec![Vec::new(); source_count];
+            tick_buffers.reset_for_tick();
+            let decoded_counts = &mut tick_buffers.decoded_counts;
+            let tick_source_offsets = &mut tick_buffers.tick_source_offsets;
+            let tick_kafka_offsets = &mut tick_buffers.tick_kafka_offsets;
+            let tick_kafka_source_ranges = &mut tick_buffers.tick_kafka_source_ranges;
+            let tick_postgres_lsns = &mut tick_buffers.tick_postgres_lsns;
+            let tick_postgres_sources = &mut tick_buffers.tick_postgres_sources;
+            let tick_postgres_table_lsns = &mut tick_buffers.tick_postgres_table_lsns;
+            let tick_source_max_event_ts = &mut tick_buffers.tick_source_max_event_ts;
+            let arrow_batches_by_source = &mut tick_buffers.arrow_batches_by_source;
+            let weighted_arrow_batches_by_source =
+                &mut tick_buffers.weighted_arrow_batches_by_source;
+            let vectorized_source_journal_batches =
+                &mut tick_buffers.vectorized_source_journal_batches;
+            let arrow_builders_by_source = &mut tick_buffers.arrow_builders_by_source;
+            let commit_acks_by_source = &mut tick_buffers.commit_acks_by_source;
             let mut cdc_staged_writes = None::<WriteBatch>;
             let mut per_connector_counts = vec![0usize; connector_queues.len()];
             let batch_len: usize;
@@ -365,15 +382,15 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     if pipeline_records > 0 {
                         record_postgres_cdc_lsn_progress(
                             &mut checkpoint_state.committed_postgres_lsns,
-                            &tick_postgres_lsns,
-                            &tick_postgres_sources,
-                            &tick_postgres_table_lsns,
+                            tick_postgres_lsns,
+                            tick_postgres_sources,
+                            tick_postgres_table_lsns,
                             &cdc_replication_debug_for_task,
                         );
                         notify_postgres_cdc_commit_senders(
                             checkpoint_state.epoch,
                             &checkpoint_state.committed_postgres_lsns,
-                            &tick_postgres_lsns,
+                            tick_postgres_lsns,
                             &postgres_cdc_commit_senders_for_task,
                         );
                         metrics::record_checkpoint_age_seconds(0);
@@ -451,7 +468,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 let selection = build_batch(
                     &mut connector_queues,
                     &source_id_by_name_for_task,
-                    source_id_by_name_for_task.len(),
+                    source_count,
                     next_connector,
                     max_batch,
                     max_batch_per_source,
@@ -542,7 +559,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                             ack.record_failed(message.clone()).await;
                         }
                         record_fatal_source_batch_failure(
-                            &mut commit_acks_by_source,
+                            commit_acks_by_source,
                             &failure_for_executor,
                             &executor_cancel,
                             message,
@@ -578,8 +595,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                             &event,
                         );
                     }
-                    // Prefer row-derived event time (from decoded timestamp columns) when available.
-                    // Connector-level event_time_ms is a fallback for sources without row timestamps.
                     let event_ts = event_ts.or(event.event_time_ms());
                     if let Some(ts) = event_ts {
                         let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
@@ -609,7 +624,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 "failed to finish Arrow ingest batch"
                             );
                             record_fatal_source_batch_failure(
-                                &mut commit_acks_by_source,
+                                commit_acks_by_source,
                                 &failure_for_executor,
                                 &executor_cancel,
                                 format!(
@@ -645,49 +660,43 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 latency_ms = decode_latency_ms,
                 "decoded ingest batch"
             );
-
             if decoded_rows_len == 0 {
-                // Replication-only CDC tables still need their staged CDC state and LSN feedback
-                // committed even when no DBSP source rows are emitted.
-                if !tick_postgres_lsns.is_empty() || cdc_staged_writes.is_some() {
-                    if let Err(err) = persist_cdc_only_tick_commit(CdcOnlyTickCommit {
+                if (!tick_postgres_lsns.is_empty() || cdc_staged_writes.is_some())
+                    && let Err(err) = persist_cdc_only_tick_commit(CdcOnlyTickCommit {
                         checkpoint_manager: &mut checkpoint_manager,
                         state: &mut checkpoint_state,
                         pending_epoch,
                         mv_registry: &mv_for_task,
                         watermark: &watermark_for_task,
                         cdc_staged_writes,
-                        tick_postgres_lsns: &tick_postgres_lsns,
-                        tick_postgres_sources: &tick_postgres_sources,
-                        tick_postgres_table_lsns: &tick_postgres_table_lsns,
+                        tick_postgres_lsns,
+                        tick_postgres_sources,
+                        tick_postgres_table_lsns,
                         cdc_replication_debug: &cdc_replication_debug_for_task,
                         postgres_cdc_commit_senders: &postgres_cdc_commit_senders_for_task,
                     })
                     .await
-                    {
-                        tracing::error!(
-                            epoch = pending_epoch,
-                            error = %err,
-                            "failed to persist CDC-only tick commit"
-                        );
-                        record_runtime_failure(
-                            &failure_for_executor,
-                            format!(
-                                "failed to persist CDC-only tick commit {pending_epoch}: {err}"
-                            ),
-                        );
-                        executor_cancel.cancel();
-                        break 'executor;
-                    }
+                {
+                    tracing::error!(
+                        epoch = pending_epoch,
+                        error = %err,
+                        "failed to persist CDC-only tick commit"
+                    );
+                    record_runtime_failure(
+                        &failure_for_executor,
+                        format!("failed to persist CDC-only tick commit {pending_epoch}: {err}"),
+                    );
+                    executor_cancel.cancel();
+                    break 'executor;
                 }
                 continue;
             }
             let changed = match apply_decoded_source_batches(
                 &mut vectorized_runtime_for_task,
                 &source_names_by_id_for_task,
-                &arrow_batches_by_source,
-                &weighted_arrow_batches_by_source,
-                &mut commit_acks_by_source,
+                arrow_batches_by_source,
+                weighted_arrow_batches_by_source,
+                commit_acks_by_source,
             )
             .await
             {
@@ -696,7 +705,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     let message = format!("failed to apply decoded source batches: {err}");
                     tracing::error!(epoch = pending_epoch, error = %err, "{message}");
                     record_fatal_source_batch_failure(
-                        &mut commit_acks_by_source,
+                        commit_acks_by_source,
                         &failure_for_executor,
                         &executor_cancel,
                         message,
@@ -712,15 +721,15 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 &source_names_by_id_for_task,
                 &definitions,
                 &source_journal_required_sources_for_task,
-                &arrow_batches_by_source,
-                &weighted_arrow_batches_by_source,
-                &tick_source_max_event_ts,
-                &mut vectorized_source_journal_batches,
+                arrow_batches_by_source,
+                weighted_arrow_batches_by_source,
+                tick_source_max_event_ts,
+                vectorized_source_journal_batches,
             ) {
                 let message = err.to_string();
                 tracing::error!(error = %err, "{message}");
                 record_fatal_source_batch_failure(
-                    &mut commit_acks_by_source,
+                    commit_acks_by_source,
                     &failure_for_executor,
                     &executor_cancel,
                     message,
@@ -728,14 +737,14 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 .await;
                 break 'executor;
             }
-            for acks in &mut commit_acks_by_source {
+            for acks in commit_acks_by_source.iter_mut() {
                 tick_commit_acks.append(acks);
             }
             let kafka_metadata_journal_batches = build_kafka_metadata_journal_batches(
                 &source_names_by_id_for_task,
                 &kafka_metadata_journal_source_ids_for_task,
-                &tick_source_max_event_ts,
-                &mut tick_kafka_source_ranges,
+                tick_source_max_event_ts,
+                tick_kafka_source_ranges,
             );
             checkpoint_state.epoch = pending_epoch;
             let epoch = checkpoint_state.epoch;
@@ -765,7 +774,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 watermark = watermark_for_task.load(Ordering::Relaxed),
             );
             let _tick_guard = tick_span.enter();
-            if epoch <= 8 || epoch % 128 == 0 {
+            if epoch <= 8 || epoch.is_multiple_of(128) {
                 tracing::info!(
                     epoch,
                     batch_size = batch_len,
@@ -810,7 +819,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 metrics::inc_ingest_tick("ok");
             }
             let state_write_latency_ms = tick_all_start.elapsed().as_millis() as u64;
-            if epoch <= 8 || epoch % 128 == 0 {
+            if epoch <= 8 || epoch.is_multiple_of(128) {
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
 
@@ -827,14 +836,12 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 None => break 'executor,
             };
 
-            checkpoint_state.record_latest_source_offset_lag(
-                &source_names_by_id_for_task,
-                &tick_source_offsets,
-            );
+            checkpoint_state
+                .record_latest_source_offset_lag(&source_names_by_id_for_task, tick_source_offsets);
             update_checkpoint_source_offsets(
                 &mut checkpoint_manager,
                 &source_names_by_id_for_task,
-                &tick_source_offsets,
+                tick_source_offsets,
             );
             let frontier = next_watermark.max(0).try_into().unwrap_or(0_u64);
             let mv_versions = collect_mv_versions_for_commit(
@@ -844,7 +851,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             let mut next_committed_kafka_offsets = checkpoint_state.committed_kafka_offsets.clone();
             advance_kafka_offset_commit_state(
                 &mut next_committed_kafka_offsets,
-                &tick_kafka_offsets,
+                tick_kafka_offsets,
             );
             let persisted_checkpoint = match persist_tick_checkpoint(PersistTickCheckpoint {
                 checkpoint_manager: &mut checkpoint_manager,
@@ -853,7 +860,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 mv_versions: &mv_versions,
                 next_committed_kafka_offsets: &next_committed_kafka_offsets,
                 source_names_by_id: &source_names_by_id_for_task,
-                vectorized_source_journal_batches: &vectorized_source_journal_batches,
+                vectorized_source_journal_batches: vectorized_source_journal_batches.as_slice(),
                 kafka_metadata_journal_batches: &kafka_metadata_journal_batches,
                 cdc_staged_writes,
             })
@@ -875,7 +882,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 }
             };
             let checkpoint_write_latency_ms = persisted_checkpoint.checkpoint_write_latency_ms;
-            if epoch <= 8 || epoch % 128 == 0 {
+            if epoch <= 8 || epoch.is_multiple_of(128) {
                 tracing::info!(
                     epoch,
                     checkpoint_write_latency_ms,
@@ -900,19 +907,19 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             }
             checkpoint_state.record_committed_source_offset_lag(
                 &source_names_by_id_for_task,
-                &tick_source_offsets,
+                tick_source_offsets,
             );
             checkpoint_state
                 .record_mv_versions_committed(&mv_versions, persisted_checkpoint.committed_at_ms);
             advance_kafka_offset_commit_state(
                 &mut checkpoint_state.committed_kafka_offsets,
-                &tick_kafka_offsets,
+                tick_kafka_offsets,
             );
             record_postgres_cdc_lsn_progress(
                 &mut checkpoint_state.committed_postgres_lsns,
-                &tick_postgres_lsns,
-                &tick_postgres_sources,
-                &tick_postgres_table_lsns,
+                tick_postgres_lsns,
+                tick_postgres_sources,
+                tick_postgres_table_lsns,
                 &cdc_replication_debug_for_task,
             );
             record_mv_freshness_metrics(
@@ -941,14 +948,14 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             .await;
             notify_kafka_commit_senders(
                 epoch,
-                &tick_kafka_offsets,
+                tick_kafka_offsets,
                 &checkpoint_state.committed_kafka_offsets,
                 &kafka_commit_senders_for_task,
             );
             notify_postgres_cdc_commit_senders(
                 epoch,
                 &checkpoint_state.committed_postgres_lsns,
-                &tick_postgres_lsns,
+                tick_postgres_lsns,
                 &postgres_cdc_commit_senders_for_task,
             );
             let tick_latency_ms = tick_start.elapsed().as_millis() as u64;
@@ -958,7 +965,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             record_ingest_queue_metrics(IngestMetrics {
                 connector_queues: &connector_queues,
                 connector_receiver_len: connector_receiver_for_task.len(),
-                decoded_counts: &decoded_counts,
+                decoded_counts: decoded_counts.as_slice(),
                 source_names_by_id: &source_names_by_id_for_task,
                 per_connector_counts: &per_connector_counts,
                 epoch,

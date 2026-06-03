@@ -4,10 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use floe_executor::SourceRowDecoder;
-use floe_node::connector::{ConnectorContext, run_connector};
-use floe_node::file_connector::{FileConnector, FileConnectorConfig};
-use floe_node::generator;
-use floe_node::source;
+use floe_node_core::connector::{ConnectorContext, run_connector};
+use floe_node_core::file_connector::{FileConnector, FileConnectorConfig};
+use floe_node_core::generator;
+use floe_node_core::source;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 

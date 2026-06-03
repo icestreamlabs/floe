@@ -11,10 +11,10 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     let storage = &config.storage;
     let maintenance = &config.maintenance;
 
-    if args.events_per_second == DEFAULT_EVENTS_PER_SECOND {
-        if let Some(events_per_second) = runtime.events_per_second {
-            args.events_per_second = events_per_second;
-        }
+    if args.events_per_second == DEFAULT_EVENTS_PER_SECOND
+        && let Some(events_per_second) = runtime.events_per_second
+    {
+        args.events_per_second = events_per_second;
     }
     if args.max_events.is_none() {
         args.max_events = runtime.max_events;
@@ -48,50 +48,50 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.transient_segment_min_score.is_none() {
         args.transient_segment_min_score = runtime.transient_segment_min_score;
     }
-    if args.ingest_queue_capacity == DEFAULT_INGEST_QUEUE_CAPACITY {
-        if let Some(capacity) = runtime.ingest_queue_capacity {
-            args.ingest_queue_capacity = capacity;
-        }
+    if args.ingest_queue_capacity == DEFAULT_INGEST_QUEUE_CAPACITY
+        && let Some(capacity) = runtime.ingest_queue_capacity
+    {
+        args.ingest_queue_capacity = capacity;
     }
-    if args.ingest_batch_size == DEFAULT_INGEST_BATCH_SIZE {
-        if let Some(batch_size) = runtime.ingest_batch_size {
-            args.ingest_batch_size = batch_size;
-        }
+    if args.ingest_batch_size == DEFAULT_INGEST_BATCH_SIZE
+        && let Some(batch_size) = runtime.ingest_batch_size
+    {
+        args.ingest_batch_size = batch_size;
     }
-    if args.ingest_batch_per_source == DEFAULT_INGEST_BATCH_PER_SOURCE {
-        if let Some(limit) = runtime.ingest_batch_per_source {
-            args.ingest_batch_per_source = limit;
-        }
+    if args.ingest_batch_per_source == DEFAULT_INGEST_BATCH_PER_SOURCE
+        && let Some(limit) = runtime.ingest_batch_per_source
+    {
+        args.ingest_batch_per_source = limit;
     }
-    if args.ingest_batch_per_connector == DEFAULT_INGEST_BATCH_PER_CONNECTOR {
-        if let Some(limit) = runtime.ingest_batch_per_connector {
-            args.ingest_batch_per_connector = limit;
-        }
+    if args.ingest_batch_per_connector == DEFAULT_INGEST_BATCH_PER_CONNECTOR
+        && let Some(limit) = runtime.ingest_batch_per_connector
+    {
+        args.ingest_batch_per_connector = limit;
     }
-    if args.mv_retain_last == DEFAULT_MV_RETAIN_LAST {
-        if let Some(retain_last) = runtime.mv_retain_last {
-            args.mv_retain_last = retain_last;
-        }
+    if args.mv_retain_last == DEFAULT_MV_RETAIN_LAST
+        && let Some(retain_last) = runtime.mv_retain_last
+    {
+        args.mv_retain_last = retain_last;
     }
-    if args.http_host == DEFAULT_HTTP_HOST {
-        if let Some(host) = runtime.http_host.as_ref() {
-            args.http_host = host.clone();
-        }
+    if args.http_host == DEFAULT_HTTP_HOST
+        && let Some(host) = runtime.http_host.as_ref()
+    {
+        args.http_host = host.clone();
     }
-    if args.kafka_group_id == DEFAULT_KAFKA_GROUP_ID {
-        if let Some(group_id) = runtime.kafka_group_id.as_ref() {
-            args.kafka_group_id = group_id.clone();
-        }
+    if args.kafka_group_id == DEFAULT_KAFKA_GROUP_ID
+        && let Some(group_id) = runtime.kafka_group_id.as_ref()
+    {
+        args.kafka_group_id = group_id.clone();
     }
-    if args.kafka_poll_ms == DEFAULT_KAFKA_POLL_MS {
-        if let Some(poll_ms) = runtime.kafka_poll_ms {
-            args.kafka_poll_ms = poll_ms;
-        }
+    if args.kafka_poll_ms == DEFAULT_KAFKA_POLL_MS
+        && let Some(poll_ms) = runtime.kafka_poll_ms
+    {
+        args.kafka_poll_ms = poll_ms;
     }
-    if args.kafka_max_messages == DEFAULT_KAFKA_MAX_MESSAGES {
-        if let Some(max_messages) = runtime.kafka_max_messages {
-            args.kafka_max_messages = max_messages;
-        }
+    if args.kafka_max_messages == DEFAULT_KAFKA_MAX_MESSAGES
+        && let Some(max_messages) = runtime.kafka_max_messages
+    {
+        args.kafka_max_messages = max_messages;
     }
 
     if args.slatedb_await_durable.is_none() {
@@ -118,36 +118,36 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.slatedb_close_timeout_ms.is_none() {
         args.slatedb_close_timeout_ms = storage.slatedb_close_timeout_ms;
     }
-    if args.zset_compaction_max_chain_len == DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN {
-        if let Some(max_chain_len) = storage.zset_compaction_max_chain_len {
-            args.zset_compaction_max_chain_len = max_chain_len;
-        }
+    if args.zset_compaction_max_chain_len == DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN
+        && let Some(max_chain_len) = storage.zset_compaction_max_chain_len
+    {
+        args.zset_compaction_max_chain_len = max_chain_len;
     }
-    if args.zset_compaction_max_segments == DEFAULT_ZSET_COMPACTION_MAX_SEGMENTS {
-        if let Some(max_segments) = storage.zset_compaction_max_segments {
-            args.zset_compaction_max_segments = max_segments;
-        }
+    if args.zset_compaction_max_segments == DEFAULT_ZSET_COMPACTION_MAX_SEGMENTS
+        && let Some(max_segments) = storage.zset_compaction_max_segments
+    {
+        args.zset_compaction_max_segments = max_segments;
     }
-    if args.zset_compaction_backoff_ticks == DEFAULT_ZSET_COMPACTION_BACKOFF_TICKS {
-        if let Some(backoff_ticks) = storage.zset_compaction_backoff_ticks {
-            args.zset_compaction_backoff_ticks = backoff_ticks;
-        }
+    if args.zset_compaction_backoff_ticks == DEFAULT_ZSET_COMPACTION_BACKOFF_TICKS
+        && let Some(backoff_ticks) = storage.zset_compaction_backoff_ticks
+    {
+        args.zset_compaction_backoff_ticks = backoff_ticks;
     }
-    if args.zset_compaction_max_concurrent_jobs == DEFAULT_ZSET_COMPACTION_MAX_CONCURRENT_JOBS {
-        if let Some(max_jobs) = storage.zset_compaction_max_concurrent_jobs {
-            args.zset_compaction_max_concurrent_jobs = max_jobs;
-        }
+    if args.zset_compaction_max_concurrent_jobs == DEFAULT_ZSET_COMPACTION_MAX_CONCURRENT_JOBS
+        && let Some(max_jobs) = storage.zset_compaction_max_concurrent_jobs
+    {
+        args.zset_compaction_max_concurrent_jobs = max_jobs;
     }
-    if args.zset_gc_grace_period_ms == DEFAULT_ZSET_GC_GRACE_PERIOD_MS {
-        if let Some(grace_ms) = storage.zset_gc_grace_period_ms {
-            args.zset_gc_grace_period_ms = grace_ms;
-        }
+    if args.zset_gc_grace_period_ms == DEFAULT_ZSET_GC_GRACE_PERIOD_MS
+        && let Some(grace_ms) = storage.zset_gc_grace_period_ms
+    {
+        args.zset_gc_grace_period_ms = grace_ms;
     }
 
-    if !args.maintenance_paused {
-        if let Some(paused) = maintenance.paused {
-            args.maintenance_paused = paused;
-        }
+    if !args.maintenance_paused
+        && let Some(paused) = maintenance.paused
+    {
+        args.maintenance_paused = paused;
     }
     if args.maintenance_inspect_namespace.is_empty() {
         args.maintenance_inspect_namespace = maintenance.inspect_namespace.clone();
@@ -161,8 +161,10 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
 }
 
 pub(super) fn mv_flush_coalescing_config(config: &MvFlushConfig) -> MvFlushCoalescingConfig {
-    let mut out = MvFlushCoalescingConfig::default();
-    out.enabled = config.enabled.unwrap_or(false);
+    let mut out = MvFlushCoalescingConfig {
+        enabled: config.enabled.unwrap_or(false),
+        ..Default::default()
+    };
     if !out.enabled {
         return out;
     }

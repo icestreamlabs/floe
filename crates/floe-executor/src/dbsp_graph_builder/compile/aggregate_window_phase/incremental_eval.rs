@@ -13,6 +13,20 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
+type IncrementalAggregateOutputDelta = (Vec<u8>, dbsp::IncrementalAggregateRow<Vec<u8>>, i64);
+type WindowIncrementalInputDelta = (dbsp::WindowIncrementalInput<Vec<u8>, Vec<u8>>, i64);
+type WindowIncrementalOutputDelta = (
+    dbsp::WindowIncrementalInput<Vec<u8>, Vec<u8>>,
+    dbsp::IncrementalAggregateRow<dbsp::WindowKey<Vec<u8>>>,
+    i64,
+);
+type PrekeyedIncrementalInputDelta = ((Vec<u8>, Vec<u8>), i64);
+type PrekeyedIncrementalOutputDelta = (
+    (Vec<u8>, Vec<u8>),
+    dbsp::IncrementalAggregateRow<Vec<u8>>,
+    i64,
+);
+
 pub(crate) fn build_incremental_aggregate_slot_kinds(
     aggregates: &[DbspAggregateExpr],
 ) -> Option<Vec<dbsp::IncrementalAggregateSlotKind>> {
@@ -46,10 +60,7 @@ pub(crate) fn build_incremental_aggregate_batch_row_evaluator(
     expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
-) -> impl Fn(&[(Vec<u8>, i64)]) -> Vec<(Vec<u8>, dbsp::IncrementalAggregateRow<Vec<u8>>, i64)>
-+ Send
-+ Sync
-+ 'static {
+) -> impl Fn(&[(Vec<u8>, i64)]) -> Vec<IncrementalAggregateOutputDelta> + Send + Sync + 'static {
     let layout = Arc::new(build_count_eval_layout(
         &aggregates,
         input_schema.as_ref(),
@@ -115,21 +126,14 @@ pub(crate) fn build_window_incremental_aggregate_batch_row_evaluator(
     expression_columns: Arc<ExpressionColumnMap>,
     graph_id: String,
     context: &'static str,
-) -> impl Fn(
-    &[(dbsp::WindowIncrementalInput<Vec<u8>, Vec<u8>>, i64)],
-) -> Vec<(
-    dbsp::WindowIncrementalInput<Vec<u8>, Vec<u8>>,
-    dbsp::IncrementalAggregateRow<dbsp::WindowKey<Vec<u8>>>,
-    i64,
-)> + Send
-+ Sync
-+ 'static {
+) -> impl Fn(&[WindowIncrementalInputDelta]) -> Vec<WindowIncrementalOutputDelta> + Send + Sync + 'static
+{
     let layout = Arc::new(build_count_eval_layout(
         &aggregates,
         input_schema.as_ref(),
         expression_columns.as_ref(),
     ));
-    move |delta_values: &[(dbsp::WindowIncrementalInput<Vec<u8>, Vec<u8>>, i64)]| {
+    move |delta_values: &[WindowIncrementalInputDelta]| {
         let input_rows = delta_values
             .iter()
             .map(|(row, weight)| (row.value.clone(), *weight))
@@ -211,12 +215,8 @@ impl PrekeyedIncrementalAggregateBatchEvaluator {
 
     pub(crate) fn evaluate_deltas(
         &self,
-        delta_values: &[((Vec<u8>, Vec<u8>), i64)],
-    ) -> Vec<(
-        (Vec<u8>, Vec<u8>),
-        dbsp::IncrementalAggregateRow<Vec<u8>>,
-        i64,
-    )> {
+        delta_values: &[PrekeyedIncrementalInputDelta],
+    ) -> Vec<PrekeyedIncrementalOutputDelta> {
         let input_rows = delta_values
             .iter()
             .map(|(pair, weight)| (pair.1.clone(), *weight))

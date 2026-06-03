@@ -905,5 +905,4 @@ impl PgOutputReader {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests;

@@ -65,72 +65,55 @@ pub(super) async fn run_http_worker(
     mv_name: &str,
     client: &Client,
     url: &str,
-    mut rx: mpsc::Receiver<SinkEvent>,
+    rx: mpsc::Receiver<SinkEvent>,
     tracker: Arc<SinkQueueTracker>,
     batch_policy: BatchPolicy,
     retry_policy: RetryPolicy,
     checkpoint_tx: Option<SinkCheckpointSender>,
 ) -> Result<()> {
-    let mut buffer = Vec::new();
-    let mut buffer_bytes = 0usize;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            SinkEvent::Rows(rows) => {
-                tracker.on_dequeue_many(rows.len());
-                for row in rows {
-                    buffer_bytes += row.byte_len;
-                    buffer.push(row);
-                    if batch_policy.should_flush(buffer.len(), buffer_bytes) {
-                        flush_http_buffer(
-                            sink_name,
-                            mv_name,
-                            client,
-                            url,
-                            &mut buffer,
-                            &mut buffer_bytes,
-                            retry_policy,
-                            &tracker,
-                            None,
-                            &checkpoint_tx,
-                        )
-                        .await?;
-                    }
-                }
-            }
-            SinkEvent::Flush { version } => {
-                tracker.on_dequeue();
-                flush_http_buffer(
-                    sink_name,
-                    mv_name,
-                    client,
-                    url,
-                    &mut buffer,
-                    &mut buffer_bytes,
-                    retry_policy,
-                    &tracker,
-                    Some(version),
-                    &checkpoint_tx,
-                )
-                .await?;
-            }
-        }
-    }
-
-    flush_http_buffer(
+    let backend = HttpSinkBackend {
         sink_name,
         mv_name,
         client,
         url,
-        &mut buffer,
-        &mut buffer_bytes,
         retry_policy,
-        &tracker,
-        None,
-        &checkpoint_tx,
-    )
-    .await?;
-    Ok(())
+        tracker: Arc::clone(&tracker),
+        checkpoint_tx,
+    };
+    run_buffered_sink_worker(rx, tracker, batch_policy, backend).await
+}
+
+struct HttpSinkBackend<'a> {
+    sink_name: &'a str,
+    mv_name: &'a str,
+    client: &'a Client,
+    url: &'a str,
+    retry_policy: RetryPolicy,
+    tracker: Arc<SinkQueueTracker>,
+    checkpoint_tx: Option<SinkCheckpointSender>,
+}
+
+impl BufferedSinkBackend for HttpSinkBackend<'_> {
+    async fn flush(
+        &mut self,
+        buffer: &mut Vec<SinkRecord>,
+        buffer_bytes: &mut usize,
+        flush_version: Option<i64>,
+    ) -> Result<()> {
+        flush_http_buffer(
+            self.sink_name,
+            self.mv_name,
+            self.client,
+            self.url,
+            buffer,
+            buffer_bytes,
+            self.retry_policy,
+            &self.tracker,
+            flush_version,
+            &self.checkpoint_tx,
+        )
+        .await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
