@@ -10,6 +10,7 @@ pub mod delta_batch;
 pub mod delta_consolidation;
 mod encoded_batch;
 pub mod encoding;
+pub mod maintenance;
 mod metrics;
 pub mod mv;
 pub mod mv_changelog;
@@ -30,7 +31,7 @@ pub mod vectorized_runtime;
 pub use context::FloeQueryContext;
 pub use dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
 pub use dbsp_graph_builder::{
-    BuildInputs, BuildOutputs, DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig,
+    LegacyGraphHarness, LegacyGraphHarnessInputs, LegacyGraphHarnessOutputs,
     PersistencePolicyConfig, PlanSourceRequirements, plan_source_requirements,
     source_batch_journal_root_source_name, source_batch_journal_root_sources,
     source_batch_journal_root_sources_with_config, transient_source_root_requirements,
@@ -38,6 +39,7 @@ pub use dbsp_graph_builder::{
 pub use dbsp_plan::{DbspPlanBuilder, ValidatedPlan, nexmark_config, validate_dbsp_plan};
 pub use delta_batch::{DeltaBatchBuffer, DeltaBatchConfig, FlushReason};
 pub use floe_core::source::SourceRegistry;
+pub use maintenance::DbspMaintenance;
 pub use mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 pub use mv::runtime::MaterializedView;
 pub use mv_loader::load_or_register_mv;

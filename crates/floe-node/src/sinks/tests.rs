@@ -30,6 +30,18 @@ fn retry_policy_backoff_is_bounded_exponential() {
 }
 
 #[test]
+fn default_kafka_transactional_id_is_stable_for_sink() {
+    assert_eq!(
+        kafka_backend::default_kafka_transactional_id("orders sink"),
+        "floe-orders_sink"
+    );
+    assert_eq!(
+        kafka_backend::default_kafka_transactional_id("orders sink"),
+        kafka_backend::default_kafka_transactional_id("orders sink")
+    );
+}
+
+#[test]
 fn debezium_mv_sink_encoding_builds_kafka_key_and_envelope() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -294,7 +306,7 @@ async fn http_sink_crash_mid_batch_emits_no_request_before_flush() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = mpsc::channel(1);
     let tracker = SinkQueueTracker::new("sink_http");
     let url = format!("http://{addr}/collect");
     let worker = tokio::spawn(async move {
@@ -324,7 +336,16 @@ async fn http_sink_crash_mid_batch_emits_no_request_before_flush() {
     }]))
     .await
     .expect("send row");
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    tx.send(SinkEvent::Rows(vec![SinkRecord {
+        version: 12,
+        row_idx: 1,
+        key: None,
+        json: serde_json::json!({"auction": 13}),
+        payload: "{\"auction\":13}".to_string(),
+        byte_len: 14,
+    }]))
+    .await
+    .expect("send buffered row after worker consumed first event");
     worker.abort();
     let _ = worker.await;
     server.abort();

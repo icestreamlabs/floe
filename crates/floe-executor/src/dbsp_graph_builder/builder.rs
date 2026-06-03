@@ -10,20 +10,18 @@ use async_recursion::async_recursion;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use dbsp::circuit::plan::DbspProjectExpr;
-use dbsp::collections::CompactionPolicy;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
-use dbsp::storage::gc::{GcPolicy, SweepStats};
 use dbsp::stream::DeltaHandleStream;
 use dbsp::{
-    CircuitNode, CircuitPlan, CompactionSchedulerConfig, DbspAggregateNode, DbspExpression,
-    DbspNodeKind, DbspScalarType, DbspTopNNode, RowSchema, StreamRetention,
+    CircuitNode, CircuitPlan, DbspAggregateNode, DbspExpression, DbspNodeKind, DbspScalarType,
+    DbspTopNNode, RowSchema, StreamRetention,
 };
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::dbsp_bridge::{DbspBridge, NamespaceStorageSummary};
+use crate::dbsp_bridge::DbspBridge;
 use crate::dbsp_plan::{
     DbspProjectNode, DbspSelectNode, DbspSourceNode, ValidatedPlan, validate_dbsp_plan,
 };
@@ -57,8 +55,8 @@ type ClosedJoinKeyTransformFn = dyn Fn(Arc<Vec<(Vec<u8>, i64)>>) -> BoxFuture<'s
     + Sync
     + 'static;
 
-/// Orchestrates compilation of a [`CircuitPlan`] into DBSP streams backed by SlateDB.
-pub struct DbspGraphBuilder {
+/// Legacy row/handle graph compiler retained for integration harness coverage.
+pub struct LegacyGraphHarness {
     pub(super) bridge: Arc<Mutex<DbspBridge>>,
     ns: GraphNamespace,
     pub(super) watermark: Arc<AtomicI64>,
@@ -68,7 +66,7 @@ pub struct DbspGraphBuilder {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct MvFlushCoalescingConfig {
+pub(super) struct MvFlushCoalescingConfig {
     pub enabled: bool,
     pub max_pending_deltas: usize,
     pub max_pending_versions: Option<usize>,
@@ -80,7 +78,7 @@ pub struct MvFlushCoalescingConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct OverlaySnapshotConfig {
+pub(super) struct OverlaySnapshotConfig {
     pub max_pending_batches: usize,
     pub max_pending_rows: usize,
     pub max_delay_ms: u64,
@@ -111,7 +109,7 @@ impl Default for MvFlushCoalescingConfig {
     }
 }
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub async fn new(db: Arc<slatedb::Db>) -> Result<Self> {
         crate::metrics::init();
         let bridge = DbspBridge::new(db).await?;
@@ -125,87 +123,10 @@ impl DbspGraphBuilder {
         })
     }
 
-    pub fn set_mv_flush_coalescing(&mut self, config: MvFlushCoalescingConfig) {
-        let mut sanitized = config;
-        if sanitized.max_pending_deltas == 0 {
-            sanitized.max_pending_deltas = 1;
-        }
-        self.mv_flush_coalescing = sanitized;
-    }
-
-    pub fn set_mv_overlay_snapshot(&mut self, config: OverlaySnapshotConfig) {
-        let mut sanitized = config;
-        if sanitized.max_pending_batches == 0 {
-            sanitized.max_pending_batches = 1;
-        }
-        if sanitized.max_pending_rows == 0 {
-            sanitized.max_pending_rows = 1;
-        }
-        if sanitized.max_delay_ms == 0 {
-            sanitized.max_delay_ms = 1;
-        }
-        self.mv_overlay_snapshot = sanitized;
-    }
-
-    pub fn set_persistence_policy_config(&mut self, config: PersistencePolicyConfig) {
-        self.persistence_policy_config = config;
-    }
-
-    pub async fn set_stream_compaction(
+    pub async fn build(
         &mut self,
-        policy: CompactionPolicy,
-        scheduler: CompactionSchedulerConfig,
-    ) {
-        let mut bridge = self.bridge.lock().await;
-        bridge.set_stream_compaction_policy(policy);
-        bridge.set_stream_compaction_scheduler_config(scheduler);
-    }
-
-    pub async fn pause_maintenance(&mut self) {
-        let mut bridge = self.bridge.lock().await;
-        bridge.pause_maintenance();
-    }
-
-    pub async fn resume_maintenance(&mut self) {
-        let mut bridge = self.bridge.lock().await;
-        bridge.resume_maintenance();
-    }
-
-    pub async fn maintenance_paused(&self) -> bool {
-        let bridge = self.bridge.lock().await;
-        bridge.maintenance_paused()
-    }
-
-    pub async fn inspect_namespace_storage(
-        &self,
-        namespace: &str,
-    ) -> Result<NamespaceStorageSummary> {
-        let bridge = self.bridge.lock().await;
-        bridge.inspect_namespace_storage(namespace).await
-    }
-
-    pub async fn run_namespace_compaction_once(&mut self, namespace: &str) -> Result<Option<u64>> {
-        let mut bridge = self.bridge.lock().await;
-        bridge.compact_namespace_once(namespace).await
-    }
-
-    pub async fn run_namespace_gc_once(
-        &self,
-        namespace: &str,
-        policy: GcPolicy,
-    ) -> Result<SweepStats> {
-        let bridge = self.bridge.lock().await;
-        bridge.run_namespace_gc_once(namespace, policy).await
-    }
-
-    /// Builds a legacy row/handle DBSP graph for integration harnesses.
-    ///
-    /// Production node execution uses the vectorized runtime path; keep this API explicit so
-    /// test-era coverage does not look like the revenue-path graph builder.
-    pub async fn build_legacy_for_harness(
-        &mut self,
-        inputs: BuildInputs<'_>,
-    ) -> Result<BuildOutputs> {
+        inputs: LegacyGraphHarnessInputs<'_>,
+    ) -> Result<LegacyGraphHarnessOutputs> {
         self.ns.set_graph_id(inputs.graph_id);
         self.watermark = Arc::clone(&inputs.watermark);
         let available_sources: BTreeSet<String> =
@@ -266,7 +187,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -302,7 +223,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -337,7 +258,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -369,7 +290,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -399,7 +320,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -449,7 +370,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -597,7 +518,7 @@ impl DbspGraphBuilder {
                         inputs.restore_transient_helper_state,
                     )
                     .await?;
-                    return Ok(BuildOutputs {
+                    return Ok(LegacyGraphHarnessOutputs {
                         node_streams: built,
                         mv_latest,
                         required_sources,
@@ -636,7 +557,7 @@ impl DbspGraphBuilder {
                     &inputs.mv_registry,
                 )
                 .await?;
-                return Ok(BuildOutputs {
+                return Ok(LegacyGraphHarnessOutputs {
                     node_streams: built,
                     mv_latest,
                     required_sources,
@@ -687,7 +608,7 @@ impl DbspGraphBuilder {
             .await?;
         }
 
-        Ok(BuildOutputs {
+        Ok(LegacyGraphHarnessOutputs {
             node_streams: built,
             mv_latest,
             required_sources,
@@ -709,7 +630,7 @@ pub use source_requirements::{
     source_batch_journal_root_sources, source_batch_journal_root_sources_with_config,
     transient_source_root_requirements,
 };
-pub use types::{BuildInputs, BuildOutputs};
+pub use types::{LegacyGraphHarnessInputs, LegacyGraphHarnessOutputs};
 
 mod compile_node;
 mod row_helpers;

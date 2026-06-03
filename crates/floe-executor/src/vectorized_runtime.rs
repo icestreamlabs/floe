@@ -7,7 +7,7 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, Int64Array};
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
+use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
@@ -606,7 +606,7 @@ fn deleted_delta_keys(
     key_indices: &[usize],
     delta: &RecordBatch,
     weight_idx: usize,
-) -> Result<HashSet<OwnedRow>> {
+) -> Result<HashSet<Vec<u8>>> {
     let weights = delta
         .column(weight_idx)
         .as_any()
@@ -619,7 +619,7 @@ fn deleted_delta_keys(
     let mut keys = HashSet::new();
     for row_idx in 0..weights.len() {
         if !weights.is_null(row_idx) && weights.value(row_idx) < 0 {
-            keys.insert(rows.row(row_idx).owned());
+            keys.insert(rows.row(row_idx).data().to_vec());
         }
     }
     Ok(keys)
@@ -628,7 +628,7 @@ fn deleted_delta_keys(
 fn filter_deleted_source_rows(
     schema: &SchemaRef,
     key_indices: &[usize],
-    delete_keys: &HashSet<OwnedRow>,
+    delete_keys: &HashSet<Vec<u8>>,
     snapshot: &[RecordBatch],
 ) -> Result<Vec<RecordBatch>> {
     let converter = key_row_converter(schema, key_indices)?;
@@ -643,7 +643,7 @@ fn filter_deleted_source_rows(
         let mut keep = BooleanBuilder::with_capacity(batch.num_rows());
         let mut kept_rows = 0usize;
         for row_idx in 0..batch.num_rows() {
-            let keep_row = !delete_keys.contains(&rows.row(row_idx).owned());
+            let keep_row = !delete_keys.contains(rows.row(row_idx).data());
             if keep_row {
                 kept_rows = kept_rows.saturating_add(1);
             }
@@ -881,7 +881,9 @@ fn to_camel_case(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::Int64Array;
+    use crate::source_decoder::mask_arrow_batch_for_required_columns;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceRegistry};
 
     fn source_state(schema: SchemaRef) -> VectorizedSourceState {
         let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
@@ -939,5 +941,92 @@ mod tests {
                 .expect("inspect delta")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn masked_query_batches_do_not_prune_execution_batches() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("note", SourceDataType::Utf8),
+            ],
+        )
+        .expect("source definition");
+        let schema = definition.to_arrow_schema();
+        let full_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["kept"])),
+            ],
+        )
+        .expect("full source batch");
+        let required_columns = Some(Arc::<[bool]>::from(vec![true, false]));
+        let masked_batch = mask_arrow_batch_for_required_columns(
+            &definition,
+            &full_batch,
+            required_columns.as_ref(),
+        )
+        .expect("mask source batch");
+
+        let mut sources = SourceRegistry::new();
+        sources.register(definition);
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let output_schema = Arc::new(Schema::new(vec![Field::new("note", DataType::Utf8, false)]));
+        let mut runtime = VectorizedExecutionRuntime::new(
+            &sources,
+            vec![VectorizedMaterializedViewPlan::new(
+                "mv_notes",
+                "SELECT note FROM orders",
+                Arc::clone(&output_schema),
+            )],
+            Arc::clone(&registry),
+        )
+        .await
+        .expect("runtime");
+
+        runtime
+            .append_source_batches_for_execution_and_query(
+                "orders",
+                vec![full_batch],
+                vec![masked_batch],
+            )
+            .await
+            .expect("append source batches");
+        runtime.run_tick(1).await.expect("run vectorized tick");
+
+        let handle = registry.get("mv_notes").expect("materialized view");
+        let (_version, snapshot) = handle.latest_arrow_snapshot().expect("mv snapshot");
+        let note = snapshot[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("mv note column")
+            .value(0);
+        assert_eq!(note, "kept");
+
+        let provider = runtime
+            .table_providers()
+            .into_iter()
+            .find_map(|(name, provider)| (name == "orders").then_some(provider))
+            .expect("orders query provider");
+        let ctx = SessionContext::new();
+        ctx.register_table("orders", provider)
+            .expect("register query provider");
+        let batches = ctx
+            .sql("SELECT note FROM orders")
+            .await
+            .expect("query provider sql")
+            .collect()
+            .await
+            .expect("collect query provider rows");
+        let note = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("note column")
+            .value(0);
+        assert_eq!(note, "");
     }
 }

@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use floe_executor::outer_stream::OuterStreamHandle;
 use floe_executor::{DbspBridge, MaterializedViewRegistry, OuterStreamRegistry};
 use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME};
-use tokio::time::{Duration, timeout};
 
 use crate::rows::{auction_row, bid_row};
 
@@ -109,18 +108,13 @@ pub(crate) async fn wait_for_version(
     if observed.unwrap_or(-1) >= target_version {
         return Ok(());
     }
-    timeout(Duration::from_secs(5), async {
-        loop {
-            rx.changed().await.context("version watch closed")?;
-            observed = *rx.borrow();
-            if observed.unwrap_or(-1) >= target_version {
-                break;
-            }
+    loop {
+        rx.changed().await.context("version watch closed")?;
+        observed = *rx.borrow();
+        if observed.unwrap_or(-1) >= target_version {
+            break;
         }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("timeout waiting for mv version")??;
+    }
     Ok(())
 }
 
@@ -129,25 +123,21 @@ pub(crate) async fn wait_for_materialized_row_count(
     view: &str,
     expected_rows: usize,
 ) -> Result<()> {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let handle = registry
-                .get(view)
-                .with_context(|| format!("materialized view handle for '{view}'"))?;
-            let snapshot = handle.snapshot_encoded();
-            let row_count: usize = snapshot
-                .values()
-                .filter(|diff| **diff > 0)
-                .map(|diff| usize::try_from(*diff).unwrap_or(0))
-                .sum();
-            if row_count >= expected_rows {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let handle = registry
+        .get(view)
+        .with_context(|| format!("materialized view handle for '{view}'"))?;
+    let mut rx = handle.version_watch();
+    loop {
+        let snapshot = handle.snapshot_encoded();
+        let row_count: usize = snapshot
+            .values()
+            .filter(|diff| **diff > 0)
+            .map(|diff| usize::try_from(*diff).unwrap_or(0))
+            .sum();
+        if row_count >= expected_rows {
+            break;
         }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("timeout waiting for materialized rows")??;
+        rx.changed().await.context("version watch closed")?;
+    }
     Ok(())
 }

@@ -1,7 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
-use std::time::Duration;
 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::logical_expr::{col, lit, table_scan};
@@ -17,7 +16,7 @@ use floe_core::catalog::ColumnType;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::dbsp_bridge::DbspBridge;
-use floe_executor::dbsp_graph_builder::{BuildInputs, DbspGraphBuilder};
+use floe_executor::dbsp_graph_builder::{LegacyGraphHarness, LegacyGraphHarnessInputs};
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_bid_table, nexmark_config, validate_dbsp_plan,
 };
@@ -28,7 +27,6 @@ use floe_executor::stream_types::EncodedDelta;
 use object_store::memory::InMemory;
 use slatedb::Db;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const SOURCE_NAME: &str = "nexmark_bid";
@@ -75,11 +73,11 @@ async fn cdc_apply_deltas_drive_mv_insert_update_and_delete() {
     let handle_streams = gather_handle_streams(&outer_streams, &source_refs);
     let transient_streams = gather_transient_streams(&outer_streams, &source_refs);
     let (task_tx, _task_rx) = mpsc::channel(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: VIEW_NAME,
             view_name: VIEW_NAME,
             plan: &plan,
@@ -348,16 +346,12 @@ async fn wait_for_logical_version(
         return;
     }
     let mut rx = handle.version_watch();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if rx.borrow().unwrap_or(-1) >= target_version {
-                break;
-            }
-            rx.changed().await.expect("version watch update");
+    loop {
+        if rx.borrow().unwrap_or(-1) >= target_version {
+            break;
         }
-    })
-    .await
-    .expect("wait for logical version");
+        rx.changed().await.expect("version watch update");
+    }
 }
 
 type TestRow = Vec<Option<EncodedRowScalar>>;

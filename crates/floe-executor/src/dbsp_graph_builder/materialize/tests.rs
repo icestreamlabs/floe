@@ -2,21 +2,21 @@ use super::*;
 
 #[test]
 fn bootstraps_authoritative_zero_only_for_zero_frontier_zero_logical_version() {
-    assert!(DbspGraphBuilder::should_bootstrap_authoritative_zero(
+    assert!(LegacyGraphHarness::should_bootstrap_authoritative_zero(
         0, None
     ));
-    assert!(DbspGraphBuilder::should_bootstrap_authoritative_zero(
+    assert!(LegacyGraphHarness::should_bootstrap_authoritative_zero(
         0,
         Some(0)
     ));
-    assert!(!DbspGraphBuilder::should_bootstrap_authoritative_zero(
+    assert!(!LegacyGraphHarness::should_bootstrap_authoritative_zero(
         1, None
     ));
-    assert!(!DbspGraphBuilder::should_bootstrap_authoritative_zero(
+    assert!(!LegacyGraphHarness::should_bootstrap_authoritative_zero(
         0,
         Some(1)
     ));
-    assert!(!DbspGraphBuilder::should_bootstrap_authoritative_zero(
+    assert!(!LegacyGraphHarness::should_bootstrap_authoritative_zero(
         2,
         Some(0)
     ));

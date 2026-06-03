@@ -22,7 +22,7 @@ use crate::outer_stream::{TransientSourceBatch, TransientSourceHandleStream};
 use crate::stream_types::EncodedDeltaBatch;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
-use super::builder::{DbspGraphBuilder, MvFlushCoalescingConfig, OverlaySnapshotConfig};
+use super::builder::{LegacyGraphHarness, MvFlushCoalescingConfig, OverlaySnapshotConfig};
 
 static MV_UPDATE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MV_UPDATE_LOG_SAMPLE_EVERY: u64 = 128;

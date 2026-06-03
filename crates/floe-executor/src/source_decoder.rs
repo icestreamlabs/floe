@@ -216,20 +216,11 @@ impl SourceRowDecoder {
 pub struct SourceArrowBatchBuilder {
     definition: SourceDefinition,
     builders: Vec<SourceArrowColumnBuilder>,
-    required_columns: Option<Arc<[bool]>>,
     row_count: usize,
 }
 
 impl SourceArrowBatchBuilder {
     pub fn new(definition: SourceDefinition, capacity: usize) -> Self {
-        Self::new_with_required_columns(definition, capacity, None)
-    }
-
-    pub fn new_with_required_columns(
-        definition: SourceDefinition,
-        capacity: usize,
-        required_columns: Option<Arc<[bool]>>,
-    ) -> Self {
         let builders = definition
             .columns()
             .iter()
@@ -238,7 +229,6 @@ impl SourceArrowBatchBuilder {
         Self {
             definition,
             builders,
-            required_columns,
             row_count: 0,
         }
     }
@@ -257,22 +247,7 @@ impl SourceArrowBatchBuilder {
             .as_object()
             .context("source payload must be a JSON object")?;
         let mut event_ts = None;
-        for (idx, (builder, column)) in self
-            .builders
-            .iter_mut()
-            .zip(self.definition.columns())
-            .enumerate()
-        {
-            if !self
-                .required_columns
-                .as_ref()
-                .and_then(|columns| columns.get(idx))
-                .copied()
-                .unwrap_or(true)
-            {
-                builder.append_skipped_value(column)?;
-                continue;
-            }
+        for (builder, column) in self.builders.iter_mut().zip(self.definition.columns()) {
             let value = object.get(column.name());
             builder.append_json_value(column, value, &mut event_ts)?;
         }

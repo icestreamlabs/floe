@@ -23,20 +23,28 @@ impl SnapshotScanLimiter {
 
     pub(super) async fn acquire(self: &Arc<Self>) -> SnapshotScanPermit {
         loop {
-            let active = self.active_workers.load(Ordering::Acquire);
-            let target = self.target_workers.load(Ordering::Acquire).max(1);
-            if active < target
-                && self
-                    .active_workers
-                    .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                self.record_metrics();
-                return SnapshotScanPermit {
-                    limiter: Arc::clone(self),
-                };
+            if let Some(permit) = self.try_acquire() {
+                return permit;
             }
             self.notify.notified().await;
+        }
+    }
+
+    pub(super) fn try_acquire(self: &Arc<Self>) -> Option<SnapshotScanPermit> {
+        let active = self.active_workers.load(Ordering::Acquire);
+        let target = self.target_workers.load(Ordering::Acquire).max(1);
+        if active < target
+            && self
+                .active_workers
+                .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.record_metrics();
+            Some(SnapshotScanPermit {
+                limiter: Arc::clone(self),
+            })
+        } else {
+            None
         }
     }
 

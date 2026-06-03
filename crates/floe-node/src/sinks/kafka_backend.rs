@@ -45,13 +45,9 @@ pub(super) async fn run_kafka_sink(config: KafkaSinkConfig<'_>) -> Result<()> {
     }
 
     let kafka_eos = config.checkpoint_topic.map(|topic_name| KafkaEosConfig {
-        transactional_id: config.transactional_id.unwrap_or_else(|| {
-            format!(
-                "floe-{}-{}",
-                config.sink_name.replace(' ', "_"),
-                current_unix_time_ms()
-            )
-        }),
+        transactional_id: config
+            .transactional_id
+            .unwrap_or_else(|| default_kafka_transactional_id(config.sink_name)),
         checkpoint_topic: topic_name,
         checkpoint_partition: config
             .checkpoint_partition
@@ -539,6 +535,10 @@ fn scan_kafka_checkpoint_range(
 
 pub(super) fn kafka_checkpoint_key(sink_name: &str, mv_name: &str) -> String {
     format!("{sink_name}\0{mv_name}")
+}
+
+pub(super) fn default_kafka_transactional_id(sink_name: &str) -> String {
+    format!("floe-{}", sink_name.replace(' ', "_"))
 }
 
 pub(super) fn consider_kafka_checkpoint_payload(

@@ -1,6 +1,6 @@
 use super::*;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(super) fn should_bootstrap_authoritative_zero(
         view_frontier: i64,
         logical_version: Option<u64>,

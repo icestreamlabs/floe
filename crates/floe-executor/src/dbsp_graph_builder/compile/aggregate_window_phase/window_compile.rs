@@ -17,7 +17,7 @@ type WindowEncodedValueDelta = ((WindowKey<Vec<u8>>, Vec<u8>), i64);
 type WindowCountStarDelta = ((WindowKey<Vec<u8>>, i64), i64);
 type AggregateValuesDelta = ((Vec<u8>, Vec<dbsp::AggregateValue>), i64);
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(super) async fn precompute_aggregate_window_expressions(
         &mut self,
         upstream: DeltaHandleStream,

@@ -1,6 +1,6 @@
 use super::*;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_materialize_delta(
         result: Result<(i64, ZSetHandle)>,

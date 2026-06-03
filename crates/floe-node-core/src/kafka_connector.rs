@@ -86,7 +86,7 @@ pub struct KafkaReplayBatch {
 pub struct KafkaConnector {
     config: KafkaConnectorConfig,
     message_format: KafkaMessageFormat,
-    definitions: Vec<SourceDefinition>,
+    definitions: Arc<[SourceDefinition]>,
     topic_arcs: HashMap<String, Arc<str>>,
     consumer: Option<BaseConsumer>,
     last_committed_tick_id: u64,
@@ -96,6 +96,13 @@ pub struct KafkaConnector {
 
 impl KafkaConnector {
     pub fn new(config: KafkaConnectorConfig, definitions: Vec<SourceDefinition>) -> Result<Self> {
+        Self::new_with_shared_definitions(config, Arc::from(definitions))
+    }
+
+    pub fn new_with_shared_definitions(
+        config: KafkaConnectorConfig,
+        definitions: Arc<[SourceDefinition]>,
+    ) -> Result<Self> {
         ensure!(
             !config.brokers.trim().is_empty(),
             "kafka brokers must not be empty"
@@ -131,7 +138,7 @@ impl KafkaConnector {
 
     pub async fn replay_range(
         config: KafkaConnectorConfig,
-        definitions: Vec<SourceDefinition>,
+        definitions: Arc<[SourceDefinition]>,
         range: KafkaReplayRange,
     ) -> Result<KafkaReplayBatch> {
         ensure!(
@@ -150,7 +157,7 @@ impl KafkaConnector {
         );
         let poll_timeout = config.poll_timeout.max(Duration::from_millis(100));
         let idle_timeout = Duration::from_secs(30);
-        let connector = KafkaConnector::new(config.clone(), definitions)?;
+        let connector = KafkaConnector::new_with_shared_definitions(config.clone(), definitions)?;
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", &config.brokers)

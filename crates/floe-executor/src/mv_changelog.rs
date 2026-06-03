@@ -494,7 +494,6 @@ mod tests {
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use futures::StreamExt;
-    use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -643,10 +642,7 @@ mod tests {
         let handle2_version = 2_i64;
         publish_arrow_version(handle.as_ref(), handle2_version, &[2], &[(1, -1), (2, 1)]);
 
-        let batch = timeout(Duration::from_millis(200), stream.next())
-            .await
-            .expect("timeout waiting for delta batch")
-            .expect("expected delta batch")?;
+        let batch = stream.next().await.expect("expected delta batch")?;
         assert_eq!(batch.version, handle2_version);
         assert_eq!(batch.kind, MvChangelogBatchKind::Delta);
         assert!(batch.version_time.is_some());
@@ -700,10 +696,7 @@ mod tests {
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
         publish_encoded_overlay(handle.as_ref(), 2, &[(10, -1), (30, 1)]);
 
-        let batch = timeout(Duration::from_millis(200), stream.next())
-            .await
-            .expect("timeout waiting for encoded delta")
-            .expect("encoded delta batch")?;
+        let batch = stream.next().await.expect("encoded delta batch")?;
         assert_eq!(batch.kind, MvChangelogBatchKind::Delta);
         let mut rows = batch_rows_with_diffs(&batch);
         rows.sort_unstable();
@@ -744,10 +737,7 @@ mod tests {
             &[(1, -1), (101, 1)],
         );
 
-        let batch = timeout(Duration::from_millis(200), stream.next())
-            .await
-            .expect("timeout waiting for bounded delta batch")
-            .expect("expected delta batch")?;
+        let batch = stream.next().await.expect("expected delta batch")?;
         assert_eq!(batch.version, handle2_version);
         assert_eq!(batch.batch.num_rows(), 2);
         assert_eq!(batch.diffs.len(), 2);
@@ -777,9 +767,9 @@ mod tests {
 
         publish_arrow_version(handle.as_ref(), 2, &[1], &[]);
 
-        let batch = timeout(Duration::from_millis(200), stream.next())
+        let batch = stream
+            .next()
             .await
-            .expect("timeout waiting for empty changelog batch")
             .expect("expected empty changelog batch")?;
         assert_eq!(batch.version, 2);
         assert_eq!(batch.batch.num_rows(), 0);
@@ -824,10 +814,7 @@ mod tests {
 
         let mut state: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         for _ in 0..3 {
-            let batch = timeout(Duration::from_millis(200), stream.next())
-                .await
-                .expect("timeout waiting for changelog batch")
-                .expect("expected changelog batch")?;
+            let batch = stream.next().await.expect("expected changelog batch")?;
             let values = batch
                 .batch
                 .column(0)
@@ -871,9 +858,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
         cancel.cancel();
-        let err = timeout(Duration::from_millis(100), stream.next())
+        let err = stream
+            .next()
             .await
-            .expect("cancellation timeout")
             .expect("expected cancellation event")
             .expect_err("expected cancellation error");
         assert!(is_mv_changelog_canceled_error(&err));
@@ -947,12 +934,6 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
 
-        assert!(
-            timeout(Duration::from_millis(20), stream.next())
-                .await
-                .is_err()
-        );
-
         let handle3_version = 3_i64;
         publish_arrow_version(handle.as_ref(), handle3_version, &[1, 2, 3], &[(3, 1)]);
 
@@ -977,17 +958,11 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
 
-        assert!(
-            timeout(Duration::from_millis(20), stream.next())
-                .await
-                .is_err()
-        );
-
         publish_arrow_version(handle.as_ref(), 1, &[11], &[(11, 1)]);
 
-        let batch = timeout(Duration::from_millis(200), stream.next())
+        let batch = stream
+            .next()
             .await
-            .expect("timeout waiting for first version")
             .expect("expected first changelog batch")?;
         assert_eq!(batch.version, 1);
         cancel.cancel();

@@ -289,22 +289,21 @@ async fn snapshot_scan_limiter_respects_dynamic_target() {
     assert_eq!(limiter.active_workers(), 2);
     assert_eq!(limiter.set_target(1), Some((2, 1)));
 
-    let acquire_waiter = {
-        let limiter = Arc::clone(&limiter);
-        tokio::spawn(async move { limiter.acquire().await })
-    };
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!acquire_waiter.is_finished());
+    assert!(
+        limiter.try_acquire().is_none(),
+        "target reduction should block new scan permits"
+    );
 
     drop(first_permit);
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!acquire_waiter.is_finished());
+    assert!(
+        limiter.try_acquire().is_none(),
+        "one active worker still satisfies reduced target"
+    );
 
     drop(second_permit);
-    let third_permit = tokio::time::timeout(Duration::from_secs(1), acquire_waiter)
-        .await
-        .expect("scan permit acquisition should resume")
-        .expect("scan permit task should succeed");
+    let third_permit = limiter
+        .try_acquire()
+        .expect("scan permit acquisition should resume");
     assert_eq!(limiter.active_workers(), 1);
     drop(third_permit);
     assert_eq!(limiter.active_workers(), 0);

@@ -1,6 +1,6 @@
 use super::*;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_transient_join_pipeline_root_receiver(
         &mut self,

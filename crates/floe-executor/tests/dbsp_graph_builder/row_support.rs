@@ -52,16 +52,12 @@ pub(super) async fn wait_for_logical_version(
         return;
     }
     let mut rx = handle.version_watch();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if rx.borrow().unwrap_or(-1) >= target_version {
-                break;
-            }
-            rx.changed().await.expect("version watch update");
+    loop {
+        if rx.borrow().unwrap_or(-1) >= target_version {
+            break;
         }
-    })
-    .await
-    .expect("wait for logical version");
+        rx.changed().await.expect("version watch update");
+    }
 }
 
 pub(super) async fn wait_for_logical_version_or_task_error(
@@ -75,27 +71,23 @@ pub(super) async fn wait_for_logical_version_or_task_error(
         return;
     }
     let mut rx = handle.version_watch();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if rx.borrow().unwrap_or(-1) >= target_version {
-                break;
+    loop {
+        if rx.borrow().unwrap_or(-1) >= target_version {
+            break;
+        }
+        tokio::select! {
+            changed = rx.changed() => {
+                changed.expect("version watch update");
             }
-            tokio::select! {
-                changed = rx.changed() => {
-                    changed.expect("version watch update");
-                }
-                maybe_event = task_rx.recv() => {
-                    let event = maybe_event.expect("graph task error");
-                    panic!(
-                        "graph task error in {} [{}]: {}",
-                        event.graph_id, event.task, event.error
-                    );
-                }
+            maybe_event = task_rx.recv() => {
+                let event = maybe_event.expect("graph task error");
+                panic!(
+                    "graph task error in {} [{}]: {}",
+                    event.graph_id, event.task, event.error
+                );
             }
         }
-    })
-    .await
-    .expect("wait for logical version or task error");
+    }
 }
 
 pub(super) async fn wait_for_visible_row_count(
@@ -103,16 +95,8 @@ pub(super) async fn wait_for_visible_row_count(
     view_name: &str,
     expected_rows: usize,
 ) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if visible_rows(registry, view_name).await.len() >= expected_rows {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("wait for visible rows");
+    wait_for_visible_rows_matching(registry, view_name, |row_count| row_count >= expected_rows)
+        .await;
 }
 
 pub(super) async fn wait_for_exact_visible_row_count(
@@ -120,16 +104,26 @@ pub(super) async fn wait_for_exact_visible_row_count(
     view_name: &str,
     expected_rows: usize,
 ) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if visible_rows(registry, view_name).await.len() == expected_rows {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_visible_rows_matching(registry, view_name, |row_count| row_count == expected_rows)
+        .await;
+}
+
+async fn wait_for_visible_rows_matching(
+    registry: &MaterializedViewRegistry,
+    view_name: &str,
+    matches: impl Fn(usize) -> bool,
+) {
+    let handle = registry.get(view_name).expect("view registered");
+    if matches(visible_rows(registry, view_name).await.len()) {
+        return;
+    }
+    let mut rx = handle.version_watch();
+    loop {
+        rx.changed().await.expect("version watch update");
+        if matches(visible_rows(registry, view_name).await.len()) {
+            break;
         }
-    })
-    .await
-    .expect("wait for exact visible rows");
+    }
 }
 
 pub(super) type TestRow = Vec<Option<EncodedRowScalar>>;

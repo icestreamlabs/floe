@@ -571,39 +571,32 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     .await
     .context("initialize vectorized execution runtime")?;
     let vectorized_source_table_providers = vectorized_runtime.table_providers();
-    let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut maintenance = DbspMaintenance::new(Arc::clone(&db))
         .await
-        .context("initialize DBSP graph builder")?;
-    graph_builder.set_persistence_policy_config(persistence_policy_config);
-    if let Some(config) = config.as_ref() {
-        graph_builder.set_mv_flush_coalescing(mv_flush_coalescing_config(&config.runtime.mv_flush));
-        graph_builder.set_mv_overlay_snapshot(mv_snapshot_config(&config.runtime.mv_snapshot));
-    }
+        .context("initialize DBSP maintenance")?;
     let stream_compaction = StreamCompactionConfig {
         max_chain_len: run_args.zset_compaction_max_chain_len,
         max_segments: run_args.zset_compaction_max_segments,
         scheduler_backoff_ticks: run_args.zset_compaction_backoff_ticks,
         scheduler_max_concurrent_jobs: run_args.zset_compaction_max_concurrent_jobs,
     };
-    graph_builder
-        .set_stream_compaction(
-            CompactionPolicy {
-                max_chain_len: stream_compaction.max_chain_len,
-                max_segments: stream_compaction.max_segments,
-                max_bucket_segments: stream_compaction.max_segments,
-            },
-            CompactionSchedulerConfig {
-                failure_backoff_ticks: stream_compaction.scheduler_backoff_ticks,
-                max_concurrent_jobs: stream_compaction.scheduler_max_concurrent_jobs,
-            },
-        )
-        .await;
+    maintenance.set_stream_compaction(
+        CompactionPolicy {
+            max_chain_len: stream_compaction.max_chain_len,
+            max_segments: stream_compaction.max_segments,
+            max_bucket_segments: stream_compaction.max_segments,
+        },
+        CompactionSchedulerConfig {
+            failure_backoff_ticks: stream_compaction.scheduler_backoff_ticks,
+            max_concurrent_jobs: stream_compaction.scheduler_max_concurrent_jobs,
+        },
+    );
     if run_args.maintenance_paused {
-        graph_builder.pause_maintenance().await;
+        maintenance.pause();
         tracing::info!("maintenance started in paused mode");
     }
     for namespace in &run_args.maintenance_inspect_namespace {
-        let summary = graph_builder
+        let summary = maintenance
             .inspect_namespace_storage(namespace)
             .await
             .with_context(|| format!("inspect namespace '{namespace}'"))?;
@@ -619,8 +612,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         );
     }
     for namespace in &run_args.maintenance_compact_namespace {
-        let compacted = graph_builder
-            .run_namespace_compaction_once(namespace)
+        let compacted = maintenance
+            .compact_namespace_once(namespace)
             .await
             .with_context(|| format!("compact namespace '{namespace}'"))?;
         tracing::info!(
@@ -630,7 +623,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         );
     }
     for namespace in &run_args.maintenance_gc_namespace {
-        let sweep_stats = graph_builder
+        let sweep_stats = maintenance
             .run_namespace_gc_once(namespace, gc_policy)
             .await
             .with_context(|| format!("run GC sweep for namespace '{namespace}'"))?;

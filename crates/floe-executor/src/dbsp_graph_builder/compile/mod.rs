@@ -30,7 +30,7 @@ use crate::encoding::EncodedRowScalar;
 use crate::encoding::decode_all_encoded_row_scalars_into;
 use crate::task_events::{GraphTaskSender, report_graph_task_error};
 
-use super::builder::DbspGraphBuilder;
+use super::builder::LegacyGraphHarness;
 
 fn report_operator_closure_error(
     handler: &RuntimeErrorHandler,

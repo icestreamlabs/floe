@@ -12,9 +12,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::StreamRetention;
 use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
 use floe_executor::{
-    BuildInputs, DbspBridge, DbspGraphBuilder, FloeQueryContext, GraphTaskError, MaterializedView,
-    MaterializedViewRegistry, OuterStreamRegistry, ValidatedPlan, load_or_register_mv,
-    validate_dbsp_plan,
+    DbspBridge, FloeQueryContext, GraphTaskError, LegacyGraphHarness, LegacyGraphHarnessInputs,
+    MaterializedView, MaterializedViewRegistry, OuterStreamRegistry, ValidatedPlan,
+    load_or_register_mv, validate_dbsp_plan,
 };
 use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
 use floe_node_core::generator;
@@ -80,7 +80,7 @@ impl MvTestHarness {
         } = validate_dbsp_plan(&circuit_plans[0], &available_sources, view_name)?;
 
         let mv_registry = Arc::new(MaterializedViewRegistry::new());
-        let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db)).await?;
+        let mut graph_builder = LegacyGraphHarness::new(Arc::clone(&db)).await?;
         let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await?;
         let outer =
             OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
@@ -92,7 +92,7 @@ impl MvTestHarness {
             mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         graph_builder
-            .build_legacy_for_harness(BuildInputs {
+            .build(LegacyGraphHarnessInputs {
                 graph_id: view_name,
                 view_name,
                 plan: &circuit_plans[0],

@@ -9,7 +9,6 @@ use super::*;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
-use std::time::Duration;
 
 use chrono::Utc;
 use datafusion::arrow::array::Array;
@@ -34,7 +33,6 @@ use object_store::memory::InMemory;
 use serde_json::{Value, json};
 use slatedb::Db;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::GraphTaskError;
