@@ -222,7 +222,6 @@ async fn recover_materialized_view_restores_frontier_ahead_of_handle_version() {
             version: handle.version,
             frontier: 2,
         }],
-        outer_streams: Vec::new(),
         sink_cursors: Vec::new(),
     };
 

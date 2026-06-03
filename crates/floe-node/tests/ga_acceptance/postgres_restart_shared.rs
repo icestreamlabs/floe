@@ -79,7 +79,6 @@ async fn postgres_cdc_table_restart_resumes_from_committed_lsn() -> Result<()> {
     let mut first = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
 
     let first_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .execute(
                 &format!(
@@ -261,7 +260,6 @@ async fn postgres_cdc_shared_source_transaction_feeds_join_mv() -> Result<()> {
     let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .batch_execute(&format!(
                 "BEGIN;

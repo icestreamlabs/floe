@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ports::find_unused_port;
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{Instant, interval};
 use tokio_postgres::NoTls;
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_bid_passthrough AS \
@@ -73,36 +73,46 @@ async fn floe_node_streams_mv_rows_over_pgwire() -> Result<()> {
 }
 
 async fn wait_for_pgwire(addr: &str) -> Result<()> {
-    for attempt in 0..50 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut poll = interval(Duration::from_millis(100));
+    let mut attempts = 0usize;
+    loop {
         match TcpStream::connect(addr).await {
             Ok(stream) => {
                 drop(stream);
                 return Ok(());
             }
-            Err(err) if attempt < 49 => {
-                sleep(Duration::from_millis(100)).await;
-                if attempt == 25 {
+            Err(err) if Instant::now() < deadline => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 25 {
                     tracing::warn!(error = %err, "waiting for pgwire listener");
                 }
+                poll.tick().await;
             }
             Err(err) => bail!("pgwire listener never became ready: {err}"),
         }
     }
-    unreachable!("loop either returns success or bail");
 }
 
 async fn wait_for_bid_rows(client: &tokio_postgres::Client) -> Result<Vec<tokio_postgres::Row>> {
     let sql = "SELECT auction, bidder, price FROM mv_bid_passthrough LIMIT 5";
-    for _ in 0..100 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         match client.query(sql, &[]).await {
             Ok(rows) if !rows.is_empty() => return Ok(rows),
-            Ok(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) if Instant::now() < deadline => {
+                poll.tick().await;
+            }
             Err(err) => {
                 // Connection is ready but the mv may not be registered yet.
-                sleep(Duration::from_millis(100)).await;
                 tracing::debug!(error = %err, "query attempt failed");
+                if Instant::now() >= deadline {
+                    return Err(anyhow!("timed out waiting for rows from {sql}: {err}"));
+                }
+                poll.tick().await;
             }
+            Ok(_) => return Err(anyhow!("timed out waiting for rows from {sql}")),
         }
     }
-    Err(anyhow!("timed out waiting for rows from {sql}"))
 }

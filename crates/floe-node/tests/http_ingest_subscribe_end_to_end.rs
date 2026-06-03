@@ -10,7 +10,7 @@ use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{Instant, interval};
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_http_ingest AS \
      SELECT auction, bidder, price FROM nexmark_bid";
@@ -130,19 +130,27 @@ async fn http_ingest_subscribe_streams_rows() -> Result<()> {
 
 async fn wait_for_healthz(addr: &str) -> Result<()> {
     let client = reqwest::Client::new();
-    for attempt in 0..50 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         match client.get(format!("{addr}/healthz")).send().await {
             Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(_) | Err(_) if attempt < 49 => sleep(Duration::from_millis(100)).await,
-            Ok(response) => bail!("healthz returned {}", response.status()),
-            Err(err) => bail!("healthz never became ready: {err}"),
+            Ok(response) if Instant::now() >= deadline => {
+                bail!("healthz returned {}", response.status())
+            }
+            Err(err) if Instant::now() >= deadline => bail!("healthz never became ready: {err}"),
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
-    unreachable!("loop either returns success or bail");
 }
 
 async fn wait_for_subscribe_rows(path: &Path) -> Result<Vec<Value>> {
-    for attempt in 0..60 {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut poll = interval(Duration::from_millis(100));
+    let mut attempts = 0usize;
+    loop {
         match tokio::fs::read_to_string(path).await {
             Ok(contents) => {
                 let mut rows = Vec::new();
@@ -162,15 +170,18 @@ async fn wait_for_subscribe_rows(path: &Path) -> Result<Vec<Value>> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        if attempt == 30 {
+        attempts = attempts.saturating_add(1);
+        if attempts == 30 {
             tracing::warn!("waiting for subscribe sink output");
         }
-        sleep(Duration::from_millis(100)).await;
+        if Instant::now() >= deadline {
+            bail!(
+                "subscribe sink output never appeared in {}",
+                path.to_string_lossy()
+            );
+        }
+        poll.tick().await;
     }
-    bail!(
-        "subscribe sink output never appeared in {}",
-        path.to_string_lossy()
-    )
 }
 
 fn temp_path(name: &str) -> PathBuf {

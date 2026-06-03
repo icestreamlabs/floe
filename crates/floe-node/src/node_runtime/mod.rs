@@ -49,9 +49,8 @@ use floe_executor::source_journal::{
     update_kafka_source_journal_checksum,
 };
 use floe_executor::{
-    DbspBridge, DbspMaintenance, FloeQueryContext, MaterializedViewRegistry,
-    MaterializedViewTableProvider, OuterStreamRegistry, SourceArrowBatchBuilder,
-    SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
+    DbspMaintenance, FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
+    SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
     VectorizedMaterializedViewPlan, mask_arrow_batch_for_required_columns,
     plan_source_requirements, validate_dbsp_plan, weighted_batch_from_diffs,
 };
@@ -77,7 +76,6 @@ use floe_sql_parser::{
 use floe_storage::MaterializedViewMetadata;
 use slatedb::WriteBatch;
 use slatedb::config::{CompactorOptions, Settings};
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::watch;

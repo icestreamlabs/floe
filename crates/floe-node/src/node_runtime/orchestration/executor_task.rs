@@ -31,7 +31,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         limits,
     } = context;
     let ExecutorRuntimeContext {
-        outer_registry,
         event_watermark,
         mv_registry,
         vectorized_runtime,
@@ -79,7 +78,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         max_batch_per_connector,
     } = limits;
 
-    let outer_for_task = Arc::clone(&outer_registry);
     let cdc_table_store_for_task = cdc_table_store.clone();
     let cdc_schemas_by_source_id_for_task = Arc::clone(&cdc_schemas_by_source_id);
     let cdc_stateful_table_ids_by_source_id_for_task =
@@ -988,7 +986,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             checkpoint_manager: &mut checkpoint_manager,
             watermark: &watermark_for_task,
             mv_registry: &mv_for_task,
-            outer_registry: &outer_for_task,
             runtime_failure: &failure_for_executor,
         })
         .await;

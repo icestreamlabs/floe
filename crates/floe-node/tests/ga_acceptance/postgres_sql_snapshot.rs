@@ -73,7 +73,6 @@ async fn postgres_cdc_sql_source_table_mv_acceptance() -> Result<()> {
     let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .execute(
                 &format!(
@@ -185,7 +184,6 @@ async fn postgres_cdc_auto_creates_publication_and_slot_acceptance() -> Result<(
     let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .execute(
                 &format!(
@@ -450,7 +448,6 @@ async fn postgres_cdc_table_aggregate_update_delete_acceptance() -> Result<()> {
     let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(&sql)).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .batch_execute(&format!(
                 "BEGIN;

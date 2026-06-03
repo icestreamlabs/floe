@@ -10,7 +10,6 @@ pub(in crate::node_runtime::orchestration) struct ExecutorTaskContext {
 }
 
 pub(in crate::node_runtime::orchestration) struct ExecutorRuntimeContext {
-    pub(in crate::node_runtime::orchestration) outer_registry: Arc<Mutex<OuterStreamRegistry>>,
     pub(in crate::node_runtime::orchestration) event_watermark: Arc<AtomicI64>,
     pub(in crate::node_runtime::orchestration) mv_registry: Arc<MaterializedViewRegistry>,
     pub(in crate::node_runtime::orchestration) vectorized_runtime: VectorizedExecutionRuntime,

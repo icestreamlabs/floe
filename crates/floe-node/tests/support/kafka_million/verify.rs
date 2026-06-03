@@ -57,7 +57,7 @@ pub(super) fn consume_sink_metrics(
             Some(Err(KafkaError::MessageConsumption(
                 RDKafkaErrorCode::UnknownTopicOrPartition,
             ))) => {
-                std::thread::sleep(Duration::from_millis(250));
+                let _ = consumer.fetch_metadata(Some(topic), Duration::from_millis(250));
             }
             Some(Err(err)) => return Err(err).context("poll sink topic"),
             None => {
@@ -235,8 +235,11 @@ pub(super) async fn verify_mv_snapshot_count_and_samples(
             (Duration::ZERO, Duration::from_millis(250))
         };
     if !settle_before_poll.is_zero() {
-        sleep(settle_before_poll).await;
+        let mut settle = interval(settle_before_poll);
+        settle.tick().await;
+        settle.tick().await;
     }
+    let mut count_poll = interval(poll_interval.max(Duration::from_millis(1)));
     let mut progress_logger = CountProgressLogger::new(count_wait_started, expected_rows);
     loop {
         let observed_rows = query_mv_count(&client, mv_name).await?;
@@ -258,7 +261,7 @@ pub(super) async fn verify_mv_snapshot_count_and_samples(
                 expected_rows
             );
         }
-        sleep(poll_interval).await;
+        count_poll.tick().await;
     }
     let wait_for_count = count_wait_started.elapsed();
     let wait_for_count_for_throughput = wait_for_count.saturating_sub(settle_before_poll);

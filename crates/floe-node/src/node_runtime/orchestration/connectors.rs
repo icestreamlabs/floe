@@ -150,6 +150,9 @@ pub(super) fn spawn_connector_tasks(
                         group_id,
                         default_source,
                         poll_timeout,
+                        replay_idle_timeout: KafkaConnectorConfig::default_replay_idle_timeout(
+                            poll_timeout,
+                        ),
                         max_messages_per_tick,
                         message_format: format,
                         commit_offsets_rx: Some(commit_rx),

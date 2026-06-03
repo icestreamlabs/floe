@@ -320,12 +320,14 @@ fn kafka_replay_connector_config(
         let group_id = group_id
             .clone()
             .unwrap_or_else(|| run_args.kafka_group_id.clone());
+        let poll_timeout = Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms));
         return Ok(KafkaConnectorConfig {
             brokers: brokers.clone(),
             topics: topics.clone(),
             group_id,
             default_source: default_source.clone(),
-            poll_timeout: Duration::from_millis(poll_ms.unwrap_or(run_args.kafka_poll_ms)),
+            poll_timeout,
+            replay_idle_timeout: KafkaConnectorConfig::default_replay_idle_timeout(poll_timeout),
             max_messages_per_tick: max_messages_per_tick.unwrap_or(run_args.kafka_max_messages),
             message_format: format.clone(),
             commit_offsets_rx: None,

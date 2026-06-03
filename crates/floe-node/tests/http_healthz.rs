@@ -10,7 +10,7 @@ use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::json;
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{Instant, interval};
 
 #[tokio::test]
 async fn http_healthz_reports_ready_during_runtime() -> Result<()> {
@@ -50,7 +50,9 @@ async fn http_healthz_reports_ready_during_runtime() -> Result<()> {
 
     let test_result = async {
         let client = reqwest::Client::new();
-        for attempt in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut poll = interval(Duration::from_millis(100));
+        loop {
             match client.get(format!("{http_addr}/healthz")).send().await {
                 Ok(response) if response.status() == StatusCode::OK => {
                     let body: serde_json::Value =
@@ -83,12 +85,17 @@ async fn http_healthz_reports_ready_during_runtime() -> Result<()> {
                     }
                     return Ok(());
                 }
-                Ok(_) | Err(_) if attempt < 49 => sleep(Duration::from_millis(100)).await,
-                Ok(response) => bail!("healthz returned {}", response.status()),
-                Err(err) => bail!("healthz never became ready: {err}"),
+                Ok(response) if Instant::now() >= deadline => {
+                    bail!("healthz returned {}", response.status())
+                }
+                Err(err) if Instant::now() >= deadline => {
+                    bail!("healthz never became ready: {err}")
+                }
+                Ok(_) | Err(_) => {
+                    poll.tick().await;
+                }
             }
         }
-        unreachable!("loop either returns success or bail");
     }
     .await;
 
@@ -131,7 +138,9 @@ async fn admin_healthz_is_available_without_http_ingest() -> Result<()> {
 
     let test_result = async {
         let client = reqwest::Client::new();
-        for attempt in 0..60 {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut poll = interval(Duration::from_millis(100));
+        loop {
             match client.get(format!("{admin_addr}/healthz")).send().await {
                 Ok(response) if response.status() == StatusCode::OK => {
                     let body: serde_json::Value =
@@ -153,12 +162,17 @@ async fn admin_healthz_is_available_without_http_ingest() -> Result<()> {
                     }
                     return Ok(());
                 }
-                Ok(_) | Err(_) if attempt < 59 => sleep(Duration::from_millis(100)).await,
-                Ok(response) => bail!("admin healthz returned {}", response.status()),
-                Err(err) => bail!("admin healthz never became ready: {err}"),
+                Ok(response) if Instant::now() >= deadline => {
+                    bail!("admin healthz returned {}", response.status())
+                }
+                Err(err) if Instant::now() >= deadline => {
+                    bail!("admin healthz never became ready: {err}")
+                }
+                Ok(_) | Err(_) => {
+                    poll.tick().await;
+                }
             }
         }
-        unreachable!("loop either returns success or bail");
     }
     .await;
 

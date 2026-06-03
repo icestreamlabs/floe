@@ -11,7 +11,6 @@ use slatedb::WriteBatch;
 use crate::dbsp_bridge::DbspBridge;
 use crate::mv::registry::{DbspPersistedState, MaterializedViewRegistry};
 use crate::operator_state::OperatorStateHandle;
-use crate::outer_stream::{OuterStreamCheckpoint, OuterStreamRegistry};
 use crate::source_journal::{KafkaSourceJournalRange, append_kafka_source_metadata_entry_to_batch};
 use crate::stream_types::Timestamp;
 
@@ -47,10 +46,6 @@ impl DbspHandleRecord {
         }
     }
 
-    pub fn source(name: impl Into<String>, namespace: impl Into<String>, version: u64) -> Self {
-        Self::new(handle_kinds::SOURCE, name, namespace, version)
-    }
-
     pub fn operator_state(
         name: impl Into<String>,
         namespace: impl Into<String>,
@@ -69,7 +64,6 @@ impl DbspHandleRecord {
 }
 
 pub mod handle_kinds {
-    pub const SOURCE: &str = "source";
     pub const OPERATOR_STATE: &str = "operator_state";
     pub const MATERIALIZED_VIEW: &str = "mv";
 }
@@ -92,17 +86,6 @@ pub struct MaterializedViewCheckpointEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceOffset {
     pub source: String,
-    pub partition: u32,
-    pub offset: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceStreamCheckpointEntry {
-    pub source: String,
-    pub namespace: String,
-    pub version: u64,
-    #[serde(default)]
-    pub frontier: i64,
     pub partition: u32,
     pub offset: u64,
 }
@@ -192,8 +175,6 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub materialized_views: Vec<MaterializedViewCheckpointEntry>,
     #[serde(default)]
-    pub outer_streams: Vec<SourceStreamCheckpointEntry>,
-    #[serde(default)]
     pub sink_cursors: Vec<SinkCursor>,
 }
 
@@ -215,13 +196,6 @@ impl CheckpointManifest {
         for entry in &self.materialized_views {
             handles.push(DbspHandleRecord::materialized_view(
                 entry.view.clone(),
-                entry.namespace.clone(),
-                entry.version,
-            ));
-        }
-        for entry in &self.outer_streams {
-            handles.push(DbspHandleRecord::source(
-                entry.source.clone(),
                 entry.namespace.clone(),
                 entry.version,
             ));
@@ -516,7 +490,6 @@ impl CheckpointManager {
             source_offsets,
             operator_states: Vec::new(),
             materialized_views: Vec::new(),
-            outer_streams: Vec::new(),
             sink_cursors: self.snapshot_sink_cursors(),
         };
         self.store.persist(&manifest).await?;
@@ -529,7 +502,6 @@ impl CheckpointManager {
         &mut self,
         watermark: Timestamp,
         mv_registry: &MaterializedViewRegistry,
-        outer_registry: &OuterStreamRegistry,
     ) -> Result<CheckpointManifest> {
         let mut dbsp_handles = Vec::new();
         if let Some(commit) = self.latest_tick_commit.as_ref() {
@@ -543,7 +515,6 @@ impl CheckpointManager {
             source_offsets: self.snapshot_offsets(),
             operator_states: Vec::new(),
             materialized_views: materialized_view_entries(mv_registry),
-            outer_streams: outer_stream_entries(outer_registry, &self.latest_offsets()),
             sink_cursors: self.snapshot_sink_cursors(),
         };
         manifest.ensure_dbsp_payload();
@@ -569,15 +540,6 @@ impl CheckpointManager {
                 .then(left.partition.cmp(&right.partition))
         });
         offsets
-    }
-
-    pub fn latest_offsets(&self) -> HashMap<String, u64> {
-        let mut merged = HashMap::new();
-        for ((source, _partition), offset) in &self.partition_offsets {
-            let entry = merged.entry(source.clone()).or_insert(0);
-            *entry = (*entry).max(*offset);
-        }
-        merged
     }
 
     pub async fn persist_tick_commit(&mut self, commit: TickCommit) -> Result<()> {
@@ -704,32 +666,6 @@ fn materialized_view_entries(
             })
         })
         .collect()
-}
-
-fn outer_stream_entries(
-    registry: &OuterStreamRegistry,
-    offsets: &HashMap<String, u64>,
-) -> Vec<SourceStreamCheckpointEntry> {
-    registry
-        .checkpoint_state()
-        .into_iter()
-        .map(|checkpoint| checkpoint_entry_from_state(checkpoint, offsets))
-        .collect()
-}
-
-fn checkpoint_entry_from_state(
-    checkpoint: OuterStreamCheckpoint,
-    offsets: &HashMap<String, u64>,
-) -> SourceStreamCheckpointEntry {
-    let offset = offsets.get(&checkpoint.source).copied().unwrap_or(0);
-    SourceStreamCheckpointEntry {
-        source: checkpoint.source,
-        namespace: checkpoint.namespace,
-        version: checkpoint.version,
-        frontier: checkpoint.frontier,
-        partition: 0,
-        offset,
-    }
 }
 
 fn current_unix_time_ms() -> u64 {
