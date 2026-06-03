@@ -489,13 +489,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let vectorized_source_batch_journal =
         VectorizedSourceBatchJournal::new(checkpoint_manager.store().table());
     let kafka_source_journal = KafkaSourceJournal::new(checkpoint_manager.store().table());
-    let outer_registry = {
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
-            .await
-            .context("initialize outer DBSP streams for sources")?
-    };
-    let outer_registry = Arc::new(Mutex::new(outer_registry));
     if circuit_plans.is_empty() {
         tracing::warn!("DBSP planning produced no circuit plans.");
     } else {
@@ -798,7 +791,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     drop(cdc_transaction_sender);
     let executor_handle = spawn_executor_task(ExecutorTaskContext {
         runtime: ExecutorRuntimeContext {
-            outer_registry: Arc::clone(&outer_registry),
             event_watermark: Arc::clone(&event_watermark),
             mv_registry: Arc::clone(&mv_registry),
             vectorized_runtime,
@@ -901,7 +893,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         cancellation_propagation_handle,
         query,
         mv_registry,
-        outer_registry,
         db,
         slatedb_close_timeout_ms: run_args.slatedb_close_timeout_ms,
         runtime_failure,

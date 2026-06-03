@@ -66,6 +66,7 @@ pub(super) async fn wait_for_pgwire(
     stderr_log_path: &Path,
 ) -> Result<()> {
     let addr = format!("127.0.0.1:{pg_port}");
+    let mut poll = interval(Duration::from_millis(250));
     for attempt in 0..120 {
         if let Some(status) = child.try_wait().context("poll floe-node process status")? {
             let stderr_tail = read_log_tail(stderr_log_path, 120).unwrap_or_else(|_| {
@@ -84,7 +85,7 @@ pub(super) async fn wait_for_pgwire(
                 if attempt % 20 == 0 {
                     eprintln!("waiting for pgwire at {addr}: {err}");
                 }
-                sleep(Duration::from_millis(250)).await;
+                poll.tick().await;
             }
             Err(err) => bail!("pgwire listener at {addr} never became ready: {err}"),
         }

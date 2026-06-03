@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
-use tokio::time::sleep;
+use tokio::time::interval;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 use ports::find_unused_port;

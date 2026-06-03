@@ -45,10 +45,20 @@ pub struct KafkaConnectorConfig {
     pub group_id: String,
     pub default_source: Option<String>,
     pub poll_timeout: Duration,
+    pub replay_idle_timeout: Duration,
     pub max_messages_per_tick: usize,
     pub message_format: Option<String>,
     pub commit_offsets_rx: Option<watch::Receiver<KafkaOffsetCommit>>,
     pub resume_from_offsets: Vec<KafkaTopicPartitionOffset>,
+}
+
+impl KafkaConnectorConfig {
+    pub fn default_replay_idle_timeout(poll_timeout: Duration) -> Duration {
+        let poll_timeout = poll_timeout.max(Duration::from_millis(1));
+        poll_timeout
+            .saturating_mul(10)
+            .clamp(Duration::from_millis(50), Duration::from_secs(5))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +122,10 @@ impl KafkaConnector {
             config.max_messages_per_tick > 0,
             "kafka max messages per tick must be positive"
         );
+        ensure!(
+            !config.replay_idle_timeout.is_zero(),
+            "kafka replay idle timeout must be positive"
+        );
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
         let topic_arcs = config
             .topics
@@ -156,7 +170,7 @@ impl KafkaConnector {
             config.topics
         );
         let poll_timeout = config.poll_timeout;
-        let idle_timeout = Duration::from_secs(30);
+        let idle_timeout = config.replay_idle_timeout;
         let connector = KafkaConnector::new_with_shared_definitions(config.clone(), definitions)?;
         let mut client_config = ClientConfig::new();
         client_config

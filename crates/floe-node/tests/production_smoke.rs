@@ -13,7 +13,7 @@ use node_process::{
 use ports::find_unused_port;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::time::sleep;
+use tokio::time::{Instant, interval, timeout};
 use tokio_postgres::NoTls;
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_smoke AS \
@@ -228,10 +228,12 @@ async fn smoke_crash_between_ingest_and_tick_commit_loses_uncommitted_tick() -> 
     .await?;
     wait_for_healthz(&http_addr).await?;
     let precommit_addr = http_addr.clone();
-    let precommit_post = tokio::spawn(async move { post_bid(&precommit_addr, 30, 130, 300).await });
-    sleep(Duration::from_millis(200)).await;
+    let mut precommit_post =
+        tokio::spawn(async move { post_bid(&precommit_addr, 30, 130, 300).await });
     assert!(
-        !precommit_post.is_finished(),
+        timeout(Duration::from_millis(200), &mut precommit_post)
+            .await
+            .is_err(),
         "HTTP ingest should wait for tick commit before returning"
     );
     stop_child(&mut first, "KILL").await;
@@ -239,12 +241,7 @@ async fn smoke_crash_between_ingest_and_tick_commit_loses_uncommitted_tick() -> 
 
     let mut restarted = spawn_node(&config_path, &data_dir, pg_port, Some(MV_SQL)).await?;
     wait_for_healthz(&http_addr).await?;
-    sleep(Duration::from_millis(300)).await;
-    let precommit_count = query_auction_count(pg_port, 30).await?;
-    assert_eq!(
-        precommit_count, 0,
-        "rows ingested before tick commit should not survive hard crash in the pre-commit window"
-    );
+    assert_auction_count_remains_zero(pg_port, 30, Duration::from_millis(300)).await?;
 
     post_bid(&http_addr, 31, 131, 310).await?;
     wait_for_auction_count_at_least(pg_port, 31, 1).await?;
@@ -265,13 +262,20 @@ async fn wait_for_rows_matching(
 }
 
 async fn wait_for_mv_count_at_least(pg_port: u16, min_count: i64) -> Result<i64> {
-    for _ in 0..80 {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         match query_mv_count(pg_port).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                poll.tick().await;
+            }
+            Ok(count) => {
+                bail!("timed out waiting for mv_smoke row count >= {min_count}; last count {count}")
+            }
+            Err(err) => bail!("timed out waiting for mv_smoke row count >= {min_count}: {err}"),
         }
     }
-    bail!("timed out waiting for mv_smoke row count >= {min_count}");
 }
 
 async fn wait_for_auction_count_at_least(
@@ -279,13 +283,53 @@ async fn wait_for_auction_count_at_least(
     auction: i64,
     min_count: i64,
 ) -> Result<i64> {
-    for _ in 0..80 {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         match query_auction_count(pg_port, auction).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                poll.tick().await;
+            }
+            Ok(count) => bail!(
+                "timed out waiting for auction {auction} row count >= {min_count}; last count {count}"
+            ),
+            Err(err) => {
+                bail!("timed out waiting for auction {auction} row count >= {min_count}: {err}")
+            }
         }
     }
-    bail!("timed out waiting for auction {auction} row count >= {min_count}");
+}
+
+async fn assert_auction_count_remains_zero(
+    pg_port: u16,
+    auction: i64,
+    duration: Duration,
+) -> Result<()> {
+    let ready_deadline = Instant::now() + Duration::from_secs(8);
+    let mut observe_deadline = None;
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
+        match query_auction_count(pg_port, auction).await {
+            Ok(0) => {
+                let deadline = *observe_deadline.get_or_insert_with(|| Instant::now() + duration);
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+            }
+            Ok(count) => {
+                bail!(
+                    "rows ingested before tick commit should not survive hard crash in the pre-commit window; found {count}"
+                );
+            }
+            Err(err) if Instant::now() < ready_deadline => {
+                poll.tick().await;
+                continue;
+            }
+            Err(err) => bail!("timed out waiting for pgwire readiness: {err}"),
+        }
+        poll.tick().await;
+    }
 }
 
 async fn query_mv_count(pg_port: u16) -> Result<i64> {
@@ -338,13 +382,20 @@ struct SourceBidRow {
 }
 
 async fn wait_for_source_bid(pg_port: u16, auction: i64) -> Result<SourceBidRow> {
-    for _ in 0..80 {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         match query_source_bid(pg_port, auction).await {
             Ok(Some(row)) => return Ok(row),
-            Ok(None) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(None) | Err(_) if Instant::now() < deadline => {
+                poll.tick().await;
+            }
+            Ok(None) => bail!("timed out waiting for source journal row for auction {auction}"),
+            Err(err) => {
+                bail!("timed out waiting for source journal row for auction {auction}: {err}")
+            }
         }
     }
-    bail!("timed out waiting for source journal row for auction {auction}");
 }
 
 async fn query_source_bid(pg_port: u16, auction: i64) -> Result<Option<SourceBidRow>> {

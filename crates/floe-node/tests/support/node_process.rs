@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
-use tokio::time::sleep;
+use tokio::time::{Instant, interval};
 
 pub(crate) async fn spawn_node(
     config_path: &Path,
@@ -69,15 +69,20 @@ pub(crate) async fn stop_child(child: &mut Child, signal: &str) {
 
 pub(crate) async fn wait_for_healthz(addr: &str) -> Result<()> {
     let client = reqwest::Client::new();
-    for attempt in 0..60 {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         match client.get(format!("{addr}/healthz")).send().await {
             Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(_) | Err(_) if attempt < 59 => sleep(Duration::from_millis(100)).await,
-            Ok(response) => bail!("healthz returned {}", response.status()),
-            Err(err) => bail!("healthz never became ready: {err}"),
+            Ok(response) if Instant::now() >= deadline => {
+                bail!("healthz returned {}", response.status())
+            }
+            Err(err) if Instant::now() >= deadline => bail!("healthz never became ready: {err}"),
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
-    unreachable!("loop either returns success or bails")
 }
 
 pub(crate) async fn post_bid_with_extra(
@@ -116,14 +121,18 @@ pub(crate) async fn wait_for_jsonl_rows_matching(
     attempts: usize,
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Vec<Value>> {
-    for _ in 0..attempts {
+    let deadline = Instant::now() + Duration::from_millis(100 * attempts as u64);
+    let mut poll = interval(Duration::from_millis(100));
+    loop {
         let rows = read_jsonl_rows(path).await?;
         if rows.iter().any(&predicate) {
             return Ok(rows);
         }
-        sleep(Duration::from_millis(100)).await;
+        if Instant::now() >= deadline {
+            bail!("predicate did not match rows in {}", path.to_string_lossy());
+        }
+        poll.tick().await;
     }
-    bail!("predicate did not match rows in {}", path.to_string_lossy())
 }
 
 pub(crate) async fn read_jsonl_rows(path: &Path) -> Result<Vec<Value>> {

@@ -471,7 +471,6 @@ pub(super) struct FinalCheckpoint<'a> {
     pub(super) checkpoint_manager: &'a mut CheckpointManager,
     pub(super) final_frontier: u64,
     pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
-    pub(super) outer_registry: &'a Arc<Mutex<OuterStreamRegistry>>,
     pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
 }
 
@@ -479,7 +478,6 @@ pub(super) struct PersistExecutorFinalCheckpoint<'a> {
     pub(super) checkpoint_manager: &'a mut CheckpointManager,
     pub(super) watermark: &'a AtomicI64,
     pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
-    pub(super) outer_registry: &'a Arc<Mutex<OuterStreamRegistry>>,
     pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
 }
 
@@ -494,7 +492,6 @@ pub(super) async fn persist_executor_final_checkpoint(args: PersistExecutorFinal
         checkpoint_manager: args.checkpoint_manager,
         final_frontier,
         mv_registry: args.mv_registry,
-        outer_registry: args.outer_registry,
         runtime_failure: args.runtime_failure,
     })
     .await;
@@ -515,14 +512,9 @@ pub(super) async fn persist_final_checkpoint_unless_failed(args: FinalCheckpoint
         return;
     }
 
-    let outer_registry = args.outer_registry.lock().await;
     if let Err(err) = args
         .checkpoint_manager
-        .persist_snapshot(
-            args.final_frontier,
-            args.mv_registry.as_ref(),
-            &outer_registry,
-        )
+        .persist_snapshot(args.final_frontier, args.mv_registry.as_ref())
         .await
     {
         tracing::warn!(error = %err, "final checkpoint persistence failed");

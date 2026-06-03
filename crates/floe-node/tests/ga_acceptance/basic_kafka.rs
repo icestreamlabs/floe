@@ -104,7 +104,6 @@ async fn kafka_to_mv_to_pgwire_acceptance() -> Result<()> {
     let mut child = spawn_node(&config_path, &data_dir, pg_port, Some(BID_MV_SQL)).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(400)).await;
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &brokers)
             .create()
@@ -182,7 +181,6 @@ async fn kafka_restart_rebuilds_transient_join_from_replayable_topic() -> Result
 
     let mut first = spawn_node(&config_path, &data_dir, pg_port, Some(JOIN_MV_SQL)).await?;
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", &brokers)
             .create()
@@ -190,7 +188,6 @@ async fn kafka_restart_rebuilds_transient_join_from_replayable_topic() -> Result
         produce_auction(&producer, &topic, 501, 9001).await?;
         produce_bid(&producer, &topic, 501, 8001, 1234).await?;
         wait_for_join_count_at_least(pg_port, 501, 1).await?;
-        sleep(Duration::from_millis(500)).await;
         Ok::<(), anyhow::Error>(())
     }
     .await;

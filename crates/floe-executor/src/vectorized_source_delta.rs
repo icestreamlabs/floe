@@ -2,14 +2,29 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, Int64Array};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 
+use crate::delta_consolidation::{DeltaConsolidator, add_weight_column_to_batches};
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
+
+const SNAPSHOT_DELTA_APPLY_BATCH_ROWS: usize = 4096;
+
+pub(super) struct SourceDeltaUpdate {
+    pub key_indices: Vec<usize>,
+    pub touched_keys: HashSet<Vec<u8>>,
+    pub final_positive_batch: Option<RecordBatch>,
+}
+
+pub(super) struct UnitSourceDelta {
+    pub positive: Vec<RecordBatch>,
+    pub negative: Vec<RecordBatch>,
+}
 
 pub(super) async fn apply_source_delta(
     schema: &SchemaRef,
@@ -27,24 +42,222 @@ pub(super) async fn apply_source_delta(
     }
 
     let old_snapshot = provider.snapshot();
-    let key_indices = source_key_indices(schema, primary_key_columns)?;
-    let key_effects = source_delta_key_effects(schema, &key_indices, delta, weight_idx)?;
-    let mut next = if key_effects.touched_keys.is_empty() {
+    let update = prepare_source_delta(schema, primary_key_columns, delta)?;
+    let mut next = if update.touched_keys.is_empty() {
         old_snapshot.iter().cloned().collect::<Vec<_>>()
     } else {
         filter_touched_source_rows(
             schema,
-            &key_indices,
-            &key_effects.touched_keys,
+            &update.key_indices,
+            &update.touched_keys,
             &old_snapshot,
         )?
     };
-    if let Some(positive_batch) =
-        final_positive_delta_batch(schema, delta, weight_idx, &key_effects.final_positive_rows)?
-    {
+    if let Some(positive_batch) = update.final_positive_batch {
         next.push(positive_batch);
     }
     Ok(next)
+}
+
+pub(super) fn prepare_source_delta(
+    schema: &SchemaRef,
+    primary_key_columns: &[String],
+    delta: &RecordBatch,
+) -> Result<SourceDeltaUpdate> {
+    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
+    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
+        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
+    }
+    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
+    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
+        bail!("source delta schema does not match source schema");
+    }
+
+    let key_indices = source_key_indices(schema, primary_key_columns)?;
+    let key_effects = source_delta_key_effects(schema, &key_indices, delta, weight_idx)?;
+    let final_positive_batch =
+        final_positive_delta_batch(schema, delta, weight_idx, &key_effects.final_positive_rows)?;
+    Ok(SourceDeltaUpdate {
+        key_indices,
+        touched_keys: key_effects.touched_keys,
+        final_positive_batch,
+    })
+}
+
+pub(super) fn unit_source_delta_batches(
+    schema: &SchemaRef,
+    delta: &RecordBatch,
+) -> Result<Option<UnitSourceDelta>> {
+    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
+    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
+        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
+    }
+    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
+    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
+        bail!("source delta schema does not match source schema");
+    }
+    let weights = delta
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
+    let mut positive = BooleanBuilder::with_capacity(delta.num_rows());
+    let mut negative = BooleanBuilder::with_capacity(delta.num_rows());
+    let mut positive_rows = 0usize;
+    let mut negative_rows = 0usize;
+    for row_idx in 0..weights.len() {
+        if weights.is_null(row_idx) {
+            return Ok(None);
+        }
+        match weights.value(row_idx) {
+            1 => {
+                positive.append_value(true);
+                negative.append_value(false);
+                positive_rows = positive_rows.saturating_add(1);
+            }
+            -1 => {
+                positive.append_value(false);
+                negative.append_value(true);
+                negative_rows = negative_rows.saturating_add(1);
+            }
+            0 => {
+                positive.append_value(false);
+                negative.append_value(false);
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some(UnitSourceDelta {
+        positive: filter_unweighted_delta(schema, delta, &positive.finish(), positive_rows)?,
+        negative: filter_unweighted_delta(schema, delta, &negative.finish(), negative_rows)?,
+    }))
+}
+
+pub(super) async fn apply_weighted_snapshot_delta(
+    schema: &SchemaRef,
+    previous: &[RecordBatch],
+    weighted_delta: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
+    let mut weighted = add_weight_column_to_batches(previous, &weighted_schema, 1)?;
+    for batch in weighted_delta {
+        if batch.schema().as_ref() != weighted_schema.as_ref() {
+            bail!("snapshot delta schema does not match weighted snapshot schema");
+        }
+        if batch.num_rows() > 0 {
+            weighted.push(batch);
+        }
+    }
+    let consolidated = DeltaConsolidator::new(weighted_schema.clone())?
+        .consolidate(weighted)
+        .await?;
+    let mut next = positive_weighted_snapshot(schema, &weighted_schema, consolidated)?;
+    if next.is_empty() {
+        next.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(next)
+}
+
+fn positive_weighted_snapshot(
+    schema: &SchemaRef,
+    weighted_schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let weight_idx = weighted_schema.index_of(WEIGHT_COLUMN_NAME)?;
+    let mut output = Vec::new();
+    let mut builders = snapshot_output_builders(schema)?;
+    let mut buffered_rows = 0usize;
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("snapshot delta weight column must be Int64"))?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) {
+                bail!("snapshot delta weight column cannot contain NULL");
+            }
+            let weight = weights.value(row_idx);
+            if weight < 0 {
+                bail!("snapshot delta removed more rows than were present");
+            }
+            let repeat = usize::try_from(weight).context("snapshot row weight exceeds usize")?;
+            for _ in 0..repeat {
+                append_snapshot_row(&mut builders, &batch, row_idx, weight_idx)?;
+                buffered_rows = buffered_rows.saturating_add(1);
+                if buffered_rows == SNAPSHOT_DELTA_APPLY_BATCH_ROWS {
+                    output.push(finish_snapshot_batch(schema, &mut builders)?);
+                    buffered_rows = 0;
+                }
+            }
+        }
+    }
+
+    if buffered_rows > 0 {
+        output.push(finish_snapshot_batch(schema, &mut builders)?);
+    }
+    Ok(output)
+}
+
+fn snapshot_output_builders(schema: &SchemaRef) -> Result<Vec<ScalarColumnBuilder>> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), SNAPSHOT_DELTA_APPLY_BATCH_ROWS))
+        .collect()
+}
+
+fn append_snapshot_row(
+    builders: &mut [ScalarColumnBuilder],
+    batch: &RecordBatch,
+    row_idx: usize,
+    weight_idx: usize,
+) -> Result<()> {
+    let mut output_idx = 0usize;
+    for column_idx in 0..batch.num_columns() {
+        if column_idx == weight_idx {
+            continue;
+        }
+        builders[output_idx].append_array_value(batch.column(column_idx).as_ref(), row_idx)?;
+        output_idx = output_idx.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn finish_snapshot_batch(
+    schema: &SchemaRef,
+    builders: &mut [ScalarColumnBuilder],
+) -> Result<RecordBatch> {
+    let arrays = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(Arc::clone(schema), arrays)?)
+}
+
+fn filter_unweighted_delta(
+    schema: &SchemaRef,
+    delta: &RecordBatch,
+    keep: &BooleanArray,
+    kept_rows: usize,
+) -> Result<Vec<RecordBatch>> {
+    if kept_rows == 0 {
+        return Ok(Vec::new());
+    }
+    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
+    let filtered = filter_record_batch(delta, keep)?;
+    let columns = filtered
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
+        .collect::<Vec<_>>();
+    Ok(vec![RecordBatch::try_new(Arc::clone(schema), columns)?])
 }
 
 pub(super) fn insert_only_source_delta_batch(

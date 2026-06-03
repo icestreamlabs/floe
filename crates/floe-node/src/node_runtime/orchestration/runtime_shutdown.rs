@@ -16,7 +16,6 @@ pub(super) struct RuntimeShutdownContext {
     pub(super) cancellation_propagation_handle: JoinHandle<()>,
     pub(super) query: FloeQueryContext,
     pub(super) mv_registry: Arc<MaterializedViewRegistry>,
-    pub(super) outer_registry: Arc<Mutex<OuterStreamRegistry>>,
     pub(super) db: Arc<slatedb::Db>,
     pub(super) slatedb_close_timeout_ms: Option<u64>,
     pub(super) runtime_failure: Arc<StdMutex<Option<String>>>,
@@ -39,7 +38,6 @@ pub(super) async fn shutdown_runtime(context: RuntimeShutdownContext) -> anyhow:
         cancellation_propagation_handle,
         query,
         mv_registry,
-        outer_registry,
         db,
         slatedb_close_timeout_ms,
         runtime_failure,
@@ -121,7 +119,6 @@ pub(super) async fn shutdown_runtime(context: RuntimeShutdownContext) -> anyhow:
 
     drop(query);
     drop(mv_registry);
-    drop(outer_registry);
 
     let close_timeout =
         Duration::from_millis(slatedb_close_timeout_ms.unwrap_or(DEFAULT_SLATEDB_CLOSE_TIMEOUT_MS));

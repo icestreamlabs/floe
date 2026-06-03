@@ -52,6 +52,9 @@ async fn kafka_connector_ingests_messages() {
         group_id,
         default_source: None,
         poll_timeout: Duration::from_millis(200),
+        replay_idle_timeout: KafkaConnectorConfig::default_replay_idle_timeout(
+            Duration::from_millis(200),
+        ),
         max_messages_per_tick: 16,
         message_format: None,
         commit_offsets_rx: None,
@@ -62,6 +65,7 @@ async fn kafka_connector_ingests_messages() {
     connector.init(&ctx).await.expect("connector init");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut poll = tokio::time::interval(Duration::from_millis(50));
     let mut emitted = 0usize;
     while tokio::time::Instant::now() < deadline {
         match connector.tick(&ctx).await.expect("connector tick") {
@@ -71,7 +75,7 @@ async fn kafka_connector_ingests_messages() {
         if emitted > 0 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        poll.tick().await;
     }
 
     let batch = tokio::time::timeout(Duration::from_secs(1), rx.recv())

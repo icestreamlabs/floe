@@ -1,5 +1,4 @@
 pub mod checkpoint;
-pub mod codec;
 pub mod context;
 pub mod dbsp_bridge;
 pub mod dbsp_plan;
@@ -16,7 +15,6 @@ pub mod mv_changelog;
 pub mod mv_loader;
 pub mod namespaces;
 pub mod operator_state;
-pub mod outer_stream;
 mod scalar_array_builder;
 pub mod source_decoder;
 pub mod source_journal;
@@ -38,7 +36,6 @@ pub use mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 pub use mv::runtime::MaterializedView;
 pub use mv_loader::load_or_register_mv;
 pub use operator_state::OperatorStateHandle;
-pub use outer_stream::OuterStreamRegistry;
 pub use source_decoder::{
     SourceArrowBatchBuilder, SourceRowDecoder, mask_arrow_batch_for_required_columns,
 };

@@ -87,7 +87,6 @@ async fn postgres_cdc_table_mv_update_delete_acceptance() -> Result<()> {
     let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(&sql), &[]).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .execute(
                 &format!(
@@ -242,7 +241,6 @@ async fn postgres_cdc_mv_to_postgres_sink_acceptance() -> Result<()> {
     let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(&sql), &[]).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .execute(
                 &format!("INSERT INTO {source_table} (id, amount, note) VALUES ($1, $2, $3)"),
@@ -353,7 +351,6 @@ async fn postgres_cdc_replication_pipeline_to_postgres_acceptance() -> Result<()
     let mut child = spawn_node_with_args(&config_path, &data_dir, 0, Some(&sql), &[]).await?;
 
     let test_result = async {
-        sleep(Duration::from_millis(500)).await;
         client
             .execute(
                 &format!("INSERT INTO {source_table} (id, amount, note) VALUES ($1, $2, $3)"),

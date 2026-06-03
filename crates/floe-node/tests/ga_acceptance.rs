@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, timeout};
 use tokio_postgres::NoTls;
 
 const BID_MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_acceptance_bid AS \
@@ -83,6 +83,7 @@ fn payload_to_rows(payload: Value) -> Vec<Value> {
 async fn wait_for_admin_metrics_contains(admin_port: u16, needle: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{admin_port}/metrics");
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         match client.get(&url).send().await {
             Ok(response) if response.status() == StatusCode::OK => {
@@ -93,7 +94,7 @@ async fn wait_for_admin_metrics_contains(admin_port: u16, needle: &str) -> Resul
             }
             Ok(_) | Err(_) => {}
         }
-        sleep(Duration::from_millis(100)).await;
+        poll.tick().await;
     }
     bail!("timed out waiting for admin metrics to contain {needle}");
 }
@@ -185,20 +186,26 @@ async fn wait_for_auction_count_at_least(
     auction: i64,
     min_count: i64,
 ) -> Result<i64> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..80 {
         match query_auction_count(pg_port, auction).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
     bail!("timed out waiting for mv_acceptance_bid count >= {min_count} for auction={auction}");
 }
 
 async fn wait_for_join_count_at_least(pg_port: u16, auction: i64, min_count: i64) -> Result<i64> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         match query_join_count(pg_port, auction).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
     bail!("timed out waiting for mv_acceptance_join count >= {min_count} for auction={auction}");
@@ -255,10 +262,13 @@ async fn wait_for_mv_price_count_at_least(
     price: i64,
     min_count: i64,
 ) -> Result<i64> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         match query_mv_price_count(pg_port, mv_name, auction, price).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
     bail!(
@@ -298,10 +308,13 @@ async fn wait_for_auction_seller_count_at_least(
     seller: i64,
     min_count: i64,
 ) -> Result<i64> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         match query_auction_seller_count(pg_port, mv_name, id, seller).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
     bail!("timed out waiting for {mv_name} count >= {min_count} for id={id}, seller={seller}");
@@ -340,10 +353,13 @@ async fn wait_for_join_mv_count_at_least(
     seller: i64,
     min_count: i64,
 ) -> Result<i64> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         match query_join_mv_count(pg_port, mv_name, auction, bidder, seller).await {
             Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
     bail!(
@@ -386,6 +402,7 @@ async fn wait_for_bidder_aggregate(
     expected_count: i64,
     expected_total: i64,
 ) -> Result<(i64, i64)> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         match query_bidder_aggregate(pg_port, mv_name, bidder).await {
             Ok(Some((bid_count, total_price)))
@@ -393,7 +410,9 @@ async fn wait_for_bidder_aggregate(
             {
                 return Ok((bid_count, total_price));
             }
-            Ok(_) | Err(_) => sleep(Duration::from_millis(100)).await,
+            Ok(_) | Err(_) => {
+                poll.tick().await;
+            }
         }
     }
     bail!(
@@ -479,6 +498,7 @@ async fn wait_for_postgres_sink_row(
     note: Option<&str>,
 ) -> Result<()> {
     let mut last_seen = None;
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         let rows = client
             .query(
@@ -502,7 +522,7 @@ async fn wait_for_postgres_sink_row(
                 last_seen = Some(format!("{} rows", rows.len()));
             }
         }
-        sleep(Duration::from_millis(100)).await;
+        poll.tick().await;
     }
     bail!(
         "timed out waiting for Postgres sink table {table} id={id} amount={amount} note={note:?}; last seen: {:?}",
@@ -520,6 +540,7 @@ async fn wait_for_postgres_sink_typed_row(
     note: Option<&str>,
 ) -> Result<()> {
     let mut last_seen = None;
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         let rows = client
             .query(
@@ -555,7 +576,7 @@ async fn wait_for_postgres_sink_typed_row(
                 last_seen = Some(format!("{} rows", rows.len()));
             }
         }
-        sleep(Duration::from_millis(100)).await;
+        poll.tick().await;
     }
     bail!(
         "timed out waiting for Postgres typed sink table {table} id={id} active={active} order_date={order_date} amount={amount} note={note:?}; last seen: {:?}",
@@ -568,6 +589,7 @@ async fn wait_for_postgres_sink_absent(
     table: &str,
     id: i64,
 ) -> Result<()> {
+    let mut poll = interval(Duration::from_millis(100));
     for _ in 0..120 {
         let row = client
             .query_one(
@@ -580,7 +602,7 @@ async fn wait_for_postgres_sink_absent(
         if count == 0 {
             return Ok(());
         }
-        sleep(Duration::from_millis(100)).await;
+        poll.tick().await;
     }
     bail!("timed out waiting for Postgres sink table {table} id={id} to be absent")
 }

@@ -571,7 +571,7 @@ pub struct ValidatedPlan {
 
 pub fn validate_dbsp_plan(
     plan: &CircuitPlan,
-    outer_streams_available: &BTreeSet<String>,
+    available_sources: &BTreeSet<String>,
     view_name: &str,
 ) -> Result<ValidatedPlan> {
     namespaces::materialized_view(view_name)?;
@@ -583,11 +583,11 @@ pub fn validate_dbsp_plan(
     let sources = required_sources(plan);
     if let Some(missing) = sources
         .iter()
-        .find(|name| !outer_streams_available.contains(*name))
+        .find(|name| !available_sources.contains(*name))
     {
         bail!(
             "source '{missing}' not provided; available sources: {}",
-            format_set(outer_streams_available)
+            format_set(available_sources)
         );
     }
 

@@ -16,7 +16,7 @@ use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
 use object_store::memory::InMemory;
 use slatedb::Db;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, interval, timeout};
 use tokio_postgres::NoTls;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -441,15 +441,19 @@ async fn postgres_pgoutput_survives_idle_before_wal() -> Result<()> {
     );
 
     let test_result = async {
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        anyhow::ensure!(
-            store.load_checkpoint(&source_id).await?.is_none(),
-            "idle replication should not create a durable checkpoint before WAL data"
-        );
-        anyhow::ensure!(
-            replication.is_running(),
-            "replication client should still be running after an idle interval"
-        );
+        let idle_deadline = Instant::now() + Duration::from_millis(700);
+        let mut idle_poll = interval(Duration::from_millis(100));
+        while Instant::now() < idle_deadline {
+            anyhow::ensure!(
+                store.load_checkpoint(&source_id).await?.is_none(),
+                "idle replication should not create a durable checkpoint before WAL data"
+            );
+            anyhow::ensure!(
+                replication.is_running(),
+                "replication client should still be running after an idle interval"
+            );
+            idle_poll.tick().await;
+        }
 
         client
             .execute(
