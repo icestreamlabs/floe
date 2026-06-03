@@ -1,5 +1,6 @@
 use super::super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_native_postgres_cdc_connector(
     mut config: PostgresCdcSourceConfig,
     runtime_plan: PostgresCdcRuntimePlan,
@@ -122,6 +123,7 @@ impl PostgresCdcRuntimeReconnectPolicy {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_native_postgres_cdc_wal_stream_with_reconnect(
     connection_string: &str,
     slot: &str,
@@ -222,6 +224,7 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_native_postgres_cdc_wal_stream_once(
     connection_string: &str,
     slot: &str,

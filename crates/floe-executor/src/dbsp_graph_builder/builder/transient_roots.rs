@@ -679,6 +679,7 @@ pub(super) fn try_build_transient_source_window_count_star_root_shape(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn try_build_transient_source_window_count_star_root_materialization(
     plan: &CircuitPlan,
     root_idx: usize,

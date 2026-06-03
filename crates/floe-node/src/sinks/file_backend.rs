@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_file_sink(
     sink_name: &str,
     registry: Arc<MaterializedViewRegistry>,
@@ -56,6 +57,7 @@ pub(super) async fn run_file_sink(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_file_worker(
     sink_name: &str,
     mv_name: &str,

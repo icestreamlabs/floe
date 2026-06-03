@@ -7,7 +7,6 @@
     clippy::nonminimal_bool,
     clippy::overly_complex_bool_expr,
     clippy::ptr_arg,
-    clippy::too_many_arguments,
     clippy::type_complexity,
     clippy::unused_enumerate_index
 )]

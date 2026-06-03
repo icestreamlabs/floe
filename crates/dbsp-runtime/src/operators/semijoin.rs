@@ -171,16 +171,16 @@ where
         keyed
     }
 
-    fn coalesce_deltas<T>(&self, deltas: Vec<(T, i64)>) -> HashMap<T, i64>
+    fn coalesce_deltas<T>(&self, deltas: &[(T, i64)]) -> HashMap<T, i64>
     where
         T: Clone + Eq + Hash,
     {
         let mut merged = HashMap::new();
         for (row, weight) in deltas {
             let entry = merged.entry(row.clone()).or_insert(0);
-            *entry += weight;
+            *entry += *weight;
             if *entry == 0 {
-                merged.remove(&row);
+                merged.remove(row);
             }
         }
         merged
@@ -202,23 +202,32 @@ where
             + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
         T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
     {
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
-        let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
-        for (key, delta) in deltas {
-            if *delta == 0 {
-                continue;
+        let keyed_deltas = deltas
+            .iter()
+            .filter_map(|(key, delta)| (*delta != 0).then_some((key, *delta)))
+            .collect::<Vec<_>>();
+        if keyed_deltas.is_empty() {
+            if base.is_some()
+                && let Some(handle) = versioned.current_handle()
+            {
+                return Ok(handle);
             }
-            let id = dict_batch
-                .intern(key)
-                .await
-                .context("intern key while staging semijoin delta")?;
+            return Ok(versioned.handle_for_version(0));
+        }
+
+        let dict = versioned.dictionary();
+        let ids = dict
+            .intern_many_values_unique(keyed_deltas.iter().map(|(key, _)| *key))
+            .await
+            .context("batch intern keys while staging semijoin delta")?;
+
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        for ((_, delta), id) in keyed_deltas.iter().zip(ids.into_iter()) {
             buckets
                 .entry(bucket_for(id))
                 .or_default()
                 .push((id, *delta));
         }
-        drop(dict_batch);
 
         let mut segments = Vec::new();
         for (bucket, mut bucket_deltas) in buckets {
@@ -330,8 +339,8 @@ where
             ..metrics::LogicalWorkSnapshot::default()
         };
 
-        let left_delta = self.coalesce_deltas(left_delta_values.as_ref().clone());
-        let right_delta = self.coalesce_deltas(right_delta_values.as_ref().clone());
+        let left_delta = self.coalesce_deltas(left_delta_values.as_ref());
+        let right_delta = self.coalesce_deltas(right_delta_values.as_ref());
 
         if left_delta.is_empty() && right_delta.is_empty() {
             self.logical_work.finish_tick(work);

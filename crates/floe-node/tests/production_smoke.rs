@@ -19,6 +19,34 @@ use tokio_postgres::NoTls;
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_smoke AS \
      SELECT auction, bidder, price FROM nexmark_bid";
 
+fn http_bid_config(http_port: u16) -> String {
+    format!(
+        r#"
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = {http_port}
+default_source = "nexmark_bid"
+"#
+    )
+}
+
+fn http_bid_file_sink_config(http_port: u16, sink_path: &Path) -> String {
+    format!(
+        r#"{}
+
+[[sinks]]
+type = "file"
+path = "{}"
+mv = "mv_smoke"
+with_snapshot = true
+append = true
+"#,
+        http_bid_config(http_port),
+        sink_path.to_string_lossy()
+    )
+}
+
 #[tokio::test]
 async fn smoke_generator_mv_emits_sink_rows() -> Result<()> {
     let temp_dir = TempDir::new().context("create temp dir")?;
@@ -71,23 +99,7 @@ async fn smoke_restart_recovers_snapshot_and_new_updates() -> Result<()> {
     let data_dir = temp_dir.path().join("data");
     let sink_path = temp_dir.path().join("restart_sink.jsonl");
     let config_path = temp_dir.path().join("restart.toml");
-    let config = format!(
-        r#"
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = {http_port}
-default_source = "nexmark_bid"
-
-[[sinks]]
-type = "file"
-path = "{}"
-mv = "mv_smoke"
-with_snapshot = true
-append = true
-"#,
-        sink_path.to_string_lossy()
-    );
+    let config = http_bid_file_sink_config(http_port, &sink_path);
     std::fs::write(&config_path, config).context("write restart config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 
@@ -124,23 +136,7 @@ async fn smoke_crash_restart_recovers_and_processes_new_ticks() -> Result<()> {
     let data_dir = temp_dir.path().join("data");
     let sink_path = temp_dir.path().join("crash_sink.jsonl");
     let config_path = temp_dir.path().join("crash.toml");
-    let config = format!(
-        r#"
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = {http_port}
-default_source = "nexmark_bid"
-
-[[sinks]]
-type = "file"
-path = "{}"
-mv = "mv_smoke"
-with_snapshot = true
-append = true
-"#,
-        sink_path.to_string_lossy()
-    );
+    let config = http_bid_file_sink_config(http_port, &sink_path);
     std::fs::write(&config_path, config).context("write crash config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 
@@ -176,15 +172,7 @@ async fn smoke_http_source_journal_is_queryable_as_source_table() -> Result<()> 
     let http_port = find_unused_port()?;
     let data_dir = temp_dir.path().join("data");
     let config_path = temp_dir.path().join("http_source_journal.toml");
-    let config = format!(
-        r#"
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = {http_port}
-default_source = "nexmark_bid"
-"#
-    );
+    let config = http_bid_config(http_port);
     std::fs::write(&config_path, config).context("write http source journal config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 
@@ -209,15 +197,7 @@ async fn smoke_sigterm_restart_recovers_and_processes_new_ticks() -> Result<()> 
     let http_port = find_unused_port()?;
     let data_dir = temp_dir.path().join("data");
     let config_path = temp_dir.path().join("sigterm_restart.toml");
-    let config = format!(
-        r#"
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = {http_port}
-default_source = "nexmark_bid"
-"#
-    );
+    let config = http_bid_config(http_port);
     std::fs::write(&config_path, config).context("write sigterm config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 
@@ -244,15 +224,7 @@ async fn smoke_crash_restart_keeps_mv_queryable() -> Result<()> {
     let http_port = find_unused_port()?;
     let data_dir = temp_dir.path().join("data");
     let config_path = temp_dir.path().join("crash_queryable.toml");
-    let config = format!(
-        r#"
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = {http_port}
-default_source = "nexmark_bid"
-"#
-    );
+    let config = http_bid_config(http_port);
     std::fs::write(&config_path, config).context("write crash config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 
@@ -279,15 +251,7 @@ async fn smoke_crash_between_ingest_and_tick_commit_loses_uncommitted_tick() -> 
     let http_port = find_unused_port()?;
     let data_dir = temp_dir.path().join("data");
     let config_path = temp_dir.path().join("crash_pre_commit.toml");
-    let config = format!(
-        r#"
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = {http_port}
-default_source = "nexmark_bid"
-"#
-    );
+    let config = http_bid_config(http_port);
     std::fs::write(&config_path, config).context("write crash config")?;
     let http_addr = format!("http://127.0.0.1:{http_port}");
 

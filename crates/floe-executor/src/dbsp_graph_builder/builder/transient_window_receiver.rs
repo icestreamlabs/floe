@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_window_count_star_receiver(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
@@ -48,6 +49,7 @@ pub(super) async fn build_transient_window_count_star_receiver(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_window_count_star_receiver_from_batches(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
@@ -334,6 +336,7 @@ pub(super) fn build_transient_window_incremental_batches(
     Ok((windowed_deltas, precomputed_rows, persisted_window_rows))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_window_incremental_receiver(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,
@@ -380,6 +383,7 @@ pub(super) async fn build_transient_window_incremental_receiver(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_window_incremental_receiver_from_batches(
     graph_id: &str,
     window: &dbsp::DbspWindowAggregateNode,

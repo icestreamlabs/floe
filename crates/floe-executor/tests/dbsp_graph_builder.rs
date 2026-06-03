@@ -19,7 +19,6 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use dbsp::StreamRetention;
 use dbsp::handles::ZSetHandle;
-use dbsp_semantic::ZSet;
 use floe_executor::GraphTaskError;
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::dbsp_bridge::DbspBridge;

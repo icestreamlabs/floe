@@ -53,6 +53,7 @@ pub(super) fn spawn_signal_handler(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_pgwire_server(
     query: FloeQueryContext,
     mv_registry: Arc<MaterializedViewRegistry>,

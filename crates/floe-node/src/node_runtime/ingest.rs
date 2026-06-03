@@ -376,6 +376,7 @@ pub(super) fn drain_ready(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_batch(
     queues: &mut [ConnectorQueue],
     source_id_by_name: &HashMap<String, usize>,

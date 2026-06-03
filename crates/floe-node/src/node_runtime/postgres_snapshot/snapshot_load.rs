@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
     connection_string: &str,
     slot: &str,
@@ -54,6 +55,7 @@ pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn finish_loaded_postgres_snapshot(
     slot: &str,
     publication: &str,
@@ -117,6 +119,7 @@ pub(super) async fn finish_loaded_postgres_snapshot(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_postgres_initial_snapshot(
     connection_string: &str,
     slot: &str,
@@ -156,6 +159,7 @@ pub(super) async fn load_postgres_initial_snapshot(
     snapshot
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_postgres_initial_snapshot_from_client(
     connection_string: &str,
     slot: &str,
@@ -202,6 +206,7 @@ pub(super) async fn load_postgres_initial_snapshot_from_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
     connection_string: &str,
     slot: &str,
@@ -440,6 +445,7 @@ pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn start_buffered_postgres_wal_stream(
     connection_string: &str,
     slot: &str,
@@ -525,6 +531,7 @@ pub(super) async fn connect_postgres_replication_client_with_retry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn buffer_postgres_wal_stream(
     mut replication: PostgresReplicationClient,
     runtime_plan: PostgresCdcRuntimePlan,

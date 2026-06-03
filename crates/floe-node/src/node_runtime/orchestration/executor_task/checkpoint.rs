@@ -298,55 +298,179 @@ pub(super) fn build_source_journal_batches(
 pub(super) async fn apply_decoded_source_batches(
     runtime: &mut VectorizedExecutionRuntime,
     source_names_by_id: &[String],
-    arrow_batches_by_source: Vec<Vec<RecordBatch>>,
-    weighted_arrow_batches_by_source: Vec<Vec<RecordBatch>>,
+    arrow_batches_by_source: &[Vec<RecordBatch>],
+    weighted_arrow_batches_by_source: &[Vec<RecordBatch>],
     commit_acks_by_source: &mut [Vec<core_source::CommitAck>],
-) -> bool {
+) -> anyhow::Result<bool> {
     let mut changed = false;
-    for (source_id, batches) in arrow_batches_by_source.into_iter().enumerate() {
+    for (source_id, batches) in arrow_batches_by_source.iter().enumerate() {
         let source_name = source_names_by_id[source_id].as_str();
         for batch in batches {
-            if let Err(err) = runtime.append_source_batch(source_name, batch).await {
+            if let Err(err) = runtime
+                .append_source_batch(source_name, batch.clone())
+                .await
+            {
+                let message =
+                    format!("failed to append Arrow source batch for '{source_name}': {err}");
                 tracing::error!(
                     source = %source_name,
                     error = %err,
                     "failed to append Arrow source batch"
                 );
                 for ack in commit_acks_by_source[source_id].drain(..) {
-                    ack.record_failed(format!(
-                        "failed to append Arrow source batch for '{source_name}': {err}"
-                    ))
-                    .await;
+                    ack.record_failed(message.clone()).await;
                 }
-                continue;
+                return Err(anyhow!(message));
             }
             changed = true;
         }
     }
-    for (source_id, batches) in weighted_arrow_batches_by_source.into_iter().enumerate() {
+    for (source_id, batches) in weighted_arrow_batches_by_source.iter().enumerate() {
         let source_name = source_names_by_id[source_id].as_str();
         for batch in batches {
             if let Err(err) = runtime
-                .apply_weighted_source_delta(source_name, batch)
+                .apply_weighted_source_delta(source_name, batch.clone())
                 .await
             {
+                let message = format!(
+                    "failed to apply weighted Arrow source delta for '{source_name}': {err}"
+                );
                 tracing::error!(
                     source = %source_name,
                     error = %err,
                     "failed to apply weighted Arrow source delta"
                 );
                 for ack in commit_acks_by_source[source_id].drain(..) {
-                    ack.record_failed(format!(
-                        "failed to apply weighted Arrow source delta for '{source_name}': {err}"
-                    ))
-                    .await;
+                    ack.record_failed(message.clone()).await;
                 }
-                continue;
+                return Err(anyhow!(message));
             }
             changed = true;
         }
     }
-    changed
+    Ok(changed)
+}
+
+pub(super) async fn fail_commit_acks_by_source(
+    commit_acks_by_source: &mut [Vec<core_source::CommitAck>],
+    message: &str,
+) {
+    for acks in commit_acks_by_source {
+        fail_commit_acks(acks.drain(..), message).await;
+    }
+}
+
+pub(super) async fn fail_commit_acks(
+    acks: impl IntoIterator<Item = core_source::CommitAck>,
+    message: &str,
+) {
+    for ack in acks {
+        ack.record_failed(message.to_string()).await;
+    }
+}
+
+pub(super) async fn record_fatal_source_batch_failure(
+    commit_acks_by_source: &mut [Vec<core_source::CommitAck>],
+    runtime_failure: &Arc<StdMutex<Option<String>>>,
+    cancel: &CancellationToken,
+    message: String,
+) {
+    fail_commit_acks_by_source(commit_acks_by_source, &message).await;
+    record_runtime_failure(runtime_failure, message);
+    cancel.cancel();
+}
+
+pub(super) async fn record_fatal_tick_failure(
+    tick_commit_acks: Vec<core_source::CommitAck>,
+    runtime_failure: &Arc<StdMutex<Option<String>>>,
+    cancel: &CancellationToken,
+    message: String,
+) {
+    fail_commit_acks(tick_commit_acks, &message).await;
+    record_runtime_failure(runtime_failure, message);
+    cancel.cancel();
+}
+
+pub(super) async fn wait_for_tick_materialized_views(
+    mv_registry: &Arc<MaterializedViewRegistry>,
+    epoch: u64,
+    cancel: &CancellationToken,
+    tick_commit_acks: Vec<core_source::CommitAck>,
+    runtime_failure: &Arc<StdMutex<Option<String>>>,
+) -> Option<Vec<core_source::CommitAck>> {
+    let visibility_start = Instant::now();
+    let target_mv_version = i64::try_from(epoch).unwrap_or(i64::MAX);
+    match wait_for_materialized_views_visible(mv_registry, target_mv_version, cancel).await {
+        Ok(waited_views) => {
+            let visibility_latency_ms = visibility_start.elapsed().as_millis() as u64;
+            metrics::observe_tick_phase_latency_ms("mv_visibility", visibility_latency_ms);
+            if waited_views > 0 && (epoch <= 8 || epoch % 128 == 0) {
+                tracing::info!(
+                    epoch,
+                    waited_views,
+                    visibility_latency_ms,
+                    "tick materialized views visible"
+                );
+            }
+            Some(tick_commit_acks)
+        }
+        Err(err) => {
+            metrics::observe_tick_phase_latency_ms(
+                "mv_visibility",
+                visibility_start.elapsed().as_millis() as u64,
+            );
+            tracing::error!(
+                epoch,
+                error = %err,
+                "failed while waiting for materialized view visibility"
+            );
+            record_fatal_tick_failure(
+                tick_commit_acks,
+                runtime_failure,
+                cancel,
+                format!("failed waiting for materialized view visibility at tick {epoch}: {err}"),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+pub(super) struct FinalCheckpoint<'a> {
+    pub(super) checkpoint_manager: &'a mut CheckpointManager,
+    pub(super) final_frontier: u64,
+    pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
+    pub(super) outer_registry: &'a Arc<Mutex<OuterStreamRegistry>>,
+    pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
+}
+
+pub(super) async fn persist_final_checkpoint_unless_failed(args: FinalCheckpoint<'_>) {
+    let has_runtime_failure = match args.runtime_failure.lock() {
+        Ok(guard) => guard.is_some(),
+        Err(poisoned) => {
+            tracing::warn!(
+                "runtime failure lock was poisoned while deciding final checkpoint behavior"
+            );
+            poisoned.into_inner().is_some()
+        }
+    };
+    if has_runtime_failure {
+        tracing::warn!("skipping final checkpoint persistence after runtime failure");
+        return;
+    }
+
+    let outer_registry = args.outer_registry.lock().await;
+    if let Err(err) = args
+        .checkpoint_manager
+        .persist_snapshot(
+            args.final_frontier,
+            args.mv_registry.as_ref(),
+            &outer_registry,
+        )
+        .await
+    {
+        tracing::warn!(error = %err, "final checkpoint persistence failed");
+    }
 }
 
 pub(super) fn build_kafka_metadata_journal_batches(

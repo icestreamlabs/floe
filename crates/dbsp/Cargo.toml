@@ -3,14 +3,9 @@ name = "dbsp"
 version = "0.1.0"
 edition.workspace = true
 
-[features]
-default = []
-semantic = ["dep:dbsp-semantic"]
-
 [dependencies]
 dbsp-circuit = { path = "../dbsp-circuit" }
 dbsp-planner = { path = "../dbsp-planner" }
-dbsp-semantic = { path = "../dbsp-semantic", optional = true }
 dbsp-runtime = { path = "../dbsp-runtime" }
 dbsp-storage = { path = "../dbsp-storage" }
 

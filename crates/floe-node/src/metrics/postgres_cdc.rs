@@ -42,10 +42,18 @@ impl PostgresTableMetricKey {
     }
 }
 
+fn metric_state_guard() -> std::sync::MutexGuard<'static, PostgresCdcMetricState> {
+    match POSTGRES_CDC_METRIC_STATE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("Postgres CDC metric state lock was poisoned; continuing");
+            poisoned.into_inner()
+        }
+    }
+}
+
 pub(crate) fn record_postgres_cdc_upstream_lsn(source: &str, slot: &str, lsn: u64) {
-    let mut state = POSTGRES_CDC_METRIC_STATE
-        .lock()
-        .expect("Postgres CDC metric state poisoned");
+    let mut state = metric_state_guard();
     let key = PostgresSourceMetricKey::new(source, slot);
     let upstream_lsn = record_max_lsn(&mut state.upstream_lsn_by_source, key.clone(), lsn);
     POSTGRES_CDC_UPSTREAM_LSN
@@ -68,9 +76,7 @@ pub(crate) fn record_postgres_cdc_upstream_lsn(source: &str, slot: &str, lsn: u6
 }
 
 pub(crate) fn record_postgres_cdc_durable_lsn(source: &str, slot: &str, lsn: u64) {
-    let mut state = POSTGRES_CDC_METRIC_STATE
-        .lock()
-        .expect("Postgres CDC metric state poisoned");
+    let mut state = metric_state_guard();
     let key = PostgresSourceMetricKey::new(source, slot);
     let durable_lsn = record_max_lsn(&mut state.durable_lsn_by_source, key.clone(), lsn);
     POSTGRES_CDC_DURABLE_LSN
@@ -102,9 +108,7 @@ pub(crate) fn record_postgres_cdc_table_applied_lsn(
     table: &str,
     lsn: u64,
 ) {
-    let mut state = POSTGRES_CDC_METRIC_STATE
-        .lock()
-        .expect("Postgres CDC metric state poisoned");
+    let mut state = metric_state_guard();
     let key = PostgresTableMetricKey::new(source, slot, table);
     let applied_lsn = record_max_lsn(&mut state.table_applied_lsn, key, lsn);
     POSTGRES_CDC_TABLE_LAST_APPLIED_LSN

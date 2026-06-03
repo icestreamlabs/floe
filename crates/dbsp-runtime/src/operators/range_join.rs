@@ -22,6 +22,9 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
+mod interval_index;
+use interval_index::LeftIntervalIndex;
+
 type BatchLeftRangeExtractor<L, K> = Arc<dyn Fn(&[(L, i64)]) -> Vec<(K, K, L, i64)> + Send + Sync>;
 type BatchRightKeyExtractor<R, K> = Arc<dyn Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync>;
 type RangeJoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
@@ -30,138 +33,7 @@ type RowDeltas<T> = HashMap<T, i64>;
 type LeftRangeDeltas<L, K> = HashMap<L, (K, K, i64)>;
 type RightKeyedDeltas<R, K> = HashMap<K, HashMap<R, i64>>;
 type LeftRangeCache<L, K> = HashMap<L, (K, K, i64)>;
-
-#[derive(Clone)]
-struct LeftInterval<L, K> {
-    row: L,
-    lower: K,
-    upper: K,
-    weight: i64,
-}
-
-struct LeftIntervalNode<L, K> {
-    center: K,
-    by_lower: Vec<LeftInterval<L, K>>,
-    by_upper_desc: Vec<LeftInterval<L, K>>,
-    left: Option<Box<LeftIntervalNode<L, K>>>,
-    right: Option<Box<LeftIntervalNode<L, K>>>,
-}
-
-struct LeftIntervalIndex<L, K> {
-    root: Option<Box<LeftIntervalNode<L, K>>>,
-}
-
-impl<L, K> LeftIntervalIndex<L, K>
-where
-    L: Clone,
-    K: Clone + Ord,
-{
-    fn from_cache(cache: &LeftRangeCache<L, K>) -> Self {
-        let intervals = cache
-            .iter()
-            .filter(|&(_row, (lower, upper, weight))| *weight != 0 && lower < upper)
-            .map(|(row, (lower, upper, weight))| LeftInterval {
-                row: row.clone(),
-                lower: lower.clone(),
-                upper: upper.clone(),
-                weight: *weight,
-            })
-            .collect::<Vec<_>>();
-        Self {
-            root: Self::build_node(intervals),
-        }
-    }
-
-    fn build_node(intervals: Vec<LeftInterval<L, K>>) -> Option<Box<LeftIntervalNode<L, K>>> {
-        if intervals.is_empty() {
-            return None;
-        }
-
-        let mut lowers = intervals
-            .iter()
-            .map(|interval| interval.lower.clone())
-            .collect::<Vec<_>>();
-        lowers.sort();
-        let center = lowers[lowers.len() / 2].clone();
-
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        let mut center_intervals = Vec::new();
-        for interval in intervals {
-            if interval.upper <= center {
-                left.push(interval);
-            } else if interval.lower > center {
-                right.push(interval);
-            } else {
-                center_intervals.push(interval);
-            }
-        }
-
-        let mut by_lower = center_intervals;
-        by_lower.sort_by(|a, b| a.lower.cmp(&b.lower).then_with(|| a.upper.cmp(&b.upper)));
-        let mut by_upper_desc = by_lower.clone();
-        by_upper_desc.sort_by(|a, b| b.upper.cmp(&a.upper).then_with(|| a.lower.cmp(&b.lower)));
-
-        Some(Box::new(LeftIntervalNode {
-            center,
-            by_lower,
-            by_upper_desc,
-            left: Self::build_node(left),
-            right: Self::build_node(right),
-        }))
-    }
-
-    fn visit_point<F>(&self, point: &K, visitor: &mut F)
-    where
-        F: FnMut(&L, &K, &K, i64),
-    {
-        if let Some(root) = self.root.as_ref() {
-            root.visit_point(point, visitor);
-        }
-    }
-}
-
-impl<L, K> LeftIntervalNode<L, K>
-where
-    K: Ord,
-{
-    fn visit_point<F>(&self, point: &K, visitor: &mut F)
-    where
-        F: FnMut(&L, &K, &K, i64),
-    {
-        if point < &self.center {
-            for interval in &self.by_lower {
-                if &interval.lower > point {
-                    break;
-                }
-                visitor(
-                    &interval.row,
-                    &interval.lower,
-                    &interval.upper,
-                    interval.weight,
-                );
-            }
-            if let Some(left) = self.left.as_ref() {
-                left.visit_point(point, visitor);
-            }
-        } else {
-            for interval in &self.by_upper_desc {
-                if &interval.upper <= point {
-                    break;
-                }
-                visitor(
-                    &interval.row,
-                    &interval.lower,
-                    &interval.upper,
-                    interval.weight,
-                );
-            }
-            if let Some(right) = self.right.as_ref() {
-                right.visit_point(point, visitor);
-            }
-        }
-    }
-}
+const RANGE_JOIN_DELTA_DELTA_INDEX_THRESHOLD: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RangeLookupMode {
@@ -636,6 +508,34 @@ where
         output_deltas: &mut HashMap<O, i64>,
         work: &mut metrics::LogicalWorkSnapshot,
     ) {
+        if left_ranges.is_empty() || right_keyed.is_empty() {
+            return;
+        }
+        let candidate_key_pairs = left_ranges.len().saturating_mul(right_keyed.len());
+        if candidate_key_pairs > RANGE_JOIN_DELTA_DELTA_INDEX_THRESHOLD {
+            let left_index = LeftIntervalIndex::from_cache(left_ranges);
+            for (right_key, right_rows) in right_keyed {
+                left_index.visit_point(right_key, &mut |left, _lower, _upper, left_weight| {
+                    for (right, right_weight) in right_rows {
+                        work.delta_delta_rows_examined =
+                            work.delta_delta_rows_examined.saturating_add(1);
+                        if let Some((out, weight)) = Self::join_pair(
+                            &self.predicate,
+                            &self.projector,
+                            left,
+                            left_weight,
+                            right,
+                            *right_weight,
+                        ) {
+                            Self::add_output(output_deltas, out, weight);
+                            work.join_output_rows = work.join_output_rows.saturating_add(1);
+                        }
+                    }
+                });
+            }
+            return;
+        }
+
         for (left, (lower, upper, left_weight)) in left_ranges {
             for (right_key, right_rows) in right_keyed {
                 if right_key < lower || right_key >= upper {

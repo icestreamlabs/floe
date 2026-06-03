@@ -7,28 +7,53 @@ pub(super) struct SpawnedConnectorTasks {
     pub(super) postgres_cdc_commit_senders: Vec<watch::Sender<PostgresCdcCommit>>,
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct SpawnConnectorTasksConfig<'a> {
+    pub(super) connector_specs: Vec<floe_config::ConnectorSpec>,
+    pub(super) definitions: Vec<SourceDefinition>,
+    pub(super) postgres_cdc_runtime_plans_by_connector: &'a HashMap<String, PostgresCdcRuntimePlan>,
+    pub(super) connector_sender: mpsc::Sender<core_source::RoutedAppendIngestEventBatch>,
+    pub(super) pending_event_counter: core_source::PendingAppendIngestEventCounter,
+    pub(super) ingest_cancel: CancellationToken,
+    pub(super) runtime_cancel: CancellationToken,
+    pub(super) runtime_failure: Arc<StdMutex<Option<String>>>,
+    pub(super) run_args: &'a cli::RunArgs,
+    pub(super) recovered_kafka_offsets: Vec<KafkaCheckpointOffset>,
+    pub(super) source_journal_skipped_sources: BTreeSet<String>,
+    pub(super) executor_running: Arc<AtomicBool>,
+    pub(super) storage_reachable: Arc<AtomicBool>,
+    pub(super) runtime_ready: Arc<AtomicBool>,
+    pub(super) watermark_debug: Arc<tokio::sync::RwLock<http_ingest::WatermarkDebugState>>,
+    pub(super) cdc_replication_debug:
+        Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    pub(super) cdc_transaction_sender: mpsc::Sender<QueuedCdcTransaction>,
+    pub(super) cdc_table_store: CdcTableStore,
+    pub(super) postgres_cdc_settings: floe_config::PostgresCdcConfig,
+}
+
 pub(super) fn spawn_connector_tasks(
-    connector_specs: Vec<floe_config::ConnectorSpec>,
-    definitions: Vec<SourceDefinition>,
-    postgres_cdc_runtime_plans_by_connector: &HashMap<String, PostgresCdcRuntimePlan>,
-    connector_sender: mpsc::Sender<core_source::RoutedAppendIngestEventBatch>,
-    pending_event_counter: core_source::PendingAppendIngestEventCounter,
-    ingest_cancel: CancellationToken,
-    runtime_cancel: CancellationToken,
-    runtime_failure: Arc<StdMutex<Option<String>>>,
-    run_args: &cli::RunArgs,
-    recovered_kafka_offsets: Vec<KafkaCheckpointOffset>,
-    source_journal_skipped_sources: BTreeSet<String>,
-    executor_running: Arc<AtomicBool>,
-    storage_reachable: Arc<AtomicBool>,
-    runtime_ready: Arc<AtomicBool>,
-    watermark_debug: Arc<tokio::sync::RwLock<http_ingest::WatermarkDebugState>>,
-    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    cdc_transaction_sender: mpsc::Sender<QueuedCdcTransaction>,
-    cdc_table_store: CdcTableStore,
-    postgres_cdc_settings: floe_config::PostgresCdcConfig,
+    config: SpawnConnectorTasksConfig<'_>,
 ) -> SpawnedConnectorTasks {
+    let SpawnConnectorTasksConfig {
+        connector_specs,
+        definitions,
+        postgres_cdc_runtime_plans_by_connector,
+        connector_sender,
+        pending_event_counter,
+        ingest_cancel,
+        runtime_cancel,
+        runtime_failure,
+        run_args,
+        recovered_kafka_offsets,
+        source_journal_skipped_sources,
+        executor_running,
+        storage_reachable,
+        runtime_ready,
+        watermark_debug,
+        cdc_replication_debug,
+        cdc_transaction_sender,
+        cdc_table_store,
+        postgres_cdc_settings,
+    } = config;
     let mut connector_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut connector_queues: Vec<ConnectorQueue> = Vec::new();
     let mut kafka_commit_senders: Vec<watch::Sender<KafkaOffsetCommit>> = Vec::new();

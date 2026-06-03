@@ -387,17 +387,19 @@ where
             return Ok(versioned.publish_replayable_batch(Arc::new(staged)));
         }
 
-        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
-        let mut dict_batch = dict.batch();
-        for (key, delta) in staged {
-            let id = dict_batch
-                .intern(&key)
-                .await
-                .context("intern key while staging top1 delta")?;
-            buckets.entry(bucket_for(id)).or_default().push((id, delta));
+        let ids = dict
+            .intern_many_values_unique(staged.iter().map(|(key, _)| key))
+            .await
+            .context("batch intern keys while staging top1 delta")?;
+
+        let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
+        for ((_, delta), id) in staged.iter().zip(ids.into_iter()) {
+            buckets
+                .entry(bucket_for(id))
+                .or_default()
+                .push((id, *delta));
         }
-        drop(dict_batch);
 
         let mut segments = Vec::new();
         for (bucket, mut bucket_deltas) in buckets {

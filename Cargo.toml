@@ -12,7 +12,6 @@ members = [
     "crates/floe-server",
     "crates/floe-storage",
     "crates/dbsp",
-    "crates/dbsp-semantic",
     "crates/dbsp-runtime",
     "crates/dbsp-storage",
     "crates/dbsp-circuit",

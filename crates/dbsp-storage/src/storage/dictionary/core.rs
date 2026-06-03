@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use ahash::{AHashMap, AHashSet};
@@ -128,6 +128,18 @@ where
         (self.hash_fn)(key)
     }
 
+    pub(super) fn cache_guard(&self) -> MutexGuard<'_, Cache> {
+        match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "dictionary cache lock was poisoned; continuing with recovered cache"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
     fn encode_k2id_key_into(&self, out: &mut Vec<u8>, hash: u64, slot: u16) {
         out.clear();
         out.reserve(self.k2id_prefix.len() + 10);
@@ -183,7 +195,15 @@ where
     }
 
     fn reserve_fresh_slot(&self, hash: u64) -> Result<u16> {
-        let mut next_slot_by_hash = self.fresh_next_slot_by_hash.lock().unwrap();
+        let mut next_slot_by_hash = match self.fresh_next_slot_by_hash.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "dictionary fresh-slot lock was poisoned; continuing with recovered slots"
+                );
+                poisoned.into_inner()
+            }
+        };
         let next_slot = next_slot_by_hash.entry(hash).or_insert(0);
         let slot = *next_slot;
         *next_slot = Self::next_probe_slot(slot)
@@ -234,7 +254,7 @@ where
                 let decoded = decompress_value(stored.as_ref())?;
                 let matches = decoded.as_slice() == encoded_key;
 
-                let mut cache = self.cache.lock().unwrap();
+                let mut cache = self.cache_guard();
                 cache.remember(decoded, id);
                 drop(cache);
 
@@ -276,7 +296,7 @@ where
         );
         self.table.write_batch(batch).await?;
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache_guard();
         cache.remember(encoded_key, id);
         Ok(())
     }
@@ -307,7 +327,7 @@ where
         }
 
         let should_allocate = {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache_guard();
             cache.is_negative(&encoded_key)
         };
         if should_allocate {
@@ -322,13 +342,13 @@ where
                 if let Some(overlay_ref) = overlay.as_deref_mut() {
                     overlay_ref.remember_positive(encoded_key.clone(), id);
                 }
-                let mut cache = self.cache.lock().unwrap();
+                let mut cache = self.cache_guard();
                 cache.remember(encoded_key, id);
                 Ok(id)
             }
             LookupExistingResult::Missing { first_free_slot } => {
                 {
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self.cache_guard();
                     cache.remember_negative(&encoded_key);
                 }
                 if let Some(overlay_ref) = overlay.as_deref_mut() {
@@ -343,7 +363,7 @@ where
     }
 
     fn lookup_existing_in_cache(&self, encoded_key: &[u8]) -> Option<u64> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache_guard();
         cache.lookup_id(encoded_key)
     }
 
@@ -360,7 +380,7 @@ where
             self.persist_mapping(encoded_key.clone(), id, hash, slot)
                 .await?;
             {
-                let mut cache = self.cache.lock().unwrap();
+                let mut cache = self.cache_guard();
                 cache.clear_negative(&encoded_key);
             }
             if let Some(overlay) = overlay {
@@ -378,7 +398,7 @@ where
         self.persist_mapping(encoded_key.clone(), id, hash, first_free_slot)
             .await?;
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache_guard();
             cache.clear_negative(&encoded_key);
         }
         if let Some(overlay) = overlay {

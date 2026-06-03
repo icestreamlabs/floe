@@ -4,11 +4,12 @@ mod checkpoint;
 mod context;
 
 use checkpoint::{
-    CdcOnlyTickCommit, ExecutorCheckpointState, IngestMetrics, PersistTickCheckpoint,
-    apply_decoded_source_batches, build_kafka_metadata_journal_batches,
+    CdcOnlyTickCommit, ExecutorCheckpointState, FinalCheckpoint, IngestMetrics,
+    PersistTickCheckpoint, apply_decoded_source_batches, build_kafka_metadata_journal_batches,
     build_source_journal_batches, notify_kafka_commit_senders, persist_cdc_only_tick_commit,
-    persist_tick_checkpoint, publish_watermark_debug_state, record_ingest_queue_metrics,
-    update_checkpoint_source_offsets,
+    persist_final_checkpoint_unless_failed, persist_tick_checkpoint, publish_watermark_debug_state,
+    record_fatal_source_batch_failure, record_fatal_tick_failure, record_ingest_queue_metrics,
+    update_checkpoint_source_offsets, wait_for_tick_materialized_views,
 };
 pub(super) use context::ExecutorTaskContext;
 
@@ -540,8 +541,13 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                         if let Some(ack) = commit_ack {
                             ack.record_failed(message.clone()).await;
                         }
-                        record_runtime_failure(&failure_for_executor, message);
-                        executor_cancel.cancel();
+                        record_fatal_source_batch_failure(
+                            &mut commit_acks_by_source,
+                            &failure_for_executor,
+                            &executor_cancel,
+                            message,
+                        )
+                        .await;
                         break 'executor;
                     };
                     let event_ts = match builder.append_event(&event) {
@@ -602,13 +608,15 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 error = %err,
                                 "failed to finish Arrow ingest batch"
                             );
-                            record_runtime_failure(
+                            record_fatal_source_batch_failure(
+                                &mut commit_acks_by_source,
                                 &failure_for_executor,
+                                &executor_cancel,
                                 format!(
                                     "failed to finish Arrow ingest batch for '{source_name}': {err}"
                                 ),
-                            );
-                            executor_cancel.cancel();
+                            )
+                            .await;
                             break 'executor;
                         }
                     }
@@ -674,6 +682,32 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 }
                 continue;
             }
+            let changed = match apply_decoded_source_batches(
+                &mut vectorized_runtime_for_task,
+                &source_names_by_id_for_task,
+                &arrow_batches_by_source,
+                &weighted_arrow_batches_by_source,
+                &mut commit_acks_by_source,
+            )
+            .await
+            {
+                Ok(changed) => changed,
+                Err(err) => {
+                    let message = format!("failed to apply decoded source batches: {err}");
+                    tracing::error!(epoch = pending_epoch, error = %err, "{message}");
+                    record_fatal_source_batch_failure(
+                        &mut commit_acks_by_source,
+                        &failure_for_executor,
+                        &executor_cancel,
+                        message,
+                    )
+                    .await;
+                    break 'executor;
+                }
+            };
+            if !changed {
+                continue;
+            }
             if let Err(err) = build_source_journal_batches(
                 &source_names_by_id_for_task,
                 &definitions,
@@ -685,18 +719,15 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             ) {
                 let message = err.to_string();
                 tracing::error!(error = %err, "{message}");
-                record_runtime_failure(&failure_for_executor, message);
-                executor_cancel.cancel();
+                record_fatal_source_batch_failure(
+                    &mut commit_acks_by_source,
+                    &failure_for_executor,
+                    &executor_cancel,
+                    message,
+                )
+                .await;
                 break 'executor;
             }
-            let changed = apply_decoded_source_batches(
-                &mut vectorized_runtime_for_task,
-                &source_names_by_id_for_task,
-                arrow_batches_by_source,
-                weighted_arrow_batches_by_source,
-                &mut commit_acks_by_source,
-            )
-            .await;
             for acks in &mut commit_acks_by_source {
                 tick_commit_acks.append(acks);
             }
@@ -706,10 +737,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 &tick_source_max_event_ts,
                 &mut tick_kafka_source_ranges,
             );
-            if !changed {
-                continue;
-            }
-
             checkpoint_state.epoch = pending_epoch;
             let epoch = checkpoint_state.epoch;
             let now_instant = Instant::now();
@@ -759,8 +786,15 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     tick_all_start.elapsed().as_millis() as u64,
                 );
                 tracing::error!(epoch, error = %err, "failed to run vectorized materialization tick");
+                record_fatal_tick_failure(
+                    tick_commit_acks,
+                    &failure_for_executor,
+                    &executor_cancel,
+                    format!("failed to run vectorized materialization tick {epoch}: {err}"),
+                )
+                .await;
                 metrics::inc_ingest_tick("error");
-                continue;
+                break 'executor;
             } else if should_sample(&TICK_LOG_COUNTER, TICK_LOG_SAMPLE_EVERY) {
                 metrics::observe_tick_phase_latency_ms(
                     "state_write",
@@ -780,50 +814,18 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
 
-            let mv_visibility_start = Instant::now();
-            let target_mv_version = i64::try_from(epoch).unwrap_or(i64::MAX);
-            match wait_for_materialized_views_visible(
+            tick_commit_acks = match wait_for_tick_materialized_views(
                 &mv_for_task,
-                target_mv_version,
+                epoch,
                 &executor_cancel,
+                tick_commit_acks,
+                &failure_for_executor,
             )
             .await
             {
-                Ok(waited_views) => {
-                    let mv_visibility_latency_ms = mv_visibility_start.elapsed().as_millis() as u64;
-                    metrics::observe_tick_phase_latency_ms(
-                        "mv_visibility",
-                        mv_visibility_latency_ms,
-                    );
-                    if waited_views > 0 && (epoch <= 8 || epoch % 128 == 0) {
-                        tracing::info!(
-                            epoch,
-                            waited_views,
-                            mv_visibility_latency_ms,
-                            "tick materialized views visible"
-                        );
-                    }
-                }
-                Err(err) => {
-                    metrics::observe_tick_phase_latency_ms(
-                        "mv_visibility",
-                        mv_visibility_start.elapsed().as_millis() as u64,
-                    );
-                    tracing::error!(
-                        epoch,
-                        error = %err,
-                        "failed while waiting for materialized view visibility"
-                    );
-                    record_runtime_failure(
-                        &failure_for_executor,
-                        format!(
-                            "failed waiting for materialized view visibility at tick {epoch}: {err}"
-                        ),
-                    );
-                    executor_cancel.cancel();
-                    break 'executor;
-                }
-            }
+                Some(acks) => acks,
+                None => break 'executor,
+            };
 
             checkpoint_state.record_latest_source_offset_lag(
                 &source_names_by_id_for_task,
@@ -976,13 +978,14 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             .max(0)
             .try_into()
             .unwrap_or(0_u64);
-        let outer_registry = outer_for_task.lock().await;
-        if let Err(err) = checkpoint_manager
-            .persist_snapshot(final_frontier, mv_for_task.as_ref(), &outer_registry)
-            .await
-        {
-            tracing::warn!(error = %err, "final checkpoint persistence failed");
-        }
+        persist_final_checkpoint_unless_failed(FinalCheckpoint {
+            checkpoint_manager: &mut checkpoint_manager,
+            final_frontier,
+            mv_registry: &mv_for_task,
+            outer_registry: &outer_for_task,
+            runtime_failure: &failure_for_executor,
+        })
+        .await;
         executor_running_for_task.store(false, Ordering::Relaxed);
     });
 

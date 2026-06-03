@@ -5,7 +5,6 @@
     clippy::needless_borrow,
     clippy::needless_borrows_for_generic_args,
     clippy::needless_update,
-    clippy::too_many_arguments,
     clippy::while_let_loop
 )]
 

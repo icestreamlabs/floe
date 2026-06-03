@@ -16,7 +16,7 @@ use checkpointing::{
     build_vectorized_source_journal_commit_batches, notify_postgres_cdc_commit_senders,
     record_postgres_cdc_lsn_progress,
 };
-use connectors::{SpawnedConnectorTasks, spawn_connector_tasks};
+use connectors::{SpawnConnectorTasksConfig, SpawnedConnectorTasks, spawn_connector_tasks};
 use executor_task::{ExecutorTaskContext, spawn_executor_task};
 use postgres_runtime::{
     insert_catalog_source_definition, insert_replication_pipeline_definition,
@@ -846,27 +846,27 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         queues: connector_queues,
         kafka_commit_senders,
         postgres_cdc_commit_senders,
-    } = spawn_connector_tasks(
+    } = spawn_connector_tasks(SpawnConnectorTasksConfig {
         connector_specs,
-        definitions.clone(),
-        &postgres_cdc_runtime_plans_by_connector,
-        connector_sender.clone(),
-        pending_event_counter.clone(),
-        ingest_cancel.clone(),
-        runtime_cancel.clone(),
-        Arc::clone(&runtime_failure),
-        &run_args,
-        recovered_kafka_offsets.clone(),
-        source_journal_skipped_sources.clone(),
-        Arc::clone(&executor_running),
-        Arc::clone(&storage_reachable),
-        Arc::clone(&runtime_ready),
-        Arc::clone(&watermark_debug),
-        Arc::clone(&cdc_replication_debug),
-        cdc_transaction_sender.clone(),
-        cdc_table_store.clone(),
+        definitions: definitions.clone(),
+        postgres_cdc_runtime_plans_by_connector: &postgres_cdc_runtime_plans_by_connector,
+        connector_sender: connector_sender.clone(),
+        pending_event_counter: pending_event_counter.clone(),
+        ingest_cancel: ingest_cancel.clone(),
+        runtime_cancel: runtime_cancel.clone(),
+        runtime_failure: Arc::clone(&runtime_failure),
+        run_args: &run_args,
+        recovered_kafka_offsets: recovered_kafka_offsets.clone(),
+        source_journal_skipped_sources: source_journal_skipped_sources.clone(),
+        executor_running: Arc::clone(&executor_running),
+        storage_reachable: Arc::clone(&storage_reachable),
+        runtime_ready: Arc::clone(&runtime_ready),
+        watermark_debug: Arc::clone(&watermark_debug),
+        cdc_replication_debug: Arc::clone(&cdc_replication_debug),
+        cdc_transaction_sender: cdc_transaction_sender.clone(),
+        cdc_table_store: cdc_table_store.clone(),
         postgres_cdc_settings,
-    );
+    });
     drop(connector_sender);
     drop(cdc_transaction_sender);
     let executor_handle = spawn_executor_task(ExecutorTaskContext {

@@ -147,11 +147,14 @@ pub(super) async fn shutdown_runtime(context: RuntimeShutdownContext) -> anyhow:
         }
     };
 
-    if let Some(message) = runtime_failure
-        .lock()
-        .expect("runtime failure lock poisoned")
-        .clone()
-    {
+    let recorded_failure = match runtime_failure.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            tracing::warn!("runtime failure lock was poisoned during shutdown");
+            poisoned.into_inner().clone()
+        }
+    };
+    if let Some(message) = recorded_failure {
         return Err(anyhow!(message));
     }
 

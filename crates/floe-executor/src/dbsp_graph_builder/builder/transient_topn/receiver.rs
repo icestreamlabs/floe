@@ -8,6 +8,7 @@ use super::processors::{
 };
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver(
     graph_id: &str,
     topn: &DbspTopNNode,
@@ -47,6 +48,7 @@ pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::dbsp_graph_builder::builder) fn build_transient_topn_receiver_from_batches(
     graph_id: &str,
     topn: &DbspTopNNode,

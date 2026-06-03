@@ -1,8 +1,7 @@
 //! Floe DBSP facade.
 //!
-//! Paper-facing semantic streams and circuits live under [`semantic`]. The
-//! root-level runtime exports remain focused on operational execution types,
-//! handle/Z-set streams, and planner/runtime wrappers.
+//! Root-level exports focus on operational execution types, handle/Z-set
+//! streams, and planner/runtime wrappers.
 
 pub mod circuit {
     pub use dbsp_circuit::circuit::*;
@@ -19,11 +18,6 @@ pub mod circuit {
             create_logical_plan_with_asof_preplanner,
         };
     }
-}
-
-#[cfg(feature = "semantic")]
-pub mod semantic {
-    pub use dbsp_semantic::*;
 }
 
 pub use dbsp_runtime::{

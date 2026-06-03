@@ -23,6 +23,7 @@ struct KafkaSinkCheckpointRecord {
     committed_at_unix_ms: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_kafka_sink(
     sink_name: &str,
     registry: Arc<MaterializedViewRegistry>,
@@ -127,6 +128,7 @@ pub(super) async fn run_kafka_sink(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_kafka_worker(
     sink_name: &str,
     mv_name: &str,
@@ -204,6 +206,7 @@ pub(super) async fn run_kafka_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn flush_kafka_buffer(
     sink_name: &str,
     mv_name: &str,

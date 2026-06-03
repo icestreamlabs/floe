@@ -269,6 +269,7 @@ pub(super) fn effective_u64_limit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn log_replication_buffer_backpressure(
     plan: &ReplicationPipelineRuntimePlan,
     phase: &str,

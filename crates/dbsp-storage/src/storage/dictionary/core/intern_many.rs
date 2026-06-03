@@ -122,7 +122,7 @@ where
                 existing
             } else {
                 let should_allocate = {
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self.cache_guard();
                     cache.is_negative(encoded)
                 };
                 if should_allocate || self.fast_path_fresh {
@@ -150,13 +150,13 @@ where
                     match existing {
                         LookupExistingResult::Existing(existing) => {
                             lookup_existing_hits += 1;
-                            let mut cache = self.cache.lock().unwrap();
+                            let mut cache = self.cache_guard();
                             cache.remember(encoded.clone(), existing);
                             existing
                         }
                         LookupExistingResult::Missing { first_free_slot } => {
                             {
-                                let mut cache = self.cache.lock().unwrap();
+                                let mut cache = self.cache_guard();
                                 cache.remember_negative(encoded);
                             }
                             reserve_calls += 1;
@@ -237,7 +237,7 @@ where
             } else {
                 let hash = self.hash(encoded.as_slice());
                 let should_allocate = {
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self.cache_guard();
                     cache.is_negative(encoded.as_slice())
                 };
                 if should_allocate || self.fast_path_fresh {
@@ -267,13 +267,13 @@ where
                     match existing {
                         LookupExistingResult::Existing(existing) => {
                             lookup_existing_hits += 1;
-                            let mut cache = self.cache.lock().unwrap();
+                            let mut cache = self.cache_guard();
                             cache.remember(encoded, existing);
                             existing
                         }
                         LookupExistingResult::Missing { first_free_slot } => {
                             {
-                                let mut cache = self.cache.lock().unwrap();
+                                let mut cache = self.cache_guard();
                                 cache.remember_negative(encoded.as_slice());
                             }
                             reserve_calls += 1;
@@ -351,7 +351,7 @@ where
             let write_batch_ms = write_start.elapsed().as_millis() as u64;
 
             let cache_update_start = Instant::now();
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache_guard();
             for (encoded, id, _, _) in pending {
                 cache.clear_negative(&encoded);
                 cache.remember(encoded, id);

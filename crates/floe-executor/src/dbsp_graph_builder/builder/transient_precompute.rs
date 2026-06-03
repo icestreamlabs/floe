@@ -399,6 +399,7 @@ pub(super) fn transient_window_evict_expired_counts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_transient_window_count_star_deltas(
     input_deltas: Vec<(Vec<u8>, i64)>,
     key_extractor: &VectorizedEncodedKeyExtractor,

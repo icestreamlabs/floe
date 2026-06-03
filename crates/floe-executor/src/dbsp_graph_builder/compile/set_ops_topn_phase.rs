@@ -394,6 +394,7 @@ struct VectorizedTopNKeyParts {
 }
 
 impl VectorizedTopNKeyParts {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         schema: Arc<RowSchema>,
         partition_key_columns: Arc<Vec<usize>>,

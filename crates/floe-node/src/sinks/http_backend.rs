@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_http_sink(
     sink_name: &str,
     registry: Arc<MaterializedViewRegistry>,
@@ -58,6 +59,7 @@ pub(super) async fn run_http_sink(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_http_worker(
     sink_name: &str,
     mv_name: &str,
@@ -131,6 +133,7 @@ pub(super) async fn run_http_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn flush_http_buffer(
     sink_name: &str,
     mv_name: &str,

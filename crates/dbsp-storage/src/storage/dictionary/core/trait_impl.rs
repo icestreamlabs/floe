@@ -18,7 +18,7 @@ where
 
         let encoded = {
             if let Some(bytes) = {
-                let mut cache = self.cache.lock().unwrap();
+                let mut cache = self.cache_guard();
                 cache.lookup_key(&id)
             } {
                 bytes
@@ -31,7 +31,7 @@ where
                     .await?
                     .ok_or_else(|| anyhow!("no key found for id {id}"))?;
                 let decoded = decompress_value(bytes.as_ref())?;
-                let mut cache = self.cache.lock().unwrap();
+                let mut cache = self.cache_guard();
                 cache.remember(decoded, id)
             }
         };

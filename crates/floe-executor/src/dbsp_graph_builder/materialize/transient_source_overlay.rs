@@ -1,6 +1,7 @@
 use super::*;
 
 impl DbspGraphBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::dbsp_graph_builder) async fn materialize_view_from_transient_source_overlay(
         &mut self,
         view_name: &str,

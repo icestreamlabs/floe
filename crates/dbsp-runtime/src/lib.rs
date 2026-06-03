@@ -1,11 +1,8 @@
 //! Operational DBSP runtime components.
 //!
-//! The paper-facing denotational stream and circuit model lives in
-//! `dbsp-semantic`. The `dbsp-runtime::stream::Stream<T>` type remains public
-//! as an execution and storage abstraction: it exposes current logical time,
-//! committed frontiers, semantic horizons, and default-tail state.
-//! Those operational observations are intentionally distinct from the paper
-//! DBSP stream object.
+//! The `dbsp-runtime::stream::Stream<T>` type is an execution and storage
+//! abstraction: it exposes current logical time, committed frontiers, semantic
+//! horizons, and default-tail state.
 
 pub mod aggregate;
 pub mod algebra;

@@ -1,13 +1,18 @@
 use datafusion::arrow::array::{Int64Array, StringArray, TimestampMillisecondArray};
 use datafusion::arrow::record_batch::RecordBatch;
 
+const ENCODED_I64: u8 = 0x01;
+const ENCODED_UTF8: u8 = 0x02;
+const ENCODED_TIMESTAMP_MILLIS: u8 = 0x03;
+const ENCODED_NULL: u8 = 0x05;
+
 pub(crate) fn bid_row(auction: i64, bidder: i64, price: i64) -> Vec<u8> {
     bid_row_nullable(Some(auction), Some(bidder), price)
 }
 
 pub(crate) fn bid_row_nullable(auction: Option<i64>, bidder: Option<i64>, price: i64) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(4 + 64);
-    encoded.extend_from_slice(&(7_u32).to_le_bytes());
+    append_field_count(&mut encoded, 7);
     append_optional_i64(&mut encoded, auction);
     append_optional_i64(&mut encoded, bidder);
     append_i64(&mut encoded, price);
@@ -26,7 +31,7 @@ pub(crate) fn auction_row(
     item_name: &str,
 ) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(4 + 96);
-    encoded.extend_from_slice(&(10_u32).to_le_bytes());
+    append_field_count(&mut encoded, 10);
     append_i64(&mut encoded, auction);
     append_utf8(&mut encoded, item_name);
     append_utf8(&mut encoded, "description");
@@ -40,27 +45,33 @@ pub(crate) fn auction_row(
     encoded
 }
 
+fn append_field_count(encoded: &mut Vec<u8>, count: usize) {
+    let count = u32::try_from(count).expect("test row field count fits u32");
+    encoded.extend_from_slice(&count.to_le_bytes());
+}
+
 fn append_i64(encoded: &mut Vec<u8>, value: i64) {
-    encoded.push(0x01);
+    encoded.push(ENCODED_I64);
     encoded.extend_from_slice(&value.to_le_bytes());
 }
 
 fn append_optional_i64(encoded: &mut Vec<u8>, value: Option<i64>) {
     match value {
         Some(value) => append_i64(encoded, value),
-        None => encoded.push(0x05),
+        None => encoded.push(ENCODED_NULL),
     }
 }
 
 fn append_timestamp_millis(encoded: &mut Vec<u8>, value: i64) {
-    encoded.push(0x03);
+    encoded.push(ENCODED_TIMESTAMP_MILLIS);
     encoded.extend_from_slice(&value.to_le_bytes());
 }
 
 fn append_utf8(encoded: &mut Vec<u8>, value: &str) {
-    encoded.push(0x02);
+    encoded.push(ENCODED_UTF8);
     let bytes = value.as_bytes();
-    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    let len = u32::try_from(bytes.len()).expect("test string length fits u32");
+    encoded.extend_from_slice(&len.to_le_bytes());
     encoded.extend_from_slice(bytes);
 }
 

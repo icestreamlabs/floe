@@ -202,6 +202,7 @@ pub(super) fn snapshot_adaptive_concurrency_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_snapshot_adaptive_concurrency_controller(
     source: String,
     slot: String,

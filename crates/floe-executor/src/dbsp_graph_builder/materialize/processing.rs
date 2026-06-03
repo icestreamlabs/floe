@@ -1,6 +1,7 @@
 use super::*;
 
 impl DbspGraphBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_materialize_delta(
         result: Result<(i64, ZSetHandle)>,
         view: &mut DbspView,
@@ -51,6 +52,7 @@ impl DbspGraphBuilder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_delta_handle_overlay(
         result: Result<(i64, ZSetHandle)>,
         delta_reader: &mut DeltaZSetHandleReader<Vec<u8>>,
@@ -140,6 +142,7 @@ impl DbspGraphBuilder {
         .context("apply encoded overlay batch for transient materialization")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_encoded_overlay_batch(
         apply_start: Instant,
         ts: i64,
@@ -305,6 +308,7 @@ impl DbspGraphBuilder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn publish_pending_view(
         view: &mut DbspView,
         bridge: &Arc<Mutex<DbspBridge>>,

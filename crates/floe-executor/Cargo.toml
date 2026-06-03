@@ -31,7 +31,6 @@ regex = "1.11"
 [dev-dependencies]
 criterion = "0.5"
 arrow-schema = { workspace = true }
-dbsp-semantic = { path = "../dbsp-semantic" }
 floe-cdc = { path = "../floe-cdc" }
 floe-cdc-core = { path = "../floe-cdc-core" }
 nexmark = { workspace = true }

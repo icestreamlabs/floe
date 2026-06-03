@@ -18,7 +18,7 @@ where
         let mut cache_hit_refs = 0usize;
 
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache_guard();
             for id in ids {
                 if *id == 0 {
                     return Err(anyhow!("id 0 is not valid"));
@@ -65,7 +65,7 @@ where
                         let id = self.decode_id2k_key_id(key.as_ref())?;
                         let decoded = decompress_value(bytes.as_ref())?;
                         let shared = {
-                            let mut cache = self.cache.lock().unwrap();
+                            let mut cache = self.cache_guard();
                             cache.remember(decoded, id)
                         };
                         encoded_by_id.insert(id, shared);
@@ -95,7 +95,7 @@ where
                     let bytes = bytes.ok_or_else(|| anyhow!("no key found for id {id}"))?;
                     let decoded = decompress_value(bytes.as_ref())?;
                     let shared = {
-                        let mut cache = self.cache.lock().unwrap();
+                        let mut cache = self.cache_guard();
                         cache.remember(decoded, id)
                     };
                     encoded_by_id.insert(id, shared);

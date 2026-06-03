@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn try_build_transient_source_window_aggregate_root_materialization(
     plan: &CircuitPlan,
     root_idx: usize,
@@ -77,6 +78,7 @@ pub(super) async fn try_build_transient_source_aggregate_root_materialization(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_aggregate_receiver(
     graph_id: &str,
     aggregate: &DbspAggregateNode,
@@ -124,6 +126,7 @@ pub(super) async fn build_transient_aggregate_receiver(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_transient_aggregate_receiver_from_batches(
     graph_id: &str,
     aggregate: &DbspAggregateNode,
