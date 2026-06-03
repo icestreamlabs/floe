@@ -260,10 +260,12 @@ async fn materialized_view_provider_applies_projection_and_limit_in_scan() {
 async fn dynamic_state_provider_applies_scan_limit() {
     let schema = id_schema(true);
     let provider = DynamicStateTableProvider::new(Arc::clone(&schema));
-    provider.set_batches(vec![
-        arrow_i64_batch(Arc::clone(&schema), &[1, 2]),
-        arrow_i64_batch(Arc::clone(&schema), &[3, 4]),
-    ]);
+    provider
+        .set_batches(vec![
+            arrow_i64_batch(Arc::clone(&schema), &[1, 2]),
+            arrow_i64_batch(Arc::clone(&schema), &[3, 4]),
+        ])
+        .expect("seed dynamic provider");
 
     let session = SessionContext::new();
     let state = session.state();
@@ -299,10 +301,12 @@ async fn dynamic_state_provider_applies_scan_limit() {
 async fn dynamic_state_provider_statistics_respect_scan_limit() {
     let schema = id_schema(true);
     let provider = DynamicStateTableProvider::new(Arc::clone(&schema));
-    provider.set_batches(vec![
-        arrow_i64_batch(Arc::clone(&schema), &[1, 2]),
-        arrow_i64_batch(Arc::clone(&schema), &[3, 4]),
-    ]);
+    provider
+        .set_batches(vec![
+            arrow_i64_batch(Arc::clone(&schema), &[1, 2]),
+            arrow_i64_batch(Arc::clone(&schema), &[3, 4]),
+        ])
+        .expect("seed dynamic provider");
 
     let session = SessionContext::new();
     let state = session.state();

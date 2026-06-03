@@ -45,6 +45,18 @@ mod tests;
 use self::commands::*;
 use self::fingerprints::*;
 use self::queries::*;
+
+fn wait_before_retry(deadline: Instant, interval: Duration) -> bool {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return false;
+    };
+    if remaining.is_zero() {
+        return false;
+    }
+    thread::park_timeout(interval.min(remaining));
+    deadline > Instant::now()
+}
+
 fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
     let mut harness = Harness::new(config)?;

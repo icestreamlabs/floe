@@ -3,11 +3,12 @@ use super::*;
 impl Harness {
     pub(super) fn wait_for_pg(&self, port: u16, user: &str, db: &str) -> Result<()> {
         let target = PgTarget { port, user, db };
-        for _ in 0..90 {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
             if self.fetch_pg_scalar(target, "SELECT 1").ok().as_deref() == Some("1") {
                 return Ok(());
             }
-            thread::sleep(Duration::from_secs(1));
+            wait_before_retry(deadline, Duration::from_secs(1));
         }
         bail!("pgwire did not become ready on port {port}")
     }
@@ -323,9 +324,9 @@ impl Harness {
         target: PgTarget<'_>,
         specs: &[RelationSpec],
     ) -> Result<()> {
-        let start = Instant::now();
+        let deadline = Instant::now() + self.config.poll_timeout;
         loop {
-            if start.elapsed() >= self.config.poll_timeout {
+            if Instant::now() >= deadline {
                 bail!("source counts did not reach targets before timeout");
             }
             let mut ready = true;
@@ -344,7 +345,7 @@ impl Harness {
             if ready {
                 return Ok(());
             }
-            thread::sleep(self.config.poll_interval);
+            wait_before_retry(deadline, self.config.poll_interval);
         }
     }
 
@@ -354,9 +355,9 @@ impl Harness {
         expected_rows: u64,
         relation: &str,
     ) -> Result<()> {
-        let start = Instant::now();
+        let deadline = Instant::now() + self.config.poll_timeout;
         loop {
-            if start.elapsed() >= self.config.poll_timeout {
+            if Instant::now() >= deadline {
                 bail!("result rows did not reach {expected_rows} before timeout");
             }
             let sql = format!("SELECT COUNT(*)::BIGINT FROM {relation}");
@@ -367,7 +368,7 @@ impl Harness {
             if rows == Some(expected_rows) {
                 return Ok(());
             }
-            thread::sleep(self.config.poll_interval);
+            wait_before_retry(deadline, self.config.poll_interval);
         }
     }
 
@@ -377,9 +378,9 @@ impl Harness {
         groups: &Groups,
         topics: &Topics,
     ) -> Result<()> {
-        let start = Instant::now();
+        let deadline = Instant::now() + self.config.poll_timeout;
         loop {
-            if start.elapsed() >= self.config.poll_timeout {
+            if Instant::now() >= deadline {
                 bail!("Floe Kafka consumer groups did not catch up before timeout");
             }
             let mut ready = true;
@@ -402,7 +403,7 @@ impl Harness {
             if ready {
                 return Ok(());
             }
-            thread::sleep(self.config.poll_interval);
+            wait_before_retry(deadline, self.config.poll_interval);
         }
     }
 

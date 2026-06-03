@@ -41,7 +41,7 @@ pub(super) async fn apply_source_delta(
         bail!("source delta schema does not match source schema");
     }
 
-    let old_snapshot = provider.snapshot();
+    let old_snapshot = provider.snapshot()?;
     let update = prepare_source_delta(schema, primary_key_columns, delta)?;
     let mut next = if update.touched_keys.is_empty() {
         old_snapshot.iter().cloned().collect::<Vec<_>>()
@@ -508,7 +508,9 @@ mod tests {
             ],
         )
         .expect("old source batch");
-        provider.set_batches(vec![old_batch]);
+        provider
+            .set_batches(vec![old_batch])
+            .expect("seed provider");
         let weighted_schema =
             crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
         let delta = RecordBatch::try_new(
