@@ -95,11 +95,7 @@ pub struct KafkaConnector {
 }
 
 impl KafkaConnector {
-    pub fn new(
-        config: KafkaConnectorConfig,
-        definitions: Vec<SourceDefinition>,
-        _required_columns_by_source: HashMap<String, Arc<[bool]>>,
-    ) -> Result<Self> {
+    pub fn new(config: KafkaConnectorConfig, definitions: Vec<SourceDefinition>) -> Result<Self> {
         ensure!(
             !config.brokers.trim().is_empty(),
             "kafka brokers must not be empty"
@@ -128,7 +124,7 @@ impl KafkaConnector {
     }
 
     pub async fn run(config: KafkaConnectorConfig, sender: AppendIngestEventSender) -> Result<()> {
-        let mut connector = KafkaConnector::new(config, Vec::new(), HashMap::new())?;
+        let mut connector = KafkaConnector::new(config, Vec::new())?;
         let ctx = ConnectorContext::new(sender);
         run_connector(&mut connector, &ctx, CancellationToken::new()).await
     }
@@ -136,7 +132,6 @@ impl KafkaConnector {
     pub async fn replay_range(
         config: KafkaConnectorConfig,
         definitions: Vec<SourceDefinition>,
-        required_columns_by_source: HashMap<String, Arc<[bool]>>,
         range: KafkaReplayRange,
     ) -> Result<KafkaReplayBatch> {
         ensure!(
@@ -155,8 +150,7 @@ impl KafkaConnector {
         );
         let poll_timeout = config.poll_timeout.max(Duration::from_millis(100));
         let idle_timeout = Duration::from_secs(30);
-        let connector =
-            KafkaConnector::new(config.clone(), definitions, required_columns_by_source)?;
+        let connector = KafkaConnector::new(config.clone(), definitions)?;
         let mut client_config = ClientConfig::new();
         client_config
             .set("bootstrap.servers", &config.brokers)

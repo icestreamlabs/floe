@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use floe_node_core::connector::{Connector, ConnectorContext, ConnectorTick};
@@ -58,8 +57,7 @@ async fn kafka_connector_ingests_messages() {
         commit_offsets_rx: None,
         resume_from_offsets: Vec::new(),
     };
-    let mut connector =
-        KafkaConnector::new(config, Vec::new(), HashMap::new()).expect("connector config");
+    let mut connector = KafkaConnector::new(config, Vec::new()).expect("connector config");
     let ctx = ConnectorContext::new(tx);
     connector.init(&ctx).await.expect("connector init");
 

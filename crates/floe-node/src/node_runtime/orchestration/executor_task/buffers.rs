@@ -25,6 +25,7 @@ pub(super) struct ExecutorTickBuffers {
 impl ExecutorTickBuffers {
     pub(super) fn new(
         active_source_definitions_by_id: &[Option<SourceDefinition>],
+        required_columns_by_source_id: &[Option<Arc<[bool]>>],
         max_batch_per_source: usize,
         connector_count: usize,
     ) -> Self {
@@ -43,9 +44,16 @@ impl ExecutorTickBuffers {
             vectorized_source_journal_batches: Vec::new(),
             arrow_builders_by_source: active_source_definitions_by_id
                 .iter()
-                .map(|definition| {
+                .enumerate()
+                .map(|(source_id, definition)| {
                     definition.as_ref().map(|definition| {
-                        SourceArrowBatchBuilder::new(definition.clone(), max_batch_per_source)
+                        SourceArrowBatchBuilder::new_with_required_columns(
+                            definition.clone(),
+                            max_batch_per_source,
+                            required_columns_by_source_id
+                                .get(source_id)
+                                .and_then(Clone::clone),
+                        )
                     })
                 })
                 .collect(),

@@ -431,10 +431,16 @@ pub(super) async fn load_latest_kafka_checkpoint(
     let mut latest: Option<(i64, SinkCursor)> = None;
     let mut idle_polls = 0usize;
     let target_last_offset = high.saturating_sub(1);
+    let checkpoint_key = kafka_checkpoint_key(sink_name, mv_name);
     while idle_polls < 5 {
         match consumer.poll(Duration::from_millis(200)) {
             Some(Ok(message)) => {
                 idle_polls = 0;
+                if let Some(key) = message.key()
+                    && key != checkpoint_key.as_bytes()
+                {
+                    continue;
+                }
                 let payload = match message.payload() {
                     Some(payload) => payload,
                     None => continue,

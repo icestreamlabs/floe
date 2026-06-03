@@ -93,6 +93,59 @@ fn debezium_mv_sink_encoding_builds_kafka_key_and_envelope() {
 }
 
 #[test]
+fn debezium_mv_sink_encoding_preserves_diff_multiplicity() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("status", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                Some("open"),
+                Some("closed"),
+                Some("ignored"),
+            ])),
+        ],
+    )
+    .expect("record batch");
+    let changelog = MvChangelogBatch {
+        version: 42,
+        version_time: Some(1_234_000),
+        kind: MvChangelogBatchKind::Delta,
+        batch,
+        diffs: vec![2, -2, 0],
+    };
+    let rows = encode_changelog_batch_as_debezium(
+        &changelog,
+        &schema,
+        &DebeziumSinkEncoding {
+            source_name: "orders_sink".to_string(),
+            database_name: "floe".to_string(),
+            schema_name: "public".to_string(),
+            table_name: "mv_orders".to_string(),
+            key_columns: vec!["id".to_string()],
+        },
+    )
+    .expect("encode Debezium sink rows");
+
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter().map(|row| row.row_idx).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    let operations = rows
+        .iter()
+        .map(|row| {
+            let value: serde_json::Value = serde_json::from_str(&row.payload).expect("value JSON");
+            value["payload"]["op"].as_str().unwrap().to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(operations, vec!["c", "c", "d", "d"]);
+}
+
+#[test]
 fn kafka_checkpoint_selection_scans_past_unrelated_suffix_records() {
     let target_payload = serde_json::to_vec(&serde_json::json!({
         "sink": "sink_a",

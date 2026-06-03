@@ -87,16 +87,16 @@ pub(super) fn build_batches_from_arrow_snapshot(
 
         let mut columns = Vec::with_capacity(projected_indices.len());
         for source_idx in &projected_indices {
-            if Some(*source_idx) == mv_version_index {
-                columns.push(Arc::new(UInt64Array::from_value(mv_version, row_count)) as ArrayRef);
-            } else {
-                let Some(column) = batch.columns().get(*source_idx) else {
-                    return Err(DataFusionError::Execution(format!(
-                        "projection source column index {source_idx} out of bounds for Arrow snapshot"
-                    )));
-                };
+            if let Some(column) = batch.columns().get(*source_idx) {
                 columns.push(Arc::clone(column));
+                continue;
             }
+            if Some(*source_idx) != mv_version_index {
+                return Err(DataFusionError::Execution(format!(
+                    "projection source column index {source_idx} out of bounds for Arrow snapshot"
+                )));
+            }
+            columns.push(Arc::new(UInt64Array::from_value(mv_version, row_count)) as ArrayRef);
         }
         batches.push(
             RecordBatch::try_new(Arc::clone(&projected_schema), columns)

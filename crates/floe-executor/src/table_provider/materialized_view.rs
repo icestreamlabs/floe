@@ -26,6 +26,8 @@ pub struct MaterializedViewTableProvider {
     registry: Arc<MaterializedViewRegistry>,
     view_name: String,
     schema: datafusion::arrow::datatypes::SchemaRef,
+    data_schema: datafusion::arrow::datatypes::SchemaRef,
+    has_virtual_mv_version: bool,
 }
 
 impl MaterializedViewTableProvider {
@@ -34,11 +36,11 @@ impl MaterializedViewTableProvider {
         view_name: impl Into<String>,
         schema: datafusion::arrow::datatypes::SchemaRef,
     ) -> Self {
-        let include_mv_version = !schema
+        let has_virtual_mv_version = !schema
             .fields()
             .iter()
             .any(|field| field.name() == MV_VERSION_COLUMN);
-        let schema_with_meta = if include_mv_version {
+        let schema_with_meta = if has_virtual_mv_version {
             append_mv_version_field(&schema)
         } else {
             Arc::clone(&schema)
@@ -47,6 +49,8 @@ impl MaterializedViewTableProvider {
             registry,
             view_name: view_name.into(),
             schema: schema_with_meta,
+            data_schema: schema,
+            has_virtual_mv_version,
         }
     }
 
@@ -62,10 +66,14 @@ impl MaterializedViewTableProvider {
         let (projected_schema, projected_indices) =
             super::helpers::project_schema(&self.schema, projection)?;
         let mv_version_index = self
-            .schema
-            .fields()
-            .iter()
-            .position(|field| field.name() == MV_VERSION_COLUMN);
+            .has_virtual_mv_version
+            .then(|| {
+                self.schema
+                    .fields()
+                    .iter()
+                    .position(|field| field.name() == MV_VERSION_COLUMN)
+            })
+            .flatten();
         let fast_count_eligible = projected_indices.is_empty()
             || mv_version_index.is_some_and(|index| {
                 !projected_indices.is_empty() && projected_indices.iter().all(|idx| *idx == index)
@@ -192,17 +200,7 @@ impl MaterializedViewTableProvider {
     }
 
     fn data_schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        let fields = self
-            .schema
-            .fields()
-            .iter()
-            .filter(|field| field.name() != MV_VERSION_COLUMN)
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>();
-        Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(
-            fields,
-            self.schema.metadata().clone(),
-        ))
+        Arc::clone(&self.data_schema)
     }
 
     fn fast_count_batches(
@@ -275,6 +273,12 @@ impl TableProvider for MaterializedViewTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
+        if !self.has_virtual_mv_version {
+            return Ok(filters
+                .iter()
+                .map(|_| TableProviderFilterPushDown::Unsupported)
+                .collect());
+        }
         let mut pushed_version = None;
         let mut pushdown = Vec::with_capacity(filters.len());
         for expr in filters {
@@ -301,7 +305,11 @@ impl TableProvider for MaterializedViewTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (as_of_version, _passthrough_filters) = extract_mv_version_filter(filters);
+        let (as_of_version, _passthrough_filters) = if self.has_virtual_mv_version {
+            extract_mv_version_filter(filters)
+        } else {
+            (None, Vec::new())
+        };
         let (projected_schema, batches) =
             self.build_batches(as_of_version, projection, limit).await?;
         Ok(Arc::new(SnapshotScanExec::new(projected_schema, batches)))

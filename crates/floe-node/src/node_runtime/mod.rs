@@ -11,10 +11,10 @@ use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchemaRef;
-use dbsp::CompactionSchedulerConfig;
 use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::{KeyValueTable, SlateTable};
+use dbsp::{CircuitPlan, CompactionSchedulerConfig};
 use floe_cdc::CdcTableStore;
 use floe_cdc_core::{
     CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, ChangeBatch,
@@ -53,8 +53,8 @@ use floe_executor::{
     GraphTaskError, MaterializedViewRegistry, MaterializedViewTableProvider,
     MvFlushCoalescingConfig, OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig,
     SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
-    VectorizedMaterializedViewPlan, source_batch_journal_root_sources_with_config,
-    validate_dbsp_plan, weighted_batch_from_diffs,
+    VectorizedMaterializedViewPlan, plan_source_requirements,
+    source_batch_journal_root_sources_with_config, validate_dbsp_plan, weighted_batch_from_diffs,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};

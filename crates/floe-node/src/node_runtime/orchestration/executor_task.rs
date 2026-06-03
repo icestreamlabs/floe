@@ -39,6 +39,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
     } = runtime;
     let ExecutorSourceContext {
         active_source_definitions_by_id,
+        required_columns_by_source_id,
         materialized_source_ids,
         source_names_by_id,
         source_id_by_name,
@@ -82,6 +83,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
     let cdc_stateful_table_ids_by_source_id_for_task =
         Arc::clone(&cdc_stateful_table_ids_by_source_id);
     let active_source_definitions_by_id_for_task = Arc::clone(&active_source_definitions_by_id);
+    let required_columns_by_source_id_for_task = Arc::clone(&required_columns_by_source_id);
     let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
     let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
     let watermark_for_task = Arc::clone(&event_watermark);
@@ -116,6 +118,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         let mut first_tick_commit_logged = false;
         let mut tick_buffers = ExecutorTickBuffers::new(
             active_source_definitions_by_id_for_task.as_slice(),
+            required_columns_by_source_id_for_task.as_slice(),
             max_batch_per_source,
             connector_queues.len(),
         );

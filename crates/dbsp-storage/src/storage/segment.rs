@@ -9,9 +9,9 @@ use arrow_schema::SchemaRef;
 use rkyv::{Archive, Deserialize, Serialize};
 use slatedb::config::ScanOptions;
 
-use crate::storage::KeyValueTable;
 use crate::storage::encoding;
 use crate::storage::keyspace;
+use crate::storage::{KeyValueTable, prefix_bounds};
 
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub struct SegmentMetadata {
@@ -183,16 +183,20 @@ impl ArrowSegmentStore {
     }
 
     pub async fn list_segment_ids(&self) -> Result<Vec<u64>> {
-        let entries = self
-            .table
-            .scan_prefix(&self.segment_prefix, &ScanOptions::default())
+        let mut segment_ids = Vec::new();
+        let mut visit_entry = |key: &[u8], _value: &[u8]| -> Result<()> {
+            segment_ids.push(self.segment_id_from_key(key)?);
+            Ok(())
+        };
+        self.table
+            .scan_range_bytes_for_each(
+                prefix_bounds(&self.segment_prefix),
+                &ScanOptions::default(),
+                &mut visit_entry,
+            )
             .await
             .context("scan Arrow segment prefix")?;
-
-        entries
-            .into_iter()
-            .map(|(key, _)| self.segment_id_from_key(&key))
-            .collect()
+        Ok(segment_ids)
     }
 
     pub fn key_for_segment(&self, segment_id: u64) -> Vec<u8> {

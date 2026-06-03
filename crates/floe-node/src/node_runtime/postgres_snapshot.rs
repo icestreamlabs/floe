@@ -138,7 +138,9 @@ mod tests;
 pub(super) use self::commit_utils::wait_for_postgres_cdc_commit;
 pub(super) use self::publication::ensure_postgres_cdc_publication_and_slot;
 pub(super) use self::schema::discover_postgres_cdc_table_schema;
-pub(super) use self::snapshot_load::run_initial_postgres_snapshot_if_needed;
+pub(super) use self::snapshot_load::{
+    InitialPostgresSnapshotConfig, run_initial_postgres_snapshot_if_needed,
+};
 
 use self::commit_utils::*;
 use self::schema::*;

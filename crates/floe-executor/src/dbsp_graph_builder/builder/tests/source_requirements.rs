@@ -149,40 +149,29 @@ async fn q4_join_aggregate_shape_is_source_batch_journal_eligible() {
 }
 
 #[tokio::test]
-async fn q4_plan_source_requirements_prune_unused_source_columns() {
-    let logical = sql_plan_with_auction_and_bid(
-        "SELECT category, AVG(max) \
+async fn nexmark_plan_source_requirements_prune_unused_source_columns() {
+    let cases = vec![
+        (
+            "q4",
+            "SELECT category, AVG(max) \
              FROM (SELECT MAX(b.price) AS max, a.category \
                    FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
                    WHERE b.date_time BETWEEN a.date_time AND a.expires \
                    GROUP BY a.id, a.category) per_auction \
              GROUP BY category",
-    )
-    .await;
-    let planner = DbspPlanBuilder::new(nexmark_config());
-    let plan = planner.build(&logical).expect("circuit plan");
-
-    let requirements = plan_source_requirements(&plan)
-        .expect("source requirements")
-        .expect("source requirements");
-    assert_eq!(
-        requirements,
-        vec![
-            PlanSourceRequirements {
-                source_name: "nexmark_auction".to_string(),
-                required_columns: vec![0, 6, 7, 8],
-            },
-            PlanSourceRequirements {
-                source_name: "nexmark_bid".to_string(),
-                required_columns: vec![0, 2],
-            },
-        ]
-    );
-}
-
-#[tokio::test]
-async fn q16_plan_source_requirements_prune_unused_source_columns() {
-    let logical = sql_plan_with_auction_and_bid(
+            vec![
+                PlanSourceRequirements {
+                    source_name: "nexmark_auction".to_string(),
+                    required_columns: vec![0, 6, 7, 8],
+                },
+                PlanSourceRequirements {
+                    source_name: "nexmark_bid".to_string(),
+                    required_columns: vec![0, 2],
+                },
+            ],
+        ),
+        (
+            "q16",
             "SELECT channel, DATE_FORMAT(date_time, 'yyyy-MM-dd') AS day, \
                     MAX(DATE_FORMAT(date_time, 'HH:mm')) AS minute, \
                     COUNT(*) AS total_bids, \
@@ -199,113 +188,64 @@ async fn q16_plan_source_requirements_prune_unused_source_columns() {
                     COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions \
              FROM nexmark_bid \
              GROUP BY channel, DATE_FORMAT(date_time, 'yyyy-MM-dd')",
-        )
-        .await;
-    let planner = DbspPlanBuilder::new(nexmark_config());
-    let plan = planner.build(&logical).expect("circuit plan");
-
-    let requirements = plan_source_requirements(&plan)
-        .expect("source requirements")
-        .expect("source requirements");
-    assert_eq!(
-        requirements,
-        vec![PlanSourceRequirements {
-            source_name: "nexmark_bid".to_string(),
-            required_columns: vec![0, 1, 2, 3, 5],
-        }]
-    );
-}
-
-#[tokio::test]
-async fn q5_plan_source_requirements_prune_unused_source_columns() {
-    let logical = sql_plan_with_auction_and_bid(
-        "SELECT auction, COUNT(*) AS num \
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![0, 1, 2, 3, 5],
+            }],
+        ),
+        (
+            "q5",
+            "SELECT auction, COUNT(*) AS num \
              FROM nexmark_bid \
              GROUP BY auction, HOP(date_time, 2000, 10000)",
-    )
-    .await;
-    let planner = DbspPlanBuilder::new(nexmark_config());
-    let plan = planner.build(&logical).expect("circuit plan");
-
-    let requirements = plan_source_requirements(&plan)
-        .expect("source requirements")
-        .expect("source requirements");
-    assert_eq!(
-        requirements,
-        vec![PlanSourceRequirements {
-            source_name: "nexmark_bid".to_string(),
-            required_columns: vec![0, 5],
-        }]
-    );
-}
-
-#[tokio::test]
-async fn q7_plan_source_requirements_prune_unused_source_columns() {
-    let logical = sql_plan_with_auction_and_bid(
-        "SELECT MAX(price) AS maxprice \
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![0, 5],
+            }],
+        ),
+        (
+            "q7",
+            "SELECT MAX(price) AS maxprice \
              FROM nexmark_bid \
              GROUP BY TUMBLE(date_time, 10000)",
-    )
-    .await;
-    let planner = DbspPlanBuilder::new(nexmark_config());
-    let plan = planner.build(&logical).expect("circuit plan");
-
-    let requirements = plan_source_requirements(&plan)
-        .expect("source requirements")
-        .expect("source requirements");
-    assert_eq!(
-        requirements,
-        vec![PlanSourceRequirements {
-            source_name: "nexmark_bid".to_string(),
-            required_columns: vec![2, 5],
-        }]
-    );
-}
-
-#[tokio::test]
-async fn q12_plan_source_requirements_prune_unused_source_columns() {
-    let logical = sql_plan_with_auction_and_bid(
-        "SELECT bidder, COUNT(*) AS bid_count \
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![2, 5],
+            }],
+        ),
+        (
+            "q12",
+            "SELECT bidder, COUNT(*) AS bid_count \
              FROM nexmark_bid \
              GROUP BY bidder, TUMBLE(date_time, 10000)",
-    )
-    .await;
-    let planner = DbspPlanBuilder::new(nexmark_config());
-    let plan = planner.build(&logical).expect("circuit plan");
-
-    let requirements = plan_source_requirements(&plan)
-        .expect("source requirements")
-        .expect("source requirements");
-    assert_eq!(
-        requirements,
-        vec![PlanSourceRequirements {
-            source_name: "nexmark_bid".to_string(),
-            required_columns: vec![1, 5],
-        }]
-    );
-}
-
-#[tokio::test]
-async fn session_window_plan_source_requirements_prune_unused_source_columns() {
-    let logical = sql_plan_with_auction_and_bid(
-        "SELECT bidder, COUNT(*) AS bid_count \
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![1, 5],
+            }],
+        ),
+        (
+            "session_window",
+            "SELECT bidder, COUNT(*) AS bid_count \
              FROM nexmark_bid \
              GROUP BY bidder, SESSION(date_time, 10000)",
-    )
-    .await;
+            vec![PlanSourceRequirements {
+                source_name: "nexmark_bid".to_string(),
+                required_columns: vec![1, 5],
+            }],
+        ),
+    ];
     let planner = DbspPlanBuilder::new(nexmark_config());
-    let plan = planner.build(&logical).expect("circuit plan");
 
-    let requirements = plan_source_requirements(&plan)
-        .expect("source requirements")
-        .expect("source requirements");
-    assert_eq!(
-        requirements,
-        vec![PlanSourceRequirements {
-            source_name: "nexmark_bid".to_string(),
-            required_columns: vec![1, 5],
-        }]
-    );
+    for (case_name, sql, expected) in cases {
+        let logical = sql_plan_with_auction_and_bid(sql).await;
+        let plan = planner
+            .build(&logical)
+            .unwrap_or_else(|err| panic!("{case_name}: circuit plan: {err}"));
+        let requirements = plan_source_requirements(&plan)
+            .unwrap_or_else(|err| panic!("{case_name}: source requirements: {err}"))
+            .unwrap_or_else(|| panic!("{case_name}: source requirements unavailable"));
+        assert_eq!(requirements, expected, "{case_name}");
+    }
 }
 
 #[tokio::test]

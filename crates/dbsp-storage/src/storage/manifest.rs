@@ -205,33 +205,35 @@ where
     }
 
     pub async fn latest_manifest(&self) -> Result<Option<M>> {
-        let entries = self
-            .table
-            .scan_range_bytes(
-                prefix_bounds(&self.manifest_prefix),
-                &ScanOptions::default(),
-            )
-            .await
-            .context("scan manifest prefix for latest manifest")?;
-
         let mut latest_version = None;
-        let mut latest_manifest = None;
-
-        for (key, bytes) in entries {
-            let version = self.version_from_key(&key)?;
+        let mut latest_bytes = None;
+        let mut visit_entry = |key: &[u8], bytes: &[u8]| -> Result<()> {
+            let version = self.version_from_key(key)?;
             if latest_version
                 .map(|current| version >= current)
                 .unwrap_or(true)
             {
                 latest_version = Some(version);
-                latest_manifest = Some(
-                    encoding::decode::<M>(bytes.as_ref())
-                        .with_context(|| format!("decode manifest version {version}"))?,
-                );
+                latest_bytes = Some(bytes.to_vec());
             }
-        }
+            Ok(())
+        };
+        self.table
+            .scan_range_bytes_for_each(
+                prefix_bounds(&self.manifest_prefix),
+                &ScanOptions::default(),
+                &mut visit_entry,
+            )
+            .await
+            .context("scan manifest prefix for latest manifest")?;
 
-        Ok(latest_manifest)
+        latest_bytes
+            .map(|bytes| {
+                let version = latest_version.unwrap_or_default();
+                encoding::decode::<M>(bytes.as_slice())
+                    .with_context(|| format!("decode manifest version {version}"))
+            })
+            .transpose()
     }
 
     pub fn key_for_version(&self, version: u64) -> Vec<u8> {

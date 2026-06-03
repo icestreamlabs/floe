@@ -596,48 +596,57 @@ fn encode_changelog_batch_as_debezium(
     let transaction_id =
         CdcTransactionId::new(format!("mv-{}-{}", config.table_name, batch.version))?;
     let mut rows = Vec::with_capacity(batch.batch.num_rows());
+    let mut output_row_idx = 0_u64;
     for row_idx in 0..batch.batch.num_rows() {
         let row = cdc_row_from_changelog_batch(batch, row_idx, &cdc_schema)?;
-        let op = batch.diffs.get(row_idx).copied().unwrap_or(1);
-        let change = if op < 0 {
-            CdcChange::Delete {
-                key: None,
-                before: Some(row),
-            }
-        } else {
-            CdcChange::Insert { row }
-        };
-        let records = encode_debezium_change(
-            &cdc_schema,
-            &change,
-            &envelope_config,
-            DebeziumEncodeContext {
-                source_position: Some(&source_position),
-                transaction_id: Some(&transaction_id),
-                sequence: Some(u64::try_from(row_idx).unwrap_or(u64::MAX)),
-                ts_ms: changelog_batch_time_ms(batch),
-            },
-        )?;
-        for record in records {
-            let Some(value_bytes) = record.value_json_bytes()? else {
-                continue;
+        let diff = batch.diffs.get(row_idx).copied().unwrap_or(1);
+        if diff == 0 {
+            continue;
+        }
+        let repeat_count = usize::try_from(diff.unsigned_abs())
+            .context("Debezium sink diff magnitude exceeds usize")?;
+        for _ in 0..repeat_count {
+            let change = if diff < 0 {
+                CdcChange::Delete {
+                    key: None,
+                    before: Some(row.clone()),
+                }
+            } else {
+                CdcChange::Insert { row: row.clone() }
             };
-            let key = record
-                .key_json_bytes()?
-                .map(String::from_utf8)
-                .transpose()
-                .context("Debezium Kafka key must be UTF-8 JSON")?;
-            let payload = String::from_utf8(value_bytes)
-                .context("Debezium Kafka value must be UTF-8 JSON")?;
-            let byte_len = payload.len() + key.as_ref().map(String::len).unwrap_or(0);
-            rows.push(SinkRecord {
-                version: batch.version,
-                row_idx: u64::try_from(row_idx).unwrap_or(u64::MAX),
-                key,
-                json: record.value().cloned().unwrap_or(serde_json::Value::Null),
-                byte_len,
-                payload,
-            });
+            let records = encode_debezium_change(
+                &cdc_schema,
+                &change,
+                &envelope_config,
+                DebeziumEncodeContext {
+                    source_position: Some(&source_position),
+                    transaction_id: Some(&transaction_id),
+                    sequence: Some(output_row_idx),
+                    ts_ms: changelog_batch_time_ms(batch),
+                },
+            )?;
+            for record in records {
+                let Some(value_bytes) = record.value_json_bytes()? else {
+                    continue;
+                };
+                let key = record
+                    .key_json_bytes()?
+                    .map(String::from_utf8)
+                    .transpose()
+                    .context("Debezium Kafka key must be UTF-8 JSON")?;
+                let payload = String::from_utf8(value_bytes)
+                    .context("Debezium Kafka value must be UTF-8 JSON")?;
+                let byte_len = payload.len() + key.as_ref().map(String::len).unwrap_or(0);
+                rows.push(SinkRecord {
+                    version: batch.version,
+                    row_idx: output_row_idx,
+                    key,
+                    json: record.value().cloned().unwrap_or(serde_json::Value::Null),
+                    byte_len,
+                    payload,
+                });
+            }
+            output_row_idx = output_row_idx.saturating_add(1);
         }
     }
     Ok(rows)
