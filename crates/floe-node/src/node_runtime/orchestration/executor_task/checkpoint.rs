@@ -319,18 +319,27 @@ pub(super) fn build_source_journal_batches(
 pub(super) async fn apply_decoded_source_batches(
     runtime: &mut VectorizedExecutionRuntime,
     source_names_by_id: &[String],
+    execution_arrow_batches_by_source: &[Vec<RecordBatch>],
     arrow_batches_by_source: &[Vec<RecordBatch>],
     weighted_arrow_batches_by_source: &[Vec<RecordBatch>],
     commit_acks_by_source: &mut [Vec<core_source::CommitAck>],
 ) -> anyhow::Result<bool> {
     let mut changed = false;
-    for (source_id, batches) in arrow_batches_by_source.iter().enumerate() {
+    for (source_id, batches) in execution_arrow_batches_by_source.iter().enumerate() {
         let source_name = source_names_by_id[source_id].as_str();
         if batches.is_empty() {
             continue;
         }
+        let query_batches = arrow_batches_by_source
+            .get(source_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         if let Err(err) = runtime
-            .append_source_batches(source_name, batches.clone())
+            .append_source_batches_for_execution_and_query(
+                source_name,
+                batches.clone(),
+                query_batches.to_vec(),
+            )
             .await
         {
             let message =
@@ -464,6 +473,31 @@ pub(super) struct FinalCheckpoint<'a> {
     pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
     pub(super) outer_registry: &'a Arc<Mutex<OuterStreamRegistry>>,
     pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
+}
+
+pub(super) struct PersistExecutorFinalCheckpoint<'a> {
+    pub(super) checkpoint_manager: &'a mut CheckpointManager,
+    pub(super) watermark: &'a AtomicI64,
+    pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
+    pub(super) outer_registry: &'a Arc<Mutex<OuterStreamRegistry>>,
+    pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
+}
+
+pub(super) async fn persist_executor_final_checkpoint(args: PersistExecutorFinalCheckpoint<'_>) {
+    let final_frontier = args
+        .watermark
+        .load(Ordering::Relaxed)
+        .max(0)
+        .try_into()
+        .unwrap_or(0_u64);
+    persist_final_checkpoint_unless_failed(FinalCheckpoint {
+        checkpoint_manager: args.checkpoint_manager,
+        final_frontier,
+        mv_registry: args.mv_registry,
+        outer_registry: args.outer_registry,
+        runtime_failure: args.runtime_failure,
+    })
+    .await;
 }
 
 pub(super) async fn persist_final_checkpoint_unless_failed(args: FinalCheckpoint<'_>) {

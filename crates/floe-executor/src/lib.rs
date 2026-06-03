@@ -43,7 +43,9 @@ pub use mv::runtime::MaterializedView;
 pub use mv_loader::load_or_register_mv;
 pub use operator_state::OperatorStateHandle;
 pub use outer_stream::OuterStreamRegistry;
-pub use source_decoder::{SourceArrowBatchBuilder, SourceRowDecoder};
+pub use source_decoder::{
+    SourceArrowBatchBuilder, SourceRowDecoder, mask_arrow_batch_for_required_columns,
+};
 pub use stream_types::{Diff, Timestamp};
 pub use subscribe::SubscribeExecutionConfig;
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};

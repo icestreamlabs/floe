@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static KAFKA_SINK_FLUSH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 const KAFKA_SINK_FLUSH_LOG_EVERY: u64 = 256;
 const KAFKA_NON_TX_IN_FLIGHT_LIMIT: usize = 1024;
+const KAFKA_CHECKPOINT_RECOVERY_BACKSCAN_RECORDS: i64 = 4096;
 
 #[derive(Clone)]
 pub(super) struct KafkaEosConfig {
@@ -308,17 +309,9 @@ async fn send_kafka_transactional_batch_with_retry(
             continue;
         }
 
-        let mut step_error: Option<anyhow::Error> = None;
-        for row in batch.rows {
-            let record = kafka_record(batch.topic, row);
-            if let Err((err, _message)) = batch.producer.send(record, Duration::from_secs(0)).await
-            {
-                step_error = Some(anyhow!(
-                    "kafka sink transactional row publish failed: {err}"
-                ));
-                break;
-            }
-        }
+        let mut step_error = send_kafka_transactional_rows(batch.producer, batch.topic, batch.rows)
+            .await
+            .err();
 
         if step_error.is_none() {
             let checkpoint = KafkaSinkCheckpointRecord {
@@ -382,6 +375,43 @@ async fn send_kafka_transactional_batch_with_retry(
     unreachable!("transaction retry loop should return or fail");
 }
 
+async fn send_kafka_transactional_rows(
+    producer: &FutureProducer,
+    topic: &str,
+    rows: &[SinkRecord],
+) -> Result<()> {
+    for chunk in rows.chunks(KAFKA_NON_TX_IN_FLIGHT_LIMIT) {
+        let mut deliveries = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            let record = kafka_record(topic, row);
+            match producer.send_result(record) {
+                Ok(delivery) => deliveries.push(delivery),
+                Err((err, _message)) => {
+                    return Err(anyhow!(
+                        "kafka sink transactional row enqueue failed: {err}"
+                    ));
+                }
+            }
+        }
+        for delivery in join_all(deliveries).await {
+            match delivery {
+                Ok(Ok(_)) => {}
+                Ok(Err((err, _message))) => {
+                    return Err(anyhow!(
+                        "kafka sink transactional row publish failed: {err}"
+                    ));
+                }
+                Err(err) => {
+                    return Err(anyhow!(
+                        "kafka sink transactional row delivery future was canceled: {err}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn load_latest_kafka_checkpoint(
     brokers: &str,
     eos: &KafkaEosConfig,
@@ -412,11 +442,53 @@ pub(super) async fn load_latest_kafka_checkpoint(
         return Ok(None);
     }
 
+    let checkpoint_key = kafka_checkpoint_key(sink_name, mv_name);
+    let tail_start = high
+        .saturating_sub(KAFKA_CHECKPOINT_RECOVERY_BACKSCAN_RECORDS)
+        .max(low);
+    if let Some(cursor) = scan_kafka_checkpoint_range(
+        &consumer,
+        eos,
+        tail_start,
+        high,
+        &checkpoint_key,
+        sink_name,
+        mv_name,
+    )? {
+        return Ok(Some(cursor));
+    }
+    if tail_start <= low {
+        return Ok(None);
+    }
+    scan_kafka_checkpoint_range(
+        &consumer,
+        eos,
+        low,
+        tail_start,
+        &checkpoint_key,
+        sink_name,
+        mv_name,
+    )
+}
+
+fn scan_kafka_checkpoint_range(
+    consumer: &BaseConsumer,
+    eos: &KafkaEosConfig,
+    start_offset: i64,
+    high_watermark: i64,
+    checkpoint_key: &str,
+    sink_name: &str,
+    mv_name: &str,
+) -> Result<Option<SinkCursor>> {
+    if high_watermark <= start_offset {
+        return Ok(None);
+    }
+
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(
         &eos.checkpoint_topic,
         eos.checkpoint_partition,
-        Offset::Offset(low),
+        Offset::Offset(start_offset),
     )
     .with_context(|| {
         format!(
@@ -430,8 +502,7 @@ pub(super) async fn load_latest_kafka_checkpoint(
 
     let mut latest: Option<(i64, SinkCursor)> = None;
     let mut idle_polls = 0usize;
-    let target_last_offset = high.saturating_sub(1);
-    let checkpoint_key = kafka_checkpoint_key(sink_name, mv_name);
+    let target_last_offset = high_watermark.saturating_sub(1);
     while idle_polls < 5 {
         match consumer.poll(Duration::from_millis(200)) {
             Some(Ok(message)) => {

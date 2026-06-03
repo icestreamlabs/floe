@@ -53,12 +53,9 @@ pub(super) fn build_batches_from_arrow_snapshot(
     projection: Option<&Vec<usize>>,
     limit: Option<usize>,
     mv_version: u64,
+    virtual_mv_version_index: Option<usize>,
 ) -> DFResult<(SchemaRef, Vec<RecordBatch>)> {
     let (projected_schema, projected_indices) = project_schema(&schema, projection)?;
-    let mv_version_index = schema
-        .fields()
-        .iter()
-        .position(|field| field.name() == MV_VERSION_COLUMN);
     let zero_column_projection = projected_indices.is_empty();
     let mut batches = Vec::new();
     let mut total_rows = 0usize;
@@ -91,7 +88,7 @@ pub(super) fn build_batches_from_arrow_snapshot(
                 columns.push(Arc::clone(column));
                 continue;
             }
-            if Some(*source_idx) != mv_version_index {
+            if Some(*source_idx) != virtual_mv_version_index {
                 return Err(DataFusionError::Execution(format!(
                     "projection source column index {source_idx} out of bounds for Arrow snapshot"
                 )));

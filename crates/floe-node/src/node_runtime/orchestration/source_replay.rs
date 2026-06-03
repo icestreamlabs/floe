@@ -59,7 +59,6 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
         run_args,
         definitions,
         source_id_by_name,
-        required_columns_by_source_id,
     } = config;
     let raw_entries = if raw_journal_sources.is_empty() {
         Vec::new()
@@ -76,70 +75,71 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
             .await?
     };
 
-    let mut raw_entry_by_tick_and_source = BTreeMap::new();
+    let mut entries_by_tick = BTreeMap::<u64, ReplayTickEntries>::new();
     for entry in raw_entries {
-        raw_entry_by_tick_and_source.insert((entry.tick_id, entry.source.clone()), entry);
+        entries_by_tick
+            .entry(entry.tick_id)
+            .or_default()
+            .raw
+            .push(entry);
     }
-    let mut kafka_entry_by_tick_and_source = BTreeMap::new();
     for entry in kafka_entries {
-        kafka_entry_by_tick_and_source.insert((entry.tick_id, entry.source.clone()), entry);
+        entries_by_tick
+            .entry(entry.tick_id)
+            .or_default()
+            .kafka
+            .push(entry);
+    }
+    for entries in entries_by_tick.values_mut() {
+        entries
+            .raw
+            .sort_by(|left, right| left.source.cmp(&right.source));
+        entries
+            .kafka
+            .sort_by(|left, right| left.source.cmp(&right.source));
     }
 
-    let replay_sources: BTreeSet<String> = raw_journal_sources
-        .union(kafka_metadata_sources)
-        .cloned()
-        .collect();
     let mut replayed_raw = 0usize;
     let mut replayed_kafka = 0usize;
-    for tick_id in 1..=max_tick_id {
+    for (tick_id, entries) in entries_by_tick {
         let mut tick_changed = false;
-        for source in &replay_sources {
-            if raw_journal_sources.contains(source) {
-                let Some(entry) = raw_entry_by_tick_and_source.remove(&(tick_id, source.clone()))
-                else {
-                    continue;
-                };
-                replayed_raw = replayed_raw.saturating_add(1);
-                for batch in entry.batches {
-                    vectorized_runtime
-                        .apply_weighted_source_delta(&entry.source, batch)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "replay vectorized source journal for '{}' at tick {}",
-                                entry.source, tick_id
-                            )
-                        })?;
-                    tick_changed = true;
-                }
-            } else if kafka_metadata_sources.contains(source) {
-                let Some(entry) = kafka_entry_by_tick_and_source.remove(&(tick_id, source.clone()))
-                else {
-                    continue;
-                };
-                replayed_kafka = replayed_kafka.saturating_add(1);
-                let replayed_batches =
-                    replay_kafka_source_journal_entry_as_arrow(KafkaSourceJournalReplayConfig {
-                        entry,
-                        connector_specs,
-                        run_args,
-                        definitions,
-                        source_id_by_name,
-                        required_columns_by_source_id,
-                    })
-                    .await?;
-                for (source_name, batch) in replayed_batches {
-                    vectorized_runtime
-                        .apply_weighted_source_delta(&source_name, batch)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "replay kafka metadata journal into vectorized source '{}' at tick {}",
-                                source_name, tick_id
-                            )
-                        })?;
-                    tick_changed = true;
-                }
+        for entry in entries.raw {
+            replayed_raw = replayed_raw.saturating_add(1);
+            for batch in entry.batches {
+                vectorized_runtime
+                    .apply_weighted_source_delta(&entry.source, batch)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "replay vectorized source journal for '{}' at tick {}",
+                            entry.source, tick_id
+                        )
+                    })?;
+                tick_changed = true;
+            }
+        }
+        for entry in entries.kafka {
+            replayed_kafka = replayed_kafka.saturating_add(1);
+            let replayed_batches =
+                replay_kafka_source_journal_entry_as_arrow(KafkaSourceJournalReplayConfig {
+                    entry,
+                    connector_specs,
+                    run_args,
+                    definitions,
+                    source_id_by_name,
+                })
+                .await?;
+            for (source_name, batch) in replayed_batches {
+                vectorized_runtime
+                    .apply_weighted_source_delta(&source_name, batch)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "replay kafka metadata journal into vectorized source '{}' at tick {}",
+                            source_name, tick_id
+                        )
+                    })?;
+                tick_changed = true;
             }
         }
         if tick_changed {
@@ -150,6 +150,12 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
         }
     }
     Ok((replayed_raw, replayed_kafka))
+}
+
+#[derive(Default)]
+struct ReplayTickEntries {
+    raw: Vec<floe_executor::source_journal::VectorizedSourceBatchJournalEntry>,
+    kafka: Vec<floe_executor::source_journal::KafkaSourceJournalEntry>,
 }
 
 pub(super) struct ReplayCommittedVectorizedSourceJournalConfig<'a> {
@@ -163,7 +169,6 @@ pub(super) struct ReplayCommittedVectorizedSourceJournalConfig<'a> {
     pub(super) run_args: &'a cli::RunArgs,
     pub(super) definitions: &'a [SourceDefinition],
     pub(super) source_id_by_name: &'a HashMap<String, usize>,
-    pub(super) required_columns_by_source_id: &'a [Option<Arc<[bool]>>],
 }
 
 struct KafkaSourceJournalReplayConfig<'a> {
@@ -172,7 +177,6 @@ struct KafkaSourceJournalReplayConfig<'a> {
     run_args: &'a cli::RunArgs,
     definitions: &'a [SourceDefinition],
     source_id_by_name: &'a HashMap<String, usize>,
-    required_columns_by_source_id: &'a [Option<Arc<[bool]>>],
 }
 
 async fn replay_kafka_source_journal_entry_as_arrow(
@@ -184,7 +188,6 @@ async fn replay_kafka_source_journal_entry_as_arrow(
         run_args,
         definitions,
         source_id_by_name,
-        required_columns_by_source_id,
     } = config;
     let mut batches = Vec::new();
     for range in entry.ranges {
@@ -220,13 +223,8 @@ async fn replay_kafka_source_journal_entry_as_arrow(
             .get(source_id)
             .cloned()
             .ok_or_else(|| anyhow!("missing source definition for '{}'", entry.source))?;
-        let mut builder = SourceArrowBatchBuilder::new_with_required_columns(
-            definition.clone(),
-            replayed.events.len().max(1),
-            required_columns_by_source_id
-                .get(source_id)
-                .and_then(Clone::clone),
-        );
+        let mut builder =
+            SourceArrowBatchBuilder::new(definition.clone(), replayed.events.len().max(1));
         let mut row_count = 0u64;
         let mut checksum = kafka_source_journal_initial_checksum();
         for event in replayed.events {

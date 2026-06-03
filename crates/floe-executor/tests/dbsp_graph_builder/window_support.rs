@@ -208,7 +208,7 @@ pub(super) async fn build_window_plan_rows_with_durable_source(
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan,

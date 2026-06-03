@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, Int64Array};
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::catalog::TableProvider;
-use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
@@ -20,6 +21,8 @@ use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::DynamicStateTableProvider;
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
+const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
+const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct VectorizedMaterializedViewPlan {
@@ -46,8 +49,10 @@ impl VectorizedMaterializedViewPlan {
 struct VectorizedSourceState {
     schema: SchemaRef,
     provider: Arc<DynamicStateTableProvider>,
+    query_provider: Arc<DynamicStateTableProvider>,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
+    query_alias_provider: Option<Arc<DynamicStateTableProvider>>,
     primary_key_columns: Vec<String>,
 }
 
@@ -120,6 +125,7 @@ impl VectorizedExecutionRuntime {
         for definition in sources.definitions() {
             let schema = definition.to_arrow_schema();
             let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
+            let query_provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
             ctx.register_table(
                 definition.name(),
                 Arc::clone(&provider) as Arc<dyn TableProvider>,
@@ -141,14 +147,19 @@ impl VectorizedExecutionRuntime {
                 } else {
                     (None, None)
                 };
+            let query_alias_provider = alias_schema
+                .as_ref()
+                .map(|schema| Arc::new(DynamicStateTableProvider::new(Arc::clone(schema))));
 
             source_states.insert(
                 definition.name().to_string(),
                 VectorizedSourceState {
                     schema,
                     provider,
+                    query_provider,
                     alias_schema,
                     alias_provider,
+                    query_alias_provider,
                     primary_key_columns: source_primary_key_columns(definition),
                 },
             );
@@ -208,10 +219,10 @@ impl VectorizedExecutionRuntime {
         for (source_name, source) in &self.sources {
             providers.push((
                 source_name.clone(),
-                Arc::clone(&source.provider) as Arc<dyn TableProvider>,
+                Arc::clone(&source.query_provider) as Arc<dyn TableProvider>,
             ));
             if let Some(alias) = source_name.strip_prefix("nexmark_")
-                && let Some(alias_provider) = source.alias_provider.as_ref()
+                && let Some(alias_provider) = source.query_alias_provider.as_ref()
             {
                 providers.push((
                     alias.to_string(),
@@ -235,7 +246,17 @@ impl VectorizedExecutionRuntime {
         source_name: &str,
         batches: Vec<RecordBatch>,
     ) -> Result<()> {
-        if batches.is_empty() {
+        self.append_source_batches_for_execution_and_query(source_name, batches.clone(), batches)
+            .await
+    }
+
+    pub async fn append_source_batches_for_execution_and_query(
+        &mut self,
+        source_name: &str,
+        execution_batches: Vec<RecordBatch>,
+        query_batches: Vec<RecordBatch>,
+    ) -> Result<()> {
+        if execution_batches.is_empty() && query_batches.is_empty() {
             return Ok(());
         }
         let state = self
@@ -243,12 +264,12 @@ impl VectorizedExecutionRuntime {
             .get(source_name)
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
-        for batch in &batches {
+        for batch in execution_batches.iter().chain(query_batches.iter()) {
             if batch.schema().as_ref() != state.schema.as_ref() {
                 bail!("source batch schema does not match source '{source_name}'");
             }
         }
-        self.apply_insert_source_batches(source_name, &state, batches)
+        self.apply_insert_source_batches(source_name, &state, execution_batches, query_batches)
     }
 
     pub async fn apply_weighted_source_delta(
@@ -262,19 +283,34 @@ impl VectorizedExecutionRuntime {
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
         if let Some(insert_batch) = insert_only_source_delta_batch(&state, &delta)? {
-            return self.apply_insert_source_batches(source_name, &state, vec![insert_batch]);
+            return self.apply_insert_source_batches(
+                source_name,
+                &state,
+                vec![insert_batch.clone()],
+                vec![insert_batch],
+            );
         }
         self.current_insert_batches.remove(source_name);
         self.current_general_delta_sources
             .insert(source_name.to_string());
-        let next = apply_source_delta_with_datafusion(&state, delta)
+        let next = apply_source_delta(&state, &state.provider, &delta)
             .await
             .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
+        let query_next = apply_source_delta(&state, &state.query_provider, &delta)
+            .await
+            .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
         state.provider.set_batches(next.clone());
+        state.query_provider.set_batches(query_next.clone());
         if let (Some(alias_schema), Some(alias_provider)) =
             (state.alias_schema.as_ref(), state.alias_provider.as_ref())
         {
             alias_provider.set_batches(rename_batches(&next, alias_schema)?);
+        }
+        if let (Some(alias_schema), Some(alias_provider)) = (
+            state.alias_schema.as_ref(),
+            state.query_alias_provider.as_ref(),
+        ) {
+            alias_provider.set_batches(rename_batches(&query_next, alias_schema)?);
         }
         Ok(())
     }
@@ -307,22 +343,30 @@ impl VectorizedExecutionRuntime {
         &mut self,
         source_name: &str,
         state: &VectorizedSourceState,
-        batches: Vec<RecordBatch>,
+        execution_batches: Vec<RecordBatch>,
+        query_batches: Vec<RecordBatch>,
     ) -> Result<()> {
-        if batches.is_empty() {
+        if execution_batches.is_empty() && query_batches.is_empty() {
             return Ok(());
         }
-        state.provider.append_batches(batches.clone());
+        state.provider.append_batches(execution_batches.clone());
+        state.query_provider.append_batches(query_batches.clone());
         if let (Some(alias_schema), Some(alias_provider)) =
             (state.alias_schema.as_ref(), state.alias_provider.as_ref())
         {
-            alias_provider.append_batches(rename_batches(&batches, alias_schema)?);
+            alias_provider.append_batches(rename_batches(&execution_batches, alias_schema)?);
+        }
+        if let (Some(alias_schema), Some(alias_provider)) = (
+            state.alias_schema.as_ref(),
+            state.query_alias_provider.as_ref(),
+        ) {
+            alias_provider.append_batches(rename_batches(&query_batches, alias_schema)?);
         }
         if !self.current_general_delta_sources.contains(source_name) {
             self.current_insert_batches
                 .entry(source_name.to_string())
                 .or_default()
-                .extend(batches);
+                .extend(execution_batches);
         }
         Ok(())
     }
@@ -455,6 +499,7 @@ async fn run_incremental_materialized_view_tick(
         .cloned()
         .collect::<Vec<_>>();
     next_snapshot.extend(delta.iter().filter(|batch| batch.num_rows() > 0).cloned());
+    compact_incremental_snapshot_batches(&mv.output_schema, &mut next_snapshot)?;
     if next_snapshot.is_empty() {
         next_snapshot.push(RecordBatch::new_empty(Arc::clone(&mv.output_schema)));
     }
@@ -472,9 +517,45 @@ async fn run_incremental_materialized_view_tick(
     Ok(true)
 }
 
-async fn apply_source_delta_with_datafusion(
+fn compact_incremental_snapshot_batches(
+    schema: &SchemaRef,
+    batches: &mut Vec<RecordBatch>,
+) -> Result<()> {
+    if batches.len() <= INCREMENTAL_SNAPSHOT_MAX_BATCHES {
+        return Ok(());
+    }
+
+    let mut compacted = Vec::new();
+    let mut chunk = Vec::new();
+    let mut chunk_rows = 0usize;
+    for batch in batches.drain(..) {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        chunk_rows = chunk_rows.saturating_add(batch.num_rows());
+        chunk.push(batch);
+        if chunk_rows >= INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS {
+            compacted.push(concat_snapshot_chunk(schema, &chunk)?);
+            chunk.clear();
+            chunk_rows = 0;
+        }
+    }
+    if !chunk.is_empty() {
+        compacted.push(concat_snapshot_chunk(schema, &chunk)?);
+    }
+    *batches = compacted;
+    Ok(())
+}
+
+fn concat_snapshot_chunk(schema: &SchemaRef, chunk: &[RecordBatch]) -> Result<RecordBatch> {
+    let refs = chunk.iter().collect::<Vec<_>>();
+    concat_batches(schema, refs).context("compact incremental materialized view snapshot batches")
+}
+
+async fn apply_source_delta(
     state: &VectorizedSourceState,
-    delta: RecordBatch,
+    provider: &DynamicStateTableProvider,
+    delta: &RecordBatch,
 ) -> Result<Vec<RecordBatch>> {
     let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
     if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
@@ -486,57 +567,142 @@ async fn apply_source_delta_with_datafusion(
         bail!("source delta schema does not match source schema");
     }
 
-    let old_snapshot = state.provider.snapshot();
-    let ctx = SessionContext::new();
-    ctx.register_table(
-        "state",
-        Arc::new(MemTable::try_new(
-            Arc::clone(&state.schema),
-            vec![old_snapshot.iter().cloned().collect()],
-        )?),
-    )?;
-    ctx.register_table(
-        "delta",
-        Arc::new(MemTable::try_new(delta.schema(), vec![vec![delta]])?),
-    )?;
-
-    let select_state = select_list("s", &state.schema);
-    let select_delta = select_list("d", &state.schema);
-    let delete_key_columns = if state.primary_key_columns.is_empty() {
-        state
-            .schema
-            .fields()
-            .iter()
-            .map(|field| field.name().to_string())
-            .collect::<Vec<_>>()
+    let old_snapshot = provider.snapshot();
+    let delete_key_indices = delete_key_indices(state)?;
+    let delete_keys = deleted_delta_keys(&state.schema, &delete_key_indices, delta, weight_idx)?;
+    let mut next = if delete_keys.is_empty() {
+        old_snapshot.iter().cloned().collect::<Vec<_>>()
     } else {
-        state.primary_key_columns.clone()
+        filter_deleted_source_rows(
+            &state.schema,
+            &delete_key_indices,
+            &delete_keys,
+            &old_snapshot,
+        )?
     };
-    let delete_keys = delete_key_columns
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let delete_join = delete_key_columns
+    if let Some(positive_batch) = positive_delta_batch(&state.schema, delta, weight_idx)? {
+        next.push(positive_batch);
+    }
+    Ok(next)
+}
+
+fn delete_key_indices(state: &VectorizedSourceState) -> Result<Vec<usize>> {
+    if state.primary_key_columns.is_empty() {
+        return Ok((0..state.schema.fields().len()).collect());
+    }
+    state
+        .primary_key_columns
         .iter()
         .map(|column| {
-            let quoted = quote_ident(column);
-            format!("s.{quoted} = deleted.{quoted}")
+            state.schema.index_of(column).with_context(|| {
+                format!("source primary key column '{column}' missing from schema")
+            })
         })
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let sql = format!(
-        "SELECT {select_state} \
-         FROM state s \
-         LEFT ANTI JOIN (SELECT DISTINCT {delete_keys} FROM delta WHERE {weight} < 0) deleted \
-         ON {delete_join} \
-         UNION ALL \
-         SELECT {select_delta} FROM delta d WHERE d.{weight} > 0",
-        weight = quote_ident(WEIGHT_COLUMN_NAME),
-    );
+        .collect()
+}
 
-    let batches = ctx.sql(&sql).await?.collect().await?;
-    normalize_batches(batches, &state.schema)
+fn deleted_delta_keys(
+    schema: &SchemaRef,
+    key_indices: &[usize],
+    delta: &RecordBatch,
+    weight_idx: usize,
+) -> Result<HashSet<OwnedRow>> {
+    let weights = delta
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
+    let converter = key_row_converter(schema, key_indices)?;
+    let rows = converter
+        .convert_columns(&project_columns(delta, key_indices))
+        .context("encode source delete keys")?;
+    let mut keys = HashSet::new();
+    for row_idx in 0..weights.len() {
+        if !weights.is_null(row_idx) && weights.value(row_idx) < 0 {
+            keys.insert(rows.row(row_idx).owned());
+        }
+    }
+    Ok(keys)
+}
+
+fn filter_deleted_source_rows(
+    schema: &SchemaRef,
+    key_indices: &[usize],
+    delete_keys: &HashSet<OwnedRow>,
+    snapshot: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    let converter = key_row_converter(schema, key_indices)?;
+    let mut next = Vec::with_capacity(snapshot.len());
+    for batch in snapshot {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let rows = converter
+            .convert_columns(&project_columns(batch, key_indices))
+            .context("encode source state keys")?;
+        let mut keep = BooleanBuilder::with_capacity(batch.num_rows());
+        let mut kept_rows = 0usize;
+        for row_idx in 0..batch.num_rows() {
+            let keep_row = !delete_keys.contains(&rows.row(row_idx).owned());
+            if keep_row {
+                kept_rows = kept_rows.saturating_add(1);
+            }
+            keep.append_value(keep_row);
+        }
+        if kept_rows == batch.num_rows() {
+            next.push(batch.clone());
+        } else if kept_rows > 0 {
+            next.push(filter_record_batch(batch, &keep.finish())?);
+        }
+    }
+    Ok(next)
+}
+
+fn positive_delta_batch(
+    schema: &SchemaRef,
+    delta: &RecordBatch,
+    weight_idx: usize,
+) -> Result<Option<RecordBatch>> {
+    let weights = delta
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
+    let mut keep = BooleanBuilder::with_capacity(weights.len());
+    let mut kept_rows = 0usize;
+    for row_idx in 0..weights.len() {
+        let keep_row = !weights.is_null(row_idx) && weights.value(row_idx) > 0;
+        if keep_row {
+            kept_rows = kept_rows.saturating_add(1);
+        }
+        keep.append_value(keep_row);
+    }
+    if kept_rows == 0 {
+        return Ok(None);
+    }
+    let filtered = filter_record_batch(delta, &keep.finish())?;
+    let columns = filtered
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
+        .collect::<Vec<_>>();
+    Ok(Some(RecordBatch::try_new(Arc::clone(schema), columns)?))
+}
+
+fn key_row_converter(schema: &SchemaRef, key_indices: &[usize]) -> Result<RowConverter> {
+    let fields = key_indices
+        .iter()
+        .map(|idx| SortField::new(schema.field(*idx).data_type().clone()))
+        .collect::<Vec<_>>();
+    RowConverter::new(fields).context("build Arrow row converter for source keys")
+}
+
+fn project_columns(batch: &RecordBatch, indices: &[usize]) -> Vec<ArrayRef> {
+    indices
+        .iter()
+        .map(|idx| Arc::clone(batch.column(*idx)))
+        .collect()
 }
 
 fn insert_only_source_delta_batch(
@@ -633,22 +799,6 @@ pub fn weighted_batch_from_diffs(
     Ok(RecordBatch::try_new(Arc::clone(weighted_schema), columns)?)
 }
 
-fn select_list(alias: &str, schema: &SchemaRef) -> String {
-    schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let ident = quote_ident(field.name());
-            format!("{alias}.{ident} AS {ident}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn quote_ident(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
 fn incremental_source_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -734,11 +884,15 @@ mod tests {
     use datafusion::arrow::array::Int64Array;
 
     fn source_state(schema: SchemaRef) -> VectorizedSourceState {
+        let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
+        let query_provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
         VectorizedSourceState {
-            provider: Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema))),
+            provider,
+            query_provider,
             schema,
             alias_schema: None,
             alias_provider: None,
+            query_alias_provider: None,
             primary_key_columns: Vec::new(),
         }
     }

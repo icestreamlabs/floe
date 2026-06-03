@@ -102,7 +102,7 @@ async fn tumbling_window_max_recomputes_from_transient_source_journal_retraction
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build(BuildInputs {
+        .build_legacy_for_harness(BuildInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

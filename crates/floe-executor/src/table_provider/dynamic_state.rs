@@ -20,6 +20,8 @@ use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
 };
 
+const DYNAMIC_STATE_SCAN_PARTITIONS: usize = 16;
+
 #[derive(Clone)]
 pub struct DynamicStateTableProvider {
     schema: SchemaRef,
@@ -145,6 +147,7 @@ pub struct DynamicStateExec {
     schema: SchemaRef,
     state: Arc<ArcSwap<Vec<RecordBatch>>>,
     limit: Option<usize>,
+    partition_count: usize,
     cache: PlanProperties,
 }
 
@@ -165,9 +168,14 @@ impl DynamicStateExec {
         state: Arc<ArcSwap<Vec<RecordBatch>>>,
         limit: Option<usize>,
     ) -> Self {
+        let partition_count = if limit.is_some() {
+            1
+        } else {
+            DYNAMIC_STATE_SCAN_PARTITIONS
+        };
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::RoundRobinBatch(1),
+            Partitioning::UnknownPartitioning(partition_count),
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
@@ -177,6 +185,7 @@ impl DynamicStateExec {
             schema,
             state,
             limit,
+            partition_count,
             cache,
         }
     }
@@ -185,10 +194,16 @@ impl DynamicStateExec {
         self.state.load_full()
     }
 
-    fn limited_snapshot_batches(&self) -> Vec<RecordBatch> {
+    fn limited_snapshot_batches(&self, partition: usize) -> Vec<RecordBatch> {
         let snapshot = self.snapshot_batches();
         let Some(limit) = self.limit else {
-            return snapshot.iter().cloned().collect();
+            return snapshot
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, batch)| {
+                    (idx % self.partition_count == partition).then_some(batch.clone())
+                })
+                .collect();
         };
         if limit == 0 {
             return Vec::new();
@@ -211,14 +226,20 @@ impl DynamicStateExec {
         batches
     }
 
-    fn snapshot_statistics(&self) -> SnapshotStatistics {
+    fn snapshot_statistics(&self, partition: Option<usize>) -> SnapshotStatistics {
         let snapshot = self.snapshot_batches();
         let mut rows = 0usize;
         let mut bytes = 0usize;
         let mut exact_bytes = true;
         let mut remaining = self.limit.unwrap_or(usize::MAX);
 
-        for batch in snapshot.iter() {
+        for (idx, batch) in snapshot.iter().enumerate() {
+            if self.limit.is_none()
+                && let Some(partition) = partition
+                && idx % self.partition_count != partition
+            {
+                continue;
+            }
             if remaining == 0 {
                 break;
             }
@@ -255,7 +276,7 @@ impl DisplayAs for DynamicStateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "DynamicStateExec: partitions=1")
+                write!(f, "DynamicStateExec: partitions={}", self.partition_count)
             }
             DisplayFormatType::TreeRender => write!(f, ""),
         }
@@ -295,23 +316,23 @@ impl ExecutionPlan for DynamicStateExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        if partition > 0 {
+        if partition >= self.partition_count {
             return internal_err!("Invalid partition {partition} for DynamicStateExec");
         }
 
-        let batches = self.limited_snapshot_batches();
+        let batches = self.limited_snapshot_batches(partition);
         let stream = MemoryStream::try_new(batches, Arc::clone(&self.schema), None)?;
         Ok(Box::pin(stream))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Statistics> {
         if let Some(idx) = partition
-            && idx != 0
+            && idx >= self.partition_count
         {
             return internal_err!("Invalid partition index {idx} for DynamicStateExec");
         }
 
-        let stats = self.snapshot_statistics();
+        let stats = self.snapshot_statistics(partition);
         let byte_size = if stats.exact_bytes {
             Precision::Exact(stats.bytes)
         } else {

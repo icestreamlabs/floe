@@ -354,16 +354,16 @@ async fn cancelled_snapshot_before_commit_leaves_no_checkpoint_for_retry() {
     let cancel = CancellationToken::new();
     cancel.cancel();
 
-    let err = finish_loaded_postgres_snapshot(
-        "slot",
-        "publication",
-        &runtime_plan,
-        &table_store,
-        &sender,
-        Some(&mut commit_receiver),
-        &cancel,
+    let err = finish_loaded_postgres_snapshot(FinishLoadedPostgresSnapshotConfig {
+        slot: "slot",
+        publication: "publication",
+        runtime_plan: &runtime_plan,
+        table_store: &table_store,
+        sender: &sender,
+        commit_lsn_rx: Some(&mut commit_receiver),
+        cancel: &cancel,
         snapshot,
-    )
+    })
     .await
     .expect_err("cancelled snapshot should not finish");
 

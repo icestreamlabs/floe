@@ -106,6 +106,7 @@ impl MaterializedViewTableProvider {
                 projection,
                 limit,
                 version,
+                mv_version_index,
             );
         }
         if let Some((snapshot, version)) = self.load_encoded_snapshot(as_of_version, limit).await? {
@@ -115,6 +116,7 @@ impl MaterializedViewTableProvider {
                 projection,
                 limit,
                 version,
+                mv_version_index,
             );
         }
         build_batches_from_arrow_snapshot(
@@ -123,6 +125,7 @@ impl MaterializedViewTableProvider {
             projection,
             limit,
             as_of_version.unwrap_or(0),
+            mv_version_index,
         )
     }
 

@@ -92,7 +92,7 @@ impl MvTestHarness {
             mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
         let cancel = CancellationToken::new();
         graph_builder
-            .build(BuildInputs {
+            .build_legacy_for_harness(BuildInputs {
                 graph_id: view_name,
                 view_name,
                 plan: &circuit_plans[0],

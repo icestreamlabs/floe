@@ -198,7 +198,14 @@ impl DbspGraphBuilder {
         bridge.run_namespace_gc_once(namespace, policy).await
     }
 
-    pub async fn build(&mut self, inputs: BuildInputs<'_>) -> Result<BuildOutputs> {
+    /// Builds a legacy row/handle DBSP graph for integration harnesses.
+    ///
+    /// Production node execution uses the vectorized runtime path; keep this API explicit so
+    /// test-era coverage does not look like the revenue-path graph builder.
+    pub async fn build_legacy_for_harness(
+        &mut self,
+        inputs: BuildInputs<'_>,
+    ) -> Result<BuildOutputs> {
         self.ns.set_graph_id(inputs.graph_id);
         self.watermark = Arc::clone(&inputs.watermark);
         let available_sources: BTreeSet<String> =

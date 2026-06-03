@@ -14,6 +14,7 @@ pub(super) struct ExecutorTickBuffers {
     pub(super) tick_postgres_table_lsns: Vec<(String, String, String, u64)>,
     pub(super) tick_source_max_event_ts: Vec<Option<i64>>,
     pub(super) arrow_batches_by_source: Vec<Vec<RecordBatch>>,
+    pub(super) execution_arrow_batches_by_source: Vec<Vec<RecordBatch>>,
     pub(super) weighted_arrow_batches_by_source: Vec<Vec<RecordBatch>>,
     pub(super) vectorized_source_journal_batches: Vec<VectorizedSourceJournalTransientBatch>,
     pub(super) arrow_builders_by_source: Vec<Option<SourceArrowBatchBuilder>>,
@@ -40,6 +41,7 @@ impl ExecutorTickBuffers {
             tick_postgres_table_lsns: Vec::new(),
             tick_source_max_event_ts: vec![None; source_count],
             arrow_batches_by_source: (0..source_count).map(|_| Vec::new()).collect(),
+            execution_arrow_batches_by_source: (0..source_count).map(|_| Vec::new()).collect(),
             weighted_arrow_batches_by_source: (0..source_count).map(|_| Vec::new()).collect(),
             vectorized_source_journal_batches: Vec::new(),
             arrow_builders_by_source: active_source_definitions_by_id
@@ -77,6 +79,9 @@ impl ExecutorTickBuffers {
         self.tick_postgres_table_lsns.clear();
         self.tick_source_max_event_ts.fill(None);
         for batches in &mut self.arrow_batches_by_source {
+            batches.clear();
+        }
+        for batches in &mut self.execution_arrow_batches_by_source {
             batches.clear();
         }
         for batches in &mut self.weighted_arrow_batches_by_source {

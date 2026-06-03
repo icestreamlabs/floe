@@ -40,7 +40,11 @@ struct KafkaNativeTopic {
     ptr: *mut RDKafkaTopic,
 }
 
+// SAFETY: librdkafka topic handles are reference-counted by the parent client and may be used from
+// any thread while the client is alive. This wrapper owns exactly one handle and destroys it in Drop.
 unsafe impl Send for KafkaNativeTopic {}
+// SAFETY: the wrapped pointer is immutable after construction, and librdkafka accepts concurrent
+// produce calls that share a topic handle through the owning producer.
 unsafe impl Sync for KafkaNativeTopic {}
 
 impl KafkaNativeTopic {
@@ -51,6 +55,8 @@ impl KafkaNativeTopic {
         let topic_cstring =
             CString::new(topic).context("replication pipeline Kafka topic contains null byte")?;
         let ptr = unsafe {
+            // SAFETY: the producer native pointer is valid for the ThreadedProducer lifetime, and
+            // topic_cstring is NUL-terminated and only needed during this call.
             rdsys::rd_kafka_topic_new(
                 producer.client().native_ptr(),
                 topic_cstring.as_ptr(),
@@ -69,6 +75,8 @@ impl KafkaNativeTopic {
 impl Drop for KafkaNativeTopic {
     fn drop(&mut self) {
         unsafe {
+            // SAFETY: KafkaNativeTopic owns exactly one handle returned by rd_kafka_topic_new and
+            // Drop runs once, after all references to this wrapper are gone.
             rdsys::rd_kafka_topic_destroy(self.ptr);
         }
     }
@@ -516,6 +524,9 @@ impl KafkaReplicationPipelineWriter {
         let key_len = key.map_or(0, <[u8]>::len);
         let opaque_ptr = Arc::into_raw(delivery_state).cast::<c_void>().cast_mut();
         let produce_result = unsafe {
+            // SAFETY: self.native_topic owns a valid librdkafka topic handle, key/payload slices
+            // stay live for the call, RD_KAFKA_MSG_F_COPY makes librdkafka copy bytes before
+            // returning, and opaque_ptr comes from Arc::into_raw for the delivery callback.
             rdsys::rd_kafka_produce(
                 self.native_topic.ptr,
                 -1,
@@ -531,12 +542,18 @@ impl KafkaReplicationPipelineWriter {
             Ok(())
         } else {
             unsafe {
+                // SAFETY: rd_kafka_produce did not accept ownership of opaque_ptr on failure, so
+                // the Arc created by Arc::into_raw above must be reconstructed and dropped here.
                 drop(Arc::from_raw(
                     opaque_ptr.cast::<KafkaDeliveryBatchState>().cast_const(),
                 ));
             }
             Err(KafkaError::MessageProduction(RDKafkaErrorCode::from(
-                unsafe { rdsys::rd_kafka_last_error() },
+                unsafe {
+                    // SAFETY: rd_kafka_last_error reads librdkafka's thread-local last error after
+                    // the immediately preceding failed produce call.
+                    rdsys::rd_kafka_last_error()
+                },
             )))
         }
     }
