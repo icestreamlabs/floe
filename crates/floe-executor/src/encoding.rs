@@ -1,57 +1,5 @@
 use anyhow::{Result, anyhow};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EncodedRowProjectionSource {
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EncodedRowProjectionColumn {
-    pub source: EncodedRowProjectionSource,
-    pub index: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PreparedJoinedEncodedRowProjection {
-    columns: Vec<EncodedRowProjectionColumn>,
-    left_requests: Vec<(usize, usize)>,
-    right_requests: Vec<(usize, usize)>,
-    projected_count_bytes: [u8; 4],
-}
-
-impl PreparedJoinedEncodedRowProjection {
-    pub(crate) fn try_new(columns: &[EncodedRowProjectionColumn]) -> Result<Self> {
-        let projected_count =
-            u32::try_from(columns.len()).map_err(|_| anyhow!("too many columns in MV key"))?;
-        let mut left_requests = Vec::new();
-        let mut right_requests = Vec::new();
-        for (output_idx, column) in columns.iter().copied().enumerate() {
-            match column.source {
-                EncodedRowProjectionSource::Left => {
-                    left_requests.push((column.index, output_idx));
-                }
-                EncodedRowProjectionSource::Right => {
-                    right_requests.push((column.index, output_idx));
-                }
-            }
-        }
-        left_requests.sort_unstable_by_key(|(index, _)| *index);
-        right_requests.sort_unstable_by_key(|(index, _)| *index);
-
-        Ok(Self {
-            columns: columns.to_vec(),
-            left_requests,
-            right_requests,
-            projected_count_bytes: projected_count.to_le_bytes(),
-        })
-    }
-
-    fn column_count(&self) -> usize {
-        self.columns.len()
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EncodedRowScalar {
     Int64(i64),
@@ -311,16 +259,6 @@ pub fn concat_encoded_rows(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(test)]
-pub(crate) fn project_joined_encoded_rows(
-    left: &[u8],
-    right: &[u8],
-    columns: &[EncodedRowProjectionColumn],
-) -> Result<Vec<u8>> {
-    let plan = PreparedJoinedEncodedRowProjection::try_new(columns)?;
-    project_joined_encoded_rows_prepared(left, right, &plan)
-}
-
 pub(crate) fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < 4 {
         return Err(anyhow!("encoded key too short"));
@@ -443,89 +381,6 @@ fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<
 
 fn is_null_field_tag(tag: u8) -> bool {
     matches!(tag, 0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C)
-}
-
-fn collect_encoded_field_spans_into(
-    bytes: &[u8],
-    requests: &[(usize, usize)],
-    spans_by_output: &mut [(usize, usize)],
-) -> Result<usize> {
-    if requests.is_empty() {
-        return Ok(0);
-    }
-
-    let count = encoded_row_column_count(bytes)?;
-    if requests.iter().any(|(index, _)| *index >= count) {
-        return Err(anyhow!(
-            "encoded row has {count} columns but a requested index was out of bounds"
-        ));
-    }
-
-    let mut request_idx = 0usize;
-    let mut cursor = 4usize;
-    let mut total_payload_len = 0usize;
-
-    for column_idx in 0..count {
-        let start = cursor;
-        let tag = *bytes
-            .get(cursor)
-            .ok_or_else(|| anyhow!("unexpected end of key while decoding tag"))?;
-        cursor += 1;
-        cursor = encoded_field_end(bytes, cursor, tag)?;
-        let end = cursor;
-
-        while request_idx < requests.len() && requests[request_idx].0 == column_idx {
-            let output_idx = requests[request_idx].1;
-            spans_by_output[output_idx] = (start, end);
-            total_payload_len += end - start;
-            request_idx += 1;
-        }
-    }
-
-    Ok(total_payload_len)
-}
-
-pub(crate) fn project_joined_encoded_rows_prepared(
-    left: &[u8],
-    right: &[u8],
-    plan: &PreparedJoinedEncodedRowProjection,
-) -> Result<Vec<u8>> {
-    const INLINE_PROJECTED_COLUMNS: usize = 32;
-
-    if plan.column_count() <= INLINE_PROJECTED_COLUMNS {
-        let mut inline_spans = [(0usize, 0usize); INLINE_PROJECTED_COLUMNS];
-        project_joined_encoded_rows_with_spans(
-            left,
-            right,
-            plan,
-            &mut inline_spans[..plan.column_count()],
-        )
-    } else {
-        let mut spans = vec![(0usize, 0usize); plan.column_count()];
-        project_joined_encoded_rows_with_spans(left, right, plan, &mut spans)
-    }
-}
-
-fn project_joined_encoded_rows_with_spans(
-    left: &[u8],
-    right: &[u8],
-    plan: &PreparedJoinedEncodedRowProjection,
-    spans_by_output: &mut [(usize, usize)],
-) -> Result<Vec<u8>> {
-    let total_payload_len =
-        collect_encoded_field_spans_into(left, &plan.left_requests, spans_by_output)?
-            + collect_encoded_field_spans_into(right, &plan.right_requests, spans_by_output)?;
-
-    let mut out = Vec::with_capacity(4 + total_payload_len);
-    out.extend_from_slice(&plan.projected_count_bytes);
-    for (output_idx, (start, end)) in spans_by_output.iter().copied().enumerate() {
-        let source_bytes = match plan.columns[output_idx].source {
-            EncodedRowProjectionSource::Left => left,
-            EncodedRowProjectionSource::Right => right,
-        };
-        out.extend_from_slice(&source_bytes[start..end]);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -669,54 +524,6 @@ mod tests {
                 Some(EncodedRowScalar::Utf8("left".into())),
                 Some(EncodedRowScalar::Bool(true)),
                 Some(EncodedRowScalar::TimestampMillis(55)),
-            ]
-        );
-    }
-
-    #[test]
-    fn projects_joined_rows_without_full_decode() {
-        let left = encode_test_row(&[
-            TestEncodedField::Int64(10),
-            TestEncodedField::Utf8("left"),
-            TestEncodedField::Bool(true),
-        ]);
-        let right = encode_test_row(&[
-            TestEncodedField::TimestampMillis(55),
-            TestEncodedField::Int64(99),
-        ]);
-
-        let projected = project_joined_encoded_rows(
-            &left,
-            &right,
-            &[
-                EncodedRowProjectionColumn {
-                    source: EncodedRowProjectionSource::Right,
-                    index: 1,
-                },
-                EncodedRowProjectionColumn {
-                    source: EncodedRowProjectionSource::Left,
-                    index: 0,
-                },
-                EncodedRowProjectionColumn {
-                    source: EncodedRowProjectionSource::Right,
-                    index: 0,
-                },
-                EncodedRowProjectionColumn {
-                    source: EncodedRowProjectionSource::Left,
-                    index: 2,
-                },
-            ],
-        )
-        .expect("project");
-        let decoded = decode_test_row(&projected);
-
-        assert_eq!(
-            decoded,
-            vec![
-                Some(EncodedRowScalar::Int64(99)),
-                Some(EncodedRowScalar::Int64(10)),
-                Some(EncodedRowScalar::TimestampMillis(55)),
-                Some(EncodedRowScalar::Bool(true)),
             ]
         );
     }

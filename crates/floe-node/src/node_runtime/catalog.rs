@@ -189,29 +189,3 @@ pub(super) fn df_schema_to_arrow(schema: &DFSchemaRef) -> anyhow::Result<SchemaR
         .collect();
     Ok(Arc::new(Schema::new(fields)))
 }
-
-pub(super) fn gather_handle_streams(
-    registry: &OuterStreamRegistry,
-    sources: &BTreeSet<String>,
-) -> HashMap<String, dbsp::DeltaHandleStream> {
-    let mut map = HashMap::new();
-    for source in sources {
-        if let Some(stream) = registry.delta_handle_stream(source) {
-            map.insert(source.clone(), stream);
-        }
-    }
-    map
-}
-
-pub(super) fn gather_transient_streams(
-    registry: &OuterStreamRegistry,
-    sources: &BTreeSet<String>,
-) -> HashMap<String, floe_executor::outer_stream::TransientSourceHandleStream> {
-    let mut map = HashMap::new();
-    for source in sources {
-        if let Some(stream) = registry.transient_stream(source) {
-            map.insert(source.clone(), stream);
-        }
-    }
-    map
-}

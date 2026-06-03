@@ -3,22 +3,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanBuilder, Int64Array};
-use datafusion::arrow::compute::{concat_batches, filter_record_batch};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{ArrayRef, Int64Array};
+use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
 use crate::delta_consolidation::{add_weight_column_to_batches, diff_snapshot_batches};
 use crate::metrics;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::DynamicStateTableProvider;
+use crate::vectorized_source_delta::{apply_source_delta, insert_only_source_delta_batch};
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
@@ -282,7 +281,7 @@ impl VectorizedExecutionRuntime {
             .get(source_name)
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
-        if let Some(insert_batch) = insert_only_source_delta_batch(&state, &delta)? {
+        if let Some(insert_batch) = insert_only_source_delta_batch(&state.schema, &delta)? {
             return self.apply_insert_source_batches(
                 source_name,
                 &state,
@@ -293,12 +292,22 @@ impl VectorizedExecutionRuntime {
         self.current_insert_batches.remove(source_name);
         self.current_general_delta_sources
             .insert(source_name.to_string());
-        let next = apply_source_delta(&state, &state.provider, &delta)
-            .await
-            .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
-        let query_next = apply_source_delta(&state, &state.query_provider, &delta)
-            .await
-            .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
+        let next = apply_source_delta(
+            &state.schema,
+            &state.primary_key_columns,
+            &state.provider,
+            &delta,
+        )
+        .await
+        .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
+        let query_next = apply_source_delta(
+            &state.schema,
+            &state.primary_key_columns,
+            &state.query_provider,
+            &delta,
+        )
+        .await
+        .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
         state.provider.set_batches(next.clone());
         state.query_provider.set_batches(query_next.clone());
         if let (Some(alias_schema), Some(alias_provider)) =
@@ -552,196 +561,6 @@ fn concat_snapshot_chunk(schema: &SchemaRef, chunk: &[RecordBatch]) -> Result<Re
     concat_batches(schema, refs).context("compact incremental materialized view snapshot batches")
 }
 
-async fn apply_source_delta(
-    state: &VectorizedSourceState,
-    provider: &DynamicStateTableProvider,
-    delta: &RecordBatch,
-) -> Result<Vec<RecordBatch>> {
-    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
-    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
-        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
-    }
-    let expected_delta_schema =
-        crate::delta_consolidation::weighted_snapshot_schema(&state.schema)?;
-    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
-        bail!("source delta schema does not match source schema");
-    }
-
-    let old_snapshot = provider.snapshot();
-    let delete_key_indices = delete_key_indices(state)?;
-    let delete_keys = deleted_delta_keys(&state.schema, &delete_key_indices, delta, weight_idx)?;
-    let mut next = if delete_keys.is_empty() {
-        old_snapshot.iter().cloned().collect::<Vec<_>>()
-    } else {
-        filter_deleted_source_rows(
-            &state.schema,
-            &delete_key_indices,
-            &delete_keys,
-            &old_snapshot,
-        )?
-    };
-    if let Some(positive_batch) = positive_delta_batch(&state.schema, delta, weight_idx)? {
-        next.push(positive_batch);
-    }
-    Ok(next)
-}
-
-fn delete_key_indices(state: &VectorizedSourceState) -> Result<Vec<usize>> {
-    if state.primary_key_columns.is_empty() {
-        return Ok((0..state.schema.fields().len()).collect());
-    }
-    state
-        .primary_key_columns
-        .iter()
-        .map(|column| {
-            state.schema.index_of(column).with_context(|| {
-                format!("source primary key column '{column}' missing from schema")
-            })
-        })
-        .collect()
-}
-
-fn deleted_delta_keys(
-    schema: &SchemaRef,
-    key_indices: &[usize],
-    delta: &RecordBatch,
-    weight_idx: usize,
-) -> Result<HashSet<Vec<u8>>> {
-    let weights = delta
-        .column(weight_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
-    let converter = key_row_converter(schema, key_indices)?;
-    let rows = converter
-        .convert_columns(&project_columns(delta, key_indices))
-        .context("encode source delete keys")?;
-    let mut keys = HashSet::new();
-    for row_idx in 0..weights.len() {
-        if !weights.is_null(row_idx) && weights.value(row_idx) < 0 {
-            keys.insert(rows.row(row_idx).data().to_vec());
-        }
-    }
-    Ok(keys)
-}
-
-fn filter_deleted_source_rows(
-    schema: &SchemaRef,
-    key_indices: &[usize],
-    delete_keys: &HashSet<Vec<u8>>,
-    snapshot: &[RecordBatch],
-) -> Result<Vec<RecordBatch>> {
-    let converter = key_row_converter(schema, key_indices)?;
-    let mut next = Vec::with_capacity(snapshot.len());
-    for batch in snapshot {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let rows = converter
-            .convert_columns(&project_columns(batch, key_indices))
-            .context("encode source state keys")?;
-        let mut keep = BooleanBuilder::with_capacity(batch.num_rows());
-        let mut kept_rows = 0usize;
-        for row_idx in 0..batch.num_rows() {
-            let keep_row = !delete_keys.contains(rows.row(row_idx).data());
-            if keep_row {
-                kept_rows = kept_rows.saturating_add(1);
-            }
-            keep.append_value(keep_row);
-        }
-        if kept_rows == batch.num_rows() {
-            next.push(batch.clone());
-        } else if kept_rows > 0 {
-            next.push(filter_record_batch(batch, &keep.finish())?);
-        }
-    }
-    Ok(next)
-}
-
-fn positive_delta_batch(
-    schema: &SchemaRef,
-    delta: &RecordBatch,
-    weight_idx: usize,
-) -> Result<Option<RecordBatch>> {
-    let weights = delta
-        .column(weight_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
-    let mut keep = BooleanBuilder::with_capacity(weights.len());
-    let mut kept_rows = 0usize;
-    for row_idx in 0..weights.len() {
-        let keep_row = !weights.is_null(row_idx) && weights.value(row_idx) > 0;
-        if keep_row {
-            kept_rows = kept_rows.saturating_add(1);
-        }
-        keep.append_value(keep_row);
-    }
-    if kept_rows == 0 {
-        return Ok(None);
-    }
-    let filtered = filter_record_batch(delta, &keep.finish())?;
-    let columns = filtered
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
-        .collect::<Vec<_>>();
-    Ok(Some(RecordBatch::try_new(Arc::clone(schema), columns)?))
-}
-
-fn key_row_converter(schema: &SchemaRef, key_indices: &[usize]) -> Result<RowConverter> {
-    let fields = key_indices
-        .iter()
-        .map(|idx| SortField::new(schema.field(*idx).data_type().clone()))
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).context("build Arrow row converter for source keys")
-}
-
-fn project_columns(batch: &RecordBatch, indices: &[usize]) -> Vec<ArrayRef> {
-    indices
-        .iter()
-        .map(|idx| Arc::clone(batch.column(*idx)))
-        .collect()
-}
-
-fn insert_only_source_delta_batch(
-    state: &VectorizedSourceState,
-    delta: &RecordBatch,
-) -> Result<Option<RecordBatch>> {
-    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
-    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
-        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
-    }
-    let expected_delta_schema =
-        crate::delta_consolidation::weighted_snapshot_schema(&state.schema)?;
-    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
-        bail!("source delta schema does not match source schema");
-    }
-
-    let weights = delta
-        .column(weight_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
-    for row_idx in 0..weights.len() {
-        if weights.is_null(row_idx) || weights.value(row_idx) <= 0 {
-            return Ok(None);
-        }
-    }
-
-    let columns = delta
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
-        .collect::<Vec<_>>();
-    Ok(Some(RecordBatch::try_new(
-        Arc::clone(&state.schema),
-        columns,
-    )?))
-}
-
 fn normalize_batches(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
     batches
         .into_iter()
@@ -883,65 +702,8 @@ mod tests {
     use super::*;
     use crate::source_decoder::mask_arrow_batch_for_required_columns;
     use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::DataType;
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceRegistry};
-
-    fn source_state(schema: SchemaRef) -> VectorizedSourceState {
-        let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
-        let query_provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema)));
-        VectorizedSourceState {
-            provider,
-            query_provider,
-            schema,
-            alias_schema: None,
-            alias_provider: None,
-            query_alias_provider: None,
-            primary_key_columns: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn insert_only_delta_strips_weight_without_rebuilding_source_state() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let weighted_schema =
-            crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
-        let delta = RecordBatch::try_new(
-            weighted_schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(Int64Array::from(vec![1, 1])),
-            ],
-        )
-        .expect("weighted delta");
-
-        let batch = insert_only_source_delta_batch(&source_state(Arc::clone(&schema)), &delta)
-            .expect("detect insert-only")
-            .expect("insert batch");
-
-        assert_eq!(batch.schema().as_ref(), schema.as_ref());
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 1);
-    }
-
-    #[test]
-    fn delete_delta_uses_general_source_state_path() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let weighted_schema =
-            crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
-        let delta = RecordBatch::try_new(
-            weighted_schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int64Array::from(vec![-1])),
-            ],
-        )
-        .expect("weighted delta");
-
-        assert!(
-            insert_only_source_delta_batch(&source_state(schema), &delta)
-                .expect("inspect delta")
-                .is_none()
-        );
-    }
 
     #[tokio::test]
     async fn masked_query_batches_do_not_prune_execution_batches() {

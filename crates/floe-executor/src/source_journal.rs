@@ -5,11 +5,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use datafusion::arrow::array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
-    TimestampMillisecondArray,
-};
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::storage::{KeyValueTable, prefix_bounds};
 use slatedb::WriteBatch;
@@ -371,106 +366,6 @@ fn decode_vectorized_entry(value: &[u8]) -> Result<(Option<i64>, Vec<RecordBatch
         (max_event_time_ms >= 0).then_some(max_event_time_ms),
         batches,
     ))
-}
-
-pub(crate) fn encode_arrow_payload_row(
-    batch: &RecordBatch,
-    payload_width: usize,
-    row_idx: usize,
-) -> Result<Vec<u8>> {
-    let count = u32::try_from(payload_width).context("too many vectorized output columns")?;
-    let mut encoded = Vec::with_capacity(4 + payload_width.saturating_mul(16));
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for column_idx in 0..payload_width {
-        append_arrow_value(batch.column(column_idx).as_ref(), row_idx, &mut encoded)?;
-    }
-    Ok(encoded)
-}
-
-fn append_arrow_value(array: &dyn Array, row_idx: usize, encoded: &mut Vec<u8>) -> Result<()> {
-    match array.data_type() {
-        DataType::Int64 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow!("expected Int64 array"))?;
-            if values.is_null(row_idx) {
-                encoded.push(0x05);
-            } else {
-                encoded.push(0x01);
-                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
-            }
-        }
-        DataType::Utf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| anyhow!("expected Utf8 array"))?;
-            if values.is_null(row_idx) {
-                encoded.push(0x06);
-            } else {
-                encoded.push(0x02);
-                let bytes = values.value(row_idx).as_bytes();
-                let len = u32::try_from(bytes.len()).context("utf8 value too large for MV key")?;
-                encoded.extend_from_slice(&len.to_le_bytes());
-                encoded.extend_from_slice(bytes);
-            }
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| anyhow!("expected TimestampMillisecond array"))?;
-            if values.is_null(row_idx) {
-                encoded.push(0x07);
-            } else {
-                encoded.push(0x03);
-                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
-            }
-        }
-        DataType::Boolean => {
-            let values = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| anyhow!("expected Boolean array"))?;
-            if values.is_null(row_idx) {
-                encoded.push(0x08);
-            } else {
-                encoded.push(0x04);
-                encoded.push(u8::from(values.value(row_idx)));
-            }
-        }
-        DataType::Date32 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| anyhow!("expected Date32 array"))?;
-            if values.is_null(row_idx) {
-                encoded.push(0x0A);
-            } else {
-                encoded.push(0x09);
-                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
-            }
-        }
-        DataType::Decimal128(_, _) => {
-            let values = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| anyhow!("expected Decimal128 array"))?;
-            if values.is_null(row_idx) {
-                encoded.push(0x0C);
-            } else {
-                encoded.push(0x0B);
-                encoded.extend_from_slice(&values.value(row_idx).to_le_bytes());
-            }
-        }
-        other => {
-            return Err(anyhow!(
-                "unsupported vectorized output Arrow type for encoded boundary: {other:?}"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn encode_kafka_entry(

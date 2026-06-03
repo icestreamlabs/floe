@@ -155,7 +155,7 @@ impl KafkaConnector {
             range.topic,
             config.topics
         );
-        let poll_timeout = config.poll_timeout.max(Duration::from_millis(100));
+        let poll_timeout = config.poll_timeout;
         let idle_timeout = Duration::from_secs(30);
         let connector = KafkaConnector::new_with_shared_definitions(config.clone(), definitions)?;
         let mut client_config = ClientConfig::new();

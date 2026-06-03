@@ -42,12 +42,6 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.subscribe_max_catchup_versions.is_none() {
         args.subscribe_max_catchup_versions = runtime.subscribe_max_catchup_versions;
     }
-    if args.transient_segment_max_nodes.is_none() {
-        args.transient_segment_max_nodes = runtime.transient_segment_max_nodes;
-    }
-    if args.transient_segment_min_score.is_none() {
-        args.transient_segment_min_score = runtime.transient_segment_min_score;
-    }
     if args.ingest_queue_capacity == DEFAULT_INGEST_QUEUE_CAPACITY
         && let Some(capacity) = runtime.ingest_queue_capacity
     {

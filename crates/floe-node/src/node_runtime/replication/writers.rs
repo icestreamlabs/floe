@@ -29,8 +29,10 @@ use super::{
 };
 
 pub(super) struct KafkaReplicationPipelineWriter {
-    producer: ThreadedProducer<KafkaReplicationPipelineContext>,
+    // Drop native_topic before producer so librdkafka destroys the topic handle
+    // while its owning client is still alive.
     native_topic: KafkaNativeTopic,
+    producer: ThreadedProducer<KafkaReplicationPipelineContext>,
     topic: String,
     partition_offsets: usize,
     perf_log: bool,
@@ -284,8 +286,8 @@ impl KafkaReplicationPipelineWriter {
             }
         };
         Ok(Self {
-            producer,
             native_topic,
+            producer,
             topic: topic.to_string(),
             partition_offsets,
             perf_log,

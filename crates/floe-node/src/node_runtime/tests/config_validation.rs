@@ -413,8 +413,6 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             pre_tick_commit_delay_ms: Some(5),
             subscribe_channel_capacity: Some(512),
             subscribe_max_catchup_versions: Some(64),
-            transient_segment_max_nodes: Some(48),
-            transient_segment_min_score: Some(0),
             admin_port: Some(9090),
             pgwire_addr: Some("127.0.0.1:7777".to_string()),
             pgwire_enabled: Some(false),
@@ -466,8 +464,6 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
     assert_eq!(args.watermark_idle_source_ms, Some(45_000));
     assert_eq!(args.subscribe_channel_capacity, Some(512));
     assert_eq!(args.subscribe_max_catchup_versions, Some(64));
-    assert_eq!(args.transient_segment_max_nodes, Some(48));
-    assert_eq!(args.transient_segment_min_score, Some(0));
     assert_eq!(args.slatedb_await_durable, Some(true));
     assert_eq!(args.data_dir.as_deref(), Some("/tmp/floe-data"));
     assert_eq!(args.slatedb_config.as_deref(), Some("/tmp/slatedb.toml"));

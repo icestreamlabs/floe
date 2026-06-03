@@ -49,12 +49,11 @@ use floe_executor::source_journal::{
     update_kafka_source_journal_checksum,
 };
 use floe_executor::{
-    DbspBridge, DbspMaintenance, FloeQueryContext, GRAPH_TASK_EVENT_CHANNEL_CAPACITY,
-    GraphTaskError, MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry,
-    PersistencePolicyConfig, SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan,
-    VectorizedExecutionRuntime, VectorizedMaterializedViewPlan,
-    mask_arrow_batch_for_required_columns, plan_source_requirements,
-    source_batch_journal_root_sources_with_config, validate_dbsp_plan, weighted_batch_from_diffs,
+    DbspBridge, DbspMaintenance, FloeQueryContext, MaterializedViewRegistry,
+    MaterializedViewTableProvider, OuterStreamRegistry, SourceArrowBatchBuilder,
+    SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
+    VectorizedMaterializedViewPlan, mask_arrow_batch_for_required_columns,
+    plan_source_requirements, validate_dbsp_plan, weighted_batch_from_diffs,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};

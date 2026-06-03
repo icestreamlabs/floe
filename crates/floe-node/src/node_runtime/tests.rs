@@ -25,8 +25,6 @@ fn default_run_args() -> cli::RunArgs {
         watermark_idle_source_ms: None,
         subscribe_channel_capacity: None,
         subscribe_max_catchup_versions: None,
-        transient_segment_max_nodes: None,
-        transient_segment_min_score: None,
         slatedb_config: None,
         slatedb_env_prefix: None,
         slatedb_flush_interval_ms: None,
