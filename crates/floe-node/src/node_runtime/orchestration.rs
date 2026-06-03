@@ -34,15 +34,16 @@ use runtime_services::{RuntimeServicesConfig, start_runtime_services};
 use runtime_shutdown::{RuntimeShutdownContext, shutdown_runtime};
 use runtime_sources::build_runtime_source_indexes;
 use runtime_tasks::{spawn_cancellation_propagation, spawn_graph_task_monitor};
+use source_replay::{
+    ReplayCommittedVectorizedSourceJournalConfig,
+    replay_committed_vectorized_source_journal_entries, source_is_replayable_from_connector,
+};
 pub(super) use source_replay::{
     kafka_metadata_journal_required_sources, source_journal_required_sources,
 };
-use source_replay::{
-    replay_committed_vectorized_source_journal_entries, source_is_replayable_from_connector,
-};
 #[cfg(test)]
 pub(super) use wal_stream::PostgresCdcRuntimeReconnectPolicy;
-use wal_stream::run_native_postgres_cdc_connector;
+use wal_stream::{NativePostgresCdcConnectorConfig, run_native_postgres_cdc_connector};
 
 pub(crate) async fn run() -> anyhow::Result<()> {
     init_tracing();
@@ -739,6 +740,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .enumerate()
         .map(|(idx, definition)| (definition.name().to_string(), idx))
         .collect();
+    let required_columns_by_source_id = required_column_masks_by_source_id(
+        &definitions,
+        &all_required_sources,
+        &circuit_plans,
+        &plan_required_sources,
+        &source_journal_required_sources,
+    )?;
     let runtime_services = start_runtime_services(RuntimeServicesConfig {
         connector_specs: &connector_specs,
         source_registry: &source_registry,
@@ -766,6 +774,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let runtime_source_indexes = build_runtime_source_indexes(
         &definitions,
         &all_required_sources,
+        required_columns_by_source_id,
         &kafka_metadata_journal_required_sources,
         &source_journal_required_sources,
         &postgres_cdc_runtime_plans_by_connector,
@@ -789,16 +798,21 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         && !source_replay_covered_sources.is_empty()
     {
         let (replayed_raw, replayed_kafka) = replay_committed_vectorized_source_journal_entries(
-            &vectorized_source_batch_journal,
-            &kafka_source_journal,
-            &mut vectorized_runtime,
-            tick_commit.tick_id,
-            &source_journal_required_sources,
-            &kafka_metadata_journal_required_sources,
-            &connector_specs,
-            &run_args,
-            &definitions,
-            &source_id_by_name,
+            ReplayCommittedVectorizedSourceJournalConfig {
+                source_batch_journal: &vectorized_source_batch_journal,
+                kafka_journal: &kafka_source_journal,
+                vectorized_runtime: &mut vectorized_runtime,
+                max_tick_id: tick_commit.tick_id,
+                raw_journal_sources: &source_journal_required_sources,
+                kafka_metadata_sources: &kafka_metadata_journal_required_sources,
+                connector_specs: &connector_specs,
+                run_args: &run_args,
+                definitions: &definitions,
+                source_id_by_name: &source_id_by_name,
+                required_columns_by_source_id: runtime_source_indexes
+                    .required_columns_by_source_id
+                    .as_slice(),
+            },
         )
         .await
         .context("replay committed vectorized source journal entries")?;
@@ -875,6 +889,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         sources: ExecutorSourceContext {
             active_source_definitions_by_id: Arc::clone(
                 &runtime_source_indexes.active_source_definitions_by_id,
+            ),
+            required_columns_by_source_id: Arc::clone(
+                &runtime_source_indexes.required_columns_by_source_id,
             ),
             materialized_source_ids: Arc::clone(&runtime_source_indexes.materialized_source_ids),
             source_names_by_id: Arc::clone(&runtime_source_indexes.source_names_by_id),
@@ -996,4 +1013,102 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         runtime_failure,
     })
     .await
+}
+
+fn required_column_masks_by_source_id(
+    definitions: &[SourceDefinition],
+    all_required_sources: &BTreeSet<String>,
+    circuit_plans: &[CircuitPlan],
+    plan_required_sources: &[BTreeSet<String>],
+    full_width_sources: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Option<Arc<[bool]>>>> {
+    let source_id_by_name = definitions
+        .iter()
+        .enumerate()
+        .map(|(idx, definition)| (definition.name().to_string(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut force_all_columns = vec![false; definitions.len()];
+    mark_required_sources_full_width(
+        &source_id_by_name,
+        &mut force_all_columns,
+        full_width_sources,
+    );
+    let mut masks = definitions
+        .iter()
+        .map(|definition| {
+            all_required_sources
+                .contains(definition.name())
+                .then(|| vec![false; definition.columns().len()])
+        })
+        .collect::<Vec<_>>();
+
+    for (plan, required_sources) in circuit_plans.iter().zip(plan_required_sources) {
+        let Some(requirements) = plan_source_requirements(plan)? else {
+            mark_required_sources_full_width(
+                &source_id_by_name,
+                &mut force_all_columns,
+                required_sources,
+            );
+            continue;
+        };
+        let mut exact_sources = HashSet::new();
+        for requirement in requirements {
+            exact_sources.insert(requirement.source_name.clone());
+            let Some(source_id) = source_id_by_name.get(&requirement.source_name).copied() else {
+                return Err(anyhow!(
+                    "plan referenced unknown source '{}'",
+                    requirement.source_name
+                ));
+            };
+            let Some(mask) = masks[source_id].as_mut() else {
+                continue;
+            };
+            for column_idx in requirement.required_columns {
+                let Some(required) = mask.get_mut(column_idx) else {
+                    return Err(anyhow!(
+                        "plan required column {column_idx} outside source '{}' schema",
+                        requirement.source_name
+                    ));
+                };
+                *required = true;
+            }
+        }
+        let missing_exact_sources = required_sources
+            .iter()
+            .filter(|source| !exact_sources.contains(source.as_str()))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        mark_required_sources_full_width(
+            &source_id_by_name,
+            &mut force_all_columns,
+            &missing_exact_sources,
+        );
+    }
+
+    Ok(masks
+        .into_iter()
+        .enumerate()
+        .map(|(source_id, mask)| {
+            mask.map(|mut mask| {
+                if force_all_columns[source_id] {
+                    mask.fill(true);
+                }
+                Arc::from(mask)
+            })
+        })
+        .collect())
+}
+
+fn mark_required_sources_full_width(
+    source_id_by_name: &HashMap<String, usize>,
+    force_all_columns: &mut [bool],
+    sources: &BTreeSet<String>,
+) {
+    for source in sources {
+        if let Some(source_id) = source_id_by_name.get(source).copied()
+            && let Some(force_all) = force_all_columns.get_mut(source_id)
+        {
+            *force_all = true;
+        }
+    }
 }

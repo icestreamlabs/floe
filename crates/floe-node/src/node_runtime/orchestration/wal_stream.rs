@@ -1,16 +1,54 @@
 use super::super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_native_postgres_cdc_connector(
-    mut config: PostgresCdcSourceConfig,
-    runtime_plan: PostgresCdcRuntimePlan,
-    snapshot_settings: PostgresCdcSnapshotConfig,
-    reconnect_settings: PostgresCdcReconnectConfig,
-    table_store: CdcTableStore,
-    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+pub(super) struct NativePostgresCdcConnectorConfig {
+    pub(super) config: PostgresCdcSourceConfig,
+    pub(super) runtime_plan: PostgresCdcRuntimePlan,
+    pub(super) snapshot_settings: PostgresCdcSnapshotConfig,
+    pub(super) reconnect_settings: PostgresCdcReconnectConfig,
+    pub(super) table_store: CdcTableStore,
+    pub(super) cdc_replication_debug:
+        Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    pub(super) sender: mpsc::Sender<QueuedCdcTransaction>,
+    pub(super) cancel: CancellationToken,
+}
+
+#[derive(Clone)]
+struct PostgresCdcWalStreamContext<'a> {
+    connection_string: &'a str,
+    slot: &'a str,
+    publication: &'a str,
+    runtime_plan: &'a PostgresCdcRuntimePlan,
+    table_store: &'a CdcTableStore,
+    cdc_replication_debug: &'a Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
     sender: mpsc::Sender<QueuedCdcTransaction>,
-    cancel: CancellationToken,
+    cancel: &'a CancellationToken,
+}
+
+struct PostgresCdcWalStreamReconnectConfig<'a> {
+    context: PostgresCdcWalStreamContext<'a>,
+    commit_lsn_rx: Option<&'a mut watch::Receiver<PostgresCdcCommit>>,
+    policy: PostgresCdcRuntimeReconnectPolicy,
+}
+
+struct PostgresCdcWalStreamOnceConfig<'a> {
+    context: PostgresCdcWalStreamContext<'a>,
+    commit_lsn_rx: Option<&'a mut watch::Receiver<PostgresCdcCommit>>,
+    reconnect_attempts: u64,
+}
+
+pub(super) async fn run_native_postgres_cdc_connector(
+    connector: NativePostgresCdcConnectorConfig,
 ) -> anyhow::Result<()> {
+    let NativePostgresCdcConnectorConfig {
+        mut config,
+        runtime_plan,
+        snapshot_settings,
+        reconnect_settings,
+        table_store,
+        cdc_replication_debug,
+        sender,
+        cancel,
+    } = connector;
     config.validate()?;
     let connection_string = config.connection_string.clone();
     let slot = config.slot.clone();
@@ -26,16 +64,18 @@ pub(super) async fn run_native_postgres_cdc_connector(
     .await?;
     let initial_snapshot =
         super::super::postgres_snapshot::run_initial_postgres_snapshot_if_needed(
-            &connection_string,
-            &slot,
-            &publication,
-            &runtime_plan,
-            &table_store,
-            &sender,
-            &cdc_replication_debug,
-            snapshot_settings,
-            config.commit_lsn_rx.as_mut(),
-            &cancel,
+            super::super::postgres_snapshot::InitialPostgresSnapshotConfig {
+                connection_string: &connection_string,
+                slot: &slot,
+                publication: &publication,
+                runtime_plan: &runtime_plan,
+                table_store: &table_store,
+                sender: &sender,
+                cdc_replication_debug: &cdc_replication_debug,
+                settings: snapshot_settings,
+                commit_lsn_rx: config.commit_lsn_rx.as_mut(),
+                cancel: &cancel,
+            },
         )
         .await?;
     if let Some(lsn) = initial_snapshot.lsn {
@@ -80,18 +120,20 @@ pub(super) async fn run_native_postgres_cdc_connector(
         }
     }
     let reconnect_policy = PostgresCdcRuntimeReconnectPolicy::from_config(reconnect_settings);
-    run_native_postgres_cdc_wal_stream_with_reconnect(
-        &connection_string,
-        &slot,
-        &publication,
-        &runtime_plan,
-        &table_store,
-        &cdc_replication_debug,
-        sender,
-        config.commit_lsn_rx.as_mut(),
-        &cancel,
-        reconnect_policy,
-    )
+    run_native_postgres_cdc_wal_stream_with_reconnect(PostgresCdcWalStreamReconnectConfig {
+        context: PostgresCdcWalStreamContext {
+            connection_string: &connection_string,
+            slot: &slot,
+            publication: &publication,
+            runtime_plan: &runtime_plan,
+            table_store: &table_store,
+            cdc_replication_debug: &cdc_replication_debug,
+            sender,
+            cancel: &cancel,
+        },
+        commit_lsn_rx: config.commit_lsn_rx.as_mut(),
+        policy: reconnect_policy,
+    })
     .await
 }
 
@@ -123,55 +165,43 @@ impl PostgresCdcRuntimeReconnectPolicy {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_native_postgres_cdc_wal_stream_with_reconnect(
-    connection_string: &str,
-    slot: &str,
-    publication: &str,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    table_store: &CdcTableStore,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    sender: mpsc::Sender<QueuedCdcTransaction>,
-    mut commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
-    cancel: &CancellationToken,
-    policy: PostgresCdcRuntimeReconnectPolicy,
+    mut config: PostgresCdcWalStreamReconnectConfig<'_>,
 ) -> anyhow::Result<()> {
+    let context = config.context;
+    let policy = config.policy;
     let mut reconnects = 0usize;
     loop {
-        match run_native_postgres_cdc_wal_stream_once(
-            connection_string,
-            slot,
-            publication,
-            runtime_plan,
-            table_store,
-            cdc_replication_debug,
-            sender.clone(),
-            commit_lsn_rx.as_deref_mut(),
-            cancel,
-            reconnects as u64,
-        )
+        match run_native_postgres_cdc_wal_stream_once(PostgresCdcWalStreamOnceConfig {
+            context: PostgresCdcWalStreamContext {
+                sender: context.sender.clone(),
+                ..context.clone()
+            },
+            commit_lsn_rx: config.commit_lsn_rx.as_deref_mut(),
+            reconnect_attempts: reconnects as u64,
+        })
         .await
         {
             Ok(()) => return Ok(()),
-            Err(err) if cancel.is_cancelled() => return Err(err),
+            Err(err) if context.cancel.is_cancelled() => return Err(err),
             Err(err) if !is_reconnectable_postgres_cdc_error(&err) => return Err(err),
             Err(err) if reconnects < policy.max_reconnects => {
                 let backoff = policy.backoff_for_reconnect(reconnects);
                 reconnects = reconnects.saturating_add(1);
                 metrics::record_postgres_cdc_source_connected(
-                    runtime_plan.source_id.as_str(),
-                    slot,
+                    context.runtime_plan.source_id.as_str(),
+                    context.slot,
                     false,
                 );
                 metrics::inc_postgres_cdc_reconnect(
-                    runtime_plan.source_id.as_str(),
-                    slot,
+                    context.runtime_plan.source_id.as_str(),
+                    context.slot,
                     "scheduled",
                 );
                 record_postgres_cdc_debug_connection_state(
-                    cdc_replication_debug,
-                    runtime_plan.source_id.as_str(),
-                    slot,
+                    context.cdc_replication_debug,
+                    context.runtime_plan.source_id.as_str(),
+                    context.slot,
                     false,
                     reconnects as u64,
                     Some(
@@ -180,8 +210,8 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
                     ),
                 );
                 tracing::warn!(
-                    source = %runtime_plan.source_id.as_str(),
-                    slot,
+                    source = %context.runtime_plan.source_id.as_str(),
+                    slot = %context.slot,
                     reconnects,
                     max_reconnects = policy.max_reconnects,
                     retry_delay_ms = backoff.as_millis() as u64,
@@ -190,7 +220,7 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
                 );
                 if !backoff.is_zero() {
                     tokio::select! {
-                        _ = cancel.cancelled() => {
+                        _ = context.cancel.cancelled() => {
                             return Err(anyhow!("cancelled before Postgres CDC reconnect"));
                         }
                         _ = tokio::time::sleep(backoff) => {}
@@ -199,19 +229,19 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
             }
             Err(err) => {
                 metrics::record_postgres_cdc_source_connected(
-                    runtime_plan.source_id.as_str(),
-                    slot,
+                    context.runtime_plan.source_id.as_str(),
+                    context.slot,
                     false,
                 );
                 metrics::inc_postgres_cdc_reconnect(
-                    runtime_plan.source_id.as_str(),
-                    slot,
+                    context.runtime_plan.source_id.as_str(),
+                    context.slot,
                     "exhausted",
                 );
                 record_postgres_cdc_debug_connection_state(
-                    cdc_replication_debug,
-                    runtime_plan.source_id.as_str(),
-                    slot,
+                    context.cdc_replication_debug,
+                    context.runtime_plan.source_id.as_str(),
+                    context.slot,
                     false,
                     reconnects as u64,
                     Some("Postgres CDC stream reconnect attempts exhausted".to_string()),
@@ -224,19 +254,24 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_native_postgres_cdc_wal_stream_once(
-    connection_string: &str,
-    slot: &str,
-    publication: &str,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    table_store: &CdcTableStore,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    sender: mpsc::Sender<QueuedCdcTransaction>,
-    mut commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
-    cancel: &CancellationToken,
-    reconnect_attempts: u64,
+    config: PostgresCdcWalStreamOnceConfig<'_>,
 ) -> anyhow::Result<()> {
+    let PostgresCdcWalStreamOnceConfig {
+        context:
+            PostgresCdcWalStreamContext {
+                connection_string,
+                slot,
+                publication,
+                runtime_plan,
+                table_store,
+                cdc_replication_debug,
+                sender,
+                cancel,
+            },
+        mut commit_lsn_rx,
+        reconnect_attempts,
+    } = config;
     let start_lsn = stored_slot_start_lsn(connection_string, slot)
         .await
         .map_err(reconnectable_postgres_cdc_error)

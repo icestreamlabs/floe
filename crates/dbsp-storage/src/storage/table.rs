@@ -46,6 +46,19 @@ pub trait KeyValueTable: Send + Sync {
         Ok(output)
     }
 
+    async fn scan_range_bytes_for_each(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        visit_entry: &mut (dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<()> + Send),
+    ) -> Result<()> {
+        let entries = self.scan_range_bytes(range, options).await?;
+        for (key, value) in entries {
+            visit_entry(key.as_ref(), value.as_ref())?;
+        }
+        Ok(())
+    }
+
     async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_bytes(key)
             .await
@@ -188,6 +201,24 @@ impl KeyValueTable for SlateTable {
             }
         }
         Ok(entries)
+    }
+
+    async fn scan_range_bytes_for_each(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        visit_entry: &mut (dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<()> + Send),
+    ) -> Result<()> {
+        let mut iter = self
+            .db
+            .scan_with_options(range, options)
+            .await
+            .map_err(map_slate_err)?;
+
+        while let Some(kv) = iter.next().await.map_err(map_slate_err)? {
+            visit_entry(kv.key.as_ref(), kv.value.as_ref())?;
+        }
+        Ok(())
     }
 }
 

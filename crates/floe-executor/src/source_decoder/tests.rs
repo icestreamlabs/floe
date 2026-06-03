@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray, TimestampMillisecondArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use floe_core::RowValue;
@@ -335,6 +336,47 @@ fn direct_encoding_can_omit_unneeded_columns() {
         Some(EncodedRowScalar::TimestampMillis(1_700_000_000))
     );
     assert_eq!(direct_ts, Some(1_700_000_000_u64));
+}
+
+#[test]
+fn arrow_batch_builder_can_omit_unneeded_columns() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("note", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("created_at", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("definition");
+    let mut builder = SourceArrowBatchBuilder::new_with_required_columns(
+        definition,
+        1,
+        Some(Arc::from([true, false, true])),
+    );
+    let event = AppendIngestEvent::new(
+        "orders",
+        json!({
+            "id": 42,
+            "created_at": 1_700_000_000_i64
+        }),
+    );
+
+    let event_ts = builder.append_event(&event).expect("append event");
+    let batch = builder
+        .finish()
+        .expect("finish batch")
+        .expect("record batch");
+
+    assert_eq!(event_ts, Some(1_700_000_000_u64));
+    assert_eq!(batch.num_rows(), 1);
+    let note = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("note array");
+    assert!(!note.is_null(0));
+    assert_eq!(note.value(0), "");
 }
 
 #[test]

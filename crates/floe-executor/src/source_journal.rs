@@ -11,7 +11,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
-use dbsp::storage::KeyValueTable;
+use dbsp::storage::{KeyValueTable, prefix_bounds};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
@@ -93,14 +93,23 @@ impl VectorizedSourceBatchJournal {
         max_tick_id: u64,
         allowed_sources: &BTreeSet<String>,
     ) -> Result<Vec<VectorizedSourceBatchJournalEntry>> {
+        let prefix = vectorized_entry_prefix();
+        let mut should_continue = |key: &[u8], _value: &[u8]| -> Result<bool> {
+            let (tick_id, _) = parse_vectorized_entry_key(key)?;
+            Ok(tick_id <= max_tick_id)
+        };
         let entries = self
             .table
-            .scan_prefix(&vectorized_entry_prefix(), &ScanOptions::default())
+            .scan_range_bytes_until(
+                prefix_bounds(&prefix),
+                &ScanOptions::default(),
+                &mut should_continue,
+            )
             .await
             .context("scan vectorized source batch journal")?;
         let mut recovered = Vec::new();
         for (key, value) in entries {
-            let (tick_id, source) = parse_vectorized_entry_key(&key)?;
+            let (tick_id, source) = parse_vectorized_entry_key(key.as_ref())?;
             if tick_id > max_tick_id {
                 break;
             }
@@ -108,7 +117,7 @@ impl VectorizedSourceBatchJournal {
                 continue;
             }
             let (max_event_time_ms, batches) =
-                decode_vectorized_entry(&value).with_context(|| {
+                decode_vectorized_entry(value.as_ref()).with_context(|| {
                     format!(
                         "decode vectorized source batch journal entry for '{source}' at tick {tick_id}"
                     )
@@ -158,23 +167,33 @@ impl KafkaSourceJournal {
         max_tick_id: u64,
         allowed_sources: &BTreeSet<String>,
     ) -> Result<Vec<KafkaSourceJournalEntry>> {
+        let prefix = kafka_entry_prefix();
+        let mut should_continue = |key: &[u8], _value: &[u8]| -> Result<bool> {
+            let (tick_id, _) = parse_kafka_entry_key(key)?;
+            Ok(tick_id <= max_tick_id)
+        };
         let entries = self
             .table
-            .scan_prefix(&kafka_entry_prefix(), &ScanOptions::default())
+            .scan_range_bytes_until(
+                prefix_bounds(&prefix),
+                &ScanOptions::default(),
+                &mut should_continue,
+            )
             .await
             .context("scan kafka source journal metadata")?;
         let mut recovered = Vec::new();
         for (key, value) in entries {
-            let (tick_id, source) = parse_kafka_entry_key(&key)?;
+            let (tick_id, source) = parse_kafka_entry_key(key.as_ref())?;
             if tick_id > max_tick_id {
                 break;
             }
             if !allowed_sources.is_empty() && !allowed_sources.contains(&source) {
                 continue;
             }
-            let (max_event_time_ms, ranges) = decode_kafka_entry(&value).with_context(|| {
-                format!("decode kafka source journal metadata for '{source}' at tick {tick_id}")
-            })?;
+            let (max_event_time_ms, ranges) =
+                decode_kafka_entry(value.as_ref()).with_context(|| {
+                    format!("decode kafka source journal metadata for '{source}' at tick {tick_id}")
+                })?;
             recovered.push(KafkaSourceJournalEntry {
                 source,
                 tick_id,

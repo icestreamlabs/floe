@@ -1,18 +1,34 @@
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
+pub(in crate::node_runtime) struct InitialPostgresSnapshotConfig<'a> {
+    pub(in crate::node_runtime) connection_string: &'a str,
+    pub(in crate::node_runtime) slot: &'a str,
+    pub(in crate::node_runtime) publication: &'a str,
+    pub(in crate::node_runtime) runtime_plan: &'a PostgresCdcRuntimePlan,
+    pub(in crate::node_runtime) table_store: &'a CdcTableStore,
+    pub(in crate::node_runtime) sender: &'a mpsc::Sender<QueuedCdcTransaction>,
+    pub(in crate::node_runtime) cdc_replication_debug:
+        &'a Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    pub(in crate::node_runtime) settings: PostgresCdcSnapshotConfig,
+    pub(in crate::node_runtime) commit_lsn_rx: Option<&'a mut watch::Receiver<PostgresCdcCommit>>,
+    pub(in crate::node_runtime) cancel: &'a CancellationToken,
+}
+
 pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
-    connection_string: &str,
-    slot: &str,
-    publication: &str,
-    runtime_plan: &PostgresCdcRuntimePlan,
-    table_store: &CdcTableStore,
-    sender: &mpsc::Sender<QueuedCdcTransaction>,
-    cdc_replication_debug: &Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    settings: PostgresCdcSnapshotConfig,
-    commit_lsn_rx: Option<&mut watch::Receiver<PostgresCdcCommit>>,
-    cancel: &CancellationToken,
+    mut config: InitialPostgresSnapshotConfig<'_>,
 ) -> Result<InitialPostgresSnapshot> {
+    let InitialPostgresSnapshotConfig {
+        connection_string,
+        slot,
+        publication,
+        runtime_plan,
+        table_store,
+        sender,
+        cdc_replication_debug,
+        settings,
+        ref mut commit_lsn_rx,
+        cancel,
+    } = config;
     if table_store
         .load_checkpoint(&runtime_plan.source_id)
         .await
@@ -48,7 +64,7 @@ pub(in crate::node_runtime) async fn run_initial_postgres_snapshot_if_needed(
         runtime_plan,
         table_store,
         sender,
-        commit_lsn_rx,
+        commit_lsn_rx.as_deref_mut(),
         cancel,
         snapshot,
     )

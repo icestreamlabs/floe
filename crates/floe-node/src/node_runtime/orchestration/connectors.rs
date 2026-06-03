@@ -155,19 +155,18 @@ pub(super) fn spawn_connector_tasks(
                         commit_offsets_rx: Some(commit_rx),
                         resume_from_offsets,
                     };
-                    let mut connector =
-                        match KafkaConnector::new(config, definitions, HashMap::new()) {
-                            Ok(connector) => connector,
-                            Err(err) => {
-                                tracing::error!(error = %err, "Kafka connector config invalid");
-                                record_runtime_failure(
-                                    &failure_state,
-                                    format!("Kafka connector config invalid: {err}"),
-                                );
-                                runtime_cancel.cancel();
-                                return;
-                            }
-                        };
+                    let mut connector = match KafkaConnector::new(config, definitions) {
+                        Ok(connector) => connector,
+                        Err(err) => {
+                            tracing::error!(error = %err, "Kafka connector config invalid");
+                            record_runtime_failure(
+                                &failure_state,
+                                format!("Kafka connector config invalid: {err}"),
+                            );
+                            runtime_cancel.cancel();
+                            return;
+                        }
+                    };
                     let ctx = ConnectorContext::new(sender);
                     if let Err(err) = run_connector(&mut connector, &ctx, cancel.clone()).await {
                         tracing::error!(error = %err, "Kafka connector failed");
@@ -312,17 +311,18 @@ pub(super) fn spawn_connector_tasks(
                 let snapshot_settings = postgres_cdc_settings.snapshot;
                 let reconnect_settings = postgres_cdc_settings.reconnect;
                 connector_handles.push(tokio::spawn(async move {
-                    if let Err(err) = run_native_postgres_cdc_connector(
-                        config,
-                        runtime_plan,
-                        snapshot_settings,
-                        reconnect_settings,
-                        table_store,
-                        cdc_replication_debug,
-                        transaction_sender,
-                        cancel.clone(),
-                    )
-                    .await
+                    if let Err(err) =
+                        run_native_postgres_cdc_connector(NativePostgresCdcConnectorConfig {
+                            config,
+                            runtime_plan,
+                            snapshot_settings,
+                            reconnect_settings,
+                            table_store,
+                            cdc_replication_debug,
+                            sender: transaction_sender,
+                            cancel: cancel.clone(),
+                        })
+                        .await
                     {
                         if cancel.is_cancelled() {
                             tracing::debug!(

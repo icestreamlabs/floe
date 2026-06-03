@@ -326,25 +326,26 @@ pub(super) async fn apply_decoded_source_batches(
     let mut changed = false;
     for (source_id, batches) in arrow_batches_by_source.iter().enumerate() {
         let source_name = source_names_by_id[source_id].as_str();
-        for batch in batches {
-            if let Err(err) = runtime
-                .append_source_batch(source_name, batch.clone())
-                .await
-            {
-                let message =
-                    format!("failed to append Arrow source batch for '{source_name}': {err}");
-                tracing::error!(
-                    source = %source_name,
-                    error = %err,
-                    "failed to append Arrow source batch"
-                );
-                for ack in commit_acks_by_source[source_id].drain(..) {
-                    ack.record_failed(message.clone()).await;
-                }
-                return Err(anyhow!(message));
-            }
-            changed = true;
+        if batches.is_empty() {
+            continue;
         }
+        if let Err(err) = runtime
+            .append_source_batches(source_name, batches.clone())
+            .await
+        {
+            let message =
+                format!("failed to append Arrow source batches for '{source_name}': {err}");
+            tracing::error!(
+                source = %source_name,
+                error = %err,
+                "failed to append Arrow source batches"
+            );
+            for ack in commit_acks_by_source[source_id].drain(..) {
+                ack.record_failed(message.clone()).await;
+            }
+            return Err(anyhow!(message));
+        }
+        changed = true;
     }
     for (source_id, batches) in weighted_arrow_batches_by_source.iter().enumerate() {
         let source_name = source_names_by_id[source_id].as_str();

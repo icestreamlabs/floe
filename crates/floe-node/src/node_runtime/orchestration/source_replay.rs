@@ -45,19 +45,22 @@ pub(super) fn source_is_replayable_from_connector(definition: &SourceDefinition)
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn replay_committed_vectorized_source_journal_entries(
-    source_batch_journal: &VectorizedSourceBatchJournal,
-    kafka_journal: &KafkaSourceJournal,
-    vectorized_runtime: &mut VectorizedExecutionRuntime,
-    max_tick_id: u64,
-    raw_journal_sources: &BTreeSet<String>,
-    kafka_metadata_sources: &BTreeSet<String>,
-    connector_specs: &[config::ConnectorSpec],
-    run_args: &cli::RunArgs,
-    definitions: &[SourceDefinition],
-    source_id_by_name: &HashMap<String, usize>,
+    config: ReplayCommittedVectorizedSourceJournalConfig<'_>,
 ) -> anyhow::Result<(usize, usize)> {
+    let ReplayCommittedVectorizedSourceJournalConfig {
+        source_batch_journal,
+        kafka_journal,
+        vectorized_runtime,
+        max_tick_id,
+        raw_journal_sources,
+        kafka_metadata_sources,
+        connector_specs,
+        run_args,
+        definitions,
+        source_id_by_name,
+        required_columns_by_source_id,
+    } = config;
     let raw_entries = if raw_journal_sources.is_empty() {
         Vec::new()
     } else {
@@ -115,14 +118,16 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
                     continue;
                 };
                 replayed_kafka = replayed_kafka.saturating_add(1);
-                let replayed_batches = replay_kafka_source_journal_entry_as_arrow(
-                    entry,
-                    connector_specs,
-                    run_args,
-                    definitions,
-                    source_id_by_name,
-                )
-                .await?;
+                let replayed_batches =
+                    replay_kafka_source_journal_entry_as_arrow(KafkaSourceJournalReplayConfig {
+                        entry,
+                        connector_specs,
+                        run_args,
+                        definitions,
+                        source_id_by_name,
+                        required_columns_by_source_id,
+                    })
+                    .await?;
                 for (source_name, batch) in replayed_batches {
                     vectorized_runtime
                         .apply_weighted_source_delta(&source_name, batch)
@@ -147,14 +152,40 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
     Ok((replayed_raw, replayed_kafka))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn replay_kafka_source_journal_entry_as_arrow(
+pub(super) struct ReplayCommittedVectorizedSourceJournalConfig<'a> {
+    pub(super) source_batch_journal: &'a VectorizedSourceBatchJournal,
+    pub(super) kafka_journal: &'a KafkaSourceJournal,
+    pub(super) vectorized_runtime: &'a mut VectorizedExecutionRuntime,
+    pub(super) max_tick_id: u64,
+    pub(super) raw_journal_sources: &'a BTreeSet<String>,
+    pub(super) kafka_metadata_sources: &'a BTreeSet<String>,
+    pub(super) connector_specs: &'a [config::ConnectorSpec],
+    pub(super) run_args: &'a cli::RunArgs,
+    pub(super) definitions: &'a [SourceDefinition],
+    pub(super) source_id_by_name: &'a HashMap<String, usize>,
+    pub(super) required_columns_by_source_id: &'a [Option<Arc<[bool]>>],
+}
+
+struct KafkaSourceJournalReplayConfig<'a> {
     entry: floe_executor::source_journal::KafkaSourceJournalEntry,
-    connector_specs: &[config::ConnectorSpec],
-    run_args: &cli::RunArgs,
-    definitions: &[SourceDefinition],
-    source_id_by_name: &HashMap<String, usize>,
+    connector_specs: &'a [config::ConnectorSpec],
+    run_args: &'a cli::RunArgs,
+    definitions: &'a [SourceDefinition],
+    source_id_by_name: &'a HashMap<String, usize>,
+    required_columns_by_source_id: &'a [Option<Arc<[bool]>>],
+}
+
+async fn replay_kafka_source_journal_entry_as_arrow(
+    config: KafkaSourceJournalReplayConfig<'_>,
 ) -> anyhow::Result<Vec<(String, RecordBatch)>> {
+    let KafkaSourceJournalReplayConfig {
+        entry,
+        connector_specs,
+        run_args,
+        definitions,
+        source_id_by_name,
+        required_columns_by_source_id,
+    } = config;
     let mut batches = Vec::new();
     for range in entry.ranges {
         let config = kafka_replay_connector_config(connector_specs, run_args, &range.topic)?;
@@ -167,24 +198,19 @@ async fn replay_kafka_source_journal_entry_as_arrow(
             start_offset: range.start_offset,
             end_offset: range.end_offset,
         };
-        let replayed = KafkaConnector::replay_range(
-            config,
-            definitions.to_vec(),
-            HashMap::new(),
-            replay_range,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "replay kafka range {}[{}] {}..{} for source '{}' tick {}",
-                range.topic,
-                range.partition,
-                range.start_offset,
-                range.end_offset,
-                entry.source,
-                entry.tick_id
-            )
-        })?;
+        let replayed = KafkaConnector::replay_range(config, definitions.to_vec(), replay_range)
+            .await
+            .with_context(|| {
+                format!(
+                    "replay kafka range {}[{}] {}..{} for source '{}' tick {}",
+                    range.topic,
+                    range.partition,
+                    range.start_offset,
+                    range.end_offset,
+                    entry.source,
+                    entry.tick_id
+                )
+            })?;
 
         let source_id = source_id_by_name
             .get(entry.source.as_str())
@@ -194,8 +220,13 @@ async fn replay_kafka_source_journal_entry_as_arrow(
             .get(source_id)
             .cloned()
             .ok_or_else(|| anyhow!("missing source definition for '{}'", entry.source))?;
-        let mut builder =
-            SourceArrowBatchBuilder::new(definition.clone(), replayed.events.len().max(1));
+        let mut builder = SourceArrowBatchBuilder::new_with_required_columns(
+            definition.clone(),
+            replayed.events.len().max(1),
+            required_columns_by_source_id
+                .get(source_id)
+                .and_then(Clone::clone),
+        );
         let mut row_count = 0u64;
         let mut checksum = kafka_source_journal_initial_checksum();
         for event in replayed.events {

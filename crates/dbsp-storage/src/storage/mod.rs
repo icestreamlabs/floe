@@ -7,7 +7,7 @@ pub mod segment;
 pub mod segment_compaction;
 mod table;
 pub mod timestamps;
-pub use table::{KeyValueTable, SlateTable};
+pub use table::{KeyValueTable, SlateTable, prefix_bounds};
 
 use slatedb::Error as SlateError;
 

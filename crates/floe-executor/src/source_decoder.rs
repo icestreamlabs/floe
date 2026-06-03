@@ -216,11 +216,20 @@ impl SourceRowDecoder {
 pub struct SourceArrowBatchBuilder {
     definition: SourceDefinition,
     builders: Vec<SourceArrowColumnBuilder>,
+    required_columns: Option<Arc<[bool]>>,
     row_count: usize,
 }
 
 impl SourceArrowBatchBuilder {
     pub fn new(definition: SourceDefinition, capacity: usize) -> Self {
+        Self::new_with_required_columns(definition, capacity, None)
+    }
+
+    pub fn new_with_required_columns(
+        definition: SourceDefinition,
+        capacity: usize,
+        required_columns: Option<Arc<[bool]>>,
+    ) -> Self {
         let builders = definition
             .columns()
             .iter()
@@ -229,6 +238,7 @@ impl SourceArrowBatchBuilder {
         Self {
             definition,
             builders,
+            required_columns,
             row_count: 0,
         }
     }
@@ -247,7 +257,22 @@ impl SourceArrowBatchBuilder {
             .as_object()
             .context("source payload must be a JSON object")?;
         let mut event_ts = None;
-        for (builder, column) in self.builders.iter_mut().zip(self.definition.columns()) {
+        for (idx, (builder, column)) in self
+            .builders
+            .iter_mut()
+            .zip(self.definition.columns())
+            .enumerate()
+        {
+            if !self
+                .required_columns
+                .as_ref()
+                .and_then(|columns| columns.get(idx))
+                .copied()
+                .unwrap_or(true)
+            {
+                builder.append_skipped_value(column)?;
+                continue;
+            }
             let value = object.get(column.name());
             builder.append_json_value(column, value, &mut event_ts)?;
         }
@@ -425,6 +450,30 @@ impl SourceArrowColumnBuilder {
             Self::DateDays(builder) => builder.append_null(),
             Self::Decimal128(builder) => builder.append_null(),
             Self::Numeric(builder) => builder.append_null(),
+        }
+        Ok(())
+    }
+
+    fn append_skipped_value(&mut self, column: &SourceColumn) -> Result<()> {
+        if column.nullable() {
+            return self.append_null();
+        }
+        match (column.data_type(), self) {
+            (SourceDataType::Int64, Self::Int64(builder)) => builder.append_value(0),
+            (SourceDataType::Bool, Self::Bool(builder)) => builder.append_value(false),
+            (SourceDataType::Utf8, Self::Utf8(builder)) => builder.append_value(""),
+            (SourceDataType::TimestampMillis, Self::TimestampMillis(builder)) => {
+                builder.append_value(0)
+            }
+            (SourceDataType::DateDays, Self::DateDays(builder)) => builder.append_value(0),
+            (SourceDataType::Decimal128 { .. }, Self::Decimal128(builder)) => {
+                builder.append_value(0)
+            }
+            (SourceDataType::Numeric, Self::Numeric(builder)) => builder.append_value("0"),
+            (data_type, _) => bail!(
+                "source column '{}' does not match Arrow builder for {data_type:?}",
+                column.name()
+            ),
         }
         Ok(())
     }

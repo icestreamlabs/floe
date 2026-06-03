@@ -50,6 +50,10 @@ impl DynamicStateTableProvider {
             return;
         }
         let current = self.state.load_full();
+        if current.is_empty() {
+            self.state.store(Arc::new(batches));
+            return;
+        }
         let mut next = Vec::with_capacity(current.len().saturating_add(batches.len()));
         next.extend(current.iter().cloned());
         next.append(&mut batches);

@@ -119,6 +119,22 @@ fn publish_encoded_i64_overlay(view: &MaterializedViewHandle, version: u64, valu
     );
 }
 
+async fn count_star(ctx: &SessionContext, table_name: &str) -> i64 {
+    let batches = ctx
+        .sql(&format!("SELECT COUNT(*) AS row_count FROM {table_name}"))
+        .await
+        .expect("build count query")
+        .collect()
+        .await
+        .expect("collect count query");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count array")
+        .value(0)
+}
+
 #[tokio::test]
 async fn materialized_view_provider_emits_rows() {
     let registry = Arc::new(MaterializedViewRegistry::new());
@@ -462,68 +478,79 @@ async fn materialized_view_provider_builds_mv_version_only_batches_from_authorit
 }
 
 #[tokio::test]
-async fn materialized_view_provider_answers_count_star_from_authoritative_state() {
+async fn materialized_view_provider_preserves_user_mv_version_column() {
     let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_count_fast");
+    let view = registry.register("mv_user_version_column");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new(MV_VERSION_COLUMN, DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![7, 8])),
+        ],
+    )
+    .expect("record batch");
+    view.publish_arrow_version(11, vec![batch], Vec::new());
 
-    let schema = id_schema(true);
-    publish_i64_snapshot(view.as_ref(), 11, Arc::clone(&schema), &[1, 2, 3]);
-    let provider = MaterializedViewTableProvider::new(registry, "mv_count_fast", schema);
+    let provider =
+        MaterializedViewTableProvider::new(Arc::clone(&registry), "mv_user_version_column", schema);
+    assert_eq!(provider.schema().fields().len(), 2);
     let ctx = SessionContext::new();
     ctx.register_table(
-        "mv_count_fast",
+        "mv_user_version_column",
         Arc::new(provider) as Arc<dyn TableProvider>,
     )
     .expect("register mv provider");
 
     let batches = ctx
-        .sql("SELECT COUNT(*) AS row_count FROM mv_count_fast")
+        .sql(
+            "SELECT id, __mv_version \
+             FROM mv_user_version_column \
+             WHERE __mv_version = 7",
+        )
         .await
-        .expect("build count query")
+        .expect("build query")
         .collect()
         .await
-        .expect("collect count query");
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].num_rows(), 1);
-    let count = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count, 3);
+        .expect("collect query");
+    let ids = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id array");
+            (0..values.len())
+                .map(|idx| values.value(idx))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![1]);
 }
 
 #[tokio::test]
-async fn materialized_view_provider_answers_count_star_from_authoritative_non_null_state() {
-    let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_count_fast_non_null");
+async fn materialized_view_provider_answers_count_star_from_authoritative_state() {
+    for nullable in [true, false] {
+        let view_name = if nullable {
+            "mv_count_fast_nullable"
+        } else {
+            "mv_count_fast_non_null"
+        };
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        let view = registry.register(view_name);
+        let schema = id_schema(nullable);
+        publish_i64_snapshot(view.as_ref(), 11, Arc::clone(&schema), &[1, 2, 3]);
+        let provider = MaterializedViewTableProvider::new(registry, view_name, schema);
+        let ctx = SessionContext::new();
+        ctx.register_table(view_name, Arc::new(provider) as Arc<dyn TableProvider>)
+            .expect("register mv provider");
 
-    let schema = id_schema(false);
-    publish_i64_snapshot(view.as_ref(), 11, Arc::clone(&schema), &[1, 2, 3]);
-    let provider = MaterializedViewTableProvider::new(registry, "mv_count_fast_non_null", schema);
-    let ctx = SessionContext::new();
-    ctx.register_table(
-        "mv_count_fast_non_null",
-        Arc::new(provider) as Arc<dyn TableProvider>,
-    )
-    .expect("register mv provider");
-
-    let batches = ctx
-        .sql("SELECT COUNT(*) AS row_count FROM mv_count_fast_non_null")
-        .await
-        .expect("build count query")
-        .collect()
-        .await
-        .expect("collect count query");
-    assert_eq!(batches.len(), 1);
-    let count = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count, 3);
+        assert_eq!(count_star(&ctx, view_name).await, 3, "{view_name}");
+    }
 }
 
 #[tokio::test]
@@ -540,37 +567,11 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
     )
     .expect("register mv provider");
 
-    let before_publish = ctx
-        .sql("SELECT COUNT(*) AS row_count FROM mv_count_visibility")
-        .await
-        .expect("build pre-publish count query")
-        .collect()
-        .await
-        .expect("collect pre-publish count query");
-    let count_before = before_publish[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count_before, 0);
+    assert_eq!(count_star(&ctx, "mv_count_visibility").await, 0);
 
     publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[7]);
 
-    let after_publish = ctx
-        .sql("SELECT COUNT(*) AS row_count FROM mv_count_visibility")
-        .await
-        .expect("build post-publish count query")
-        .collect()
-        .await
-        .expect("collect post-publish count query");
-    let count_after = after_publish[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count_after, 1);
+    assert_eq!(count_star(&ctx, "mv_count_visibility").await, 1);
 }
 
 #[tokio::test]
@@ -589,36 +590,10 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
     )
     .expect("register mv provider");
 
-    let while_staged = ctx
-        .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
-        .await
-        .expect("build staged count query")
-        .collect()
-        .await
-        .expect("collect staged count query");
-    let count_while_staged = while_staged[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count_while_staged, 1);
+    assert_eq!(count_star(&ctx, "mv_count_staged_visibility").await, 1);
 
     publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[1, 2]);
-    let after_publish = ctx
-        .sql("SELECT COUNT(*) AS row_count FROM mv_count_staged_visibility")
-        .await
-        .expect("build published count query")
-        .collect()
-        .await
-        .expect("collect published count query");
-    let count_after_publish = after_publish[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count_after_publish, 2);
+    assert_eq!(count_star(&ctx, "mv_count_staged_visibility").await, 2);
 }
 
 #[tokio::test]
@@ -639,20 +614,10 @@ async fn materialized_view_provider_uses_cached_count_on_first_overlay_visible_v
         )
         .expect("register mv provider");
 
-    let result = session
-        .sql("SELECT COUNT(*) AS row_count FROM mv_overlay_first_visible_count")
-        .await
-        .expect("build count query")
-        .collect()
-        .await
-        .expect("collect count query");
-    let count = result[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count array")
-        .value(0);
-    assert_eq!(count, 1);
+    assert_eq!(
+        count_star(&session, "mv_overlay_first_visible_count").await,
+        1
+    );
     assert_eq!(view.authoritative_row_count_for(1), Some(1));
 }
 
