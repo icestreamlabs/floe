@@ -93,6 +93,42 @@ fn debezium_mv_sink_encoding_builds_kafka_key_and_envelope() {
 }
 
 #[test]
+fn kafka_checkpoint_selection_scans_past_unrelated_suffix_records() {
+    let target_payload = serde_json::to_vec(&serde_json::json!({
+        "sink": "sink_a",
+        "mv_name": "mv_a",
+        "last_emitted_mv_version": 17,
+        "committed_at_unix_ms": 1
+    }))
+    .expect("target checkpoint JSON");
+    let unrelated_payload = serde_json::to_vec(&serde_json::json!({
+        "sink": "sink_b",
+        "mv_name": "mv_b",
+        "last_emitted_mv_version": 99,
+        "committed_at_unix_ms": 2
+    }))
+    .expect("unrelated checkpoint JSON");
+
+    let mut latest = None;
+    consider_kafka_checkpoint_payload(&mut latest, 10, &target_payload, "sink_a", "mv_a");
+    for offset in 11..3011 {
+        consider_kafka_checkpoint_payload(
+            &mut latest,
+            offset,
+            &unrelated_payload,
+            "sink_a",
+            "mv_a",
+        );
+    }
+
+    let (_, cursor) = latest.expect("target checkpoint should still be found");
+    assert_eq!(cursor.sink, "sink_a");
+    assert_eq!(cursor.mv_name, "mv_a");
+    assert_eq!(cursor.last_emitted_mv_version, 17);
+    assert_eq!(kafka_checkpoint_key("sink_a", "mv_a"), "sink_a\0mv_a");
+}
+
+#[test]
 fn http_idempotency_keys_include_mv_version_and_row_index() {
     let rows = vec![
         SinkRecord {
@@ -210,18 +246,18 @@ async fn http_sink_crash_mid_batch_emits_no_request_before_flush() {
     let url = format!("http://{addr}/collect");
     let worker = tokio::spawn(async move {
         let client = Client::new();
-        run_http_worker(
-            "sink_http",
-            "mv_bid",
-            &client,
-            &url,
+        run_http_worker(HttpWorkerConfig {
+            sink_name: "sink_http",
+            mv_name: "mv_bid",
+            client: &client,
+            url: &url,
             rx,
             tracker,
-            BatchPolicy::new(1000, usize::MAX).expect("batch policy"),
-            RetryPolicy::new(3, Duration::from_millis(10), Duration::from_millis(20))
+            batch_policy: BatchPolicy::new(1000, usize::MAX).expect("batch policy"),
+            retry_policy: RetryPolicy::new(3, Duration::from_millis(10), Duration::from_millis(20))
                 .expect("retry policy"),
-            None,
-        )
+            checkpoint_tx: None,
+        })
         .await
     });
 

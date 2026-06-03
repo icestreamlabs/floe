@@ -13,6 +13,21 @@ pub(super) struct KafkaEosConfig {
     checkpoint_partition: i32,
 }
 
+pub(super) struct KafkaSinkConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) changelog: ChangelogSourceConfig<'a>,
+    pub(super) brokers: &'a str,
+    pub(super) topic: &'a str,
+    pub(super) queue_capacity: usize,
+    pub(super) batch_policy: BatchPolicy,
+    pub(super) retry_policy: RetryPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+    pub(super) transactional_id: Option<String>,
+    pub(super) checkpoint_topic: Option<String>,
+    pub(super) checkpoint_partition: Option<i32>,
+    pub(super) encoding: SinkEncoding,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct KafkaSinkCheckpointRecord {
     sink: String,
@@ -23,43 +38,27 @@ struct KafkaSinkCheckpointRecord {
     committed_at_unix_ms: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_kafka_sink(
-    sink_name: &str,
-    registry: Arc<MaterializedViewRegistry>,
-    cancel: CancellationToken,
-    brokers: &str,
-    topic: &str,
-    mv: &str,
-    with_snapshot: bool,
-    as_of: Option<i64>,
-    queue_capacity: usize,
-    batch_policy: BatchPolicy,
-    retry_policy: RetryPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-    transactional_id: Option<String>,
-    checkpoint_topic: Option<String>,
-    checkpoint_partition: Option<i32>,
-    encoding: SinkEncoding,
-) -> Result<()> {
-    if queue_capacity == 0 {
+pub(super) async fn run_kafka_sink(config: KafkaSinkConfig<'_>) -> Result<()> {
+    if config.queue_capacity == 0 {
         bail!("sink queue_capacity must be greater than zero");
     }
 
-    let kafka_eos = checkpoint_topic.map(|topic_name| KafkaEosConfig {
-        transactional_id: transactional_id.unwrap_or_else(|| {
+    let kafka_eos = config.checkpoint_topic.map(|topic_name| KafkaEosConfig {
+        transactional_id: config.transactional_id.unwrap_or_else(|| {
             format!(
                 "floe-{}-{}",
-                sink_name.replace(' ', "_"),
+                config.sink_name.replace(' ', "_"),
                 current_unix_time_ms()
             )
         }),
         checkpoint_topic: topic_name,
-        checkpoint_partition: checkpoint_partition.unwrap_or(DEFAULT_KAFKA_CHECKPOINT_PARTITION),
+        checkpoint_partition: config
+            .checkpoint_partition
+            .unwrap_or(DEFAULT_KAFKA_CHECKPOINT_PARTITION),
     });
 
     let mut producer_config = ClientConfig::new();
-    producer_config.set("bootstrap.servers", brokers);
+    producer_config.set("bootstrap.servers", config.brokers);
     if let Some(eos) = &kafka_eos {
         producer_config
             .set("enable.idempotence", "true")
@@ -73,10 +72,12 @@ pub(super) async fn run_kafka_sink(
             .context("initialize kafka transactions for sink")?;
     }
 
-    let mut effective_as_of = as_of;
-    let mut effective_with_snapshot = with_snapshot;
+    let mut effective_as_of = config.changelog.as_of;
+    let mut effective_with_snapshot = config.changelog.with_snapshot;
     if let Some(eos) = &kafka_eos
-        && let Some(cursor) = load_latest_kafka_checkpoint(brokers, eos, sink_name, mv).await?
+        && let Some(cursor) =
+            load_latest_kafka_checkpoint(config.brokers, eos, config.sink_name, config.changelog.mv)
+                .await?
     {
         effective_as_of = Some(
             effective_as_of
@@ -87,36 +88,36 @@ pub(super) async fn run_kafka_sink(
     }
 
     let stream = execute_mv_changelog(
-        registry.as_ref(),
+        config.changelog.registry.as_ref(),
         MvChangelogParams {
-            mv_name: mv.to_string(),
+            mv_name: config.changelog.mv.to_string(),
             with_snapshot: effective_with_snapshot,
             as_of: effective_as_of,
         },
-        cancel,
+        config.changelog.cancel.clone(),
     )
     .await?;
 
-    let (tx, rx) = mpsc::channel(queue_capacity);
-    let tracker = SinkQueueTracker::new(sink_name);
+    let (tx, rx) = mpsc::channel(config.queue_capacity);
+    let tracker = SinkQueueTracker::new(config.sink_name);
     let producer_task = tokio::spawn(stream_changelog_into_queue_with_encoding(
         stream,
         tx,
         Arc::clone(&tracker),
-        encoding,
+        config.encoding,
     ));
-    let consumer_result = run_kafka_worker(
-        sink_name,
-        mv,
-        &producer,
-        topic,
+    let consumer_result = run_kafka_worker(KafkaWorkerConfig {
+        sink_name: config.sink_name,
+        mv_name: config.changelog.mv,
+        producer: &producer,
+        topic: config.topic,
         rx,
         tracker,
-        batch_policy,
-        retry_policy,
-        checkpoint_tx,
+        batch_policy: config.batch_policy,
+        retry_policy: config.retry_policy,
+        checkpoint_tx: config.checkpoint_tx,
         kafka_eos,
-    )
+    })
     .await;
     let producer_result = producer_task
         .await
@@ -128,30 +129,31 @@ pub(super) async fn run_kafka_sink(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_kafka_worker(
-    sink_name: &str,
-    mv_name: &str,
-    producer: &FutureProducer,
-    topic: &str,
-    rx: mpsc::Receiver<SinkEvent>,
-    tracker: Arc<SinkQueueTracker>,
-    batch_policy: BatchPolicy,
-    retry_policy: RetryPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-    kafka_eos: Option<KafkaEosConfig>,
-) -> Result<()> {
+pub(super) struct KafkaWorkerConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) mv_name: &'a str,
+    pub(super) producer: &'a FutureProducer,
+    pub(super) topic: &'a str,
+    pub(super) rx: mpsc::Receiver<SinkEvent>,
+    pub(super) tracker: Arc<SinkQueueTracker>,
+    pub(super) batch_policy: BatchPolicy,
+    pub(super) retry_policy: RetryPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+    pub(super) kafka_eos: Option<KafkaEosConfig>,
+}
+
+pub(super) async fn run_kafka_worker(config: KafkaWorkerConfig<'_>) -> Result<()> {
     let backend = KafkaSinkBackend {
-        sink_name,
-        mv_name,
-        producer,
-        topic,
-        retry_policy,
-        tracker: Arc::clone(&tracker),
-        checkpoint_tx,
-        kafka_eos,
+        sink_name: config.sink_name,
+        mv_name: config.mv_name,
+        producer: config.producer,
+        topic: config.topic,
+        retry_policy: config.retry_policy,
+        tracker: Arc::clone(&config.tracker),
+        checkpoint_tx: config.checkpoint_tx,
+        kafka_eos: config.kafka_eos,
     };
-    run_buffered_sink_worker(rx, tracker, batch_policy, backend).await
+    run_buffered_sink_worker(config.rx, config.tracker, config.batch_policy, backend).await
 }
 
 struct KafkaSinkBackend<'a> {
@@ -173,35 +175,40 @@ impl BufferedSinkBackend for KafkaSinkBackend<'_> {
         flush_version: Option<i64>,
     ) -> Result<()> {
         flush_kafka_buffer(
-            self.sink_name,
-            self.mv_name,
-            self.producer,
-            self.topic,
+            KafkaFlushContext {
+                sink_name: self.sink_name,
+                mv_name: self.mv_name,
+                producer: self.producer,
+                topic: self.topic,
+                retry_policy: self.retry_policy,
+                tracker: &self.tracker,
+                checkpoint_tx: &self.checkpoint_tx,
+                kafka_eos: self.kafka_eos.as_ref(),
+            },
             buffer,
             buffer_bytes,
-            self.retry_policy,
-            &self.tracker,
             flush_version,
-            &self.checkpoint_tx,
-            self.kafka_eos.as_ref(),
         )
         .await
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn flush_kafka_buffer(
-    sink_name: &str,
-    mv_name: &str,
-    producer: &FutureProducer,
-    topic: &str,
+struct KafkaFlushContext<'a> {
+    sink_name: &'a str,
+    mv_name: &'a str,
+    producer: &'a FutureProducer,
+    topic: &'a str,
+    retry_policy: RetryPolicy,
+    tracker: &'a SinkQueueTracker,
+    checkpoint_tx: &'a Option<SinkCheckpointSender>,
+    kafka_eos: Option<&'a KafkaEosConfig>,
+}
+
+async fn flush_kafka_buffer(
+    context: KafkaFlushContext<'_>,
     buffer: &mut Vec<SinkRecord>,
     buffer_bytes: &mut usize,
-    retry_policy: RetryPolicy,
-    tracker: &SinkQueueTracker,
     flush_version: Option<i64>,
-    checkpoint_tx: &Option<SinkCheckpointSender>,
-    kafka_eos: Option<&KafkaEosConfig>,
 ) -> Result<()> {
     let flush_start = std::time::Instant::now();
     let rows_in_flush = buffer.len();
@@ -216,30 +223,37 @@ pub(super) async fn flush_kafka_buffer(
         return Ok(());
     }
 
-    if let Some(eos) = kafka_eos {
-        send_kafka_transactional_batch_with_retry(
-            sink_name,
-            mv_name,
-            producer,
-            topic,
-            buffer,
+    if let Some(eos) = context.kafka_eos {
+        send_kafka_transactional_batch_with_retry(KafkaTransactionalBatch {
+            sink_name: context.sink_name,
+            mv_name: context.mv_name,
+            producer: context.producer,
+            topic: context.topic,
+            rows: buffer,
             flushed_version,
-            retry_policy,
+            retry_policy: context.retry_policy,
             eos,
-        )
+        })
         .await?;
     } else {
-        send_kafka_batch_with_retry(sink_name, producer, topic, buffer, retry_policy).await?;
+        send_kafka_batch_with_retry(
+            context.sink_name,
+            context.producer,
+            context.topic,
+            buffer,
+            context.retry_policy,
+        )
+        .await?;
     }
     buffer.clear();
     *buffer_bytes = 0;
     if flushed_version >= 0 {
-        tracker.on_flushed(flushed_version);
+        context.tracker.on_flushed(flushed_version);
         publish_sink_cursor(
-            checkpoint_tx,
+            context.checkpoint_tx,
             SinkCursor {
-                sink: sink_name.to_string(),
-                mv_name: mv_name.to_string(),
+                sink: context.sink_name.to_string(),
+                mv_name: context.mv_name.to_string(),
                 last_emitted_mv_version: flushed_version,
                 row_index: None,
             },
@@ -254,14 +268,14 @@ pub(super) async fn flush_kafka_buffer(
             "batch_or_drain"
         };
         tracing::info!(
-            sink = %sink_name,
-            mv = %mv_name,
+            sink = %context.sink_name,
+            mv = %context.mv_name,
             flush_seq,
             flush_reason,
             rows = rows_in_flush,
             bytes = bytes_in_flush,
             flushed_version,
-            transactional = kafka_eos.is_some(),
+            transactional = context.kafka_eos.is_some(),
             latency_ms = flush_start.elapsed().as_millis() as u64,
             "kafka sink flush metrics"
         );
@@ -269,32 +283,36 @@ pub(super) async fn flush_kafka_buffer(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn send_kafka_transactional_batch_with_retry(
-    sink_name: &str,
-    mv_name: &str,
-    producer: &FutureProducer,
-    topic: &str,
-    rows: &[SinkRecord],
+struct KafkaTransactionalBatch<'a> {
+    sink_name: &'a str,
+    mv_name: &'a str,
+    producer: &'a FutureProducer,
+    topic: &'a str,
+    rows: &'a [SinkRecord],
     flushed_version: i64,
     retry_policy: RetryPolicy,
-    eos: &KafkaEosConfig,
+    eos: &'a KafkaEosConfig,
+}
+
+async fn send_kafka_transactional_batch_with_retry(
+    batch: KafkaTransactionalBatch<'_>,
 ) -> Result<()> {
-    for attempt in 0..retry_policy.max_attempts {
-        if let Err(err) = producer.begin_transaction() {
-            if attempt + 1 == retry_policy.max_attempts {
+    for attempt in 0..batch.retry_policy.max_attempts {
+        if let Err(err) = batch.producer.begin_transaction() {
+            if attempt + 1 == batch.retry_policy.max_attempts {
                 return Err(anyhow!(
                     "kafka sink failed to begin transaction after retries: {err}"
                 ));
             }
-            tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
+            tokio::time::sleep(batch.retry_policy.backoff_for_failure(attempt)).await;
             continue;
         }
 
         let mut step_error: Option<anyhow::Error> = None;
-        for row in rows {
-            let record = kafka_record(topic, row);
-            if let Err((err, _message)) = producer.send(record, Duration::from_secs(0)).await {
+        for row in batch.rows {
+            let record = kafka_record(batch.topic, row);
+            if let Err((err, _message)) = batch.producer.send(record, Duration::from_secs(0)).await
+            {
                 step_error = Some(anyhow!(
                     "kafka sink transactional row publish failed: {err}"
                 ));
@@ -304,19 +322,21 @@ pub(super) async fn send_kafka_transactional_batch_with_retry(
 
         if step_error.is_none() {
             let checkpoint = KafkaSinkCheckpointRecord {
-                sink: sink_name.to_string(),
-                mv_name: mv_name.to_string(),
-                last_emitted_mv_version: flushed_version,
+                sink: batch.sink_name.to_string(),
+                mv_name: batch.mv_name.to_string(),
+                last_emitted_mv_version: batch.flushed_version,
                 row_index: None,
                 committed_at_unix_ms: current_unix_time_ms(),
             };
             let payload =
                 serde_json::to_string(&checkpoint).context("serialize kafka checkpoint")?;
-            let checkpoint_record = FutureRecord::<str, _>::to(&eos.checkpoint_topic)
-                .partition(eos.checkpoint_partition)
-                .key(sink_name)
+            let checkpoint_key = kafka_checkpoint_key(batch.sink_name, batch.mv_name);
+            let checkpoint_record = FutureRecord::<str, _>::to(&batch.eos.checkpoint_topic)
+                .partition(batch.eos.checkpoint_partition)
+                .key(&checkpoint_key)
                 .payload(&payload);
-            if let Err((err, _message)) = producer
+            if let Err((err, _message)) = batch
+                .producer
                 .send(checkpoint_record, Duration::from_secs(0))
                 .await
             {
@@ -327,28 +347,35 @@ pub(super) async fn send_kafka_transactional_batch_with_retry(
         }
 
         if let Some(err) = step_error {
-            let _ = producer.abort_transaction(DEFAULT_KAFKA_TRANSACTION_TIMEOUT);
-            if attempt + 1 == retry_policy.max_attempts {
-                metrics::inc_sink_failure(sink_name, "kafka");
+            let _ = batch
+                .producer
+                .abort_transaction(DEFAULT_KAFKA_TRANSACTION_TIMEOUT);
+            if attempt + 1 == batch.retry_policy.max_attempts {
+                metrics::inc_sink_failure(batch.sink_name, "kafka");
                 return Err(err);
             }
-            metrics::inc_sink_retry(sink_name, "kafka");
-            tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
+            metrics::inc_sink_retry(batch.sink_name, "kafka");
+            tokio::time::sleep(batch.retry_policy.backoff_for_failure(attempt)).await;
             continue;
         }
 
-        match producer.commit_transaction(DEFAULT_KAFKA_TRANSACTION_TIMEOUT) {
+        match batch
+            .producer
+            .commit_transaction(DEFAULT_KAFKA_TRANSACTION_TIMEOUT)
+        {
             Ok(()) => return Ok(()),
             Err(err) => {
-                let _ = producer.abort_transaction(DEFAULT_KAFKA_TRANSACTION_TIMEOUT);
-                if attempt + 1 == retry_policy.max_attempts {
-                    metrics::inc_sink_failure(sink_name, "kafka");
+                let _ = batch
+                    .producer
+                    .abort_transaction(DEFAULT_KAFKA_TRANSACTION_TIMEOUT);
+                if attempt + 1 == batch.retry_policy.max_attempts {
+                    metrics::inc_sink_failure(batch.sink_name, "kafka");
                     return Err(anyhow!(
                         "kafka sink transaction commit failed after retries: {err}"
                     ));
                 }
-                metrics::inc_sink_retry(sink_name, "kafka");
-                tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
+                metrics::inc_sink_retry(batch.sink_name, "kafka");
+                tokio::time::sleep(batch.retry_policy.backoff_for_failure(attempt)).await;
             }
         }
     }
@@ -369,6 +396,7 @@ pub(super) async fn load_latest_kafka_checkpoint(
             format!("floe-sink-cursor-reader-{}", current_unix_time_ms()),
         )
         .set("enable.auto.commit", "false")
+        .set("isolation.level", "read_committed")
         .set("auto.offset.reset", "earliest");
     let consumer: BaseConsumer = client_config
         .create()
@@ -384,12 +412,11 @@ pub(super) async fn load_latest_kafka_checkpoint(
         return Ok(None);
     }
 
-    let start = if high - low > 2048 { high - 2048 } else { low };
     let mut tpl = TopicPartitionList::new();
     tpl.add_partition_offset(
         &eos.checkpoint_topic,
         eos.checkpoint_partition,
-        Offset::Offset(start),
+        Offset::Offset(low),
     )
     .with_context(|| {
         format!(
@@ -412,29 +439,13 @@ pub(super) async fn load_latest_kafka_checkpoint(
                     Some(payload) => payload,
                     None => continue,
                 };
-                let record: KafkaSinkCheckpointRecord = match serde_json::from_slice(payload) {
-                    Ok(record) => record,
-                    Err(_) => continue,
-                };
-                if record.sink != sink_name || record.mv_name != mv_name {
-                    if message.offset() >= target_last_offset {
-                        break;
-                    }
-                    continue;
-                }
-                let cursor = SinkCursor {
-                    sink: record.sink,
-                    mv_name: record.mv_name,
-                    last_emitted_mv_version: record.last_emitted_mv_version,
-                    row_index: record.row_index,
-                };
-                let replace = latest
-                    .as_ref()
-                    .map(|(offset, _)| message.offset() > *offset)
-                    .unwrap_or(true);
-                if replace {
-                    latest = Some((message.offset(), cursor));
-                }
+                consider_kafka_checkpoint_payload(
+                    &mut latest,
+                    message.offset(),
+                    payload,
+                    sink_name,
+                    mv_name,
+                );
                 if message.offset() >= target_last_offset {
                     break;
                 }
@@ -447,6 +458,40 @@ pub(super) async fn load_latest_kafka_checkpoint(
     }
 
     Ok(latest.map(|(_, cursor)| cursor))
+}
+
+pub(super) fn kafka_checkpoint_key(sink_name: &str, mv_name: &str) -> String {
+    format!("{sink_name}\0{mv_name}")
+}
+
+pub(super) fn consider_kafka_checkpoint_payload(
+    latest: &mut Option<(i64, SinkCursor)>,
+    offset: i64,
+    payload: &[u8],
+    sink_name: &str,
+    mv_name: &str,
+) {
+    let Ok(record) = serde_json::from_slice::<KafkaSinkCheckpointRecord>(payload) else {
+        return;
+    };
+    if record.sink != sink_name || record.mv_name != mv_name {
+        return;
+    }
+    let replace = latest
+        .as_ref()
+        .map(|(latest_offset, _)| offset > *latest_offset)
+        .unwrap_or(true);
+    if replace {
+        *latest = Some((
+            offset,
+            SinkCursor {
+                sink: record.sink,
+                mv_name: record.mv_name,
+                last_emitted_mv_version: record.last_emitted_mv_version,
+                row_index: record.row_index,
+            },
+        ));
+    }
 }
 
 pub(super) async fn send_kafka_batch_with_retry(

@@ -9,7 +9,9 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 
+use crate::encoded_batch::{encoded_snapshot_row_count, encoded_snapshot_to_arrow_batches};
 use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::runtime::MaterializedView;
 
 use super::MV_VERSION_COLUMN;
 use super::SnapshotScanExec;
@@ -98,6 +100,15 @@ impl MaterializedViewTableProvider {
                 version,
             );
         }
+        if let Some((snapshot, version)) = self.load_encoded_snapshot(as_of_version, limit).await? {
+            return build_batches_from_arrow_snapshot(
+                snapshot,
+                Arc::clone(&self.schema),
+                projection,
+                limit,
+                version,
+            );
+        }
         build_batches_from_arrow_snapshot(
             Arc::new(Vec::new()),
             Arc::clone(&self.schema),
@@ -146,6 +157,54 @@ impl MaterializedViewTableProvider {
         Ok(Some((snapshot, target_version)))
     }
 
+    async fn load_encoded_snapshot(
+        &self,
+        as_of_version: Option<u64>,
+        limit: Option<usize>,
+    ) -> DFResult<Option<(Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>, u64)>> {
+        let Some(view) = self.registry.get(&self.view_name) else {
+            return Ok(None);
+        };
+        let latest_visible_version = view
+            .latest_version()
+            .and_then(|version| u64::try_from(version).ok());
+        let Some(target_version) = as_of_version.or(latest_visible_version) else {
+            return Ok(None);
+        };
+        let target_version_i64 = i64::try_from(target_version)
+            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
+        let snapshot = view
+            .snapshot_for(target_version_i64)
+            .await
+            .map_err(super::helpers::to_datafusion_error)?;
+        let row_count = encoded_snapshot_row_count(&snapshot);
+        let batches = encoded_snapshot_to_arrow_batches(&snapshot, self.data_schema(), limit)
+            .map_err(super::helpers::to_datafusion_error)?;
+        view.seed_authoritative_row_count_if_latest(target_version, row_count);
+        tracing::info!(
+            view = %self.view_name,
+            version = target_version,
+            rows = row_count.min(limit.unwrap_or(usize::MAX)),
+            storage = "encoded_snapshot",
+            "materialized view loaded rows"
+        );
+        Ok(Some((Arc::new(batches), target_version)))
+    }
+
+    fn data_schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+        let fields = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|field| field.name() != MV_VERSION_COLUMN)
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        Arc::new(datafusion::arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
+        ))
+    }
+
     fn fast_count_batches(
         &self,
         as_of_version: Option<u64>,
@@ -161,6 +220,17 @@ impl MaterializedViewTableProvider {
         if as_of_version.is_some() && latest_version != Some(target_version) {
             return Ok(None);
         }
+        if let Some(row_count) = view.authoritative_row_count_for(target_version) {
+            let row_count = limit.map(|limit| row_count.min(limit)).unwrap_or(row_count);
+            tracing::info!(
+                view = %self.view_name,
+                version = target_version,
+                rows = row_count,
+                storage = "authoritative_row_count",
+                "materialized view loaded rows"
+            );
+            return Ok(Some((row_count, target_version)));
+        }
         if let Some(row_count) = i64::try_from(target_version)
             .ok()
             .and_then(|version| view.arrow_row_count_for(version))
@@ -175,7 +245,7 @@ impl MaterializedViewTableProvider {
             );
             return Ok(Some((row_count, target_version)));
         }
-        Ok(Some((0, target_version)))
+        Ok(None)
     }
 }
 

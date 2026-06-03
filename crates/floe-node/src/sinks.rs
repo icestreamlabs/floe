@@ -216,6 +216,25 @@ enum SinkEvent {
     Flush { version: i64 },
 }
 
+#[derive(Clone)]
+struct ChangelogSourceConfig<'a> {
+    registry: Arc<MaterializedViewRegistry>,
+    cancel: CancellationToken,
+    mv: &'a str,
+    with_snapshot: bool,
+    as_of: Option<i64>,
+}
+
+impl<'a> ChangelogSourceConfig<'a> {
+    fn params(&self) -> MvChangelogParams {
+        MvChangelogParams {
+            mv_name: self.mv.to_string(),
+            with_snapshot: self.with_snapshot,
+            as_of: self.as_of,
+        }
+    }
+}
+
 pub fn spawn_sinks(
     sinks: Vec<SinkSpec>,
     registry: Arc<MaterializedViewRegistry>,
@@ -308,15 +327,17 @@ async fn run_sink(
                 Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
                 Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
             )?;
-            run_kafka_sink(
-                &sink.name,
-                registry,
-                cancel,
-                &brokers,
-                &topic,
-                &mv,
-                with_snapshot.unwrap_or(false) && resume_with_snapshot,
-                as_of.or(resume_as_of),
+            run_kafka_sink(KafkaSinkConfig {
+                sink_name: &sink.name,
+                changelog: ChangelogSourceConfig {
+                    registry,
+                    cancel,
+                    mv: &mv,
+                    with_snapshot: with_snapshot.unwrap_or(false) && resume_with_snapshot,
+                    as_of: as_of.or(resume_as_of),
+                },
+                brokers: &brokers,
+                topic: &topic,
                 queue_capacity,
                 batch_policy,
                 retry_policy,
@@ -325,7 +346,7 @@ async fn run_sink(
                 checkpoint_topic,
                 checkpoint_partition,
                 encoding,
-            )
+            })
             .await
         }
         SinkConfig::File {
@@ -344,19 +365,21 @@ async fn run_sink(
                 batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES),
             )?;
             let queue_capacity = queue_capacity.unwrap_or(DEFAULT_SINK_QUEUE_CAPACITY);
-            run_file_sink(
-                &sink.name,
-                registry,
-                cancel,
-                &path,
-                &mv,
-                with_snapshot.unwrap_or(false) && resume_with_snapshot,
-                as_of.or(resume_as_of),
-                append.unwrap_or(true),
+            run_file_sink(FileSinkConfig {
+                sink_name: &sink.name,
+                changelog: ChangelogSourceConfig {
+                    registry,
+                    cancel,
+                    mv: &mv,
+                    with_snapshot: with_snapshot.unwrap_or(false) && resume_with_snapshot,
+                    as_of: as_of.or(resume_as_of),
+                },
+                path: &path,
+                append: append.unwrap_or(true),
                 queue_capacity,
                 batch_policy,
                 checkpoint_tx,
-            )
+            })
             .await
         }
         SinkConfig::Http {
@@ -382,19 +405,21 @@ async fn run_sink(
                 Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
                 Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
             )?;
-            run_http_sink(
-                &sink.name,
-                registry,
-                cancel,
-                &url,
-                &mv,
-                with_snapshot.unwrap_or(false) && resume_with_snapshot,
-                as_of.or(resume_as_of),
+            run_http_sink(HttpSinkConfig {
+                sink_name: &sink.name,
+                changelog: ChangelogSourceConfig {
+                    registry,
+                    cancel,
+                    mv: &mv,
+                    with_snapshot: with_snapshot.unwrap_or(false) && resume_with_snapshot,
+                    as_of: as_of.or(resume_as_of),
+                },
+                url: &url,
                 queue_capacity,
                 batch_policy,
                 retry_policy,
                 checkpoint_tx,
-            )
+            })
             .await
         }
         SinkConfig::Postgres {
@@ -415,20 +440,22 @@ async fn run_sink(
                 Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
                 Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
             )?;
-            run_postgres_sink(
-                &sink.name,
-                registry,
-                cancel,
-                &connection,
-                &table,
-                &mv,
-                mode.as_deref(),
-                primary_key.unwrap_or_default(),
-                with_snapshot.unwrap_or(false) && resume_with_snapshot,
-                as_of.or(resume_as_of),
+            run_postgres_sink(PostgresSinkConfig {
+                sink_name: &sink.name,
+                changelog: ChangelogSourceConfig {
+                    registry,
+                    cancel,
+                    mv: &mv,
+                    with_snapshot: with_snapshot.unwrap_or(false) && resume_with_snapshot,
+                    as_of: as_of.or(resume_as_of),
+                },
+                connection: &connection,
+                table: &table,
+                mode: mode.as_deref(),
+                primary_key: primary_key.unwrap_or_default(),
                 retry_policy,
                 checkpoint_tx,
-            )
+            })
             .await
         }
     }

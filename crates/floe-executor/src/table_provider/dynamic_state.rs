@@ -45,6 +45,17 @@ impl DynamicStateTableProvider {
         self.state.store(Arc::new(batches));
     }
 
+    pub fn append_batches(&self, mut batches: Vec<RecordBatch>) {
+        if batches.is_empty() {
+            return;
+        }
+        let current = self.state.load_full();
+        let mut next = Vec::with_capacity(current.len().saturating_add(batches.len()));
+        next.extend(current.iter().cloned());
+        next.append(&mut batches);
+        self.state.store(Arc::new(next));
+    }
+
     pub fn set_snapshot(&self, snapshot: Arc<Vec<RecordBatch>>) {
         self.state.store(snapshot);
     }

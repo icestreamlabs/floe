@@ -14,6 +14,9 @@ use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::encoded_batch::{
+    encoded_deltas_to_weighted_arrow_batches, encoded_snapshot_to_arrow_batches,
+};
 use crate::metrics;
 use crate::mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::mv::runtime::MaterializedView;
@@ -360,13 +363,9 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     if let Some(snapshot) = mv.arrow_snapshot_for(version) {
         return arrow_snapshot_batches_to_changelog(snapshot, schema, version, version_time);
     }
-    Ok(vec![MvChangelogBatch {
-        version,
-        version_time,
-        kind: MvChangelogBatchKind::Snapshot,
-        batch: RecordBatch::new_empty(schema),
-        diffs: Vec::new(),
-    }])
+    let snapshot = mv.snapshot_for(version).await?;
+    let batches = encoded_snapshot_to_arrow_batches(&snapshot, Arc::clone(&schema), None)?;
+    snapshot_batches_to_changelog(batches, schema, version, version_time)
 }
 
 async fn materialize_delta_batches<M: MaterializedView>(
@@ -379,18 +378,15 @@ async fn materialize_delta_batches<M: MaterializedView>(
     if let Some(delta) = mv.arrow_delta_for(version) {
         return arrow_delta_batches_to_changelog(delta, schema, version, version_time);
     }
+    let delta = mv.delta_for(version).await?;
+    let batches = encoded_deltas_to_weighted_arrow_batches(&delta, Arc::clone(&schema))?;
     tracing::debug!(
         version,
+        rows = delta.len(),
         total_ms = total_start.elapsed().as_millis() as u64,
-        "mv changelog has no Arrow delta for version"
+        "mv changelog materialized encoded delta"
     );
-    Ok(vec![MvChangelogBatch {
-        version,
-        version_time,
-        kind: MvChangelogBatchKind::Delta,
-        batch: RecordBatch::new_empty(schema),
-        diffs: Vec::new(),
-    }])
+    arrow_delta_batches_to_changelog(Arc::new(batches), schema, version, version_time)
 }
 
 fn arrow_snapshot_batches_to_changelog(
@@ -399,18 +395,33 @@ fn arrow_snapshot_batches_to_changelog(
     version: i64,
     version_time: Option<i64>,
 ) -> MvChangelogResult<Vec<MvChangelogBatch>> {
+    snapshot_batches_to_changelog(
+        snapshot.iter().cloned().collect(),
+        schema,
+        version,
+        version_time,
+    )
+}
+
+fn snapshot_batches_to_changelog(
+    snapshot: Vec<RecordBatch>,
+    schema: SchemaRef,
+    version: i64,
+    version_time: Option<i64>,
+) -> MvChangelogResult<Vec<MvChangelogBatch>> {
     let mut batches = Vec::new();
-    for batch in snapshot.iter() {
+    for batch in snapshot {
         ensure!(
             batch.schema().as_ref() == schema.as_ref(),
             "Arrow MV snapshot schema does not match catalog schema"
         );
+        let row_count = batch.num_rows();
         batches.push(MvChangelogBatch {
             version,
             version_time,
             kind: MvChangelogBatchKind::Snapshot,
-            batch: batch.clone(),
-            diffs: vec![1; batch.num_rows()],
+            batch,
+            diffs: vec![1; row_count],
         });
     }
     if batches.is_empty() {
@@ -539,6 +550,44 @@ mod tests {
         handle.publish_arrow_version(version, vec![value_batch(snapshot_values)], delta);
     }
 
+    fn encoded_i64_row(value: i64) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(4 + 1 + 8);
+        encoded.extend_from_slice(&(1_u32).to_le_bytes());
+        encoded.push(0x01);
+        encoded.extend_from_slice(&value.to_le_bytes());
+        encoded
+    }
+
+    fn publish_encoded_overlay(
+        handle: &MaterializedViewHandle,
+        version: u64,
+        deltas: &[(i64, i64)],
+    ) {
+        handle.append_encoded_overlay_batch(
+            version,
+            deltas
+                .iter()
+                .map(|(value, diff)| (encoded_i64_row(*value), *diff)),
+        );
+    }
+
+    fn batch_values(batch: &MvChangelogBatch) -> Vec<i64> {
+        let values = batch
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column");
+        (0..values.len()).map(|idx| values.value(idx)).collect()
+    }
+
+    fn batch_rows_with_diffs(batch: &MvChangelogBatch) -> Vec<(i64, i64)> {
+        batch_values(batch)
+            .into_iter()
+            .zip(batch.diffs.iter().copied())
+            .collect()
+    }
+
     #[tokio::test]
     async fn snapshot_then_streams_new_versions() -> MvChangelogResult<()> {
         let registry = Arc::new(MaterializedViewRegistry::new());
@@ -560,14 +609,7 @@ mod tests {
         let first_batch = stream.next().await.expect("expected initial batch")?;
         assert_eq!(first_batch.version, handle2_version);
         assert_eq!(first_batch.kind, MvChangelogBatchKind::Snapshot);
-        let values = first_batch
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column");
-        let first_snapshot: Vec<i64> = (0..values.len()).map(|idx| values.value(idx)).collect();
-        assert!(first_snapshot.contains(&2));
+        assert!(batch_values(&first_batch).contains(&2));
 
         let handle3_version = 3_i64;
         publish_arrow_version(handle.as_ref(), handle3_version, &[1, 2, 3], &[(3, 1)]);
@@ -575,14 +617,7 @@ mod tests {
         let second_batch = stream.next().await.expect("expected update batch")?;
         assert_eq!(second_batch.version, handle3_version);
         assert_eq!(second_batch.kind, MvChangelogBatchKind::Delta);
-        let values = second_batch
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column");
-        let second_snapshot: Vec<i64> = (0..values.len()).map(|idx| values.value(idx)).collect();
-        assert!(second_snapshot.contains(&3));
+        assert!(batch_values(&second_batch).contains(&3));
 
         cancel.cancel();
         Ok(())
@@ -615,19 +650,64 @@ mod tests {
         assert_eq!(batch.version, handle2_version);
         assert_eq!(batch.kind, MvChangelogBatchKind::Delta);
         assert!(batch.version_time.is_some());
-        let values = batch
-            .batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column");
-        assert_eq!(batch.diffs.len(), values.len());
-        let mut rows = Vec::new();
-        for idx in 0..values.len() {
-            rows.push((values.value(idx), batch.diffs[idx]));
-        }
+        let rows = batch_rows_with_diffs(&batch);
         assert!(rows.contains(&(1, -1)));
         assert!(rows.contains(&(2, 1)));
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_encoded_overlay_when_arrow_snapshot_is_missing() -> MvChangelogResult<()>
+    {
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_encoded_snapshot", build_schema());
+        let handle = registry.register("mv_encoded_snapshot");
+        publish_encoded_overlay(handle.as_ref(), 1, &[(10, 1), (20, 1)]);
+
+        let params = MvChangelogParams {
+            mv_name: "mv_encoded_snapshot".to_string(),
+            with_snapshot: true,
+            as_of: Some(1),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
+        let batch = stream.next().await.expect("snapshot batch")?;
+
+        assert_eq!(batch.kind, MvChangelogBatchKind::Snapshot);
+        assert_eq!(batch.version, 1);
+        let mut rows = batch_values(&batch);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![10, 20]);
+        assert_eq!(batch.diffs, vec![1, 1]);
+        cancel.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delta_uses_encoded_overlay_when_arrow_delta_is_missing() -> MvChangelogResult<()> {
+        let registry = Arc::new(MaterializedViewRegistry::new());
+        registry.set_schema("mv_encoded_delta", build_schema());
+        let handle = registry.register("mv_encoded_delta");
+        publish_encoded_overlay(handle.as_ref(), 1, &[(10, 1), (20, 1)]);
+
+        let params = MvChangelogParams {
+            mv_name: "mv_encoded_delta".to_string(),
+            with_snapshot: false,
+            as_of: Some(1),
+        };
+        let cancel = CancellationToken::new();
+        let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
+        publish_encoded_overlay(handle.as_ref(), 2, &[(10, -1), (30, 1)]);
+
+        let batch = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("timeout waiting for encoded delta")
+            .expect("encoded delta batch")?;
+        assert_eq!(batch.kind, MvChangelogBatchKind::Delta);
+        let mut rows = batch_rows_with_diffs(&batch);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(10, -1), (30, 1)]);
         cancel.cancel();
         Ok(())
     }

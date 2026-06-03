@@ -33,50 +33,44 @@ impl PostgresSinkMode {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_postgres_sink(
-    sink_name: &str,
-    registry: Arc<MaterializedViewRegistry>,
-    cancel: CancellationToken,
-    connection: &str,
-    table: &str,
-    mv: &str,
-    mode: Option<&str>,
-    primary_key: Vec<String>,
-    with_snapshot: bool,
-    as_of: Option<i64>,
-    retry_policy: RetryPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-) -> Result<()> {
-    let mode = PostgresSinkMode::parse(mode)?;
+pub(super) struct PostgresSinkConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) changelog: ChangelogSourceConfig<'a>,
+    pub(super) connection: &'a str,
+    pub(super) table: &'a str,
+    pub(super) mode: Option<&'a str>,
+    pub(super) primary_key: Vec<String>,
+    pub(super) retry_policy: RetryPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+}
+
+pub(super) async fn run_postgres_sink(config: PostgresSinkConfig<'_>) -> Result<()> {
+    let mode = PostgresSinkMode::parse(config.mode)?;
     let mut stream = execute_mv_changelog(
-        registry.as_ref(),
-        MvChangelogParams {
-            mv_name: mv.to_string(),
-            with_snapshot,
-            as_of,
-        },
-        cancel,
+        config.changelog.registry.as_ref(),
+        config.changelog.params(),
+        config.changelog.cancel.clone(),
     )
     .await?;
-    let schema = PostgresSinkSchema::from_arrow(stream.schema(), primary_key, mode)?;
-    let mut writer = PostgresSinkWriter::new(connection, table, mode, schema)?;
+    let schema = PostgresSinkSchema::from_arrow(stream.schema(), config.primary_key, mode)?;
+    let mut writer = PostgresSinkWriter::new(config.connection, config.table, mode, schema)?;
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
-        apply_postgres_batch_with_retry(&mut writer, &batch, retry_policy)
+        apply_postgres_batch_with_retry(&mut writer, &batch, config.retry_policy)
             .await
             .with_context(|| {
                 format!(
                     "apply MV changelog version {} to Postgres sink '{sink_name}'",
-                    batch.version
+                    batch.version,
+                    sink_name = config.sink_name
                 )
             })?;
         publish_sink_cursor(
-            &checkpoint_tx,
+            &config.checkpoint_tx,
             SinkCursor {
-                sink: sink_name.to_string(),
-                mv_name: mv.to_string(),
+                sink: config.sink_name.to_string(),
+                mv_name: config.changelog.mv.to_string(),
                 last_emitted_mv_version: batch.version,
                 row_index: None,
             },

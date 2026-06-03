@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use datafusion::arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Int64Builder,
-    NullArray, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
+    Date32Builder, Decimal128Array, Decimal128Builder, Int64Array, Int64Builder, NullArray,
+    StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
+    UInt64Array, UInt64Builder,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use floe_core::RowValue;
@@ -198,6 +200,77 @@ impl ScalarColumnBuilder {
         }
     }
 
+    pub(crate) fn append_array_value(&mut self, array: &dyn Array, row_idx: usize) -> Result<()> {
+        if row_idx >= array.len() {
+            return Err(anyhow!("row index {row_idx} is outside Arrow array"));
+        }
+        if array.is_null(row_idx) {
+            return self.append_encoded_scalar(None);
+        }
+        match self {
+            Self::Int64(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| anyhow!("expected Int64 Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::Utf8(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow!("expected Utf8 Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::TimestampMillis { builder, .. } => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| anyhow!("expected timestamp(ms) Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::DateDays(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| anyhow!("expected Date32 Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::Decimal128(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| anyhow!("expected Decimal128 Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::Bool(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| anyhow!("expected Boolean Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::Binary(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| anyhow!("expected Binary Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::UInt64(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| anyhow!("expected UInt64 Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::Null { len } => {
+                *len += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn append_encoded_scalar(&mut self, value: Option<&EncodedRowScalar>) -> Result<()> {
         match self {
             Self::Int64(builder) => match value {
@@ -285,7 +358,6 @@ impl ScalarColumnBuilder {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn append_encoded_scalar_repeated(
         &mut self,
         value: Option<&EncodedRowScalar>,

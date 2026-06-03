@@ -1,51 +1,44 @@
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_file_sink(
-    sink_name: &str,
-    registry: Arc<MaterializedViewRegistry>,
-    cancel: CancellationToken,
-    path: &str,
-    mv: &str,
-    with_snapshot: bool,
-    as_of: Option<i64>,
-    append: bool,
-    queue_capacity: usize,
-    batch_policy: BatchPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-) -> Result<()> {
-    if queue_capacity == 0 {
+pub(super) struct FileSinkConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) changelog: ChangelogSourceConfig<'a>,
+    pub(super) path: &'a str,
+    pub(super) append: bool,
+    pub(super) queue_capacity: usize,
+    pub(super) batch_policy: BatchPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+}
+
+pub(super) async fn run_file_sink(config: FileSinkConfig<'_>) -> Result<()> {
+    if config.queue_capacity == 0 {
         bail!("sink queue_capacity must be greater than zero");
     }
 
     let stream = execute_mv_changelog(
-        registry.as_ref(),
-        MvChangelogParams {
-            mv_name: mv.to_string(),
-            with_snapshot,
-            as_of,
-        },
-        cancel,
+        config.changelog.registry.as_ref(),
+        config.changelog.params(),
+        config.changelog.cancel.clone(),
     )
     .await?;
 
-    let (tx, rx) = mpsc::channel(queue_capacity);
-    let tracker = SinkQueueTracker::new(sink_name);
+    let (tx, rx) = mpsc::channel(config.queue_capacity);
+    let tracker = SinkQueueTracker::new(config.sink_name);
     let producer_task = tokio::spawn(stream_changelog_into_queue(
         stream,
         tx,
         Arc::clone(&tracker),
     ));
-    let consumer_result = run_file_worker(
-        sink_name,
-        mv,
-        path,
-        append,
+    let consumer_result = run_file_worker(FileWorkerConfig {
+        sink_name: config.sink_name,
+        mv_name: config.changelog.mv,
+        path: config.path,
+        append: config.append,
         rx,
         tracker,
-        batch_policy,
-        checkpoint_tx,
-    )
+        batch_policy: config.batch_policy,
+        checkpoint_tx: config.checkpoint_tx,
+    })
     .await;
     let producer_result = producer_task
         .await
@@ -57,34 +50,35 @@ pub(super) async fn run_file_sink(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_file_worker(
-    sink_name: &str,
-    mv_name: &str,
-    path: &str,
-    append: bool,
-    rx: mpsc::Receiver<SinkEvent>,
-    tracker: Arc<SinkQueueTracker>,
-    batch_policy: BatchPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-) -> Result<()> {
+pub(super) struct FileWorkerConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) mv_name: &'a str,
+    pub(super) path: &'a str,
+    pub(super) append: bool,
+    pub(super) rx: mpsc::Receiver<SinkEvent>,
+    pub(super) tracker: Arc<SinkQueueTracker>,
+    pub(super) batch_policy: BatchPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+}
+
+pub(super) async fn run_file_worker(config: FileWorkerConfig<'_>) -> Result<()> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
+        .append(config.append)
+        .truncate(!config.append)
+        .open(config.path)
         .await
-        .with_context(|| format!("open sink file {path}"))?;
+        .with_context(|| format!("open sink file {}", config.path))?;
 
     let backend = FileSinkBackend {
-        sink_name,
-        mv_name,
+        sink_name: config.sink_name,
+        mv_name: config.mv_name,
         file,
-        tracker: Arc::clone(&tracker),
-        checkpoint_tx,
+        tracker: Arc::clone(&config.tracker),
+        checkpoint_tx: config.checkpoint_tx,
     };
-    run_buffered_sink_worker(rx, tracker, batch_policy, backend).await
+    run_buffered_sink_worker(config.rx, config.tracker, config.batch_policy, backend).await
 }
 
 struct FileSinkBackend<'a> {

@@ -8,6 +8,7 @@ pub mod dbsp_plan;
 mod dbsp_table_environment;
 pub mod delta_batch;
 pub mod delta_consolidation;
+mod encoded_batch;
 pub mod encoding;
 mod metrics;
 pub mod mv;

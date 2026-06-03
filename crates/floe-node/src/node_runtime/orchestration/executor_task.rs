@@ -8,10 +8,11 @@ use buffers::ExecutorTickBuffers;
 use checkpoint::{
     CdcOnlyTickCommit, ExecutorCheckpointState, FinalCheckpoint, IngestMetrics,
     PersistTickCheckpoint, apply_decoded_source_batches, build_kafka_metadata_journal_batches,
-    build_source_journal_batches, notify_kafka_commit_senders, persist_cdc_only_tick_commit,
-    persist_final_checkpoint_unless_failed, persist_tick_checkpoint, publish_watermark_debug_state,
-    record_fatal_source_batch_failure, record_fatal_tick_failure, record_ingest_queue_metrics,
-    update_checkpoint_source_offsets, wait_for_tick_materialized_views,
+    build_source_journal_batches, drain_sink_checkpoint_updates, notify_kafka_commit_senders,
+    persist_cdc_only_tick_commit, persist_final_checkpoint_unless_failed, persist_tick_checkpoint,
+    publish_watermark_debug_state, record_fatal_source_batch_failure, record_fatal_tick_failure,
+    record_ingest_queue_metrics, update_checkpoint_source_offsets,
+    wait_for_tick_materialized_views,
 };
 pub(super) use context::{
     ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
@@ -88,7 +89,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
     let kafka_commit_senders_for_task = kafka_commit_senders;
     let postgres_cdc_commit_senders_for_task = postgres_cdc_commit_senders;
     let mut sink_checkpoint_rx_for_task = sink_checkpoint_rx;
-    const MAX_SINK_CURSOR_UPDATES_PER_ITER: usize = 4096;
     let watermark_debug_for_task = Arc::clone(&watermark_debug);
     let cdc_replication_debug_for_task = Arc::clone(&cdc_replication_debug);
     let executor_running_for_task = Arc::clone(&executor_running);
@@ -117,22 +117,14 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         let mut tick_buffers = ExecutorTickBuffers::new(
             active_source_definitions_by_id_for_task.as_slice(),
             max_batch_per_source,
+            connector_queues.len(),
         );
         checkpoint_state.restore_latest_commit(&checkpoint_manager, &watermark_for_task);
         'executor: loop {
-            for _ in 0..MAX_SINK_CURSOR_UPDATES_PER_ITER {
-                match sink_checkpoint_rx_for_task.try_recv() {
-                    Ok(cursor) => {
-                        checkpoint_manager.update_sink_cursor(
-                            &cursor.sink,
-                            &cursor.mv_name,
-                            cursor.last_emitted_mv_version,
-                            cursor.row_index,
-                        );
-                    }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-                }
-            }
+            drain_sink_checkpoint_updates(
+                &mut sink_checkpoint_rx_for_task,
+                &mut checkpoint_manager,
+            );
             checkpoint_state.record_periodic_metrics();
             if executor_cancel.is_cancelled() {
                 break;
@@ -196,8 +188,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             let pending_epoch = checkpoint_state.epoch.saturating_add(1);
             let source_count = source_names_by_id_for_task.len();
             let decode_start = Instant::now();
-            let mut tick_commit_acks = Vec::new();
             tick_buffers.reset_for_tick();
+            let tick_commit_acks = &mut tick_buffers.tick_commit_acks;
             let decoded_counts = &mut tick_buffers.decoded_counts;
             let tick_source_offsets = &mut tick_buffers.tick_source_offsets;
             let tick_kafka_offsets = &mut tick_buffers.tick_kafka_offsets;
@@ -213,8 +205,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 &mut tick_buffers.vectorized_source_journal_batches;
             let arrow_builders_by_source = &mut tick_buffers.arrow_builders_by_source;
             let commit_acks_by_source = &mut tick_buffers.commit_acks_by_source;
+            let per_connector_counts = &mut tick_buffers.per_connector_counts;
             let mut cdc_staged_writes = None::<WriteBatch>;
-            let mut per_connector_counts = vec![0usize; connector_queues.len()];
             let batch_len: usize;
             let mut decoded_rows_len = 0usize;
 
@@ -479,7 +471,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     batch,
                     per_connector_counts: selected_per_connector_counts,
                 } = selection;
-                per_connector_counts = selected_per_connector_counts;
+                per_connector_counts.clear();
+                per_connector_counts.extend(selected_per_connector_counts);
 
                 if batch.is_empty() {
                     continue;
@@ -795,8 +788,9 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     tick_all_start.elapsed().as_millis() as u64,
                 );
                 tracing::error!(epoch, error = %err, "failed to run vectorized materialization tick");
+                let failed_acks = std::mem::take(tick_commit_acks);
                 record_fatal_tick_failure(
-                    tick_commit_acks,
+                    failed_acks,
                     &failure_for_executor,
                     &executor_cancel,
                     format!("failed to run vectorized materialization tick {epoch}: {err}"),
@@ -823,11 +817,12 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
 
-            tick_commit_acks = match wait_for_tick_materialized_views(
+            let pending_acks = std::mem::take(tick_commit_acks);
+            *tick_commit_acks = match wait_for_tick_materialized_views(
                 &mv_for_task,
                 epoch,
                 &executor_cancel,
-                tick_commit_acks,
+                pending_acks,
                 &failure_for_executor,
             )
             .await
@@ -967,7 +962,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 connector_receiver_len: connector_receiver_for_task.len(),
                 decoded_counts: decoded_counts.as_slice(),
                 source_names_by_id: &source_names_by_id_for_task,
-                per_connector_counts: &per_connector_counts,
+                per_connector_counts,
                 epoch,
                 batch_len,
                 decoded_rows_len,

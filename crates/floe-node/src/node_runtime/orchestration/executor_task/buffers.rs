@@ -18,12 +18,15 @@ pub(super) struct ExecutorTickBuffers {
     pub(super) vectorized_source_journal_batches: Vec<VectorizedSourceJournalTransientBatch>,
     pub(super) arrow_builders_by_source: Vec<Option<SourceArrowBatchBuilder>>,
     pub(super) commit_acks_by_source: Vec<Vec<core_source::CommitAck>>,
+    pub(super) tick_commit_acks: Vec<core_source::CommitAck>,
+    pub(super) per_connector_counts: Vec<usize>,
 }
 
 impl ExecutorTickBuffers {
     pub(super) fn new(
         active_source_definitions_by_id: &[Option<SourceDefinition>],
         max_batch_per_source: usize,
+        connector_count: usize,
     ) -> Self {
         let source_count = active_source_definitions_by_id.len();
         Self {
@@ -47,6 +50,8 @@ impl ExecutorTickBuffers {
                 })
                 .collect(),
             commit_acks_by_source: (0..source_count).map(|_| Vec::new()).collect(),
+            tick_commit_acks: Vec::new(),
+            per_connector_counts: vec![0; connector_count],
         }
     }
 
@@ -73,5 +78,7 @@ impl ExecutorTickBuffers {
         for acks in &mut self.commit_acks_by_source {
             acks.clear();
         }
+        self.tick_commit_acks.clear();
+        self.per_connector_counts.fill(0);
     }
 }

@@ -1,20 +1,22 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::arrow::array::{ArrayRef, Int64Array};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::ScalarUDF;
+use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
-use crate::delta_consolidation::{add_weight_column, diff_snapshot_batches};
+use crate::delta_consolidation::{
+    add_weight_column, add_weight_column_to_batches, diff_snapshot_batches,
+};
 use crate::metrics;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::DynamicStateTableProvider;
@@ -56,6 +58,7 @@ struct VectorizedMaterializedViewState {
     output_schema: SchemaRef,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     previous_snapshot: Vec<RecordBatch>,
+    incremental_source: Option<String>,
 }
 
 pub struct VectorizedExecutionRuntime {
@@ -63,6 +66,8 @@ pub struct VectorizedExecutionRuntime {
     sources: HashMap<String, VectorizedSourceState>,
     materialized_views: Vec<VectorizedMaterializedViewState>,
     registry: Arc<MaterializedViewRegistry>,
+    current_insert_batches: HashMap<String, Vec<RecordBatch>>,
+    current_general_delta_sources: HashSet<String>,
 }
 
 impl VectorizedExecutionRuntime {
@@ -126,10 +131,12 @@ impl VectorizedExecutionRuntime {
         let mut mv_states = Vec::with_capacity(materialized_views.len());
         for mv in materialized_views {
             registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
-            let plan = ctx
+            let df = ctx
                 .sql(&mv.query)
                 .await
-                .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
+                .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
+            let incremental_source = incremental_source_for_plan(df.logical_plan(), &source_states);
+            let plan = df
                 .create_physical_plan()
                 .await
                 .with_context(|| format!("create vectorized physical plan for {}", mv.view_name))?;
@@ -138,6 +145,7 @@ impl VectorizedExecutionRuntime {
                 output_schema: mv.output_schema,
                 plan,
                 previous_snapshot: Vec::new(),
+                incremental_source,
             });
         }
 
@@ -146,6 +154,8 @@ impl VectorizedExecutionRuntime {
             sources: source_states,
             materialized_views: mv_states,
             registry,
+            current_insert_batches: HashMap::new(),
+            current_general_delta_sources: HashSet::new(),
         })
     }
 
@@ -197,6 +207,25 @@ impl VectorizedExecutionRuntime {
             .get(source_name)
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
+        if let Some(insert_batch) = insert_only_source_delta_batch(&state, &delta)? {
+            let tick_insert_batch = insert_batch.clone();
+            state.provider.append_batches(vec![insert_batch.clone()]);
+            if let (Some(alias_schema), Some(alias_provider)) =
+                (state.alias_schema.as_ref(), state.alias_provider.as_ref())
+            {
+                alias_provider.append_batches(rename_batches(&[insert_batch], alias_schema)?);
+            }
+            if !self.current_general_delta_sources.contains(source_name) {
+                self.current_insert_batches
+                    .entry(source_name.to_string())
+                    .or_default()
+                    .push(tick_insert_batch);
+            }
+            return Ok(());
+        }
+        self.current_insert_batches.remove(source_name);
+        self.current_general_delta_sources
+            .insert(source_name.to_string());
         let next = apply_source_delta_with_datafusion(&state, delta)
             .await
             .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
@@ -210,42 +239,171 @@ impl VectorizedExecutionRuntime {
     }
 
     pub async fn run_tick(&mut self, version: i64) -> Result<()> {
+        let ctx = &self.ctx;
+        let sources = &self.sources;
+        let registry = &self.registry;
+        let insert_batches = &self.current_insert_batches;
+        let general_delta_sources = &self.current_general_delta_sources;
         for mv in &mut self.materialized_views {
-            let plan_start = Instant::now();
-            let mut next_snapshot = collect(Arc::clone(&mv.plan), self.ctx.task_ctx())
+            if run_incremental_materialized_view_tick(
+                ctx,
+                sources,
+                registry,
+                insert_batches,
+                general_delta_sources,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            run_full_materialized_view_tick(ctx, registry, mv, version).await?;
+        }
+        self.current_insert_batches.clear();
+        self.current_general_delta_sources.clear();
+        Ok(())
+    }
+}
+
+async fn run_full_materialized_view_tick(
+    ctx: &SessionContext,
+    registry: &MaterializedViewRegistry,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<()> {
+    let plan_start = Instant::now();
+    let mut next_snapshot = collect(Arc::clone(&mv.plan), ctx.task_ctx())
+        .await
+        .with_context(|| format!("execute vectorized materialized view '{}'", mv.view_name))?;
+    next_snapshot = normalize_batches(next_snapshot, &mv.output_schema)?;
+    if next_snapshot.is_empty() {
+        next_snapshot.push(RecordBatch::new_empty(Arc::clone(&mv.output_schema)));
+    }
+
+    let diff_start = Instant::now();
+    let diff = diff_snapshot_batches(
+        Arc::clone(&mv.output_schema),
+        &mv.previous_snapshot,
+        &next_snapshot,
+    )
+    .await
+    .with_context(|| format!("diff vectorized snapshot for '{}'", mv.view_name))?;
+    metrics::observe_delta_consolidation(diff.stats, diff_start.elapsed().as_millis() as u64);
+
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, next_snapshot.clone(), diff.batches);
+    mv.previous_snapshot = next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "full",
+        "vectorized materialized view tick completed"
+    );
+    Ok(())
+}
+
+async fn run_incremental_materialized_view_tick(
+    ctx: &SessionContext,
+    sources: &HashMap<String, VectorizedSourceState>,
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    general_delta_sources: &HashSet<String>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    let Some(source_name) = mv.incremental_source.as_deref() else {
+        return Ok(false);
+    };
+    if general_delta_sources.contains(source_name) {
+        return Ok(false);
+    }
+
+    let plan_start = Instant::now();
+    let delta = if let Some(source_batches) = insert_batches.get(source_name) {
+        let source = sources
+            .get(source_name)
+            .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;
+        let _guard = SourceProviderSnapshotGuard::install(source, source_batches)?;
+        normalize_batches(
+            collect(Arc::clone(&mv.plan), ctx.task_ctx())
                 .await
                 .with_context(|| {
-                    format!("execute vectorized materialized view '{}'", mv.view_name)
-                })?;
-            next_snapshot = normalize_batches(next_snapshot, &mv.output_schema)?;
-            if next_snapshot.is_empty() {
-                next_snapshot.push(RecordBatch::new_empty(Arc::clone(&mv.output_schema)));
-            }
+                    format!(
+                        "execute incremental vectorized materialized view '{}'",
+                        mv.view_name
+                    )
+                })?,
+            &mv.output_schema,
+        )?
+    } else {
+        Vec::new()
+    };
 
-            let diff_start = Instant::now();
-            let diff = diff_snapshot_batches(
-                Arc::clone(&mv.output_schema),
-                &mv.previous_snapshot,
-                &next_snapshot,
-            )
-            .await
-            .with_context(|| format!("diff vectorized snapshot for '{}'", mv.view_name))?;
-            metrics::observe_delta_consolidation(
-                diff.stats,
-                diff_start.elapsed().as_millis() as u64,
-            );
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&mv.output_schema)?;
+    let delta_batches = add_weight_column_to_batches(&delta, &weighted_schema, 1)?;
+    let mut next_snapshot = mv
+        .previous_snapshot
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    next_snapshot.extend(delta.iter().filter(|batch| batch.num_rows() > 0).cloned());
+    if next_snapshot.is_empty() {
+        next_snapshot.push(RecordBatch::new_empty(Arc::clone(&mv.output_schema)));
+    }
 
-            let handle = self.registry.register(mv.view_name.clone());
-            handle.publish_arrow_version(version, next_snapshot.clone(), diff.batches);
-            mv.previous_snapshot = next_snapshot;
-            tracing::debug!(
-                view = %mv.view_name,
-                version,
-                total_ms = plan_start.elapsed().as_millis() as u64,
-                "vectorized materialized view tick completed"
-            );
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "incremental_filter_project",
+        "vectorized materialized view tick completed"
+    );
+    Ok(true)
+}
+
+struct SourceProviderSnapshotGuard<'a> {
+    provider: &'a DynamicStateTableProvider,
+    snapshot: Arc<Vec<RecordBatch>>,
+    alias_provider: Option<&'a DynamicStateTableProvider>,
+    alias_snapshot: Option<Arc<Vec<RecordBatch>>>,
+}
+
+impl<'a> SourceProviderSnapshotGuard<'a> {
+    fn install(source: &'a VectorizedSourceState, batches: &[RecordBatch]) -> Result<Self> {
+        let snapshot = source.provider.snapshot();
+        let alias_snapshot = source
+            .alias_provider
+            .as_ref()
+            .map(|provider| provider.snapshot());
+        source.provider.set_batches(batches.to_vec());
+        if let (Some(alias_schema), Some(alias_provider)) =
+            (source.alias_schema.as_ref(), source.alias_provider.as_ref())
+        {
+            alias_provider.set_batches(rename_batches(batches, alias_schema)?);
         }
-        Ok(())
+        Ok(Self {
+            provider: source.provider.as_ref(),
+            snapshot,
+            alias_provider: source.alias_provider.as_deref(),
+            alias_snapshot,
+        })
+    }
+}
+
+impl Drop for SourceProviderSnapshotGuard<'_> {
+    fn drop(&mut self) {
+        self.provider.set_snapshot(Arc::clone(&self.snapshot));
+        if let (Some(provider), Some(snapshot)) =
+            (self.alias_provider, self.alias_snapshot.as_ref())
+        {
+            provider.set_snapshot(Arc::clone(snapshot));
+        }
     }
 }
 
@@ -314,6 +472,43 @@ async fn apply_source_delta_with_datafusion(
 
     let batches = ctx.sql(&sql).await?.collect().await?;
     normalize_batches(batches, &state.schema)
+}
+
+fn insert_only_source_delta_batch(
+    state: &VectorizedSourceState,
+    delta: &RecordBatch,
+) -> Result<Option<RecordBatch>> {
+    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
+    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
+        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
+    }
+    let expected_delta_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&state.schema)?;
+    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
+        bail!("source delta schema does not match source schema");
+    }
+
+    let weights = delta
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
+    for row_idx in 0..weights.len() {
+        if weights.is_null(row_idx) || weights.value(row_idx) <= 0 {
+            return Ok(None);
+        }
+    }
+
+    let columns = delta
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
+        .collect::<Vec<_>>();
+    Ok(Some(RecordBatch::try_new(
+        Arc::clone(&state.schema),
+        columns,
+    )?))
 }
 
 fn normalize_batches(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
@@ -389,6 +584,36 @@ fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+fn incremental_source_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Option<String> {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            incremental_source_for_plan(projection.input.as_ref(), sources)
+        }
+        LogicalPlan::Filter(filter) => incremental_source_for_plan(filter.input.as_ref(), sources),
+        LogicalPlan::SubqueryAlias(alias) => {
+            incremental_source_for_plan(alias.input.as_ref(), sources)
+        }
+        LogicalPlan::TableScan(scan) => resolve_source_table(scan.table_name.to_string(), sources),
+        _ => None,
+    }
+}
+
+fn resolve_source_table(
+    table_name: String,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Option<String> {
+    if sources.contains_key(&table_name) {
+        return Some(table_name);
+    }
+    sources
+        .keys()
+        .find(|source_name| source_name.strip_prefix("nexmark_") == Some(table_name.as_str()))
+        .cloned()
+}
+
 fn source_primary_key_columns(definition: &SourceDefinition) -> Vec<String> {
     definition
         .property(SOURCE_PRIMARY_KEY_PROPERTY)
@@ -436,4 +661,64 @@ fn to_camel_case(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::Int64Array;
+
+    fn source_state(schema: SchemaRef) -> VectorizedSourceState {
+        VectorizedSourceState {
+            provider: Arc::new(DynamicStateTableProvider::new(Arc::clone(&schema))),
+            schema,
+            alias_schema: None,
+            alias_provider: None,
+            primary_key_columns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn insert_only_delta_strips_weight_without_rebuilding_source_state() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let weighted_schema =
+            crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+        let delta = RecordBatch::try_new(
+            weighted_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+            ],
+        )
+        .expect("weighted delta");
+
+        let batch = insert_only_source_delta_batch(&source_state(Arc::clone(&schema)), &delta)
+            .expect("detect insert-only")
+            .expect("insert batch");
+
+        assert_eq!(batch.schema().as_ref(), schema.as_ref());
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn delete_delta_uses_general_source_state_path() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let weighted_schema =
+            crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+        let delta = RecordBatch::try_new(
+            weighted_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![-1])),
+            ],
+        )
+        .expect("weighted delta");
+
+        assert!(
+            insert_only_source_delta_batch(&source_state(schema), &delta)
+                .expect("inspect delta")
+                .is_none()
+        );
+    }
 }

@@ -9,11 +9,13 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{Result as DFResult, internal_err};
-use datafusion::datasource::MemTable;
-use datafusion::functions_aggregate::expr_fn::{min, sum};
-use datafusion::prelude::{Expr, SessionContext, col, lit};
+use datafusion::error::DataFusionError;
 
 use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
+
+use crate::scalar_array_builder::ScalarColumnBuilder;
+
+const CONSOLIDATED_BATCH_ROW_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsolidationMode {
@@ -80,19 +82,10 @@ impl DeltaConsolidator {
         }
         let input_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
 
-        let ctx = SessionContext::new();
-        let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
-        ctx.register_table("delta", Arc::new(table))?;
-
-        let df = ctx.table("delta").await?;
-        let (group_exprs, aggr_exprs, select_exprs) = build_exprs(&self.schema, self.mode)?;
-        let df = df.aggregate(group_exprs, aggr_exprs)?;
-        let df = df.select(select_exprs)?;
-        let grouped = df.collect().await?;
-        let grouped_rows = grouped.iter().map(RecordBatch::num_rows).sum::<usize>();
-
-        let mut batches = filter_zero_weight_rows(grouped, Arc::clone(&self.schema)).await?;
-        let output_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let output = consolidate_rows(&batches, &self.schema, self.mode)?;
+        let grouped_rows = output.grouped_rows;
+        let output_rows = output.output_rows;
+        let mut batches = output.batches;
         if batches.is_empty() {
             batches.push(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
@@ -188,58 +181,6 @@ pub async fn diff_snapshot_batches(
     DeltaConsolidator::new(weighted_schema)?
         .consolidate_with_stats(weighted_batches)
         .await
-}
-
-async fn filter_zero_weight_rows(
-    batches: Vec<RecordBatch>,
-    schema: SchemaRef,
-) -> DFResult<Vec<RecordBatch>> {
-    validate_schema(&schema, ConsolidationMode::ByAllColumns)?;
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let ctx = SessionContext::new();
-    let table_schema = batches
-        .first()
-        .map(RecordBatch::schema)
-        .unwrap_or_else(|| Arc::clone(&schema));
-    let table = MemTable::try_new(table_schema, vec![batches])?;
-    ctx.register_table("grouped_delta", Arc::new(table))?;
-
-    let filtered = ctx
-        .table("grouped_delta")
-        .await?
-        .filter(col(WEIGHT_COLUMN_NAME).not_eq(lit(0_i64)))?
-        .collect()
-        .await?;
-    filtered
-        .into_iter()
-        .map(|batch| normalize_batch_schema(batch, &schema))
-        .collect()
-}
-
-fn normalize_batch_schema(
-    batch: RecordBatch,
-    expected_schema: &SchemaRef,
-) -> DFResult<RecordBatch> {
-    if batch.schema().as_ref() == expected_schema.as_ref() {
-        return Ok(batch);
-    }
-    if batch.num_columns() != expected_schema.fields().len() {
-        return internal_err!("consolidated batch schema column count changed");
-    }
-    let batch_schema = batch.schema();
-    for (idx, expected) in expected_schema.fields().iter().enumerate() {
-        let actual = batch_schema.field(idx);
-        if actual.name() != expected.name() || actual.data_type() != expected.data_type() {
-            return internal_err!("consolidated batch schema does not match declared delta schema");
-        }
-    }
-    Ok(RecordBatch::try_new(
-        Arc::clone(expected_schema),
-        batch.columns().to_vec(),
-    )?)
 }
 
 fn validate_key_payload_consistency(batches: &[RecordBatch], schema: &SchemaRef) -> DFResult<()> {
@@ -401,43 +342,273 @@ fn validate_schema(schema: &SchemaRef, mode: ConsolidationMode) -> DFResult<()> 
     Ok(())
 }
 
-fn build_exprs(
+#[derive(Clone, Copy)]
+struct SourceRowRef {
+    batch_idx: usize,
+    row_idx: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GroupedRow {
+    source: SourceRowRef,
+    weight: i64,
+}
+
+struct ConsolidatedRows {
+    batches: Vec<RecordBatch>,
+    grouped_rows: usize,
+    output_rows: usize,
+}
+
+fn consolidate_rows(
+    batches: &[RecordBatch],
     schema: &SchemaRef,
     mode: ConsolidationMode,
-) -> DFResult<(Vec<Expr>, Vec<Expr>, Vec<Expr>)> {
+) -> DFResult<ConsolidatedRows> {
     validate_schema(schema, mode)?;
+    let weight_idx = schema.index_of(WEIGHT_COLUMN_NAME)?;
+    let grouping_indices = grouping_indices(schema, mode)?;
+    let grouping_count = u32::try_from(grouping_indices.len())
+        .map_err(|_| DataFusionError::Internal("delta grouping key too wide".to_string()))?;
+    let key_idx = if mode == ConsolidationMode::ByKey {
+        Some(schema.index_of(KEY_COLUMN_NAME)?)
+    } else {
+        None
+    };
 
-    let mut group_exprs = Vec::new();
-    let mut aggr_exprs = Vec::new();
+    let mut groups: HashMap<Vec<u8>, GroupedRow> = HashMap::new();
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let Some(weights) = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+        else {
+            return internal_err!("{} column must be Int64", WEIGHT_COLUMN_NAME);
+        };
+        let grouping_columns = grouping_indices
+            .iter()
+            .map(|idx| Arc::clone(batch.column(*idx)))
+            .collect::<Vec<_>>();
+        let key_values = match key_idx {
+            Some(idx) => Some(
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "{KEY_COLUMN_NAME} column must be Binary"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
 
-    match mode {
-        ConsolidationMode::ByAllColumns => {
-            for field in schema.fields() {
-                if field.name() == WEIGHT_COLUMN_NAME {
-                    continue;
-                }
-                group_exprs.push(col(field.name()));
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) {
+                return internal_err!("{} column cannot contain NULL", WEIGHT_COLUMN_NAME);
             }
-            aggr_exprs.push(sum(col(WEIGHT_COLUMN_NAME)).alias(WEIGHT_COLUMN_NAME));
-        }
-        ConsolidationMode::ByKey => {
-            group_exprs.push(col(KEY_COLUMN_NAME));
-            for field in schema.fields() {
-                let name = field.name();
-                if name == KEY_COLUMN_NAME || name == WEIGHT_COLUMN_NAME {
-                    continue;
+            let group_key = if let Some(keys) = key_values {
+                if keys.is_null(row_idx) {
+                    return internal_err!("{} column cannot contain NULL", KEY_COLUMN_NAME);
                 }
-                aggr_exprs.push(min(col(name)).alias(name));
-            }
-            aggr_exprs.push(sum(col(WEIGHT_COLUMN_NAME)).alias(WEIGHT_COLUMN_NAME));
+                keys.value(row_idx).to_vec()
+            } else {
+                encode_payload_row(&grouping_columns, row_idx, grouping_count)?
+            };
+            let source = SourceRowRef { batch_idx, row_idx };
+            groups
+                .entry(group_key)
+                .and_modify(|group| {
+                    group.weight = group.weight.saturating_add(weights.value(row_idx));
+                })
+                .or_insert(GroupedRow {
+                    source,
+                    weight: weights.value(row_idx),
+                });
         }
     }
 
-    let select_exprs = schema
+    let grouped_rows = groups.len();
+    let mut rows = groups
+        .into_iter()
+        .filter_map(|(key, row)| (row.weight != 0).then_some((key, row)))
+        .collect::<Vec<_>>();
+    rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let output_rows = rows.len();
+    let rows = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    let batches = build_consolidated_batches(schema, weight_idx, batches, &rows)?;
+    Ok(ConsolidatedRows {
+        batches,
+        grouped_rows,
+        output_rows,
+    })
+}
+
+fn grouping_indices(schema: &SchemaRef, mode: ConsolidationMode) -> DFResult<Vec<usize>> {
+    Ok(match mode {
+        ConsolidationMode::ByAllColumns => schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| (field.name() != WEIGHT_COLUMN_NAME).then_some(idx))
+            .collect(),
+        ConsolidationMode::ByKey => vec![schema.index_of(KEY_COLUMN_NAME)?],
+    })
+}
+
+fn build_consolidated_batches(
+    schema: &SchemaRef,
+    weight_idx: usize,
+    source_batches: &[RecordBatch],
+    rows: &[GroupedRow],
+) -> DFResult<Vec<RecordBatch>> {
+    let mut output = Vec::new();
+    let mut builders = new_output_builders(schema)?;
+    let mut buffered_rows = 0usize;
+
+    for row in rows {
+        let source_batch = source_batches
+            .get(row.source.batch_idx)
+            .ok_or_else(|| DataFusionError::Internal("source batch index out of bounds".into()))?;
+        for (column_idx, builder) in builders.iter_mut().enumerate() {
+            if column_idx == weight_idx {
+                builder
+                    .append_i64_value(row.weight)
+                    .map_err(to_execution_error)?;
+            } else {
+                builder
+                    .append_array_value(
+                        source_batch.column(column_idx).as_ref(),
+                        row.source.row_idx,
+                    )
+                    .map_err(to_execution_error)?;
+            }
+        }
+        buffered_rows += 1;
+        if buffered_rows == CONSOLIDATED_BATCH_ROW_LIMIT {
+            output.push(finish_consolidated_batch(schema, &mut builders)?);
+            buffered_rows = 0;
+        }
+    }
+
+    if buffered_rows > 0 {
+        output.push(finish_consolidated_batch(schema, &mut builders)?);
+    }
+    Ok(output)
+}
+
+fn new_output_builders(schema: &SchemaRef) -> DFResult<Vec<ScalarColumnBuilder>> {
+    schema
         .fields()
         .iter()
-        .map(|field| col(field.name()))
-        .collect::<Vec<_>>();
+        .map(|field| {
+            ScalarColumnBuilder::new(field.data_type(), CONSOLIDATED_BATCH_ROW_LIMIT)
+                .map_err(to_execution_error)
+        })
+        .collect()
+}
 
-    Ok((group_exprs, aggr_exprs, select_exprs))
+fn finish_consolidated_batch(
+    schema: &SchemaRef,
+    builders: &mut [ScalarColumnBuilder],
+) -> DFResult<RecordBatch> {
+    let arrays = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(Arc::clone(schema), arrays)?)
+}
+
+fn to_execution_error(err: anyhow::Error) -> DataFusionError {
+    DataFusionError::Execution(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{BinaryArray, Int64Array, StringArray};
+
+    fn int_weight_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN_NAME, DataType::Int64, false),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn consolidates_by_all_columns_without_datafusion_roundtrip() {
+        let schema = int_weight_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+                Arc::new(Int64Array::from(vec![1, -1, 3])),
+            ],
+        )
+        .expect("delta batch");
+
+        let output = DeltaConsolidator::new(Arc::clone(&schema))
+            .expect("consolidator")
+            .consolidate_with_stats(vec![batch])
+            .await
+            .expect("consolidate");
+
+        assert_eq!(output.stats.input_rows, 3);
+        assert_eq!(output.stats.grouped_rows, 2);
+        assert_eq!(output.stats.output_rows, 1);
+        assert_eq!(output.stats.zero_weight_dropped_rows, 1);
+        let ids = output.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column");
+        let weights = output.batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("weight column");
+        assert_eq!(ids.values(), &[2]);
+        assert_eq!(weights.values(), &[3]);
+    }
+
+    #[tokio::test]
+    async fn consolidates_by_key_preserving_payload() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("payload", DataType::Utf8, false),
+            Field::new(KEY_COLUMN_NAME, DataType::Binary, false),
+            Field::new(WEIGHT_COLUMN_NAME, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["row", "row", "other"])),
+                Arc::new(BinaryArray::from_vec(vec![b"k1", b"k1", b"k2"])),
+                Arc::new(Int64Array::from(vec![1, 2, -1])),
+            ],
+        )
+        .expect("keyed delta batch");
+
+        let output = DeltaConsolidator::with_mode(Arc::clone(&schema), ConsolidationMode::ByKey)
+            .expect("consolidator")
+            .consolidate_with_stats(vec![batch])
+            .await
+            .expect("consolidate by key");
+
+        assert_eq!(output.stats.output_rows, 2);
+        let payloads = output.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("payload column");
+        let weights = output.batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("weight column");
+        assert_eq!(payloads.value(0), "row");
+        assert_eq!(weights.value(0), 3);
+        assert_eq!(payloads.value(1), "other");
+        assert_eq!(weights.value(1), -1);
+    }
 }

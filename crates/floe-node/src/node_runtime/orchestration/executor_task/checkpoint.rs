@@ -15,6 +15,27 @@ pub(super) struct ExecutorCheckpointState {
     pub(super) last_checkpoint_commit_at: Instant,
 }
 
+const MAX_SINK_CURSOR_UPDATES_PER_ITER: usize = 4096;
+
+pub(super) fn drain_sink_checkpoint_updates(
+    receiver: &mut mpsc::Receiver<SinkCursor>,
+    checkpoint_manager: &mut CheckpointManager,
+) {
+    for _ in 0..MAX_SINK_CURSOR_UPDATES_PER_ITER {
+        match receiver.try_recv() {
+            Ok(cursor) => {
+                checkpoint_manager.update_sink_cursor(
+                    &cursor.sink,
+                    &cursor.mv_name,
+                    cursor.last_emitted_mv_version,
+                    cursor.row_index,
+                );
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
 impl ExecutorCheckpointState {
     pub(super) fn new(tracked_mv_names: &[String]) -> Self {
         Self {

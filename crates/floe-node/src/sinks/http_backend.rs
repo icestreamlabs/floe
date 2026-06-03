@@ -1,53 +1,46 @@
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_http_sink(
-    sink_name: &str,
-    registry: Arc<MaterializedViewRegistry>,
-    cancel: CancellationToken,
-    url: &str,
-    mv: &str,
-    with_snapshot: bool,
-    as_of: Option<i64>,
-    queue_capacity: usize,
-    batch_policy: BatchPolicy,
-    retry_policy: RetryPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-) -> Result<()> {
-    if queue_capacity == 0 {
+pub(super) struct HttpSinkConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) changelog: ChangelogSourceConfig<'a>,
+    pub(super) url: &'a str,
+    pub(super) queue_capacity: usize,
+    pub(super) batch_policy: BatchPolicy,
+    pub(super) retry_policy: RetryPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+}
+
+pub(super) async fn run_http_sink(config: HttpSinkConfig<'_>) -> Result<()> {
+    if config.queue_capacity == 0 {
         bail!("sink queue_capacity must be greater than zero");
     }
 
     let client = Client::new();
     let stream = execute_mv_changelog(
-        registry.as_ref(),
-        MvChangelogParams {
-            mv_name: mv.to_string(),
-            with_snapshot,
-            as_of,
-        },
-        cancel,
+        config.changelog.registry.as_ref(),
+        config.changelog.params(),
+        config.changelog.cancel.clone(),
     )
     .await?;
 
-    let (tx, rx) = mpsc::channel(queue_capacity);
-    let tracker = SinkQueueTracker::new(sink_name);
+    let (tx, rx) = mpsc::channel(config.queue_capacity);
+    let tracker = SinkQueueTracker::new(config.sink_name);
     let producer_task = tokio::spawn(stream_changelog_into_queue(
         stream,
         tx,
         Arc::clone(&tracker),
     ));
-    let consumer_result = run_http_worker(
-        sink_name,
-        mv,
-        &client,
-        url,
+    let consumer_result = run_http_worker(HttpWorkerConfig {
+        sink_name: config.sink_name,
+        mv_name: config.changelog.mv,
+        client: &client,
+        url: config.url,
         rx,
         tracker,
-        batch_policy,
-        retry_policy,
-        checkpoint_tx,
-    )
+        batch_policy: config.batch_policy,
+        retry_policy: config.retry_policy,
+        checkpoint_tx: config.checkpoint_tx,
+    })
     .await;
     let producer_result = producer_task
         .await
@@ -59,28 +52,29 @@ pub(super) async fn run_http_sink(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_http_worker(
-    sink_name: &str,
-    mv_name: &str,
-    client: &Client,
-    url: &str,
-    rx: mpsc::Receiver<SinkEvent>,
-    tracker: Arc<SinkQueueTracker>,
-    batch_policy: BatchPolicy,
-    retry_policy: RetryPolicy,
-    checkpoint_tx: Option<SinkCheckpointSender>,
-) -> Result<()> {
+pub(super) struct HttpWorkerConfig<'a> {
+    pub(super) sink_name: &'a str,
+    pub(super) mv_name: &'a str,
+    pub(super) client: &'a Client,
+    pub(super) url: &'a str,
+    pub(super) rx: mpsc::Receiver<SinkEvent>,
+    pub(super) tracker: Arc<SinkQueueTracker>,
+    pub(super) batch_policy: BatchPolicy,
+    pub(super) retry_policy: RetryPolicy,
+    pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+}
+
+pub(super) async fn run_http_worker(config: HttpWorkerConfig<'_>) -> Result<()> {
     let backend = HttpSinkBackend {
-        sink_name,
-        mv_name,
-        client,
-        url,
-        retry_policy,
-        tracker: Arc::clone(&tracker),
-        checkpoint_tx,
+        sink_name: config.sink_name,
+        mv_name: config.mv_name,
+        client: config.client,
+        url: config.url,
+        retry_policy: config.retry_policy,
+        tracker: Arc::clone(&config.tracker),
+        checkpoint_tx: config.checkpoint_tx,
     };
-    run_buffered_sink_worker(rx, tracker, batch_policy, backend).await
+    run_buffered_sink_worker(config.rx, config.tracker, config.batch_policy, backend).await
 }
 
 struct HttpSinkBackend<'a> {
@@ -101,42 +95,47 @@ impl BufferedSinkBackend for HttpSinkBackend<'_> {
         flush_version: Option<i64>,
     ) -> Result<()> {
         flush_http_buffer(
-            self.sink_name,
-            self.mv_name,
-            self.client,
-            self.url,
+            HttpFlushContext {
+                sink_name: self.sink_name,
+                mv_name: self.mv_name,
+                client: self.client,
+                url: self.url,
+                retry_policy: self.retry_policy,
+                tracker: &self.tracker,
+                checkpoint_tx: &self.checkpoint_tx,
+            },
             buffer,
             buffer_bytes,
-            self.retry_policy,
-            &self.tracker,
             flush_version,
-            &self.checkpoint_tx,
         )
         .await
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn flush_http_buffer(
-    sink_name: &str,
-    mv_name: &str,
-    client: &Client,
-    url: &str,
+pub(super) struct HttpFlushContext<'a> {
+    sink_name: &'a str,
+    mv_name: &'a str,
+    client: &'a Client,
+    url: &'a str,
+    retry_policy: RetryPolicy,
+    tracker: &'a SinkQueueTracker,
+    checkpoint_tx: &'a Option<SinkCheckpointSender>,
+}
+
+async fn flush_http_buffer(
+    context: HttpFlushContext<'_>,
     buffer: &mut Vec<SinkRecord>,
     buffer_bytes: &mut usize,
-    retry_policy: RetryPolicy,
-    tracker: &SinkQueueTracker,
     flush_version: Option<i64>,
-    checkpoint_tx: &Option<SinkCheckpointSender>,
 ) -> Result<()> {
     if buffer.is_empty() {
         if let Some(version) = flush_version {
-            tracker.on_flushed(version);
+            context.tracker.on_flushed(version);
             publish_sink_cursor(
-                checkpoint_tx,
+                context.checkpoint_tx,
                 SinkCursor {
-                    sink: sink_name.to_string(),
-                    mv_name: mv_name.to_string(),
+                    sink: context.sink_name.to_string(),
+                    mv_name: context.mv_name.to_string(),
                     last_emitted_mv_version: version,
                     row_index: None,
                 },
@@ -146,7 +145,14 @@ pub(super) async fn flush_http_buffer(
         return Ok(());
     }
 
-    post_http_batch_with_retry(sink_name, client, url, buffer, retry_policy).await?;
+    post_http_batch_with_retry(
+        context.sink_name,
+        context.client,
+        context.url,
+        buffer,
+        context.retry_policy,
+    )
+    .await?;
     let mut flushed_version = flush_version.unwrap_or(-1);
     for row in buffer.iter() {
         flushed_version = flushed_version.max(row.version);
@@ -154,12 +160,12 @@ pub(super) async fn flush_http_buffer(
     buffer.clear();
     *buffer_bytes = 0;
     if flushed_version >= 0 {
-        tracker.on_flushed(flushed_version);
+        context.tracker.on_flushed(flushed_version);
         publish_sink_cursor(
-            checkpoint_tx,
+            context.checkpoint_tx,
             SinkCursor {
-                sink: sink_name.to_string(),
-                mv_name: mv_name.to_string(),
+                sink: context.sink_name.to_string(),
+                mv_name: context.mv_name.to_string(),
                 last_emitted_mv_version: flushed_version,
                 row_index: None,
             },
