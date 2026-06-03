@@ -80,10 +80,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub subscribe_max_catchup_versions: Option<i64>,
     #[serde(default)]
-    pub transient_segment_max_nodes: Option<usize>,
-    #[serde(default)]
-    pub transient_segment_min_score: Option<i32>,
-    #[serde(default)]
     pub admin_port: Option<u16>,
     #[serde(default)]
     pub pgwire_addr: Option<String>,

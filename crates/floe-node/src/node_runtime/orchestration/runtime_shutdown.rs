@@ -6,13 +6,11 @@ pub(super) struct RuntimeShutdownContext {
     pub(super) ingest_cancel: CancellationToken,
     pub(super) sink_cancel: CancellationToken,
     pub(super) service_cancel: CancellationToken,
-    pub(super) task_event_tx: mpsc::Sender<GraphTaskError>,
     pub(super) connector_handles: Vec<JoinHandle<()>>,
     pub(super) sink_handles: Vec<JoinHandle<()>>,
     pub(super) admin_handle: JoinHandle<()>,
     pub(super) cdc_replication_debug_handle: JoinHandle<()>,
     pub(super) executor_handle: JoinHandle<()>,
-    pub(super) task_monitor: JoinHandle<()>,
     pub(super) server_handle: JoinHandle<anyhow::Result<()>>,
     pub(super) signal_handle: JoinHandle<()>,
     pub(super) cancellation_propagation_handle: JoinHandle<()>,
@@ -31,13 +29,11 @@ pub(super) async fn shutdown_runtime(context: RuntimeShutdownContext) -> anyhow:
         ingest_cancel,
         sink_cancel,
         service_cancel,
-        task_event_tx,
         connector_handles,
         sink_handles,
         admin_handle,
         cdc_replication_debug_handle,
         executor_handle,
-        task_monitor,
         server_handle,
         signal_handle,
         cancellation_propagation_handle,
@@ -71,7 +67,6 @@ pub(super) async fn shutdown_runtime(context: RuntimeShutdownContext) -> anyhow:
     service_cancel.cancel();
     runtime_cancel.cancel();
     ingest_cancel.cancel();
-    drop(task_event_tx);
 
     for handle in connector_handles {
         if let Err(err) = handle.await
@@ -106,12 +101,6 @@ pub(super) async fn shutdown_runtime(context: RuntimeShutdownContext) -> anyhow:
         && !err.is_cancelled()
     {
         tracing::error!(error = %err, "executor task joined with error");
-    }
-
-    if let Err(err) = task_monitor.await
-        && !err.is_cancelled()
-    {
-        tracing::error!(error = %err, "graph monitor task joined with error");
     }
 
     let server_result = match server_handle.await {

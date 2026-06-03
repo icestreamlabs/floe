@@ -92,14 +92,6 @@ pub struct RunArgs {
     #[arg(long = "subscribe-max-catchup-versions", value_parser = parse_positive_i64)]
     pub subscribe_max_catchup_versions: Option<i64>,
 
-    /// Maximum number of transient operators folded into one materialization segment.
-    #[arg(long = "transient-segment-max-nodes", value_parser = parse_positive_usize)]
-    pub transient_segment_max_nodes: Option<usize>,
-
-    /// Minimum score required before the transient segment optimization is used.
-    #[arg(long = "transient-segment-min-score", value_parser = parse_nonnegative_i32)]
-    pub transient_segment_min_score: Option<i32>,
-
     /// SlateDB settings file (TOML/YAML/JSON).
     #[arg(long = "slatedb-config")]
     pub slatedb_config: Option<String>,
@@ -369,17 +361,6 @@ fn parse_positive_i64(value: &str) -> Result<i64, String> {
         .map_err(|_| "value must be a positive integer".to_string())?;
     if parsed <= 0 {
         Err("value must be greater than 0".to_string())
-    } else {
-        Ok(parsed)
-    }
-}
-
-fn parse_nonnegative_i32(value: &str) -> Result<i32, String> {
-    let parsed: i32 = value
-        .parse()
-        .map_err(|_| "value must be a non-negative integer".to_string())?;
-    if parsed < 0 {
-        Err("value must be greater than or equal to 0".to_string())
     } else {
         Ok(parsed)
     }

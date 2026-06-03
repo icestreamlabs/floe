@@ -462,8 +462,6 @@ fn load_config_accepts_materialized_views_and_runtime_sections() {
             pre_tick_commit_delay_ms = 10
             subscribe_channel_capacity = 512
             subscribe_max_catchup_versions = 64
-            transient_segment_max_nodes = 48
-            transient_segment_min_score = 0
 
             [runtime.mv_snapshot]
             max_pending_batches = 2048
@@ -496,8 +494,6 @@ fn load_config_accepts_materialized_views_and_runtime_sections() {
     assert_eq!(config.runtime.pre_tick_commit_delay_ms, Some(10));
     assert_eq!(config.runtime.subscribe_channel_capacity, Some(512));
     assert_eq!(config.runtime.subscribe_max_catchup_versions, Some(64));
-    assert_eq!(config.runtime.transient_segment_max_nodes, Some(48));
-    assert_eq!(config.runtime.transient_segment_min_score, Some(0));
     assert_eq!(config.storage.await_durable, Some(true));
     assert_eq!(config.storage.data_dir.as_deref(), Some("/tmp/floe-data"));
     assert_eq!(

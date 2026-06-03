@@ -36,7 +36,7 @@ use query_runtime::{RuntimeFrontendServices, StartRuntimeFrontendServicesConfig}
 use runtime_services::{RuntimeServicesConfig, start_runtime_services};
 use runtime_shutdown::{RuntimeShutdownContext, shutdown_runtime};
 use runtime_sources::build_runtime_source_indexes;
-use runtime_tasks::{spawn_cancellation_propagation, spawn_graph_task_monitor};
+use runtime_tasks::spawn_cancellation_propagation;
 use source_replay::{
     ReplayCommittedVectorizedSourceJournalConfig,
     replay_committed_vectorized_source_journal_entries, source_is_replayable_from_connector,
@@ -369,13 +369,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(max_catchup_versions) = run_args.subscribe_max_catchup_versions {
         subscribe_execution_config.max_catchup_versions = max_catchup_versions;
     }
-    let mut persistence_policy_config = PersistencePolicyConfig::default();
-    if let Some(max_nodes) = run_args.transient_segment_max_nodes {
-        persistence_policy_config.max_transient_segment_nodes = max_nodes;
-    }
-    if let Some(min_score) = run_args.transient_segment_min_score {
-        persistence_policy_config.min_transient_segment_score = min_score;
-    }
     let circuit_plans = build_dataflows(
         &planned_materialized_views,
         &available_sources,
@@ -384,8 +377,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut all_required_sources: BTreeSet<String> = BTreeSet::new();
     let available_source_names: BTreeSet<String> = available_sources.iter().cloned().collect();
     let mut plan_required_sources: Vec<BTreeSet<String>> = Vec::with_capacity(circuit_plans.len());
-    let mut transient_eligible_sources: BTreeSet<String> = BTreeSet::new();
-    let mut durable_required_sources: BTreeSet<String> = BTreeSet::new();
     for (mv_idx, plan) in circuit_plans.iter().enumerate() {
         let view_name = planned_materialized_views[mv_idx]
             .definition()
@@ -395,40 +386,20 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             required_sources, ..
         } = validate_dbsp_plan(plan, &available_source_names, &view_name)?;
         all_required_sources.extend(required_sources.iter().cloned());
-        if let Some(source_names) =
-            source_batch_journal_root_sources_with_config(plan, persistence_policy_config)?
-            && !source_names.is_empty()
-            && source_names == required_sources
-        {
-            transient_eligible_sources.extend(source_names);
-        } else {
-            durable_required_sources.extend(required_sources.iter().cloned());
-        }
         plan_required_sources.push(required_sources);
     }
-    let transient_only_sources: BTreeSet<String> = transient_eligible_sources
-        .difference(&durable_required_sources)
-        .cloned()
-        .collect();
-    tracing::info!(
-        transient_eligible_sources = ?transient_eligible_sources,
-        durable_required_sources = ?durable_required_sources,
-        transient_only_sources = ?transient_only_sources,
-        "resolved source durability sets"
-    );
     let source_journal_mode = config
         .as_ref()
         .and_then(|config| config.storage.source_journal)
         .unwrap_or(SourceJournalConfig::Auto);
-    let vectorized_replay_candidate_sources = all_required_sources.clone();
     let source_journal_required_sources = source_journal_required_sources(
         &source_registry,
-        &vectorized_replay_candidate_sources,
+        &all_required_sources,
         source_journal_mode,
     );
     let kafka_metadata_journal_required_sources = kafka_metadata_journal_required_sources(
         &source_registry,
-        &vectorized_replay_candidate_sources,
+        &all_required_sources,
         source_journal_mode,
     );
     if !source_journal_required_sources.is_empty()
@@ -444,7 +415,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .union(&kafka_metadata_journal_required_sources)
         .cloned()
         .collect();
-    let source_journal_skipped_sources: BTreeSet<String> = transient_only_sources
+    let source_journal_skipped_sources: BTreeSet<String> = all_required_sources
         .difference(&source_replay_covered_sources)
         .cloned()
         .collect();
@@ -453,7 +424,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         journaled_sources = ?source_journal_required_sources,
         kafka_metadata_sources = ?kafka_metadata_journal_required_sources,
         skipped_sources = ?source_journal_skipped_sources,
-        "resolved transient source journal policy"
+        "resolved source replay journal policy"
     );
     let non_replayable_skipped_sources: BTreeSet<String> = source_journal_skipped_sources
         .iter()
@@ -467,7 +438,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if !non_replayable_skipped_sources.is_empty() {
         tracing::warn!(
             sources = ?non_replayable_skipped_sources,
-            "source journal disabled for non-replayable transient sources; committed source rows will not be recoverable or queryable after restart"
+            "source journal disabled for non-replayable sources; committed source rows will not be recoverable or queryable after restart"
         );
     }
     if run_args.dry_run {
@@ -520,16 +491,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let kafka_source_journal = KafkaSourceJournal::new(checkpoint_manager.store().table());
     let outer_registry = {
         let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let mut registry =
-            OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
-                .await
-                .context("initialize outer DBSP streams for sources")?;
-        for source in &transient_only_sources {
-            registry.set_durable_enabled(source, false);
-            let recoverable = source_replay_covered_sources.contains(source);
-            registry.set_recoverable(source, recoverable);
-        }
-        registry
+        OuterStreamRegistry::from_validated_sources(&all_required_sources, &mut bridge)
+            .await
+            .context("initialize outer DBSP streams for sources")?
     };
     let outer_registry = Arc::new(Mutex::new(outer_registry));
     if circuit_plans.is_empty() {
@@ -646,44 +610,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let service_cancel = CancellationToken::new();
     let shutdown_signal = CancellationToken::new();
     let runtime_failure = Arc::new(StdMutex::new(None::<String>));
-    let (task_event_tx, task_event_rx) =
-        mpsc::channel::<GraphTaskError>(GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let task_monitor = spawn_graph_task_monitor(
-        runtime_cancel.clone(),
-        Arc::clone(&runtime_failure),
-        task_event_rx,
-    );
-    for (idx, _plan) in circuit_plans.iter().enumerate() {
-        let mv_def = &planned_materialized_views[idx];
-        let view_name = mv_def.definition().name();
-        let namespace = floe_executor::namespaces::materialized_view(view_name)
-            .unwrap_or_else(|_| format!("materialized_view/{view_name}"));
-        let required_sources = &plan_required_sources[idx];
-        let (handle_streams, transient_streams) = {
-            let registry_guard = outer_registry.lock().await;
-            (
-                gather_handle_streams(&registry_guard, required_sources),
-                gather_transient_streams(&registry_guard, required_sources),
-            )
-        };
-        tracing::info!(
-            view = %view_name,
-            namespace = %namespace,
-            required_sources = ?required_sources,
-            handle_streams = ?handle_streams.keys(),
-            transient_streams = ?transient_streams.keys(),
-            "building DBSP graph"
-        );
-
-        tracing::info!(
-            view = %view_name,
-            namespace = %namespace,
-            required_sources = ?required_sources,
-            handle_streams = ?handle_streams.keys(),
-            transient_streams = ?transient_streams.keys(),
-            "skipping legacy DBSP row-wise graph; vectorized runtime owns materialization"
-        );
-    }
     let mut replayed_committed_source_batches = false;
     let connector_resume_only_sources: BTreeSet<String> = source_journal_skipped_sources
         .difference(&kafka_metadata_journal_required_sources)
@@ -965,13 +891,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         ingest_cancel,
         sink_cancel,
         service_cancel,
-        task_event_tx,
         connector_handles,
         sink_handles,
         admin_handle,
         cdc_replication_debug_handle,
         executor_handle,
-        task_monitor,
         server_handle,
         signal_handle,
         cancellation_propagation_handle,

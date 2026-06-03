@@ -1,129 +1,12 @@
-use super::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+use anyhow::{Result, anyhow, bail};
+use dbsp::{CircuitNode, CircuitPlan, DbspNodeKind, RowSchema};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanSourceRequirements {
     pub source_name: String,
     pub required_columns: Vec<usize>,
-}
-
-pub fn source_batch_journal_root_sources(plan: &CircuitPlan) -> Result<Option<BTreeSet<String>>> {
-    source_batch_journal_root_sources_with_config(plan, PersistencePolicyConfig::default())
-}
-
-pub fn source_batch_journal_root_sources_with_config(
-    plan: &CircuitPlan,
-    persistence_policy_config: PersistencePolicyConfig,
-) -> Result<Option<BTreeSet<String>>> {
-    if let Some(shape) = try_build_transient_source_window_aggregate_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    if let Some(shape) = try_build_transient_source_window_count_star_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    if let Some(shape) = try_build_transient_source_aggregate_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    if let Some(shape) = try_build_transient_source_topn_root_shape(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_root.source_name])));
-    }
-    // Keep orchestration durability decisions aligned with the builder by using the same
-    // recursive source-root matcher here. Optimizer-inserted wrapper projections can otherwise
-    // preserve the transient fast path in the builder while leaving durable outer streams enabled.
-    if let Some(shape) = try_build_transient_source_root_materialization(plan, plan.root)? {
-        return Ok(Some(BTreeSet::from([shape.source_name])));
-    }
-    if let Some(shape) = try_build_transient_join_pipeline_root_materialization(plan, plan.root)?
-        && shape
-            .steps
-            .iter()
-            .any(|step| !matches!(step, TransientJoinPipelineStep::Transform(_)))
-    {
-        return Ok(Some(BTreeSet::from([
-            shape.left_source_root.source_name,
-            shape.right_source_root.source_name,
-        ])));
-    }
-
-    let persistence_policy =
-        PersistencePolicy::for_plan_with_config(plan, persistence_policy_config);
-    let Some(transient_opt) = try_build_transient_segment_optimization(
-        plan,
-        plan.root,
-        &HashMap::new(),
-        "source_batch_journal",
-        true,
-        &persistence_policy,
-    )?
-    else {
-        return Ok(None);
-    };
-    let Some(join_node) = plan.node(transient_opt.durable_input_idx) else {
-        return Ok(None);
-    };
-    let DbspNodeKind::Join(join) = &join_node.kind else {
-        return Ok(None);
-    };
-    if !matches!(join.join_type, dbsp::DbspJoinType::Inner)
-        || !has_single_consumer(plan, transient_opt.durable_input_idx)
-    {
-        return Ok(None);
-    }
-    let (left_idx, right_idx) = join_inputs(join_node)?;
-    let Some(left_root) = try_build_transient_source_root_materialization(plan, left_idx)? else {
-        return Ok(None);
-    };
-    let Some(right_root) = try_build_transient_source_root_materialization(plan, right_idx)? else {
-        return Ok(None);
-    };
-    Ok(Some(BTreeSet::from([
-        left_root.source_name,
-        right_root.source_name,
-    ])))
-}
-
-pub fn source_batch_journal_root_source_name(plan: &CircuitPlan) -> Option<String> {
-    source_batch_journal_root_sources(plan)
-        .ok()
-        .flatten()
-        .and_then(|sources| {
-            if sources.len() == 1 {
-                sources.into_iter().next()
-            } else {
-                None
-            }
-        })
-}
-
-pub fn transient_source_root_requirements(
-    plan: &CircuitPlan,
-) -> Result<Option<TransientSourceRootRequirements>> {
-    let Some(shape) = find_transient_source_root_shape(plan, plan.root)? else {
-        return Ok(None);
-    };
-    let source_name = shape.source_name().to_string();
-    let required_columns = match &shape {
-        TransientSourceRootShape::Source { source, .. }
-        | TransientSourceRootShape::Select { source, .. } => {
-            (0..source.output_schema().len()).collect()
-        }
-        TransientSourceRootShape::Project { project, .. } => required_encoded_input_columns(
-            None,
-            Some(project.expressions()),
-            project.input_schema(),
-        )?,
-        TransientSourceRootShape::FilterMap {
-            select, project, ..
-        } => required_encoded_input_columns(
-            Some(select.predicate()),
-            Some(project.expressions()),
-            select.output_schema(),
-        )?,
-    };
-    Ok(Some(TransientSourceRootRequirements {
-        source_name,
-        required_columns,
-    }))
 }
 
 pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSourceRequirements>>> {
@@ -381,6 +264,13 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
             })
             .collect(),
     ))
+}
+
+fn first_input(node: &CircuitNode, label: &str) -> Result<usize> {
+    node.inputs
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow!("{label} node missing required input"))
 }
 
 fn extend_required_columns(

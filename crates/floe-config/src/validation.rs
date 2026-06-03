@@ -66,14 +66,6 @@ fn validate_runtime_config(runtime: &RuntimeConfig) -> Result<()> {
         runtime.subscribe_max_catchup_versions,
         "runtime.subscribe_max_catchup_versions",
     )?;
-    ensure_optional_positive_usize(
-        runtime.transient_segment_max_nodes,
-        "runtime.transient_segment_max_nodes",
-    )?;
-    ensure_optional_nonnegative_i32(
-        runtime.transient_segment_min_score,
-        "runtime.transient_segment_min_score",
-    )?;
     ensure_optional_positive_u16(runtime.admin_port, "runtime.admin_port")?;
     ensure_optional_non_empty(runtime.pgwire_addr.as_deref(), "runtime.pgwire_addr")?;
     ensure_optional_positive_usize(
@@ -618,15 +610,6 @@ fn ensure_optional_positive_i64(value: Option<i64>, field_path: &str) -> Result<
         && value <= 0
     {
         bail!("{field_path} must be greater than 0");
-    }
-    Ok(())
-}
-
-fn ensure_optional_nonnegative_i32(value: Option<i32>, field_path: &str) -> Result<()> {
-    if let Some(value) = value
-        && value < 0
-    {
-        bail!("{field_path} must be greater than or equal to 0");
     }
     Ok(())
 }

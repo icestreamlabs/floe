@@ -2,13 +2,13 @@ use super::super::*;
 
 pub(in crate::node_runtime) fn source_journal_required_sources(
     registry: &SourceRegistry,
-    transient_only_sources: &BTreeSet<String>,
+    candidate_sources: &BTreeSet<String>,
     mode: SourceJournalConfig,
 ) -> BTreeSet<String> {
     match mode {
-        SourceJournalConfig::Full => transient_only_sources.clone(),
+        SourceJournalConfig::Full => candidate_sources.clone(),
         SourceJournalConfig::None => BTreeSet::new(),
-        SourceJournalConfig::Auto => transient_only_sources
+        SourceJournalConfig::Auto => candidate_sources
             .iter()
             .filter(|source| {
                 registry
@@ -22,13 +22,13 @@ pub(in crate::node_runtime) fn source_journal_required_sources(
 
 pub(in crate::node_runtime) fn kafka_metadata_journal_required_sources(
     registry: &SourceRegistry,
-    transient_only_sources: &BTreeSet<String>,
+    candidate_sources: &BTreeSet<String>,
     mode: SourceJournalConfig,
 ) -> BTreeSet<String> {
     if mode != SourceJournalConfig::Auto {
         return BTreeSet::new();
     }
-    transient_only_sources
+    candidate_sources
         .iter()
         .filter(|source| {
             registry
