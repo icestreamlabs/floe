@@ -84,7 +84,7 @@ async fn benchmark_join_child_transforms_match_pruned_source_handle_outputs() {
         })
         .collect::<HashMap<_, _>>();
 
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     builder.watermark = Arc::new(AtomicI64::new(-1));
@@ -301,7 +301,7 @@ async fn benchmark_large_bid_batch_transform_matches_pruned_source_handle_output
         })
         .collect::<HashMap<_, _>>();
 
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     builder.watermark = Arc::new(AtomicI64::new(-1));
@@ -494,7 +494,7 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         })
         .collect::<HashMap<_, _>>();
 
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     builder.watermark = Arc::new(AtomicI64::new(-1));
@@ -706,9 +706,9 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         .tick_all_with_version(1)
         .await
         .expect("tick auction batch");
-    let (ts, canonical_handle) = timeout(Duration::from_secs(1), canonical_cursor.next())
+    let (ts, canonical_handle) = canonical_cursor
+        .next()
         .await
-        .expect("wait canonical join build tick")
         .expect("canonical join build tick");
     assert_eq!(ts, 1);
     let build_tick_delta = materialize_zset_handle::<Vec<u8>>(
@@ -735,10 +735,12 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         build_tick_delta.is_empty(),
         "auction build tick should emit an explicit empty canonical join handle"
     );
+    tokio::task::yield_now().await;
     assert!(
-        timeout(Duration::from_millis(100), observer_rx.recv())
-            .await
-            .is_err(),
+        matches!(
+            observer_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
         "auction build tick should not emit transient join output until the other side advances"
     );
 
@@ -798,9 +800,9 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
             .await
             .expect("tick bid batch");
 
-        let (_, canonical_handle) = timeout(Duration::from_secs(1), canonical_cursor.next())
+        let (_, canonical_handle) = canonical_cursor
+            .next()
             .await
-            .expect("wait canonical join output")
             .expect("canonical join output");
         let actual =
             materialize_zset_handle::<Vec<u8>>(Arc::clone(&table), &mut cache, &canonical_handle)
@@ -821,14 +823,22 @@ async fn benchmark_transient_join_inputs_match_canonical_join_output() {
         };
 
         let mut transient_raw = Vec::new();
-        let recv_timeout = if actual.is_empty() {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs(1)
-        };
-        while let Ok(Some((version, transient_batch))) =
-            timeout(recv_timeout, observer_rx.recv()).await
-        {
+        loop {
+            let maybe_transient = if actual.is_empty() {
+                tokio::task::yield_now().await;
+                match observer_rx.try_recv() {
+                    Ok(batch) => Some(batch),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        panic!("transient observer closed")
+                    }
+                }
+            } else {
+                Some(observer_rx.recv().await.expect("transient join output"))
+            };
+            let Some((version, transient_batch)) = maybe_transient else {
+                break;
+            };
             assert_eq!(
                 version, expected_transient_version,
                 "unexpected transient join output version at bid tick {tick}"

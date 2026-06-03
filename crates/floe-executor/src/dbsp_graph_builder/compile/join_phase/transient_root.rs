@@ -16,7 +16,7 @@ use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use std::collections::BTreeSet;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn compile_transient_join_root_materialization(
         &mut self,

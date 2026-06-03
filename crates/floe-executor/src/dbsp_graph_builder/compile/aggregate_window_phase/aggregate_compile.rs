@@ -10,7 +10,7 @@ use super::incremental_eval::{
 use super::*;
 use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(crate) async fn compile_aggregate(
         &mut self,
         node_idx: usize,

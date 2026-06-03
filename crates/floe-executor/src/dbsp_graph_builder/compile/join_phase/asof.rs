@@ -13,7 +13,7 @@ use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 use std::cmp::Reverse;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(crate) async fn compile_asof_join(
         &mut self,
         node_idx: usize,

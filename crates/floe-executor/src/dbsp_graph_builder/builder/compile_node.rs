@@ -1,6 +1,6 @@
 use super::*;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     #[allow(clippy::too_many_arguments)]
     #[async_recursion]
     pub(super) async fn compile_node(

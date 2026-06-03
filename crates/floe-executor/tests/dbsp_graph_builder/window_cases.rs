@@ -95,14 +95,14 @@ async fn tumbling_window_max_recomputes_from_transient_source_journal_retraction
 
     let (task_tx, mut task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

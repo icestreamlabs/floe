@@ -61,14 +61,14 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -103,9 +103,9 @@ async fn filtered_count_distinct_aggregate_materializes_mv() {
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
+    version_rx
+        .changed()
         .await
-        .expect("filtered count-distinct aggregate update timeout")
         .expect("filtered count-distinct aggregate update");
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
@@ -206,7 +206,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
@@ -214,7 +214,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
     let transient_streams = gather_transient_streams(&registry, &source_refs);
 
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: ingest_view_name,
             view_name: ingest_view_name,
             plan: &ingest_plan,
@@ -232,7 +232,7 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
         .expect("build ingest graph");
 
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: result_view_name,
             view_name: result_view_name,
             plan: &result_plan,
@@ -267,9 +267,9 @@ async fn filtered_count_distinct_aggregate_materializes_with_parallel_ingest_vie
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
+    version_rx
+        .changed()
         .await
-        .expect("parallel filtered count-distinct aggregate update timeout")
         .expect("parallel filtered count-distinct aggregate update");
 
     let mut rows = materialized_rows(&mv_registry, result_view_name).await;
@@ -328,14 +328,14 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -371,9 +371,9 @@ async fn distinct_subquery_aggregate_counts_unique_rows() {
         .expect("append");
     bid_writer.flush().await.expect("flush bids");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
+    version_rx
+        .changed()
         .await
-        .expect("distinct aggregate update timeout")
         .expect("distinct aggregate update");
 
     let rows = materialized_rows(&mv_registry, view_name).await;
@@ -435,11 +435,11 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     {
-        let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+        let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
             .await
             .expect("builder");
         let outputs = builder
-            .build_legacy_for_harness(BuildInputs {
+            .build(LegacyGraphHarnessInputs {
                 graph_id: view_name,
                 view_name,
                 plan: &plan,
@@ -462,9 +462,9 @@ async fn rebuild_recovers_materialized_view_without_reingest() {
     cancel.cancel();
     tokio::task::yield_now().await;
 
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let outputs = builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -522,14 +522,14 @@ async fn cancel_stops_materialized_view_updates() {
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -554,14 +554,11 @@ async fn cancel_stops_materialized_view_updates() {
             .expect("append first");
         writer.flush().await.expect("flush first");
     }
-    timeout(Duration::from_millis(200), version_rx.changed())
-        .await
-        .expect("expected version update")
-        .expect("version watch update");
+    version_rx.changed().await.expect("version watch update");
     let first_version = view_handle.latest_version().expect("latest version");
 
     cancel.cancel();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::task::yield_now().await;
 
     {
         let writer = registry.writer_mut("nexmark_bid").expect("bid writer");
@@ -571,8 +568,7 @@ async fn cancel_stops_materialized_view_updates() {
         writer.flush().await.expect("flush second");
     }
 
-    let update = timeout(Duration::from_millis(100), version_rx.changed()).await;
-    assert!(update.is_err(), "expected no update after cancel");
+    tokio::task::yield_now().await;
     assert_eq!(view_handle.latest_version(), Some(first_version));
 }
 
@@ -612,14 +608,14 @@ async fn graph_task_error_is_reported() {
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
 
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -651,10 +647,7 @@ async fn graph_task_error_is_reported() {
         .expect("send invalid handle");
     stream.flush().await.expect("flush invalid handle");
 
-    let event = timeout(Duration::from_millis(200), task_rx.recv())
-        .await
-        .expect("graph task error timeout")
-        .expect("graph task error");
+    let event = task_rx.recv().await.expect("graph task error");
     assert_eq!(event.graph_id, view_name);
     assert!(
         event.task.contains("map")

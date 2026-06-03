@@ -54,12 +54,12 @@ async fn aggregate_with_post_projection_materializes_from_transient_source_journ
 
     let (task_tx, mut task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -153,14 +153,14 @@ async fn source_projection_with_proctime_materializes_mv() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -254,14 +254,14 @@ async fn source_filter_projection_with_count_char_materializes_from_transient_so
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -363,14 +363,14 @@ async fn source_projection_with_regexp_extract_materializes_from_transient_sourc
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -482,14 +482,14 @@ async fn source_projection_with_split_index_materializes_from_transient_source_j
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

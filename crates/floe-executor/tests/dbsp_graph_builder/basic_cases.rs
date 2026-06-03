@@ -59,12 +59,12 @@ async fn filter_and_projection_materializes_mv() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     let outputs = builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -133,9 +133,9 @@ async fn planned_mv_records_delta_work_for_retractions_and_consolidation() {
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -256,9 +256,9 @@ async fn unrelated_source_delta_only_advances_affected_materialized_view() {
     mv_registry.register(auction_view);
     let (task_tx, mut task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: bid_view,
             view_name: bid_view,
             plan: &bid_plan,
@@ -275,7 +275,7 @@ async fn unrelated_source_delta_only_advances_affected_materialized_view() {
         .await
         .expect("build bid graph");
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: auction_view,
             view_name: auction_view,
             plan: &auction_plan,
@@ -417,12 +417,12 @@ async fn inner_join_materializes_mv() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     let outputs = builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

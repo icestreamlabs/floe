@@ -2,7 +2,7 @@ use super::*;
 
 use crate::dbsp_graph_builder::vectorized_filter_project::VectorizedFilterProjectEvaluator;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(crate) async fn compile_source(
         &self,
         source: &DbspSourceNode,

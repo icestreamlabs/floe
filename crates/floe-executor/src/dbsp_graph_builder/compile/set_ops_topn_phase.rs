@@ -12,7 +12,7 @@ use datafusion::logical_expr::Expr;
 
 type ExtractedTopNRow = (Vec<u8>, i64, Option<Vec<u8>>, Option<TopNKey>);
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(crate) async fn compile_union(
         &mut self,
         _node: &DbspUnionNode,

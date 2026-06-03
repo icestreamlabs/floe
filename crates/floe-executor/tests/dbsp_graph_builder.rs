@@ -23,7 +23,7 @@ use floe_executor::GraphTaskError;
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::dbsp_bridge::DbspBridge;
 use floe_executor::dbsp_graph_builder::{
-    BuildInputs, DbspGraphBuilder, source_batch_journal_root_sources,
+    LegacyGraphHarness, LegacyGraphHarnessInputs, source_batch_journal_root_sources,
 };
 use floe_executor::dbsp_plan::{
     DbspPlanBuilder, nexmark_auction_table, nexmark_bid_table, nexmark_config,
@@ -35,7 +35,6 @@ use object_store::memory::InMemory;
 use regex::Regex;
 use slatedb::Db;
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
 #[path = "dbsp_graph_builder/row_support.rs"]

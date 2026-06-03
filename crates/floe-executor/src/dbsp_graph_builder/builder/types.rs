@@ -11,7 +11,7 @@ impl GraphNamespace {
     }
 }
 
-pub struct BuildInputs<'a> {
+pub struct LegacyGraphHarnessInputs<'a> {
     pub graph_id: &'a str,
     pub view_name: &'a str,
     pub plan: &'a CircuitPlan,
@@ -26,7 +26,7 @@ pub struct BuildInputs<'a> {
     pub watermark: Arc<AtomicI64>,
 }
 
-pub struct BuildOutputs {
+pub struct LegacyGraphHarnessOutputs {
     pub node_streams: HashMap<usize, DeltaHandleStream>,
     pub mv_latest: HashMap<String, (i64, ZSetHandle)>,
     pub required_sources: BTreeSet<String>,

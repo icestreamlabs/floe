@@ -1,6 +1,6 @@
 use super::*;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::dbsp_graph_builder) async fn materialize_view_from_delta_overlay(
         &mut self,

@@ -120,7 +120,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         let mut first_tick_commit_logged = false;
         let mut tick_buffers = ExecutorTickBuffers::new(
             active_source_definitions_by_id_for_task.as_slice(),
-            required_columns_by_source_id_for_task.as_slice(),
             max_batch_per_source,
             connector_queues.len(),
         );
@@ -585,7 +584,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 .await;
                                 break 'executor;
                             };
-                            let execution_batch = match mask_arrow_batch_for_required_columns(
+                            let query_batch = match mask_arrow_batch_for_required_columns(
                                 definition,
                                 &batch,
                                 required_columns_by_source_id_for_task
@@ -614,8 +613,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 }
                             };
                             decoded_rows_len = decoded_rows_len.saturating_add(batch.num_rows());
-                            execution_arrow_batches_by_source[source_id].push(execution_batch);
-                            arrow_batches_by_source[source_id].push(batch);
+                            execution_arrow_batches_by_source[source_id].push(batch);
+                            arrow_batches_by_source[source_id].push(query_batch);
                         }
                         Ok(None) => {}
                         Err(err) => {

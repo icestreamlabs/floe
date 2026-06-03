@@ -98,6 +98,7 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
             .kafka
             .sort_by(|left, right| left.source.cmp(&right.source));
     }
+    let shared_definitions: Arc<[SourceDefinition]> = Arc::from(definitions.to_vec());
 
     let mut replayed_raw = 0usize;
     let mut replayed_kafka = 0usize;
@@ -125,7 +126,7 @@ pub(super) async fn replay_committed_vectorized_source_journal_entries(
                     entry,
                     connector_specs,
                     run_args,
-                    definitions,
+                    definitions: Arc::clone(&shared_definitions),
                     source_id_by_name,
                 })
                 .await?;
@@ -175,7 +176,7 @@ struct KafkaSourceJournalReplayConfig<'a> {
     entry: floe_executor::source_journal::KafkaSourceJournalEntry,
     connector_specs: &'a [config::ConnectorSpec],
     run_args: &'a cli::RunArgs,
-    definitions: &'a [SourceDefinition],
+    definitions: Arc<[SourceDefinition]>,
     source_id_by_name: &'a HashMap<String, usize>,
 }
 
@@ -201,7 +202,7 @@ async fn replay_kafka_source_journal_entry_as_arrow(
             start_offset: range.start_offset,
             end_offset: range.end_offset,
         };
-        let replayed = KafkaConnector::replay_range(config, definitions.to_vec(), replay_range)
+        let replayed = KafkaConnector::replay_range(config, Arc::clone(&definitions), replay_range)
             .await
             .with_context(|| {
                 format!(

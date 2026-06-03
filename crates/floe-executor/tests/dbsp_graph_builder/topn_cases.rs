@@ -55,14 +55,14 @@ async fn aggregate_materializes_mv() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(Arc::clone(&db))
+    let mut builder = LegacyGraphHarness::new(Arc::clone(&db))
         .await
         .expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -94,10 +94,7 @@ async fn aggregate_materializes_mv() {
         .expect("append bidder 7");
     bid_writer.flush().await.expect("flush bids");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
-        .await
-        .expect("aggregate update timeout")
-        .expect("aggregate update");
+    version_rx.changed().await.expect("aggregate update");
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
@@ -113,10 +110,7 @@ async fn aggregate_materializes_mv() {
         .expect("remove bidder 42");
     bid_writer.flush().await.expect("flush removal");
 
-    timeout(Duration::from_millis(200), version_rx.changed())
-        .await
-        .expect("aggregate update timeout")
-        .expect("aggregate update");
+    version_rx.changed().await.expect("aggregate update");
 
     let mut rows = materialized_rows(&mv_registry, view_name).await;
     sort_rows_by_first_column(&mut rows);
@@ -186,12 +180,12 @@ async fn topn_materializes_mv() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -257,12 +251,12 @@ async fn topn_materializes_mv_from_transient_source_journal() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -371,12 +365,12 @@ async fn row_number_topn_with_post_projection_materializes_from_transient_source
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -497,12 +491,12 @@ async fn row_number_topn_append_only_source_journal_updates_boundary_across_tick
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -617,12 +611,12 @@ async fn row_number_top1_with_post_projection_recomputes_from_transient_source_j
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,
@@ -743,12 +737,12 @@ async fn row_number_top1_with_two_order_keys_prefers_descending_primary_key() {
 
     let (task_tx, _task_rx) =
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
-    let mut builder = DbspGraphBuilder::new(db).await.expect("builder");
+    let mut builder = LegacyGraphHarness::new(db).await.expect("builder");
     let source_refs: Vec<&str> = required_sources.iter().map(|s| s.as_str()).collect();
     let handle_streams = gather_handle_streams(&registry, &source_refs);
     let transient_streams = gather_transient_streams(&registry, &source_refs);
     builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: view_name,
             view_name,
             plan: &plan,

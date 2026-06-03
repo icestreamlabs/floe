@@ -13,7 +13,7 @@ use crate::vectorized_keys::VectorizedEncodedKeyExtractor;
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(super) fn build_transient_join_precompute_transform(
         node: &DbspProjectNode,
     ) -> Result<Arc<DeltaTransformFn>> {

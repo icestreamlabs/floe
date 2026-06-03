@@ -8,7 +8,7 @@ use crate::encoding::{
 use datafusion::common::Column;
 use datafusion::logical_expr::Expr;
 
-impl DbspGraphBuilder {
+impl LegacyGraphHarness {
     pub(crate) async fn compile_range_join(
         &mut self,
         node_idx: usize,

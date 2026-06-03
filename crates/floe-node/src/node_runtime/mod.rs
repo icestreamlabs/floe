@@ -49,13 +49,12 @@ use floe_executor::source_journal::{
     update_kafka_source_journal_checksum,
 };
 use floe_executor::{
-    DbspBridge, DbspGraphBuilder, FloeQueryContext, GRAPH_TASK_EVENT_CHANNEL_CAPACITY,
-    GraphTaskError, MaterializedViewRegistry, MaterializedViewTableProvider,
-    MvFlushCoalescingConfig, OuterStreamRegistry, OverlaySnapshotConfig, PersistencePolicyConfig,
-    SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
-    VectorizedMaterializedViewPlan, mask_arrow_batch_for_required_columns,
-    plan_source_requirements, source_batch_journal_root_sources_with_config, validate_dbsp_plan,
-    weighted_batch_from_diffs,
+    DbspBridge, DbspMaintenance, FloeQueryContext, GRAPH_TASK_EVENT_CHANNEL_CAPACITY,
+    GraphTaskError, MaterializedViewRegistry, MaterializedViewTableProvider, OuterStreamRegistry,
+    PersistencePolicyConfig, SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan,
+    VectorizedExecutionRuntime, VectorizedMaterializedViewPlan,
+    mask_arrow_batch_for_required_columns, plan_source_requirements,
+    source_batch_journal_root_sources_with_config, validate_dbsp_plan, weighted_batch_from_diffs,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};
@@ -89,10 +88,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{cli, http_ingest, metrics, sinks};
 use floe_config as config;
 use floe_config::{
-    ConnectorConfig, MvFlushConfig, MvSnapshotConfig, NodeConfig, PostgresCdcReconnectConfig,
-    PostgresCdcSnapshotConfig, SinkConfig, SinkSpec, SourceJournalConfig,
-    apply_connector_properties, load_config, materialized_view_definitions_from_config,
-    normalize_connectors, normalize_sinks, sink_spec_from_sql,
+    ConnectorConfig, NodeConfig, PostgresCdcReconnectConfig, PostgresCdcSnapshotConfig, SinkConfig,
+    SinkSpec, SourceJournalConfig, apply_connector_properties, load_config,
+    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
+    sink_spec_from_sql,
 };
 
 static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);

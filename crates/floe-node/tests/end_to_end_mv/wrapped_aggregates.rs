@@ -5,8 +5,8 @@ use std::sync::atomic::AtomicI64;
 use anyhow::Result;
 use dbsp::StreamRetention;
 use floe_executor::{
-    BuildInputs, DbspBridge, DbspGraphBuilder, GraphTaskError, MaterializedViewRegistry,
-    OuterStreamRegistry, ValidatedPlan, validate_dbsp_plan,
+    DbspBridge, GraphTaskError, LegacyGraphHarness, LegacyGraphHarnessInputs,
+    MaterializedViewRegistry, OuterStreamRegistry, ValidatedPlan, validate_dbsp_plan,
 };
 use floe_node_core::executor::{available_sources_from_registry, build_dataflows};
 use floe_node_core::generator;
@@ -131,7 +131,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
     }
 
     let mv_registry = Arc::new(MaterializedViewRegistry::new());
-    let mut graph_builder = DbspGraphBuilder::new(Arc::clone(&db)).await?;
+    let mut graph_builder = LegacyGraphHarness::new(Arc::clone(&db)).await?;
     let mut ingestion_bridge = DbspBridge::new(Arc::clone(&db)).await?;
     let mut outer =
         OuterStreamRegistry::from_validated_sources(&required_sources, &mut ingestion_bridge)
@@ -143,7 +143,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
         mpsc::channel::<GraphTaskError>(floe_executor::GRAPH_TASK_EVENT_CHANNEL_CAPACITY);
 
     graph_builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: "mv_parallel_ingest_bid",
             view_name: "mv_parallel_ingest_bid",
             plan: &circuit_plans[0],
@@ -160,7 +160,7 @@ async fn wrapped_q15_style_aggregate_materializes_with_parallel_ingest_view() ->
         .await?;
 
     graph_builder
-        .build_legacy_for_harness(BuildInputs {
+        .build(LegacyGraphHarnessInputs {
             graph_id: "mv_parallel_q15_wrapped",
             view_name: "mv_parallel_q15_wrapped",
             plan: &circuit_plans[1],
