@@ -582,7 +582,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 .await;
                                 break 'executor;
                             };
-                            let query_batch = match mask_arrow_batch_for_required_columns(
+                            let execution_batch = match mask_arrow_batch_for_required_columns(
                                 definition,
                                 &batch,
                                 required_columns_by_source_id_for_task
@@ -611,8 +611,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 }
                             };
                             decoded_rows_len = decoded_rows_len.saturating_add(batch.num_rows());
-                            execution_arrow_batches_by_source[source_id].push(batch);
-                            arrow_batches_by_source[source_id].push(query_batch);
+                            execution_arrow_batches_by_source[source_id].push(execution_batch);
+                            arrow_batches_by_source[source_id].push(batch);
                         }
                         Ok(None) => {}
                         Err(err) => {

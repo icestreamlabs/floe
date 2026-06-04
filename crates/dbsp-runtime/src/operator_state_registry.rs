@@ -4,7 +4,6 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use crate::handles::ZSetHandle;
 
 const UNCHECKPOINTED_OPERATOR_STATE_PREFIX: &str = "__uncheckpointed_operator_state/";
-const LEGACY_OPERATOR_STATE_GRAPH: &str = "__legacy_operator_state_graph";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperatorStateHandle {
@@ -63,12 +62,15 @@ fn registry_guard() -> MutexGuard<'static, OperatorStateRegistry> {
     }
 }
 
-fn graph_id_for_namespace(namespace: &str) -> &str {
-    namespace
-        .strip_prefix("op/")
-        .and_then(|suffix| suffix.split('/').next())
-        .filter(|graph_id| !graph_id.is_empty())
-        .unwrap_or(LEGACY_OPERATOR_STATE_GRAPH)
+fn graph_id_for_namespace(namespace: &str) -> Option<&str> {
+    let mut parts = namespace.strip_prefix("op/")?.split('/');
+    let graph_id = parts.next().filter(|graph_id| !graph_id.is_empty())?;
+    let operator = parts.next().filter(|operator| !operator.is_empty())?;
+    let side = parts.next().filter(|side| !side.is_empty())?;
+    if parts.next().is_some() || operator.is_empty() || side.is_empty() {
+        return None;
+    }
+    Some(graph_id)
 }
 
 pub fn record_operator_state(name: impl Into<String>, handle: ZSetHandle) {
@@ -76,11 +78,17 @@ pub fn record_operator_state(name: impl Into<String>, handle: ZSetHandle) {
         return;
     }
     let handle = OperatorStateHandle::new(name, handle.ns.clone(), handle.version);
-    let graph_id = graph_id_for_namespace(&handle.namespace).to_string();
+    let Some(graph_id) = graph_id_for_namespace(&handle.namespace) else {
+        tracing::warn!(
+            namespace = %handle.namespace,
+            "ignoring operator state handle with invalid checkpoint namespace"
+        );
+        return;
+    };
     let mut guard = registry_guard();
     guard
         .live_by_graph
-        .entry(graph_id)
+        .entry(graph_id.to_string())
         .or_default()
         .insert(handle.namespace.clone(), handle);
 }
@@ -123,9 +131,15 @@ pub fn install_operator_state_restore(handles: Vec<OperatorStateHandle>) {
         if !is_checkpointed_operator_state_namespace(&handle.namespace) {
             continue;
         }
-        let graph_id = graph_id_for_namespace(&handle.namespace).to_string();
+        let Some(graph_id) = graph_id_for_namespace(&handle.namespace) else {
+            tracing::warn!(
+                namespace = %handle.namespace,
+                "ignoring restored operator state handle with invalid checkpoint namespace"
+            );
+            continue;
+        };
         restore_by_graph
-            .entry(graph_id)
+            .entry(graph_id.to_string())
             .or_default()
             .insert(handle.namespace.clone(), handle);
     }
@@ -138,6 +152,7 @@ pub fn install_operator_state_restore_for_graph(graph_id: &str, handles: Vec<Ope
     let restore = handles
         .into_iter()
         .filter(|handle| is_checkpointed_operator_state_namespace(&handle.namespace))
+        .filter(|handle| graph_id_for_namespace(&handle.namespace) == Some(graph_id))
         .map(|handle| (handle.namespace.clone(), handle))
         .collect();
     let mut guard = registry_guard();
@@ -149,7 +164,7 @@ pub fn restored_operator_state(namespace: &str) -> Option<OperatorStateHandle> {
     if !is_checkpointed_operator_state_namespace(namespace) {
         return None;
     }
-    let graph_id = graph_id_for_namespace(namespace);
+    let graph_id = graph_id_for_namespace(namespace)?;
     let guard = registry_guard();
     guard
         .restore_by_graph
@@ -169,8 +184,18 @@ pub fn clear_operator_state_registry() {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        match TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     #[test]
     fn uncheckpointed_operator_state_is_excluded_from_snapshots_and_restore() {
+        let _guard = test_guard();
         clear_operator_state_registry();
 
         let scratch_namespace = uncheckpointed_operator_state_namespace("scratch");
@@ -181,9 +206,13 @@ mod tests {
                 version: 7,
             },
         );
-        assert!(snapshot_operator_states().is_empty());
+        assert!(
+            !snapshot_operator_states()
+                .iter()
+                .any(|handle| handle.namespace == scratch_namespace)
+        );
 
-        let checkpointed = OperatorStateHandle::new("stable", "stable_namespace", 11);
+        let checkpointed = OperatorStateHandle::new("stable", "op/graph_stable/0/stable", 11);
         install_operator_state_restore(vec![
             OperatorStateHandle::new("scratch", scratch_namespace.clone(), 7),
             checkpointed.clone(),
@@ -191,7 +220,7 @@ mod tests {
 
         assert!(restored_operator_state(&scratch_namespace).is_none());
         assert_eq!(
-            restored_operator_state("stable_namespace"),
+            restored_operator_state("op/graph_stable/0/stable"),
             Some(checkpointed)
         );
 
@@ -199,7 +228,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_checkpoint_namespace_is_ignored() {
+        let _guard = test_guard();
+        clear_operator_state_registry();
+
+        record_operator_state(
+            "invalid",
+            ZSetHandle {
+                ns: "stable_namespace".to_string(),
+                version: 11,
+            },
+        );
+        assert!(
+            !snapshot_operator_states()
+                .iter()
+                .any(|handle| handle.namespace == "stable_namespace")
+        );
+
+        install_operator_state_restore(vec![OperatorStateHandle::new(
+            "invalid",
+            "stable_namespace",
+            11,
+        )]);
+        assert!(restored_operator_state("stable_namespace").is_none());
+
+        clear_operator_state_registry();
+    }
+
+    #[test]
     fn graph_scoped_snapshot_and_restore_do_not_bleed_between_graphs() {
+        let _guard = test_guard();
         clear_operator_state_registry();
 
         record_operator_state(

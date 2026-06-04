@@ -549,27 +549,6 @@ mod tests {
         handle.publish_arrow_version(version, vec![value_batch(snapshot_values)], delta);
     }
 
-    fn encoded_i64_row(value: i64) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(4 + 1 + 8);
-        encoded.extend_from_slice(&(1_u32).to_le_bytes());
-        encoded.push(0x01);
-        encoded.extend_from_slice(&value.to_le_bytes());
-        encoded
-    }
-
-    fn publish_encoded_overlay(
-        handle: &MaterializedViewHandle,
-        version: u64,
-        deltas: &[(i64, i64)],
-    ) {
-        handle.append_encoded_overlay_batch(
-            version,
-            deltas
-                .iter()
-                .map(|(value, diff)| (encoded_i64_row(*value), *diff)),
-        );
-    }
-
     fn batch_values(batch: &MvChangelogBatch) -> Vec<i64> {
         let values = batch
             .batch
@@ -649,58 +628,6 @@ mod tests {
         let rows = batch_rows_with_diffs(&batch);
         assert!(rows.contains(&(1, -1)));
         assert!(rows.contains(&(2, 1)));
-        cancel.cancel();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn snapshot_uses_encoded_overlay_when_arrow_snapshot_is_missing() -> MvChangelogResult<()>
-    {
-        let registry = Arc::new(MaterializedViewRegistry::new());
-        registry.set_schema("mv_encoded_snapshot", build_schema());
-        let handle = registry.register("mv_encoded_snapshot");
-        publish_encoded_overlay(handle.as_ref(), 1, &[(10, 1), (20, 1)]);
-
-        let params = MvChangelogParams {
-            mv_name: "mv_encoded_snapshot".to_string(),
-            with_snapshot: true,
-            as_of: Some(1),
-        };
-        let cancel = CancellationToken::new();
-        let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
-        let batch = stream.next().await.expect("snapshot batch")?;
-
-        assert_eq!(batch.kind, MvChangelogBatchKind::Snapshot);
-        assert_eq!(batch.version, 1);
-        let mut rows = batch_values(&batch);
-        rows.sort_unstable();
-        assert_eq!(rows, vec![10, 20]);
-        assert_eq!(batch.diffs, vec![1, 1]);
-        cancel.cancel();
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delta_uses_encoded_overlay_when_arrow_delta_is_missing() -> MvChangelogResult<()> {
-        let registry = Arc::new(MaterializedViewRegistry::new());
-        registry.set_schema("mv_encoded_delta", build_schema());
-        let handle = registry.register("mv_encoded_delta");
-        publish_encoded_overlay(handle.as_ref(), 1, &[(10, 1), (20, 1)]);
-
-        let params = MvChangelogParams {
-            mv_name: "mv_encoded_delta".to_string(),
-            with_snapshot: false,
-            as_of: Some(1),
-        };
-        let cancel = CancellationToken::new();
-        let mut stream = execute_mv_changelog(registry.as_ref(), params, cancel.clone()).await?;
-        publish_encoded_overlay(handle.as_ref(), 2, &[(10, -1), (30, 1)]);
-
-        let batch = stream.next().await.expect("encoded delta batch")?;
-        assert_eq!(batch.kind, MvChangelogBatchKind::Delta);
-        let mut rows = batch_rows_with_diffs(&batch);
-        rows.sort_unstable();
-        assert_eq!(rows, vec![(10, -1), (30, 1)]);
         cancel.cancel();
         Ok(())
     }

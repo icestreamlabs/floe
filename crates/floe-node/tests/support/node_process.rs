@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -132,6 +133,45 @@ pub(crate) async fn wait_for_jsonl_rows_matching(
             bail!("predicate did not match rows in {}", path.to_string_lossy());
         }
         poll.tick().await;
+    }
+}
+
+pub(crate) async fn wait_for_count_at_least<F, Fut>(
+    label: impl AsRef<str>,
+    min_count: i64,
+    attempts: usize,
+    mut query_count: F,
+) -> Result<i64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<i64>>,
+{
+    let mut poll = interval(Duration::from_millis(100));
+    let mut last_count = None;
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match query_count().await {
+            Ok(count) if count >= min_count => return Ok(count),
+            Ok(count) => {
+                last_count = Some(count);
+                last_error = None;
+            }
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+        poll.tick().await;
+    }
+
+    let label = label.as_ref();
+    match (last_count, last_error) {
+        (Some(count), _) => {
+            bail!("timed out waiting for {label} count >= {min_count}; last count {count}")
+        }
+        (None, Some(err)) => {
+            bail!("timed out waiting for {label} count >= {min_count}: {err}")
+        }
+        (None, None) => bail!("timed out waiting for {label} count >= {min_count}"),
     }
 }
 

@@ -238,7 +238,7 @@ mod tests {
     async fn committed_operator_state_restore_opens_recorded_handle() {
         crate::operator_state_registry::clear_operator_state_registry();
         let table = build_table("relation-state-restore").await;
-        let namespace = "relation-state-restore".to_string();
+        let namespace = "op/relation_state_restore/0/state".to_string();
         let mut state = RelationState::<i64>::empty(table.clone(), namespace.clone())
             .await
             .expect("create relation state");

@@ -15,6 +15,9 @@ use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
 };
 
+const SNAPSHOT_SCAN_TARGET_ROWS_PER_PARTITION: usize = 4096;
+const SNAPSHOT_SCAN_MAX_PARTITIONS: usize = 16;
+
 #[derive(Debug)]
 pub struct SnapshotScanExec {
     schema: SchemaRef,
@@ -25,7 +28,7 @@ pub struct SnapshotScanExec {
 
 impl SnapshotScanExec {
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        let partition_count = batches.len().max(1);
+        let partition_count = partition_count_for_batches(&batches);
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(partition_count),
@@ -40,6 +43,56 @@ impl SnapshotScanExec {
             cache,
         }
     }
+}
+
+pub(crate) fn partition_count_for_batches(batches: &[RecordBatch]) -> usize {
+    let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    if total_rows == 0 {
+        return 1;
+    }
+    total_rows
+        .div_ceil(SNAPSHOT_SCAN_TARGET_ROWS_PER_PARTITION)
+        .clamp(1, SNAPSHOT_SCAN_MAX_PARTITIONS)
+        .min(total_rows)
+}
+
+pub(crate) fn partition_record_batches(
+    batches: &[RecordBatch],
+    partition: usize,
+    partition_count: usize,
+) -> Vec<RecordBatch> {
+    let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    if total_rows == 0 {
+        return Vec::new();
+    }
+
+    let base_rows = total_rows / partition_count;
+    let extra_rows = total_rows % partition_count;
+    let start = partition
+        .saturating_mul(base_rows)
+        .saturating_add(partition.min(extra_rows));
+    let len = base_rows + usize::from(partition < extra_rows);
+    let end = start.saturating_add(len);
+
+    let mut result = Vec::new();
+    let mut batch_start = 0usize;
+    for batch in batches {
+        let batch_rows = batch.num_rows();
+        let batch_end = batch_start.saturating_add(batch_rows);
+        let overlap_start = start.max(batch_start);
+        let overlap_end = end.min(batch_end);
+        if overlap_start < overlap_end {
+            result.push(batch.slice(
+                overlap_start.saturating_sub(batch_start),
+                overlap_end.saturating_sub(overlap_start),
+            ));
+        }
+        batch_start = batch_end;
+        if batch_start >= end {
+            break;
+        }
+    }
+    result
 }
 
 impl DisplayAs for SnapshotScanExec {
@@ -89,14 +142,7 @@ impl ExecutionPlan for SnapshotScanExec {
         if partition >= self.partition_count {
             return internal_err!("invalid partition {partition} for SnapshotScanExec");
         }
-        let batches = self
-            .batches
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, batch)| {
-                (idx % self.partition_count == partition).then_some(batch.clone())
-            })
-            .collect::<Vec<_>>();
+        let batches = partition_record_batches(&self.batches, partition, self.partition_count);
         let stream = MemoryStream::try_new(batches, Arc::clone(&self.schema), None)?;
         Ok(Box::pin(stream))
     }
@@ -109,12 +155,13 @@ impl ExecutionPlan for SnapshotScanExec {
         }
         let mut rows = 0usize;
         let mut bytes = 0usize;
-        for (idx, batch) in self.batches.iter().enumerate() {
-            if let Some(partition) = partition
-                && idx % self.partition_count != partition
-            {
-                continue;
+        let batches = match partition {
+            Some(partition) => {
+                partition_record_batches(&self.batches, partition, self.partition_count)
             }
+            None => self.batches.clone(),
+        };
+        for batch in batches {
             rows = rows.saturating_add(batch.num_rows());
             bytes = bytes.saturating_add(batch.get_array_memory_size());
         }

@@ -282,7 +282,7 @@ async fn arrow_indexed_reopen_preserves_persisted_state() {
 async fn arrow_indexed_restore_truncates_uncommitted_segments() {
     crate::operator_state_registry::clear_operator_state_registry();
     let table = build_table("arrow-indexed-checkpoint-restore").await;
-    let namespace = "arrow_indexed_checkpoint_restore";
+    let namespace = "op/arrow_indexed_checkpoint_restore/0/index";
     let writer = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
     writer
         .restore_committed_checkpoint()

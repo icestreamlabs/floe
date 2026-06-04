@@ -15,7 +15,7 @@ fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
 }
 
 #[tokio::test]
-async fn masked_query_batches_do_not_prune_execution_batches() {
+async fn pruned_execution_batches_do_not_prune_query_provider() {
     let definition = SourceDefinition::new(
         "orders",
         vec![
@@ -41,12 +41,12 @@ async fn masked_query_batches_do_not_prune_execution_batches() {
     let mut sources = SourceRegistry::new();
     sources.register(definition);
     let registry = Arc::new(MaterializedViewRegistry::new());
-    let output_schema = Arc::new(Schema::new(vec![Field::new("note", DataType::Utf8, false)]));
+    let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut runtime = VectorizedExecutionRuntime::new(
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
-            "mv_notes",
-            "SELECT note FROM orders",
+            "mv_orders",
+            "SELECT id FROM orders",
             Arc::clone(&output_schema),
         )],
         Arc::clone(&registry),
@@ -57,22 +57,23 @@ async fn masked_query_batches_do_not_prune_execution_batches() {
     runtime
         .append_source_batches_for_execution_and_query(
             "orders",
-            vec![full_batch],
             vec![masked_batch],
+            vec![full_batch],
         )
         .await
         .expect("append source batches");
     runtime.run_tick(1).await.expect("run vectorized tick");
 
-    let handle = registry.get("mv_notes").expect("materialized view");
-    let (_version, snapshot) = handle.latest_arrow_snapshot().expect("mv snapshot");
-    let note = snapshot[0]
+    let handle = registry.get("mv_orders").expect("materialized view");
+    let version = handle.latest_version().expect("mv version");
+    let snapshot = handle.arrow_snapshot_for(version).expect("mv snapshot");
+    let id = snapshot[0]
         .column(0)
         .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("mv note column")
+        .downcast_ref::<Int64Array>()
+        .expect("mv id column")
         .value(0);
-    assert_eq!(note, "kept");
+    assert_eq!(id, 1);
 
     let provider = runtime
         .table_providers()
@@ -95,7 +96,7 @@ async fn masked_query_batches_do_not_prune_execution_batches() {
         .downcast_ref::<StringArray>()
         .expect("note column")
         .value(0);
-    assert_eq!(note, "");
+    assert_eq!(note, "kept");
 }
 
 #[tokio::test]
@@ -163,7 +164,8 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     runtime.run_tick(2).await.expect("cdc tick");
 
     let handle = registry.get("mv_orders").expect("materialized view");
-    let (_version, snapshot) = handle.latest_arrow_snapshot().expect("mv snapshot");
+    let version = handle.latest_version().expect("mv version");
+    let snapshot = handle.arrow_snapshot_for(version).expect("mv snapshot");
     assert_eq!(snapshot.len(), 1);
     assert_eq!(int64_values(&snapshot[0], 0), vec![1]);
     assert_eq!(int64_values(&snapshot[0], 1), vec![40]);

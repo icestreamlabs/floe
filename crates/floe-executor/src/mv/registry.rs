@@ -2,12 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::stream_types::{Diff, EncodedDeltaBatch, EncodedRow, Timestamp};
-use ahash::AHashMap;
-use anyhow::Result;
+use crate::stream_types::Timestamp;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::LogicalWorkSnapshot;
@@ -105,26 +102,20 @@ impl MaterializedViewRegistry {
 
 pub struct MaterializedViewHandle {
     name: String,
-    state: RwLock<EncodedStateMap>,
     state_row_count: RwLock<i64>,
     published_row_count: RwLock<i64>,
     state_row_count_version: RwLock<Option<i64>>,
-    staged_row_count_versions: RwLock<BTreeMap<i64, i64>>,
     state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
     arrow_snapshots: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
     arrow_deltas: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
-    encoded_overlay_state: RwLock<Option<EncodedOverlayState>>,
     published_versions: PublishedVersionIndex,
     versions: RwLock<HashMap<i64, ZSetHandle>>,
     logical_work: RwLock<BTreeMap<i64, LogicalWorkSnapshot>>,
     commit_visibility_barrier: RwLock<bool>,
     retention_keep_last: Option<usize>,
 }
-
-pub type EncodedStateMap = AHashMap<EncodedRow, Diff>;
-type EncodedOverlayRows = Vec<(Vec<u8>, i64)>;
 
 #[derive(Debug)]
 struct PublishedVersionIndex {
@@ -204,17 +195,14 @@ impl MaterializedViewHandle {
         let (tx, _rx) = watch::channel(None);
         Self {
             name,
-            state: RwLock::new(EncodedStateMap::default()),
             state_row_count: RwLock::new(0),
             published_row_count: RwLock::new(0),
             state_row_count_version: RwLock::new(None),
-            staged_row_count_versions: RwLock::new(BTreeMap::new()),
             state_authoritative: RwLock::new(false),
             watermark: RwLock::new(None),
             arrow_snapshots: RwLock::new(BTreeMap::new()),
             arrow_deltas: RwLock::new(BTreeMap::new()),
             dbsp_state: RwLock::new(None),
-            encoded_overlay_state: RwLock::new(None),
             published_versions: PublishedVersionIndex::new(tx),
             versions: RwLock::new(HashMap::new()),
             logical_work: RwLock::new(BTreeMap::new()),
@@ -227,84 +215,12 @@ impl MaterializedViewHandle {
         &self.name
     }
 
-    pub fn apply_encoded_row(&self, row: &[u8], diff: Diff) {
-        self.apply_encoded(row, diff);
-    }
-
-    fn apply_encoded(&self, key: &[u8], diff: Diff) {
-        if diff == 0 {
-            return;
-        }
-
-        let mut guard = write_lock(&self.state, "materialized view encoded state");
-        let mut row_count = write_lock(&self.state_row_count, "materialized view row count");
-        Self::apply_encoded_locked(&mut guard, &mut row_count, key, diff);
-    }
-
-    fn apply_encoded_locked(
-        state: &mut EncodedStateMap,
-        row_count: &mut i64,
-        key: &[u8],
-        diff: Diff,
-    ) {
-        if diff == 0 {
-            return;
-        }
-
-        let previous = state.get(key).copied().unwrap_or(0);
-        let next = previous.saturating_add(diff);
-        if next == 0 {
-            state.remove(key);
-        } else if let Some(current) = state.get_mut(key) {
-            *current = next;
-        } else {
-            state.insert(key.to_vec(), next);
-        }
-        let previous_rows = previous.max(0);
-        let next_rows = next.max(0);
-        *row_count = row_count
-            .saturating_add(next_rows)
-            .saturating_sub(previous_rows)
-            .max(0);
-    }
-
     pub fn update_watermark(&self, watermark: Timestamp) {
         *write_lock(&self.watermark, "materialized view watermark") = Some(watermark);
     }
 
     pub fn watermark(&self) -> Option<Timestamp> {
         *read_lock(&self.watermark, "materialized view watermark")
-    }
-
-    pub fn snapshot_encoded(&self) -> EncodedStateMap {
-        read_lock(&self.state, "materialized view encoded state").clone()
-    }
-
-    pub fn mark_state_authoritative(&self) {
-        *write_lock(
-            &self.state_authoritative,
-            "materialized view authoritative state flag",
-        ) = true;
-    }
-
-    pub fn mark_state_non_authoritative(&self) {
-        *write_lock(
-            &self.state_authoritative,
-            "materialized view authoritative state flag",
-        ) = false;
-        write_lock(
-            &self.staged_row_count_versions,
-            "materialized view staged row count versions",
-        )
-        .clear();
-        *write_lock(
-            &self.published_row_count,
-            "materialized view published row count",
-        ) = 0;
-        *write_lock(
-            &self.state_row_count_version,
-            "materialized view state row count version",
-        ) = None;
     }
 
     pub fn seed_authoritative_row_count_if_latest(&self, version: u64, row_count: usize) -> bool {
@@ -320,11 +236,6 @@ impl MaterializedViewHandle {
             &self.published_row_count,
             "materialized view published row count",
         ) = row_count;
-        write_lock(
-            &self.staged_row_count_versions,
-            "materialized view staged row count versions",
-        )
-        .retain(|candidate, _| *candidate > version);
         *write_lock(
             &self.state_row_count_version,
             "materialized view state row count version",
@@ -333,31 +244,6 @@ impl MaterializedViewHandle {
             &self.state_authoritative,
             "materialized view authoritative state flag",
         ) = true;
-        true
-    }
-
-    pub fn seed_cached_row_count_if_latest(&self, version: u64, row_count: usize) -> bool {
-        let Ok(version) = i64::try_from(version) else {
-            return false;
-        };
-        if self.latest_version() != Some(version) {
-            return false;
-        }
-        let row_count = i64::try_from(row_count).unwrap_or(i64::MAX);
-        *write_lock(&self.state_row_count, "materialized view row count") = row_count;
-        *write_lock(
-            &self.published_row_count,
-            "materialized view published row count",
-        ) = row_count;
-        write_lock(
-            &self.staged_row_count_versions,
-            "materialized view staged row count versions",
-        )
-        .retain(|candidate, _| *candidate > version);
-        *write_lock(
-            &self.state_row_count_version,
-            "materialized view state row count version",
-        ) = Some(version);
         true
     }
 
@@ -397,98 +283,6 @@ impl MaterializedViewHandle {
             ))
             .unwrap_or(0),
         )
-    }
-
-    pub fn advance_authoritative_row_count_version(&self, version: u64) {
-        if !*read_lock(
-            &self.state_authoritative,
-            "materialized view authoritative state flag",
-        ) {
-            return;
-        }
-        let Ok(version) = i64::try_from(version) else {
-            return;
-        };
-        let row_count = *read_lock(&self.state_row_count, "materialized view row count");
-        *write_lock(
-            &self.published_row_count,
-            "materialized view published row count",
-        ) = row_count;
-        *write_lock(
-            &self.state_row_count_version,
-            "materialized view state row count version",
-        ) = Some(version);
-        write_lock(
-            &self.staged_row_count_versions,
-            "materialized view staged row count versions",
-        )
-        .retain(|candidate, _| *candidate > version);
-    }
-
-    pub fn apply_encoded_state_batch(&self, version: u64, deltas: &[(Vec<u8>, i64)]) -> Result<()> {
-        self.apply_encoded_state_batch_inner(version, deltas, false)
-    }
-
-    pub fn apply_consolidated_encoded_state_batch(
-        &self,
-        version: u64,
-        deltas: &[(Vec<u8>, i64)],
-    ) -> Result<()> {
-        self.apply_encoded_state_batch_inner(version, deltas, true)
-    }
-
-    fn apply_encoded_state_batch_inner(
-        &self,
-        version: u64,
-        deltas: &[(Vec<u8>, i64)],
-        deltas_consolidated: bool,
-    ) -> Result<()> {
-        if !*read_lock(
-            &self.state_authoritative,
-            "materialized view authoritative state flag",
-        ) {
-            return Ok(());
-        }
-        {
-            let mut state = write_lock(&self.state, "materialized view encoded state");
-            let mut row_count = write_lock(&self.state_row_count, "materialized view row count");
-            if deltas_consolidated {
-                for (key, diff) in deltas {
-                    Self::apply_encoded_locked(&mut state, &mut row_count, key, *diff);
-                }
-            } else {
-                let mut merged = HashMap::<&[u8], i64>::with_capacity(deltas.len());
-                for (key, diff) in deltas {
-                    if *diff != 0 {
-                        *merged.entry(key.as_slice()).or_insert(0) += *diff;
-                    }
-                }
-                for (key, diff) in merged {
-                    Self::apply_encoded_locked(&mut state, &mut row_count, key, diff);
-                }
-            }
-        }
-        self.stage_authoritative_row_count_version(version);
-        Ok(())
-    }
-
-    pub fn stage_authoritative_row_count_version(&self, version: u64) {
-        if !*read_lock(
-            &self.state_authoritative,
-            "materialized view authoritative state flag",
-        ) {
-            return;
-        }
-        let Ok(version) = i64::try_from(version) else {
-            return;
-        };
-        let row_count = *read_lock(&self.state_row_count, "materialized view row count");
-        write_lock(
-            &self.staged_row_count_versions,
-            "materialized view staged row count versions",
-        )
-        .insert(version, row_count);
-        self.promote_staged_row_count_if_visible(version);
     }
 
     pub fn publish_arrow_version(
@@ -537,13 +331,6 @@ impl MaterializedViewHandle {
             .cloned()
     }
 
-    pub fn latest_arrow_snapshot(&self) -> Option<(i64, Arc<Vec<RecordBatch>>)> {
-        read_lock(&self.arrow_snapshots, "materialized view arrow snapshots")
-            .iter()
-            .next_back()
-            .map(|(version, batches)| (*version, Arc::clone(batches)))
-    }
-
     pub fn arrow_delta_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
         read_lock(&self.arrow_deltas, "materialized view arrow deltas")
             .get(&version)
@@ -572,166 +359,6 @@ impl MaterializedViewHandle {
         read_lock(&self.dbsp_state, "materialized view DBSP state").clone()
     }
 
-    pub fn has_encoded_overlay(&self) -> bool {
-        read_lock(
-            &self.encoded_overlay_state,
-            "materialized view encoded overlay state",
-        )
-        .is_some()
-    }
-
-    pub fn append_shared_encoded_overlay_batch(
-        &self,
-        version: u64,
-        deltas: EncodedDeltaBatch,
-    ) -> EncodedOverlayApplyStats {
-        let apply_start = Instant::now();
-        let overlay_rows = deltas.iter().filter(|(_, diff)| *diff != 0).count();
-        let overlay_bytes = deltas
-            .iter()
-            .filter(|(_, diff)| *diff != 0)
-            .map(|(key, _)| key.len() + std::mem::size_of::<i64>())
-            .sum();
-        let mut guard = write_lock(
-            &self.encoded_overlay_state,
-            "materialized view encoded overlay state",
-        );
-        let state = guard.get_or_insert_with(|| EncodedOverlayState {
-            base_version: self
-                .dbsp_state()
-                .map(|state| state.logical_version())
-                .unwrap_or(0),
-            ..Default::default()
-        });
-        if overlay_rows > 0 {
-            state.batches.insert(version, deltas);
-        }
-        state.latest_version = state.latest_version.max(version);
-        let stats = EncodedOverlayApplyStats {
-            overlay_rows,
-            overlay_bytes,
-            overlay_batches: state.batches.len(),
-            apply_ms: apply_start.elapsed().as_millis() as u64,
-        };
-        drop(guard);
-        stats
-    }
-
-    pub fn append_encoded_overlay_batch<I>(
-        &self,
-        version: u64,
-        deltas: I,
-    ) -> EncodedOverlayApplyStats
-    where
-        I: IntoIterator<Item = (Vec<u8>, i64)>,
-    {
-        let stats = self
-            .append_shared_encoded_overlay_batch(version, Arc::new(deltas.into_iter().collect()));
-        self.publish_logical_version(version as i64);
-        stats
-    }
-
-    pub fn encoded_overlay_batches(
-        &self,
-        as_of_version: Option<u64>,
-    ) -> Option<(u64, u64, EncodedOverlayRows)> {
-        let guard = read_lock(
-            &self.encoded_overlay_state,
-            "materialized view encoded overlay state",
-        );
-        let state = guard.as_ref()?;
-        let target_version = as_of_version.unwrap_or(state.latest_version);
-        if target_version < state.base_version {
-            return None;
-        }
-        let mut overlay = Vec::new();
-        for (version, deltas) in &state.batches {
-            if *version > target_version {
-                break;
-            }
-            overlay.extend(deltas.iter().cloned());
-        }
-        Some((state.base_version, target_version, overlay))
-    }
-
-    pub fn encoded_overlay_merged_delta(
-        &self,
-        as_of_version: Option<u64>,
-    ) -> Option<(u64, u64, HashMap<Vec<u8>, i64>)> {
-        let guard = read_lock(
-            &self.encoded_overlay_state,
-            "materialized view encoded overlay state",
-        );
-        let state = guard.as_ref()?;
-        let target_version = as_of_version.unwrap_or(state.latest_version);
-        if target_version < state.base_version {
-            return None;
-        }
-        let mut overlay = HashMap::new();
-        for (version, deltas) in &state.batches {
-            if *version > target_version {
-                break;
-            }
-            for (key, diff) in deltas.iter() {
-                if *diff == 0 {
-                    continue;
-                }
-                let entry = overlay.entry(key.clone()).or_insert(0);
-                *entry += *diff;
-                if *entry == 0 {
-                    overlay.remove(key);
-                }
-            }
-        }
-        Some((state.base_version, target_version, overlay))
-    }
-
-    pub fn encoded_overlay_batch(&self, version: u64) -> Option<Vec<(Vec<u8>, i64)>> {
-        let guard = read_lock(
-            &self.encoded_overlay_state,
-            "materialized view encoded overlay state",
-        );
-        let state = guard.as_ref()?;
-        state
-            .batches
-            .get(&version)
-            .map(|deltas| deltas.iter().cloned().collect())
-    }
-
-    pub fn compact_encoded_overlay_up_to(
-        &self,
-        base_version: u64,
-    ) -> EncodedOverlayCompactionStats {
-        let mut guard = write_lock(
-            &self.encoded_overlay_state,
-            "materialized view encoded overlay state",
-        );
-        let Some(state) = guard.as_mut() else {
-            return EncodedOverlayCompactionStats::default();
-        };
-        let removed_batches = state
-            .batches
-            .keys()
-            .take_while(|version| **version <= base_version)
-            .count();
-        let removed_versions: Vec<u64> = state
-            .batches
-            .keys()
-            .copied()
-            .take_while(|version| *version <= base_version)
-            .collect();
-        for version in removed_versions {
-            state.batches.remove(&version);
-        }
-        state.base_version = state.base_version.max(base_version);
-        let remaining_rows = state.batches.values().map(|deltas| deltas.len()).sum();
-        EncodedOverlayCompactionStats {
-            removed_batches,
-            remaining_batches: state.batches.len(),
-            remaining_rows,
-        }
-    }
-
     pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
         let namespace = handle.ns.clone();
         {
@@ -739,7 +366,6 @@ impl MaterializedViewHandle {
             guard.insert(version, handle);
         }
         self.record_latest_version(version);
-        self.promote_staged_row_count_if_visible(version);
         self.prune_retained_versions();
         tracing::debug!(
             view = %self.name,
@@ -751,7 +377,6 @@ impl MaterializedViewHandle {
 
     pub fn publish_logical_version(&self, version: i64) {
         self.record_latest_version(version);
-        self.promote_staged_row_count_if_visible(version);
         self.prune_retained_versions();
         tracing::debug!(
             view = %self.name,
@@ -866,59 +491,6 @@ impl MaterializedViewHandle {
             .unwrap_or_else(current_time_micros);
         self.published_versions.record(version, version_time);
     }
-
-    fn promote_staged_row_count_if_visible(&self, version: i64) {
-        if !*read_lock(
-            &self.state_authoritative,
-            "materialized view authoritative state flag",
-        ) {
-            return;
-        }
-        if self.latest_version() != Some(version) {
-            return;
-        }
-        let row_count = {
-            let mut staged = write_lock(
-                &self.staged_row_count_versions,
-                "materialized view staged row count versions",
-            );
-            let Some(row_count) = staged.get(&version).copied() else {
-                return;
-            };
-            staged.retain(|candidate, _| *candidate > version);
-            row_count
-        };
-        *write_lock(
-            &self.published_row_count,
-            "materialized view published row count",
-        ) = row_count;
-        *write_lock(
-            &self.state_row_count_version,
-            "materialized view state row count version",
-        ) = Some(version);
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EncodedOverlayApplyStats {
-    pub overlay_rows: usize,
-    pub overlay_bytes: usize,
-    pub overlay_batches: usize,
-    pub apply_ms: u64,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EncodedOverlayCompactionStats {
-    pub removed_batches: usize,
-    pub remaining_batches: usize,
-    pub remaining_rows: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct EncodedOverlayState {
-    base_version: u64,
-    latest_version: u64,
-    batches: BTreeMap<u64, EncodedDeltaBatch>,
 }
 
 fn current_time_micros() -> i64 {
@@ -935,11 +507,9 @@ fn watermark_to_micros(watermark: Timestamp) -> i64 {
 
 impl fmt::Debug for MaterializedViewHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state_len = read_lock(&self.state, "materialized view encoded state").len();
         let latest = self.latest_version();
         f.debug_struct("MaterializedViewHandle")
             .field("name", &self.name)
-            .field("state_len", &state_len)
             .field("latest_version", &latest)
             .finish()
     }

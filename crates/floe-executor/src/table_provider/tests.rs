@@ -76,49 +76,6 @@ fn publish_i64_snapshot(
     view.publish_arrow_version(version, vec![arrow_i64_batch(schema, values)], Vec::new());
 }
 
-fn encoded_i64_utf8_row(id: i64, label: &str) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(4 + 1 + 8 + 1 + 4 + label.len());
-    encoded.extend_from_slice(&(2_u32).to_le_bytes());
-    encoded.push(0x01);
-    encoded.extend_from_slice(&id.to_le_bytes());
-    encoded.push(0x02);
-    let label_bytes = label.as_bytes();
-    encoded.extend_from_slice(
-        &u32::try_from(label_bytes.len())
-            .expect("label length")
-            .to_le_bytes(),
-    );
-    encoded.extend_from_slice(label_bytes);
-    encoded
-}
-
-fn encoded_i64_row(value: i64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(4 + 1 + 8);
-    encoded.extend_from_slice(&(1_u32).to_le_bytes());
-    encoded.push(0x01);
-    encoded.extend_from_slice(&value.to_le_bytes());
-    encoded
-}
-
-fn publish_encoded_id_label_overlay(
-    view: &MaterializedViewHandle,
-    version: u64,
-    rows: &[(i64, &str)],
-) {
-    view.append_encoded_overlay_batch(
-        version,
-        rows.iter()
-            .map(|(id, label)| (encoded_i64_utf8_row(*id, label), 1)),
-    );
-}
-
-fn publish_encoded_i64_overlay(view: &MaterializedViewHandle, version: u64, values: &[i64]) {
-    view.append_encoded_overlay_batch(
-        version,
-        values.iter().map(|value| (encoded_i64_row(*value), 1)),
-    );
-}
-
 async fn count_star(ctx: &SessionContext, table_name: &str) -> i64 {
     let batches = ctx
         .sql(&format!("SELECT COUNT(*) AS row_count FROM {table_name}"))
@@ -162,24 +119,6 @@ async fn materialized_view_provider_emits_rows() {
         .build_batches_at_version(1)
         .await
         .expect("build as of version");
-    assert_eq!(as_of.len(), 1);
-    assert_eq!(as_of[0].num_rows(), 1);
-}
-
-#[tokio::test]
-async fn materialized_view_provider_resolves_logical_versions_to_encoded_overlay() {
-    let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_logical_version_test");
-
-    let logical_version = 42_u64;
-    let schema = id_label_schema();
-    publish_encoded_id_label_overlay(view.as_ref(), logical_version, &[(7, "seven")]);
-    let provider = MaterializedViewTableProvider::new(registry, "mv_logical_version_test", schema);
-
-    let as_of = provider
-        .build_batches_at_version(logical_version)
-        .await
-        .expect("build logical as of version");
     assert_eq!(as_of.len(), 1);
     assert_eq!(as_of[0].num_rows(), 1);
 }
@@ -382,38 +321,8 @@ async fn materialized_view_provider_recovers_authoritative_row_count_from_latest
 }
 
 #[tokio::test]
-async fn materialized_view_provider_recovers_authoritative_row_count_from_overlay_snapshot() {
-    let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_overlay_count_recovery");
-
-    let schema = id_schema(true);
-    let handle_version = 1_u64;
-    let latest_version = handle_version.saturating_add(1);
-    publish_encoded_i64_overlay(view.as_ref(), handle_version, &[1, 2]);
-    publish_encoded_i64_overlay(view.as_ref(), latest_version, &[3]);
-    let provider = MaterializedViewTableProvider::new(
-        Arc::clone(&registry),
-        "mv_overlay_count_recovery",
-        schema,
-    );
-
-    assert_eq!(view.authoritative_row_count(), None);
-    let batches = provider
-        .build_batches_for_test()
-        .await
-        .expect("build recovered overlay snapshot");
-    assert_eq!(batches[0].num_rows(), 3);
-    assert_eq!(view.authoritative_row_count_for(latest_version), Some(3));
-    assert_eq!(view.authoritative_row_count(), Some(3));
-    let second = provider
-        .build_batches_for_test()
-        .await
-        .expect("build recovered overlay snapshot again");
-    assert_eq!(second[0].num_rows(), 3);
-}
-
-#[tokio::test]
-async fn materialized_view_provider_invalidates_stale_authoritative_count_after_version_advance() {
+async fn materialized_view_provider_invalidates_stale_authoritative_count_after_arrow_publication()
+{
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_stale_count_recovery");
     view.publish_logical_version(0);
@@ -579,7 +488,7 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
 }
 
 #[tokio::test]
-async fn materialized_view_provider_keeps_latest_visible_count_while_next_version_is_staged() {
+async fn materialized_view_provider_updates_visible_count_after_arrow_publication() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_staged_visibility");
 
@@ -598,31 +507,6 @@ async fn materialized_view_provider_keeps_latest_visible_count_while_next_versio
 
     publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[1, 2]);
     assert_eq!(count_star(&ctx, "mv_count_staged_visibility").await, 2);
-}
-
-#[tokio::test]
-async fn materialized_view_provider_uses_cached_count_on_first_overlay_visible_version() {
-    let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_overlay_first_visible_count");
-
-    let schema = id_schema(true);
-    publish_encoded_i64_overlay(view.as_ref(), 0, &[]);
-    publish_encoded_i64_overlay(view.as_ref(), 1, &[7]);
-    let provider =
-        MaterializedViewTableProvider::new(registry, "mv_overlay_first_visible_count", schema);
-    let session = SessionContext::new();
-    session
-        .register_table(
-            "mv_overlay_first_visible_count",
-            Arc::new(provider) as Arc<dyn TableProvider>,
-        )
-        .expect("register mv provider");
-
-    assert_eq!(
-        count_star(&session, "mv_overlay_first_visible_count").await,
-        1
-    );
-    assert_eq!(view.authoritative_row_count_for(1), Some(1));
 }
 
 #[test]

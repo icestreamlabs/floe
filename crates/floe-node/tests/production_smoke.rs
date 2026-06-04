@@ -262,20 +262,8 @@ async fn wait_for_rows_matching(
 }
 
 async fn wait_for_mv_count_at_least(pg_port: u16, min_count: i64) -> Result<i64> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        match query_mv_count(pg_port).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) if Instant::now() < deadline => {
-                poll.tick().await;
-            }
-            Ok(count) => {
-                bail!("timed out waiting for mv_smoke row count >= {min_count}; last count {count}")
-            }
-            Err(err) => bail!("timed out waiting for mv_smoke row count >= {min_count}: {err}"),
-        }
-    }
+    node_process::wait_for_count_at_least("mv_smoke", min_count, 80, || query_mv_count(pg_port))
+        .await
 }
 
 async fn wait_for_auction_count_at_least(
@@ -283,22 +271,10 @@ async fn wait_for_auction_count_at_least(
     auction: i64,
     min_count: i64,
 ) -> Result<i64> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        match query_auction_count(pg_port, auction).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) if Instant::now() < deadline => {
-                poll.tick().await;
-            }
-            Ok(count) => bail!(
-                "timed out waiting for auction {auction} row count >= {min_count}; last count {count}"
-            ),
-            Err(err) => {
-                bail!("timed out waiting for auction {auction} row count >= {min_count}: {err}")
-            }
-        }
-    }
+    node_process::wait_for_count_at_least(format!("auction {auction}"), min_count, 80, || {
+        query_auction_count(pg_port, auction)
+    })
+    .await
 }
 
 async fn assert_auction_count_remains_zero(
