@@ -21,7 +21,6 @@ fn default_run_args() -> cli::RunArgs {
         pgwire_addr: None,
         disable_pgwire: false,
         admin_port: None,
-        pre_tick_commit_delay_ms: None,
         watermark_idle_source_ms: None,
         subscribe_channel_capacity: None,
         subscribe_max_catchup_versions: None,

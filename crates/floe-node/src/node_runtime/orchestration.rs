@@ -618,7 +618,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let max_batch = run_args.ingest_batch_size;
     let max_batch_per_source = run_args.ingest_batch_per_source;
     let max_batch_per_connector = run_args.ingest_batch_per_connector;
-    let pre_tick_commit_delay_ms = run_args.pre_tick_commit_delay_ms.unwrap_or(0);
     let watermark_idle_source_ms = run_args.watermark_idle_source_ms.unwrap_or(0);
     let watermark_idle_source_ms = if watermark_idle_source_ms == 0 {
         DEFAULT_WATERMARK_IDLE_SOURCE_MS
@@ -843,7 +842,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 .collect(),
             watermark_debug: Arc::clone(&watermark_debug),
             watermark_idle_source_ms,
-            pre_tick_commit_delay_ms,
         },
         limits: ExecutorBatchLimits {
             max_batch,

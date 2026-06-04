@@ -56,10 +56,10 @@ pub(crate) fn encoded_deltas_to_weighted_arrow_batches(
     deltas: &[(Vec<u8>, i64)],
     schema: SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
-    let mut buffer = DeltaBatchBuffer::new(schema, false, DeltaBatchConfig::default())?;
+    let mut buffer = DeltaBatchBuffer::new(schema, DeltaBatchConfig::default())?;
     let mut batches = Vec::new();
     for (row, diff) in deltas {
-        if let Some(batch) = buffer.push_ref(row, *diff, None)? {
+        if let Some(batch) = buffer.push_ref(row, *diff)? {
             batches.push(batch);
         }
     }

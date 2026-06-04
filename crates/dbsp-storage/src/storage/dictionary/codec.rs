@@ -46,23 +46,19 @@ pub(super) fn compress_value(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(super) fn decompress_value(bytes: &[u8]) -> Result<Vec<u8>> {
-    if let Some((codec, payload)) = bytes.split_first() {
-        match *codec {
-            VALUE_CODEC_RAW => return Ok(payload.to_vec()),
+    match bytes.split_first() {
+        Some((codec, payload)) => match *codec {
+            VALUE_CODEC_RAW => Ok(payload.to_vec()),
             VALUE_CODEC_SNAP => {
                 let mut decoder = Decoder::new();
-                return decoder
+                decoder
                     .decompress_vec(payload)
-                    .map_err(|err| anyhow!("failed to decompress dictionary value: {err}"));
+                    .map_err(|err| anyhow!("failed to decompress dictionary value: {err}"))
             }
-            _ => {
-                // Backward compatibility for values written before codec tagging.
-            }
-        }
+            other => Err(anyhow!(
+                "unsupported dictionary value codec tag 0x{other:02x}"
+            )),
+        },
+        None => Err(anyhow!("dictionary value is missing codec tag")),
     }
-
-    let mut decoder = Decoder::new();
-    decoder
-        .decompress_vec(bytes)
-        .map_err(|err| anyhow!("failed to decompress dictionary value: {err}"))
 }

@@ -2,8 +2,6 @@ use anyhow::{Context, Result, bail};
 use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcRow};
 use floe_core::RowValue;
 
-use crate::json::decode_json_value;
-
 pub(crate) const CDC_ROW_STATE_MAGIC: &[u8; 8] = b"FCDCRW1\0";
 const CDC_ROW_VALUE_NULL: u8 = 0;
 const CDC_ROW_VALUE_INT64: u8 = 1;
@@ -144,7 +142,7 @@ fn encode_cdc_columnar_row_value(
 
 pub(crate) fn decode_cdc_row_state(bytes: &[u8]) -> Result<CdcRow> {
     if !bytes.starts_with(CDC_ROW_STATE_MAGIC) {
-        return decode_json_value(bytes, "legacy CDC row state");
+        bail!("CDC row state is missing binary codec magic");
     }
     let mut cursor = CdcRowStateCursor::new(&bytes[CDC_ROW_STATE_MAGIC.len()..]);
     let value_count = cursor.read_u32()? as usize;

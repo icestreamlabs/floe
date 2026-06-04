@@ -174,30 +174,11 @@ pub fn restored_operator_state(namespace: &str) -> Option<OperatorStateHandle> {
 }
 
 #[cfg(test)]
-pub fn clear_operator_state_registry() {
-    let mut guard = registry_guard();
-    guard.live_by_graph.clear();
-    guard.restore_by_graph.clear();
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        match TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
     #[test]
     fn uncheckpointed_operator_state_is_excluded_from_snapshots_and_restore() {
-        let _guard = test_guard();
-        clear_operator_state_registry();
-
         let scratch_namespace = uncheckpointed_operator_state_namespace("scratch");
         record_operator_state(
             "scratch",
@@ -212,26 +193,25 @@ mod tests {
                 .any(|handle| handle.namespace == scratch_namespace)
         );
 
-        let checkpointed = OperatorStateHandle::new("stable", "op/graph_stable/0/stable", 11);
-        install_operator_state_restore(vec![
-            OperatorStateHandle::new("scratch", scratch_namespace.clone(), 7),
-            checkpointed.clone(),
-        ]);
+        let checkpointed =
+            OperatorStateHandle::new("stable", "op/graph_uncheckpointed_restore/0/stable", 11);
+        install_operator_state_restore_for_graph(
+            "graph_uncheckpointed_restore",
+            vec![
+                OperatorStateHandle::new("scratch", scratch_namespace.clone(), 7),
+                checkpointed.clone(),
+            ],
+        );
 
         assert!(restored_operator_state(&scratch_namespace).is_none());
         assert_eq!(
-            restored_operator_state("op/graph_stable/0/stable"),
+            restored_operator_state("op/graph_uncheckpointed_restore/0/stable"),
             Some(checkpointed)
         );
-
-        clear_operator_state_registry();
     }
 
     #[test]
     fn invalid_checkpoint_namespace_is_ignored() {
-        let _guard = test_guard();
-        clear_operator_state_registry();
-
         record_operator_state(
             "invalid",
             ZSetHandle {
@@ -245,21 +225,15 @@ mod tests {
                 .any(|handle| handle.namespace == "stable_namespace")
         );
 
-        install_operator_state_restore(vec![OperatorStateHandle::new(
-            "invalid",
-            "stable_namespace",
-            11,
-        )]);
+        install_operator_state_restore_for_graph(
+            "invalid_checkpoint_namespace",
+            vec![OperatorStateHandle::new("invalid", "stable_namespace", 11)],
+        );
         assert!(restored_operator_state("stable_namespace").is_none());
-
-        clear_operator_state_registry();
     }
 
     #[test]
     fn graph_scoped_snapshot_and_restore_do_not_bleed_between_graphs() {
-        let _guard = test_guard();
-        clear_operator_state_registry();
-
         record_operator_state(
             "left",
             ZSetHandle {
@@ -288,7 +262,5 @@ mod tests {
             Some(OperatorStateHandle::new("left", "op/graph_a/1/left", 2))
         );
         assert!(restored_operator_state("op/graph_b/1/left").is_none());
-
-        clear_operator_state_registry();
     }
 }

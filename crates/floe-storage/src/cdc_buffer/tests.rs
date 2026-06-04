@@ -1,9 +1,6 @@
-use super::keys::{
-    payload_blob_key, payload_key, payload_object_key, payload_prefix, pending_manifest_key,
-};
+use super::keys::payload_object_key;
 use super::payload_codec::{
     CDC_BUFFER_PAYLOAD_MAGIC_V1, decode_payload_records, encode_optional_bytes,
-    encode_payload_records,
 };
 use super::*;
 use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcTableId};
@@ -25,10 +22,6 @@ fn reopened_store(store: &CdcBufferStore) -> CdcBufferStore {
         Arc::clone(&store.db),
         Arc::clone(store.object_store.as_ref().expect("object store")),
     )
-}
-
-async fn write_durable_batch(db: &Db, batch: WriteBatch) -> Result<()> {
-    write_batch(db, batch, true).await
 }
 
 #[tokio::test]
@@ -58,24 +51,6 @@ async fn appends_and_replays_pending_transactions() {
             .await
             .is_ok()
     );
-    assert!(
-        store
-            .db
-            .get(payload_blob_key("pipe", manifest.transaction_key()))
-            .await
-            .expect("load legacy payload blob")
-            .is_none()
-    );
-    assert!(
-        scan_prefix(
-            &store.db,
-            &payload_prefix("pipe", manifest.transaction_key())
-        )
-        .await
-        .expect("legacy payload records")
-        .is_empty()
-    );
-
     let frontier = store
         .source_frontier("pipe")
         .await
@@ -542,88 +517,6 @@ fn decodes_v1_payload_blob_without_headers() {
 
     assert_eq!(decoded, records);
     assert!(decoded.iter().all(|record| record.headers().is_empty()));
-}
-
-#[tokio::test]
-async fn replays_legacy_json_payload_records() {
-    let store = test_store("cdc-buffer-legacy-records").await;
-    let append = append("0/10", 1000, vec![record(1), record(2)]);
-    let transaction_key =
-        transaction_key(append.source_position(), append.transaction_id()).unwrap();
-    let manifest = CdcBufferedTransactionManifest {
-        pipeline_name: append.pipeline_name().to_string(),
-        source_name: append.source_name().to_string(),
-        table_id: append.table_id().to_string(),
-        transaction_key: transaction_key.clone(),
-        source_position: append.source_position().clone(),
-        transaction_id: append.transaction_id().cloned(),
-        record_count: append.records().len(),
-        payload_bytes: append.records().iter().map(CdcBufferRecord::byte_len).sum(),
-        payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
-        payload_format: CdcBufferPayloadFormat::KafkaRecords,
-        schema_versions: CdcSchemaVersionMap::new(),
-        payload_object_key: None,
-        buffered_at_unix_ms: append.buffered_at_unix_ms(),
-        delivered_at_unix_ms: None,
-    };
-    let mut batch = WriteBatch::new();
-    batch.put(
-        pending_manifest_key("pipe", &transaction_key),
-        serde_json::to_vec(&manifest).unwrap(),
-    );
-    for (idx, record) in append.records().iter().enumerate() {
-        batch.put(
-            payload_key("pipe", &transaction_key, idx),
-            serde_json::to_vec(record).unwrap(),
-        );
-    }
-    write_durable_batch(store.db.as_ref(), batch)
-        .await
-        .expect("write legacy payload");
-
-    assert_eq!(
-        store.records(&manifest).await.unwrap(),
-        vec![record(1), record(2)]
-    );
-}
-
-#[tokio::test]
-async fn replays_legacy_slatedb_payload_blob() {
-    let store = test_store("cdc-buffer-legacy-blob").await;
-    let append = append("0/10", 1000, vec![record(1), record(2)]);
-    let transaction_key =
-        transaction_key(append.source_position(), append.transaction_id()).unwrap();
-    let payload = encode_payload_records(append.records()).expect("encode payload");
-    let manifest = CdcBufferedTransactionManifest {
-        pipeline_name: append.pipeline_name().to_string(),
-        source_name: append.source_name().to_string(),
-        table_id: append.table_id().to_string(),
-        transaction_key: transaction_key.clone(),
-        source_position: append.source_position().clone(),
-        transaction_id: append.transaction_id().cloned(),
-        record_count: append.records().len(),
-        payload_bytes: payload.len(),
-        payload_storage: CdcBufferPayloadStorage::SlateDbBlob,
-        payload_format: CdcBufferPayloadFormat::KafkaRecords,
-        schema_versions: CdcSchemaVersionMap::new(),
-        payload_object_key: None,
-        buffered_at_unix_ms: append.buffered_at_unix_ms(),
-        delivered_at_unix_ms: None,
-    };
-    let mut batch = WriteBatch::new();
-    batch.put(
-        pending_manifest_key("pipe", &transaction_key),
-        serde_json::to_vec(&manifest).unwrap(),
-    );
-    batch.put(payload_blob_key("pipe", &transaction_key), payload);
-    write_durable_batch(store.db.as_ref(), batch)
-        .await
-        .expect("write legacy payload blob");
-
-    assert_eq!(
-        store.records(&manifest).await.unwrap(),
-        vec![record(1), record(2)]
-    );
 }
 
 fn append(lsn: &str, buffered_at_unix_ms: u64, records: Vec<CdcBufferRecord>) -> CdcBufferAppend {

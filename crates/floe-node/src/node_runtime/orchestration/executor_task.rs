@@ -70,7 +70,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         tracked_mv_names,
         watermark_debug,
         watermark_idle_source_ms,
-        pre_tick_commit_delay_ms,
     } = checkpoint;
     let ExecutorBatchLimits {
         max_batch,
@@ -781,9 +780,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     decoded_rows = decoded_rows_len,
                     "tick begin"
                 );
-            }
-            if pre_tick_commit_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(pre_tick_commit_delay_ms)).await;
             }
             let tick_all_start = Instant::now();
             if let Err(err) = vectorized_runtime_for_task

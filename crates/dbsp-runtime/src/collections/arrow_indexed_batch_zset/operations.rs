@@ -521,24 +521,6 @@ where
         if lower_bytes >= upper_bytes {
             return Ok(Vec::new());
         }
-        let range_format = self
-            .table
-            .get_bytes(&self.range_format_key)
-            .await
-            .context("read Arrow-index range format marker")?;
-        if range_format.is_none() {
-            let legacy_entries = self
-                .table
-                .scan_prefix(&self.index_prefix, &ScanOptions::default())
-                .await
-                .context("scan legacy Arrow-index key prefix for range compatibility")?;
-            if !legacy_entries.is_empty() {
-                return Err(anyhow!(
-                    "range index namespace is on legacy layout; rebuild/replay is required"
-                ));
-            }
-        }
-
         let mut refs_by_key: SegmentRefsByKey = FastMap::default();
         for (entry_key, entry_value) in self
             .table

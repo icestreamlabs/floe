@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use floe_cdc_core::CdcTransactionId;
 use floe_storage::{
-    CdcBufferPayloadFormat, CdcBufferPayloadStorage, CdcBufferRecord, CdcBufferStore,
-    CdcBufferedTransactionManifest, SlateCatalog,
+    CdcBufferPayloadFormat, CdcBufferRecord, CdcBufferStore, CdcBufferedTransactionManifest,
+    SlateCatalog,
 };
 
 use super::super::{ReplicationPipelineRuntimeFormat, ReplicationPipelineRuntimePlan};
@@ -200,9 +200,7 @@ pub(super) async fn load_manifest_records(
 
 fn record_object_store_get(
     plan: &ReplicationPipelineRuntimePlan,
-    manifest: &CdcBufferedTransactionManifest,
+    _manifest: &CdcBufferedTransactionManifest,
 ) {
-    if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
-        crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
-    }
+    crate::metrics::inc_cdc_buffer_object_op(&plan.name, "get", 1);
 }

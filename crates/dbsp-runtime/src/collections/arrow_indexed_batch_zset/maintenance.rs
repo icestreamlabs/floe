@@ -590,25 +590,6 @@ where
     }
 
     pub(super) async fn ensure_range_layout(&self) -> Result<()> {
-        let range_format = self
-            .table
-            .get_bytes(&self.range_format_key)
-            .await
-            .context("read Arrow-index range format marker")?;
-        if range_format.is_some() {
-            return Ok(());
-        }
-
-        let legacy_entries = self
-            .table
-            .scan_prefix(&self.index_prefix, &ScanOptions::default())
-            .await
-            .context("scan legacy Arrow-index key prefix for range compatibility")?;
-        if !legacy_entries.is_empty() {
-            return Err(anyhow!(
-                "range index namespace is on legacy layout; rebuild/replay is required"
-            ));
-        }
         Ok(())
     }
 

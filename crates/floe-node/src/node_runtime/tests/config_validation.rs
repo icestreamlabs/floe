@@ -410,7 +410,6 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
             kafka_poll_ms: Some(250),
             kafka_max_messages: Some(1024),
             watermark_idle_source_ms: Some(45_000),
-            pre_tick_commit_delay_ms: Some(5),
             subscribe_channel_capacity: Some(512),
             subscribe_max_catchup_versions: Some(64),
             admin_port: Some(9090),
@@ -460,7 +459,6 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
     assert_eq!(args.pgwire_addr.as_deref(), Some("127.0.0.1:7777"));
     assert!(args.disable_pgwire);
     assert_eq!(args.admin_port, Some(9090));
-    assert_eq!(args.pre_tick_commit_delay_ms, Some(5));
     assert_eq!(args.watermark_idle_source_ms, Some(45_000));
     assert_eq!(args.subscribe_channel_capacity, Some(512));
     assert_eq!(args.subscribe_max_catchup_versions, Some(64));

@@ -74,8 +74,6 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub watermark_idle_source_ms: Option<u64>,
     #[serde(default)]
-    pub pre_tick_commit_delay_ms: Option<u64>,
-    #[serde(default)]
     pub subscribe_channel_capacity: Option<usize>,
     #[serde(default)]
     pub subscribe_max_catchup_versions: Option<i64>,

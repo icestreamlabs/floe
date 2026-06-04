@@ -46,21 +46,6 @@ pub(super) fn delivered_manifest_key(
     key
 }
 
-pub(super) fn payload_prefix(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"payload/");
-    key.extend_from_slice(transaction_key.as_bytes());
-    key.extend_from_slice(b"/");
-    key
-}
-
-pub(super) fn payload_blob_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
-    key.extend_from_slice(b"payload_blob/");
-    key.extend_from_slice(transaction_key.as_bytes());
-    key
-}
-
 pub(super) fn payload_object_key(pipeline_name: &str, transaction_key: &str) -> String {
     format!(
         "floe_cdc_buffer_blobs/v1/pipeline/{}/{}.bin",
@@ -74,17 +59,6 @@ pub(super) fn payload_object_prefix(pipeline_name: &str) -> String {
         "floe_cdc_buffer_blobs/v1/pipeline/{}/",
         hex_component(pipeline_name.as_bytes())
     )
-}
-
-#[cfg(test)]
-pub(super) fn payload_key(
-    pipeline_name: &str,
-    transaction_key: &str,
-    record_idx: usize,
-) -> Vec<u8> {
-    let mut key = payload_prefix(pipeline_name, transaction_key);
-    key.extend_from_slice(format!("{record_idx:020}").as_bytes());
-    key
 }
 
 fn pipeline_prefix(pipeline_name: &str) -> Vec<u8> {

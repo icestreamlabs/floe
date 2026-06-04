@@ -66,6 +66,7 @@ struct VectorizedMaterializedViewState {
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     previous_snapshot: Vec<RecordBatch>,
     incremental: Option<IncrementalMaterializedViewState>,
+    execution_mode: MaterializedViewExecutionMode,
 }
 
 struct IncrementalMaterializedViewState {
@@ -76,6 +77,12 @@ struct IncrementalMaterializedViewState {
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializedViewExecutionMode {
+    IncrementalFilterProject,
+    FullRefresh,
 }
 
 impl IncrementalMaterializedViewState {
@@ -211,6 +218,11 @@ impl VectorizedExecutionRuntime {
                 ),
                 None => None,
             };
+            let execution_mode = if incremental.is_some() {
+                MaterializedViewExecutionMode::IncrementalFilterProject
+            } else {
+                MaterializedViewExecutionMode::FullRefresh
+            };
             let plan = df
                 .create_physical_plan()
                 .await
@@ -221,6 +233,7 @@ impl VectorizedExecutionRuntime {
                 plan,
                 previous_snapshot: Vec::new(),
                 incremental,
+                execution_mode,
             });
         }
 
@@ -408,7 +421,7 @@ impl VectorizedExecutionRuntime {
             {
                 continue;
             }
-            run_full_materialized_view_tick(ctx, registry, mv, version).await?;
+            run_full_refresh_materialized_view_tick(ctx, registry, mv, version).await?;
         }
         self.current_insert_batches.clear();
         self.current_weighted_delta_batches.clear();
@@ -504,7 +517,7 @@ async fn build_incremental_materialized_view_state(
     })
 }
 
-async fn run_full_materialized_view_tick(
+async fn run_full_refresh_materialized_view_tick(
     ctx: &SessionContext,
     registry: &MaterializedViewRegistry,
     mv: &mut VectorizedMaterializedViewState,
@@ -537,14 +550,14 @@ async fn run_full_materialized_view_tick(
     handle.publish_arrow_version(version, next_snapshot.clone(), diff.batches);
     mv.previous_snapshot = next_snapshot;
     let total_ms = plan_start.elapsed().as_millis() as u64;
-    metrics::observe_full_mv_fallback_tick(snapshot_rows, total_ms);
+    metrics::observe_full_mv_refresh_tick(snapshot_rows, total_ms);
     tracing::warn!(
         view = %mv.view_name,
         version,
         rows = snapshot_rows,
         total_ms,
-        mode = "full",
-        "vectorized materialized view used full-snapshot fallback"
+        mode = ?mv.execution_mode,
+        "vectorized materialized view full-refresh tick completed"
     );
     Ok(())
 }
@@ -628,9 +641,13 @@ async fn run_signed_incremental_materialized_view_tick(
     let mut positive_source_batches = Vec::new();
     let mut negative_source_batches = Vec::new();
     for batch in weighted_source_batches {
-        let Some(unit_delta) = unit_source_delta_batches(&incremental.source_schema, batch)? else {
-            return Ok(false);
-        };
+        let unit_delta = unit_source_delta_batches(&incremental.source_schema, batch)?
+            .with_context(|| {
+                format!(
+                    "incremental vectorized materialized view '{}' received non-unit weighted source deltas",
+                    mv.view_name
+                )
+            })?;
         positive_source_batches.extend(unit_delta.positive);
         negative_source_batches.extend(unit_delta.negative);
     }
