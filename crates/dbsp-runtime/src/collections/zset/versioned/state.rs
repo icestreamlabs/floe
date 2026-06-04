@@ -202,11 +202,6 @@ where
         &self.intent_key
     }
 
-    #[cfg(test)]
-    pub(crate) fn state_key_bytes(&self) -> &[u8] {
-        &self.state_key
-    }
-
     pub(crate) async fn adopt_persisted_version(&mut self, version: u64) -> Result<()> {
         if version == 0 {
             self.current_version = 0;

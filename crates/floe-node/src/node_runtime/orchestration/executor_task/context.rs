@@ -66,7 +66,6 @@ pub(in crate::node_runtime::orchestration) struct ExecutorCheckpointContext {
     pub(in crate::node_runtime::orchestration) watermark_debug:
         Arc<tokio::sync::RwLock<http_ingest::WatermarkDebugState>>,
     pub(in crate::node_runtime::orchestration) watermark_idle_source_ms: u64,
-    pub(in crate::node_runtime::orchestration) pre_tick_commit_delay_ms: u64,
 }
 
 pub(in crate::node_runtime::orchestration) struct ExecutorBatchLimits {

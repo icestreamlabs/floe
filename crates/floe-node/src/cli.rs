@@ -76,10 +76,6 @@ pub struct RunArgs {
     #[arg(long = "admin-port")]
     pub admin_port: Option<u16>,
 
-    /// Test/debug delay before committing each runtime tick.
-    #[arg(long = "pre-tick-commit-delay-ms", value_parser = parse_nonnegative_u64)]
-    pub pre_tick_commit_delay_ms: Option<u64>,
-
     /// Duration after which idle sources stop holding back the global watermark.
     #[arg(long = "watermark-idle-source-ms", value_parser = parse_positive_u64)]
     pub watermark_idle_source_ms: Option<u64>,

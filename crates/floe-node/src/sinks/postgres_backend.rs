@@ -115,6 +115,8 @@ struct PostgresSinkWriter {
     insert_sql: String,
     delete_sql: Option<String>,
     connection: Option<PostgresSinkConnection>,
+    insert_stage_ready: bool,
+    delete_stage_ready: bool,
 }
 
 struct PostgresSinkConnection {
@@ -164,6 +166,8 @@ impl PostgresSinkWriter {
             insert_sql,
             delete_sql,
             connection: None,
+            insert_stage_ready: false,
+            delete_stage_ready: false,
         })
     }
 
@@ -179,6 +183,8 @@ impl PostgresSinkWriter {
         let insert_sql = self.insert_sql.clone();
         let delete_sql = self.delete_sql.clone();
         let mode = self.mode;
+        let mut insert_stage_ready = self.insert_stage_ready;
+        let mut delete_stage_ready = self.delete_stage_ready;
         self.ensure_connected().await?;
         let connection = self
             .connection
@@ -200,15 +206,16 @@ impl PostgresSinkWriter {
                 .iter()
                 .map(|idx| &self.schema.columns[*idx])
                 .collect::<Vec<_>>();
-            create_stage_table(
+            prepare_stage_table(
                 &transaction,
                 POSTGRES_DELETE_STAGE_TABLE,
                 key_columns.len(),
                 false,
+                &mut delete_stage_ready,
             )
             .await
             .with_context(|| {
-                format!("create Postgres sink delete stage table for {target_table}")
+                format!("prepare Postgres sink delete stage table for {target_table}")
             })?;
             copy_stage_rows(
                 &transaction,
@@ -228,15 +235,16 @@ impl PostgresSinkWriter {
         }
 
         if !actions.inserts.is_empty() {
-            create_stage_table(
+            prepare_stage_table(
                 &transaction,
                 POSTGRES_INSERT_STAGE_TABLE,
                 self.schema.columns.len(),
                 true,
+                &mut insert_stage_ready,
             )
             .await
             .with_context(|| {
-                format!("create Postgres sink insert stage table for {target_table}")
+                format!("prepare Postgres sink insert stage table for {target_table}")
             })?;
             copy_stage_rows(
                 &transaction,
@@ -263,7 +271,10 @@ impl PostgresSinkWriter {
         transaction
             .commit()
             .await
-            .with_context(|| format!("commit Postgres sink transaction for {target_table}"))
+            .with_context(|| format!("commit Postgres sink transaction for {target_table}"))?;
+        self.insert_stage_ready = insert_stage_ready;
+        self.delete_stage_ready = delete_stage_ready;
+        Ok(())
     }
 
     fn batch_actions(&self, batch: &MvChangelogBatch) -> Result<PostgresBatchActions> {
@@ -323,11 +334,15 @@ impl PostgresSinkWriter {
             }
         });
         self.connection = Some(PostgresSinkConnection { client, task });
+        self.insert_stage_ready = false;
+        self.delete_stage_ready = false;
         Ok(())
     }
 
     fn disconnect(&mut self) {
         self.connection = None;
+        self.insert_stage_ready = false;
+        self.delete_stage_ready = false;
     }
 
     fn row_params(
@@ -510,12 +525,19 @@ fn postgres_param_from_row_value(
     }
 }
 
-async fn create_stage_table(
+async fn prepare_stage_table(
     transaction: &tokio_postgres::Transaction<'_>,
     stage_table: &str,
     column_count: usize,
     include_row_index: bool,
+    stage_ready: &mut bool,
 ) -> Result<()> {
+    if *stage_ready {
+        let sql = format!("TRUNCATE {}", quote_postgres_ident(stage_table));
+        transaction.batch_execute(&sql).await?;
+        return Ok(());
+    }
+
     let mut columns = (0..column_count)
         .map(|idx| format!("{} text", quote_postgres_ident(&stage_column_name(idx))))
         .collect::<Vec<_>>();
@@ -526,11 +548,12 @@ async fn create_stage_table(
         ));
     }
     let sql = format!(
-        "CREATE TEMP TABLE {} ({}) ON COMMIT DROP",
+        "CREATE TEMP TABLE {} ({}) ON COMMIT PRESERVE ROWS",
         quote_postgres_ident(stage_table),
         columns.join(", ")
     );
     transaction.batch_execute(&sql).await?;
+    *stage_ready = true;
     Ok(())
 }
 

@@ -467,7 +467,7 @@ async fn materialized_view_provider_answers_count_star_from_authoritative_state(
 }
 
 #[tokio::test]
-async fn materialized_view_provider_hides_unpublished_authoritative_count_until_version_visible() {
+async fn materialized_view_provider_count_tracks_visible_arrow_versions() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_count_visibility");
 
@@ -482,31 +482,12 @@ async fn materialized_view_provider_hides_unpublished_authoritative_count_until_
 
     assert_eq!(count_star(&ctx, "mv_count_visibility").await, 0);
 
-    publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[7]);
+    publish_i64_snapshot(view.as_ref(), 1, id_schema(true), &[7]);
 
     assert_eq!(count_star(&ctx, "mv_count_visibility").await, 1);
-}
 
-#[tokio::test]
-async fn materialized_view_provider_updates_visible_count_after_arrow_publication() {
-    let registry = Arc::new(MaterializedViewRegistry::new());
-    let view = registry.register("mv_count_staged_visibility");
-
-    let schema = id_schema(true);
-    publish_i64_snapshot(view.as_ref(), 1, Arc::clone(&schema), &[1]);
-    let provider =
-        MaterializedViewTableProvider::new(registry, "mv_count_staged_visibility", schema);
-    let ctx = SessionContext::new();
-    ctx.register_table(
-        "mv_count_staged_visibility",
-        Arc::new(provider) as Arc<dyn TableProvider>,
-    )
-    .expect("register mv provider");
-
-    assert_eq!(count_star(&ctx, "mv_count_staged_visibility").await, 1);
-
-    publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[1, 2]);
-    assert_eq!(count_star(&ctx, "mv_count_staged_visibility").await, 2);
+    publish_i64_snapshot(view.as_ref(), 2, id_schema(true), &[7, 8]);
+    assert_eq!(count_star(&ctx, "mv_count_visibility").await, 2);
 }
 
 #[test]

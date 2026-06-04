@@ -14,14 +14,12 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
-use slatedb::config::ScanOptions;
 
 use crate::handles::ZSetHandle;
 use crate::storage::dictionary::KeyIntern;
 use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::util::{publish_transient_zset_batch, transient_zset_batch};
 
-use super::super::prefix_bounds;
 use super::{
     SegmentId, SegmentRecord, VersionChainStats, VersionWritePlan, VersionedZSet,
     ZSetVersionManifest, ZSetVersionState,
@@ -510,7 +508,6 @@ where
                 .context("clear stale versioned intent")?;
         }
 
-        let mut repair_empty_state = false;
         if let Some(state) = self.load_version_state().await? {
             if state.persisted_version == 0 {
                 self.current_version = 0;
@@ -528,69 +525,17 @@ where
                 return Ok(());
             }
 
-            tracing::warn!(
-                namespace = %self.namespace,
-                version = state.persisted_version,
-                "versioned ZSet state metadata referenced a missing manifest; falling back to manifest scan"
-            );
-            repair_empty_state = true;
+            return Err(anyhow!(
+                "versioned ZSet state metadata for namespace '{}' referenced missing manifest version {}",
+                self.namespace,
+                state.persisted_version
+            ));
         }
 
-        self.refresh_state_from_manifest_scan(repair_empty_state)
-            .await
-    }
-
-    async fn refresh_state_from_manifest_scan(&mut self, repair_empty_state: bool) -> Result<()> {
-        let entries = self
-            .table
-            .scan_range_bytes(
-                prefix_bounds(&self.manifest_prefix),
-                &ScanOptions::default(),
-            )
-            .await
-            .context("scan manifests while refreshing versioned ZSet")?;
-
-        let mut current = None;
-        let mut max_version = 0u64;
-        let mut max_segment_id = 0u64;
-
-        for (key, bytes) in entries {
-            if key.len() != self.manifest_prefix.len() + 8 {
-                continue;
-            }
-
-            let mut version_bytes = [0u8; 8];
-            version_bytes
-                .copy_from_slice(&key[self.manifest_prefix.len()..self.manifest_prefix.len() + 8]);
-            let version = u64::from_be_bytes(version_bytes);
-            let manifest = decode_manifest(&bytes)?;
-
-            for segments in manifest.buckets.values() {
-                for id in segments {
-                    max_segment_id = max_segment_id.max(*id);
-                }
-            }
-
-            if version >= max_version {
-                max_version = version;
-                current = Some(manifest.clone());
-            }
-        }
-
-        self.current_version = max_version;
-        self.persisted_version = max_version;
-        self.manifest = current;
-        self.next_segment_id = max_segment_id.saturating_add(1).max(1);
-
-        if max_version != 0 || repair_empty_state {
-            let mut batch = WriteBatch::new();
-            self.enqueue_version_state(max_version, self.next_segment_id, &mut batch)?;
-            self.table
-                .write_batch(batch)
-                .await
-                .context("persist migrated versioned ZSet state")?;
-        }
-
+        self.current_version = 0;
+        self.persisted_version = 0;
+        self.manifest = None;
+        self.next_segment_id = 1;
         Ok(())
     }
 

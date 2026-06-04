@@ -15,9 +15,9 @@ mod keys;
 mod payload_codec;
 
 use keys::{
-    delivered_manifest_key, delivered_manifest_prefix, delivery_frontier_key, payload_blob_key,
-    payload_object_key, payload_object_prefix, payload_prefix, pending_manifest_key,
-    pending_manifest_prefix, source_frontier_key, transaction_key,
+    delivered_manifest_key, delivered_manifest_prefix, delivery_frontier_key, payload_object_key,
+    payload_object_prefix, pending_manifest_key, pending_manifest_prefix, source_frontier_key,
+    transaction_key,
 };
 pub use payload_codec::{decode_cdc_buffer_records_payload, encode_cdc_buffer_records_payload};
 use payload_codec::{
@@ -95,7 +95,6 @@ pub struct CdcBufferedTransactionManifest {
 #[serde(rename_all = "snake_case")]
 pub enum CdcBufferPayloadStorage {
     #[default]
-    SlateDbBlob,
     ObjectStore,
 }
 
@@ -153,13 +152,6 @@ pub struct CdcBufferIntegrityReport {
 }
 
 impl CdcBufferStore {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self {
-            db,
-            object_store: None,
-        }
-    }
-
     pub fn with_object_store(db: Arc<Db>, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             db,
@@ -265,18 +257,13 @@ impl CdcBufferStore {
             manifest.transaction_key(),
             manifest.payload_format()
         );
-        let records = match manifest.payload_storage() {
-            CdcBufferPayloadStorage::ObjectStore => {
-                let payload = self.object_payload(manifest).await?;
-                decode_payload_records(&payload).with_context(|| {
-                    format!(
-                        "decode CDC buffer payload object '{}'",
-                        manifest.transaction_key(),
-                    )
-                })?
-            }
-            CdcBufferPayloadStorage::SlateDbBlob => self.legacy_slate_records(manifest).await?,
-        };
+        let payload = self.object_payload(manifest).await?;
+        let records = decode_payload_records(&payload).with_context(|| {
+            format!(
+                "decode CDC buffer payload object '{}'",
+                manifest.transaction_key(),
+            )
+        })?;
         ensure!(
             records.len() == manifest.record_count(),
             "CDC buffer transaction '{}' expected {} records, found {}",
@@ -297,23 +284,13 @@ impl CdcBufferStore {
             manifest.transaction_key(),
             manifest.payload_format()
         );
-        let batches = match manifest.payload_storage() {
-            CdcBufferPayloadStorage::ObjectStore => {
-                let payload = self.object_payload(manifest).await?;
-                decode_payload_change_batches(&payload).with_context(|| {
-                    format!(
-                        "decode CDC buffer change batch payload '{}'",
-                        manifest.transaction_key(),
-                    )
-                })?
-            }
-            CdcBufferPayloadStorage::SlateDbBlob => {
-                anyhow::bail!(
-                    "CDC buffer transaction '{}' stores change batches in unsupported legacy SlateDB payload storage",
-                    manifest.transaction_key()
-                )
-            }
-        };
+        let payload = self.object_payload(manifest).await?;
+        let batches = decode_payload_change_batches(&payload).with_context(|| {
+            format!(
+                "decode CDC buffer change batch payload '{}'",
+                manifest.transaction_key(),
+            )
+        })?;
         let change_count = batches.iter().map(ChangeBatch::change_count).sum::<usize>();
         ensure!(
             change_count == manifest.record_count(),
@@ -403,10 +380,7 @@ impl CdcBufferStore {
     pub async fn stats(&self, pipeline_name: &str, now_unix_ms: u64) -> Result<CdcBufferStats> {
         let manifests = self.pending_transactions(pipeline_name, usize::MAX).await?;
         let pending_transactions = manifests.len();
-        let pending_objects = manifests
-            .iter()
-            .filter(|manifest| manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore)
-            .count();
+        let pending_objects = manifests.len();
         let pending_records = manifests
             .iter()
             .map(CdcBufferedTransactionManifest::record_count)
@@ -471,51 +445,19 @@ impl CdcBufferStore {
                 summary.deleted_transactions = summary.deleted_transactions.saturating_add(1);
                 continue;
             }
-            match manifest.payload_storage() {
-                CdcBufferPayloadStorage::ObjectStore => {
-                    let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
-                        anyhow!(
-                            "delivered CDC buffer transaction '{}' is missing payload object key",
-                            manifest.transaction_key()
-                        )
-                    })?;
-                    self.delete_payload_object(payload_object_key).await?;
-                    summary.deleted_records = summary
-                        .deleted_records
-                        .saturating_add(manifest.record_count());
-                    summary.deleted_bytes = summary
-                        .deleted_bytes
-                        .saturating_add(manifest.payload_bytes());
-                }
-                CdcBufferPayloadStorage::SlateDbBlob => {
-                    let blob_key =
-                        payload_blob_key(manifest.pipeline_name(), manifest.transaction_key());
-                    let mut deleted_blob = false;
-                    if let Some(payload) =
-                        self.db.get(blob_key.clone()).await.map_err(map_slate_err)?
-                    {
-                        batch.delete(blob_key);
-                        summary.deleted_records = summary
-                            .deleted_records
-                            .saturating_add(manifest.record_count());
-                        summary.deleted_bytes = summary.deleted_bytes.saturating_add(payload.len());
-                        deleted_blob = true;
-                    }
-                    for (payload_key, payload_value) in scan_prefix(
-                        &self.db,
-                        &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
-                    )
-                    .await?
-                    {
-                        batch.delete(payload_key);
-                        if !deleted_blob {
-                            summary.deleted_records = summary.deleted_records.saturating_add(1);
-                        }
-                        summary.deleted_bytes =
-                            summary.deleted_bytes.saturating_add(payload_value.len());
-                    }
-                }
-            }
+            let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+                anyhow!(
+                    "delivered CDC buffer transaction '{}' is missing payload object key",
+                    manifest.transaction_key()
+                )
+            })?;
+            self.delete_payload_object(payload_object_key).await?;
+            summary.deleted_records = summary
+                .deleted_records
+                .saturating_add(manifest.record_count());
+            summary.deleted_bytes = summary
+                .deleted_bytes
+                .saturating_add(manifest.payload_bytes());
             batch.delete(key);
             summary.deleted_transactions = summary.deleted_transactions.saturating_add(1);
         }
@@ -574,43 +516,15 @@ impl CdcBufferStore {
             return Ok(summary);
         }
 
-        match manifest.payload_storage() {
-            CdcBufferPayloadStorage::ObjectStore => {
-                let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
-                    anyhow!(
-                        "delivered CDC buffer transaction '{}' is missing payload object key",
-                        manifest.transaction_key()
-                    )
-                })?;
-                self.delete_payload_object(payload_object_key).await?;
-                summary.deleted_records = manifest.record_count();
-                summary.deleted_bytes = manifest.payload_bytes();
-            }
-            CdcBufferPayloadStorage::SlateDbBlob => {
-                let blob_key =
-                    payload_blob_key(manifest.pipeline_name(), manifest.transaction_key());
-                let mut deleted_blob = false;
-                if let Some(payload) = self.db.get(blob_key.clone()).await.map_err(map_slate_err)? {
-                    batch.delete(blob_key);
-                    summary.deleted_records = manifest.record_count();
-                    summary.deleted_bytes = payload.len();
-                    deleted_blob = true;
-                }
-                for (payload_key, payload_value) in scan_prefix(
-                    &self.db,
-                    &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
-                )
-                .await?
-                {
-                    batch.delete(payload_key);
-                    if !deleted_blob {
-                        summary.deleted_records = summary.deleted_records.saturating_add(1);
-                    }
-                    summary.deleted_bytes =
-                        summary.deleted_bytes.saturating_add(payload_value.len());
-                }
-            }
-        }
+        let payload_object_key = manifest.payload_object_key().ok_or_else(|| {
+            anyhow!(
+                "delivered CDC buffer transaction '{}' is missing payload object key",
+                manifest.transaction_key()
+            )
+        })?;
+        self.delete_payload_object(payload_object_key).await?;
+        summary.deleted_records = manifest.record_count();
+        summary.deleted_bytes = manifest.payload_bytes();
         batch.delete(delivered_key);
         summary.deleted_transactions = 1;
         write_batch(self.db.as_ref(), batch, false)
@@ -727,10 +641,8 @@ impl CdcBufferStore {
                 &mut references.missing_payload_objects,
             )
             .await?;
-            if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
-                references.pending_payload_objects =
-                    references.pending_payload_objects.saturating_add(1);
-            }
+            references.pending_payload_objects =
+                references.pending_payload_objects.saturating_add(1);
         }
         for manifest in &delivered {
             self.record_manifest_payload_integrity(
@@ -739,10 +651,8 @@ impl CdcBufferStore {
                 &mut references.missing_payload_objects,
             )
             .await?;
-            if manifest.payload_storage() == CdcBufferPayloadStorage::ObjectStore {
-                references.delivered_payload_objects =
-                    references.delivered_payload_objects.saturating_add(1);
-            }
+            references.delivered_payload_objects =
+                references.delivered_payload_objects.saturating_add(1);
         }
 
         Ok(references)
@@ -754,9 +664,6 @@ impl CdcBufferStore {
         referenced_object_keys: &mut HashSet<String>,
         missing_payload_objects: &mut usize,
     ) -> Result<()> {
-        if manifest.payload_storage() != CdcBufferPayloadStorage::ObjectStore {
-            return Ok(());
-        }
         let Some(payload_object_key) = manifest.payload_object_key() else {
             *missing_payload_objects = missing_payload_objects.saturating_add(1);
             return Ok(());
@@ -795,40 +702,6 @@ impl CdcBufferStore {
             "CDC buffer",
         )
         .await
-    }
-
-    async fn legacy_slate_records(
-        &self,
-        manifest: &CdcBufferedTransactionManifest,
-    ) -> Result<Vec<CdcBufferRecord>> {
-        if let Some(value) = self
-            .db
-            .get(payload_blob_key(
-                manifest.pipeline_name(),
-                manifest.transaction_key(),
-            ))
-            .await
-            .map_err(map_slate_err)?
-        {
-            return decode_payload_records(&value).with_context(|| {
-                format!(
-                    "decode legacy CDC buffer payload blob '{}'",
-                    manifest.transaction_key()
-                )
-            });
-        }
-
-        scan_prefix(
-            &self.db,
-            &payload_prefix(manifest.pipeline_name(), manifest.transaction_key()),
-        )
-        .await?
-        .into_iter()
-        .map(|(_, value)| {
-            serde_json::from_slice::<CdcBufferRecord>(&value)
-                .context("decode legacy CDC buffer payload record")
-        })
-        .collect::<Result<Vec<_>>>()
     }
 
     async fn delete_payload_object(&self, payload_object_key: &str) -> Result<()> {

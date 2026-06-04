@@ -280,7 +280,6 @@ async fn arrow_indexed_reopen_preserves_persisted_state() {
 
 #[tokio::test]
 async fn arrow_indexed_restore_truncates_uncommitted_segments() {
-    crate::operator_state_registry::clear_operator_state_registry();
     let table = build_table("arrow-indexed-checkpoint-restore").await;
     let namespace = "op/arrow_indexed_checkpoint_restore/0/index";
     let writer = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
@@ -292,17 +291,22 @@ async fn arrow_indexed_restore_truncates_uncommitted_segments() {
         .apply_deltas(vec![(1, 10, 1)])
         .await
         .expect("apply committed segment");
-    let committed_handle = crate::operator_state_registry::snapshot_operator_states()
-        .into_iter()
-        .find(|handle| handle.namespace == namespace)
-        .expect("checkpointed index handle");
+    let committed_handle = crate::operator_state_registry::snapshot_operator_states_for_graph(
+        "arrow_indexed_checkpoint_restore",
+    )
+    .into_iter()
+    .find(|handle| handle.namespace == namespace)
+    .expect("checkpointed index handle");
     assert_eq!(committed_handle.version, 2);
 
     writer
         .apply_deltas(vec![(1, 99, 1)])
         .await
         .expect("apply uncommitted segment");
-    crate::operator_state_registry::install_operator_state_restore(vec![committed_handle]);
+    crate::operator_state_registry::install_operator_state_restore_for_graph(
+        "arrow_indexed_checkpoint_restore",
+        vec![committed_handle],
+    );
 
     let restored = IndexedBatchZSet::<i64, i64>::new(table.clone(), namespace);
     restored
@@ -326,7 +330,6 @@ async fn arrow_indexed_restore_truncates_uncommitted_segments() {
         .expect("lookup restored key after write");
     values.sort_unstable();
     assert_eq!(values, vec![(10, 1), (20, 1)]);
-    crate::operator_state_registry::clear_operator_state_registry();
 }
 
 #[tokio::test]
@@ -424,26 +427,6 @@ async fn arrow_indexed_first_range_lookup_stops_after_first_posting_group() {
         counting.scan_range_entries(),
         4,
         "full range lookup still materializes all postings in the requested range",
-    );
-}
-
-#[tokio::test]
-async fn arrow_indexed_range_scan_rejects_legacy_layout() {
-    let table = build_table("arrow-indexed-range-legacy").await;
-    let index =
-        IndexedBatchZSet::<i64, i64>::with_range_index(table.clone(), "arrow_indexed_range_legacy");
-    index
-        .apply_deltas(vec![(1, 10, 1), (2, 20, 1)])
-        .await
-        .expect("apply legacy deltas");
-
-    let err = index
-        .values_for_key_range(&1, &3)
-        .await
-        .expect_err("legacy range layout should require rebuild");
-    assert!(
-        err.to_string().contains("legacy layout"),
-        "unexpected error: {err}"
     );
 }
 

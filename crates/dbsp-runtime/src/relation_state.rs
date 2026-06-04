@@ -236,7 +236,6 @@ mod tests {
 
     #[tokio::test]
     async fn committed_operator_state_restore_opens_recorded_handle() {
-        crate::operator_state_registry::clear_operator_state_registry();
         let table = build_table("relation-state-restore").await;
         let namespace = "op/relation_state_restore/0/state".to_string();
         let mut state = RelationState::<i64>::empty(table.clone(), namespace.clone())
@@ -254,8 +253,13 @@ mod tests {
             .expect("create version");
         state.update_handle(state.integrated.handle_for_version(version));
 
-        let handles = crate::operator_state_registry::snapshot_operator_states();
-        crate::operator_state_registry::install_operator_state_restore(handles);
+        let handles = crate::operator_state_registry::snapshot_operator_states_for_graph(
+            "relation_state_restore",
+        );
+        crate::operator_state_registry::install_operator_state_restore_for_graph(
+            "relation_state_restore",
+            handles,
+        );
 
         let restored = RelationState::<i64>::empty(table, namespace)
             .await
@@ -267,6 +271,5 @@ mod tests {
             .await
             .expect("materialize restored state");
         assert_eq!(materialized.get(&99).copied(), Some(3));
-        crate::operator_state_registry::clear_operator_state_registry();
     }
 }

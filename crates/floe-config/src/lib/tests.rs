@@ -459,7 +459,6 @@ fn load_config_accepts_materialized_views_and_runtime_sections() {
             admin_port = 8082
             pgwire_addr = "127.0.0.1:6543"
             pgwire_enabled = false
-            pre_tick_commit_delay_ms = 10
             subscribe_channel_capacity = 512
             subscribe_max_catchup_versions = 64
 
@@ -491,7 +490,6 @@ fn load_config_accepts_materialized_views_and_runtime_sections() {
         Some("127.0.0.1:6543")
     );
     assert_eq!(config.runtime.pgwire_enabled, Some(false));
-    assert_eq!(config.runtime.pre_tick_commit_delay_ms, Some(10));
     assert_eq!(config.runtime.subscribe_channel_capacity, Some(512));
     assert_eq!(config.runtime.subscribe_max_catchup_versions, Some(64));
     assert_eq!(config.storage.await_durable, Some(true));

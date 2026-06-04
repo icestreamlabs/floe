@@ -188,6 +188,7 @@ impl ScalarColumnBuilder {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn append_binary_value(&mut self, value: &[u8]) -> Result<()> {
         match self {
             Self::Binary(builder) => {

@@ -30,9 +30,6 @@ pub(super) fn apply_runtime_config_defaults(args: &mut cli::RunArgs, config: &No
     if args.admin_port.is_none() {
         args.admin_port = runtime.admin_port;
     }
-    if args.pre_tick_commit_delay_ms.is_none() {
-        args.pre_tick_commit_delay_ms = runtime.pre_tick_commit_delay_ms;
-    }
     if args.watermark_idle_source_ms.is_none() {
         args.watermark_idle_source_ms = runtime.watermark_idle_source_ms;
     }

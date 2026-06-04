@@ -10,7 +10,7 @@ mod tests;
 
 const MV_VERSION_COLUMN: &str = "__mv_version";
 
-pub use dynamic_state::{DynamicStateExec, DynamicStateTableProvider};
+pub(crate) use dynamic_state::DynamicStateTableProvider;
 pub use materialized_view::MaterializedViewTableProvider;
-pub use scan_exec::SnapshotScanExec;
+pub(crate) use scan_exec::SnapshotScanExec;
 pub use slate::SlateTableProvider;

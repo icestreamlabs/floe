@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn row_state_uses_binary_codec_and_reads_legacy_json() {
+    async fn row_state_uses_binary_codec_and_rejects_untagged_state() {
         let table = test_table("cdc-row-state-binary").await;
         let store = CdcTableStore::new(Arc::clone(&table));
         let schema = orders_schema();
@@ -518,20 +518,30 @@ mod tests {
             Some(binary_row)
         );
 
-        let legacy_row = row(88, None, Some("legacy"));
-        let legacy_key = row_key_bytes(&table_id, &key(88)).expect("legacy row key");
+        let untagged_row = row(88, None, Some("untagged"));
+        let untagged_key = row_key_bytes(&table_id, &key(88)).expect("untagged row key");
         let mut batch = WriteBatch::new();
         batch.put(
-            legacy_key,
-            serde_json::to_vec(&legacy_row).expect("legacy JSON row"),
+            untagged_key,
+            serde_json::to_vec(&untagged_row).expect("untagged JSON row"),
         );
-        table.write_batch(batch).await.expect("write legacy row");
-        assert_eq!(
+        table.write_batch(batch).await.expect("write untagged row");
+        let error = store
+            .load_row(&table_id, &key(88))
+            .await
+            .expect_err("untagged row state should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("CDC row state is missing binary codec magic"),
+            "{error}"
+        );
+        assert!(
             store
-                .load_row(&table_id, &key(88))
+                .load_row(&table_id, &key(1))
                 .await
-                .expect("load legacy row"),
-            Some(legacy_row)
+                .expect("load tagged row")
+                .is_some()
         );
     }
 

@@ -55,28 +55,28 @@ static DELTA_CONSOLIDATION_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
     .expect("register floe_delta_consolidation_latency_ms")
 });
 
-static FULL_MV_FALLBACK_TICKS: LazyLock<IntCounter> = LazyLock::new(|| {
+static FULL_MV_REFRESH_TICKS: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
-        "floe_full_mv_fallback_ticks_total",
-        "Number of materialized view ticks executed with the full-snapshot fallback"
+        "floe_full_mv_refresh_ticks_total",
+        "Number of materialized view ticks executed with full-refresh execution"
     )
-    .expect("register floe_full_mv_fallback_ticks_total")
+    .expect("register floe_full_mv_refresh_ticks_total")
 });
 
-static FULL_MV_FALLBACK_ROWS: LazyLock<Histogram> = LazyLock::new(|| {
+static FULL_MV_REFRESH_ROWS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(HistogramOpts::new(
-        "floe_full_mv_fallback_rows",
-        "Rows scanned by full-snapshot materialized view fallback ticks",
+        "floe_full_mv_refresh_rows",
+        "Rows scanned by full-refresh materialized view ticks",
     ))
-    .expect("register floe_full_mv_fallback_rows")
+    .expect("register floe_full_mv_refresh_rows")
 });
 
-static FULL_MV_FALLBACK_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
+static FULL_MV_REFRESH_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(HistogramOpts::new(
-        "floe_full_mv_fallback_latency_ms",
-        "Time spent executing full-snapshot materialized view fallback ticks in milliseconds",
+        "floe_full_mv_refresh_latency_ms",
+        "Time spent executing full-refresh materialized view ticks in milliseconds",
     ))
-    .expect("register floe_full_mv_fallback_latency_ms")
+    .expect("register floe_full_mv_refresh_latency_ms")
 });
 
 pub(crate) fn observe_delta_batch(rows: usize, bytes: usize) {
@@ -108,10 +108,10 @@ pub(crate) fn observe_delta_consolidation(stats: ConsolidationStats, latency_ms:
     DELTA_CONSOLIDATION_LATENCY_MS.observe(latency_ms as f64);
 }
 
-pub(crate) fn observe_full_mv_fallback_tick(snapshot_rows: usize, latency_ms: u64) {
-    FULL_MV_FALLBACK_TICKS.inc();
-    FULL_MV_FALLBACK_ROWS.observe(snapshot_rows as f64);
-    FULL_MV_FALLBACK_LATENCY_MS.observe(latency_ms as f64);
+pub(crate) fn observe_full_mv_refresh_tick(snapshot_rows: usize, latency_ms: u64) {
+    FULL_MV_REFRESH_TICKS.inc();
+    FULL_MV_REFRESH_ROWS.observe(snapshot_rows as f64);
+    FULL_MV_REFRESH_LATENCY_MS.observe(latency_ms as f64);
 }
 
 pub(crate) fn inc_subscribe_rows(count: usize) {
@@ -127,7 +127,7 @@ pub(crate) fn init() {
     let _ = &*DELTA_BATCH_FLUSHES;
     let _ = &*DELTA_CONSOLIDATION_ROWS;
     let _ = &*DELTA_CONSOLIDATION_LATENCY_MS;
-    let _ = &*FULL_MV_FALLBACK_TICKS;
-    let _ = &*FULL_MV_FALLBACK_ROWS;
-    let _ = &*FULL_MV_FALLBACK_LATENCY_MS;
+    let _ = &*FULL_MV_REFRESH_TICKS;
+    let _ = &*FULL_MV_REFRESH_ROWS;
+    let _ = &*FULL_MV_REFRESH_LATENCY_MS;
 }

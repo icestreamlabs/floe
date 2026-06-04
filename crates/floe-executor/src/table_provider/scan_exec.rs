@@ -19,7 +19,7 @@ const SNAPSHOT_SCAN_TARGET_ROWS_PER_PARTITION: usize = 4096;
 const SNAPSHOT_SCAN_MAX_PARTITIONS: usize = 16;
 
 #[derive(Debug)]
-pub struct SnapshotScanExec {
+pub(crate) struct SnapshotScanExec {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     partition_count: usize,
@@ -27,7 +27,7 @@ pub struct SnapshotScanExec {
 }
 
 impl SnapshotScanExec {
-    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+    pub(crate) fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
         let partition_count = partition_count_for_batches(&batches);
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
