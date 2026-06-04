@@ -1,7 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, bail};
@@ -26,9 +25,12 @@ use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
 };
 
+use crate::scalar_array_builder::ScalarColumnBuilder;
+
 use super::scan_exec::partition_record_batches;
 
 const DYNAMIC_STATE_SCAN_PARTITIONS: usize = 16;
+const KEYED_STATE_SNAPSHOT_BATCH_ROWS: usize = 65_536;
 
 #[derive(Clone)]
 pub(crate) struct DynamicStateTableProvider {
@@ -36,7 +38,6 @@ pub(crate) struct DynamicStateTableProvider {
     state: Arc<ArcSwap<DynamicStateSnapshot>>,
     key_indices: Option<Arc<[usize]>>,
     keyed_state: Option<Arc<RwLock<DynamicKeyedState>>>,
-    next_generation: Arc<AtomicU64>,
     exec: Arc<DynamicStateExec>,
 }
 
@@ -67,7 +68,6 @@ impl DynamicStateTableProvider {
         let keyed_state = key_indices
             .as_ref()
             .map(|_| Arc::new(RwLock::new(DynamicKeyedState::default())));
-        let next_generation = Arc::new(AtomicU64::new(1));
         let exec = Arc::new(DynamicStateExec::new(
             Arc::clone(&schema),
             Arc::clone(&state),
@@ -79,7 +79,6 @@ impl DynamicStateTableProvider {
             state,
             key_indices,
             keyed_state,
-            next_generation,
             exec,
         }
     }
@@ -135,17 +134,19 @@ impl DynamicStateTableProvider {
         for key in touched_keys {
             keyed_state.rows.remove(key);
         }
+        if !touched_keys.is_empty() {
+            keyed_state.invalidate_snapshot();
+        }
         keyed_state.insert_state_batches(&converter, key_indices, state_batches)
     }
 
     pub(crate) fn snapshot(&self) -> Result<Arc<Vec<RecordBatch>>> {
         if let Some(keyed_state) = self.keyed_state.as_ref() {
-            let keyed_state = keyed_state
-                .read()
+            let mut keyed_state = keyed_state
+                .write()
                 .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
-            return Ok(Arc::new(effective_snapshot_batches(
-                &keyed_state.snapshot(),
-            )));
+            let snapshot = keyed_state.snapshot(&self.schema)?;
+            return Ok(Arc::new(effective_snapshot_batches(snapshot.as_ref())));
         }
         Ok(Arc::new(effective_snapshot_batches(
             &self.state.load_full(),
@@ -156,7 +157,7 @@ impl DynamicStateTableProvider {
         Arc::clone(&self.exec)
     }
 
-    fn state_batches(&self, batches: Vec<RecordBatch>) -> Result<Vec<DynamicStateBatch>> {
+    fn state_batches(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         let mut state_batches = Vec::new();
         for batch in batches {
             if batch.schema().as_ref() != self.schema.as_ref() {
@@ -165,21 +166,18 @@ impl DynamicStateTableProvider {
             if batch.num_rows() == 0 {
                 continue;
             }
-            state_batches.push(DynamicStateBatch {
-                generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
-                batch,
-            });
+            state_batches.push(batch);
         }
         Ok(state_batches)
     }
 
-    fn publish_state(&self, batches: Vec<DynamicStateBatch>) -> Result<()> {
+    fn publish_state(&self, batches: Vec<RecordBatch>) -> Result<()> {
         let snapshot = DynamicStateSnapshot { batches };
         self.state.store(Arc::new(snapshot));
         Ok(())
     }
 
-    fn replace_keyed_state(&self, state_batches: Vec<DynamicStateBatch>) -> Result<()> {
+    fn replace_keyed_state(&self, state_batches: Vec<RecordBatch>) -> Result<()> {
         let key_indices = self
             .key_indices
             .as_deref()
@@ -193,10 +191,11 @@ impl DynamicStateTableProvider {
             .write()
             .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
         keyed_state.rows.clear();
+        keyed_state.invalidate_snapshot();
         keyed_state.insert_state_batches(&converter, key_indices, state_batches)
     }
 
-    fn upsert_keyed_state(&self, state_batches: Vec<DynamicStateBatch>) -> Result<()> {
+    fn upsert_keyed_state(&self, state_batches: Vec<RecordBatch>) -> Result<()> {
         let key_indices = self
             .key_indices
             .as_deref()
@@ -295,43 +294,57 @@ pub(crate) struct DynamicStateExec {
 
 #[derive(Debug, Default)]
 struct DynamicStateSnapshot {
-    batches: Vec<DynamicStateBatch>,
+    batches: Vec<RecordBatch>,
 }
 
 #[derive(Debug, Clone)]
-struct DynamicStateBatch {
-    generation: u64,
+struct DynamicStateRow {
     batch: RecordBatch,
+    row_idx: usize,
 }
 
 #[derive(Debug, Default)]
 struct DynamicKeyedState {
-    rows: BTreeMap<Vec<u8>, DynamicStateBatch>,
+    rows: BTreeMap<Vec<u8>, DynamicStateRow>,
+    snapshot: Option<Arc<DynamicStateSnapshot>>,
 }
 
 impl DynamicKeyedState {
-    fn snapshot(&self) -> DynamicStateSnapshot {
-        DynamicStateSnapshot {
-            batches: self.rows.values().cloned().collect(),
+    fn snapshot(&mut self, schema: &SchemaRef) -> Result<Arc<DynamicStateSnapshot>> {
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            return Ok(Arc::clone(snapshot));
         }
+        let snapshot = Arc::new(DynamicStateSnapshot {
+            batches: compact_keyed_state_rows(schema, self.rows.values())?,
+        });
+        self.snapshot = Some(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
+    fn invalidate_snapshot(&mut self) {
+        self.snapshot = None;
     }
 
     fn insert_state_batches(
         &mut self,
         converter: &RowConverter,
         key_indices: &[usize],
-        state_batches: Vec<DynamicStateBatch>,
+        state_batches: Vec<RecordBatch>,
     ) -> Result<()> {
+        if state_batches.is_empty() {
+            return Ok(());
+        }
+        self.invalidate_snapshot();
         for entry in state_batches {
             let rows = converter
-                .convert_columns(&project_columns(&entry.batch, key_indices))
+                .convert_columns(&project_columns(&entry, key_indices))
                 .context("encode dynamic source keys")?;
-            for row_idx in 0..entry.batch.num_rows() {
+            for row_idx in 0..entry.num_rows() {
                 self.rows.insert(
                     rows.row(row_idx).data().to_vec(),
-                    DynamicStateBatch {
-                        generation: entry.generation,
-                        batch: entry.batch.slice(row_idx, 1),
+                    DynamicStateRow {
+                        batch: entry.clone(),
+                        row_idx,
                     },
                 );
             }
@@ -390,10 +403,12 @@ impl DynamicStateExec {
 
     fn snapshot_batches(&self) -> DFResult<Arc<DynamicStateSnapshot>> {
         if let Some(keyed_state) = self.keyed_state.as_ref() {
-            let keyed_state = keyed_state.read().map_err(|_| {
+            let mut keyed_state = keyed_state.write().map_err(|_| {
                 DataFusionError::Execution("dynamic state keyed storage lock poisoned".to_string())
             })?;
-            return Ok(Arc::new(keyed_state.snapshot()));
+            return keyed_state
+                .snapshot(&self.schema)
+                .map_err(|err| DataFusionError::Execution(err.to_string()));
         }
         Ok(self.state.load_full())
     }
@@ -484,23 +499,19 @@ fn partition_effective_batches(
 }
 
 fn effective_snapshot_batches(snapshot: &DynamicStateSnapshot) -> Vec<RecordBatch> {
-    snapshot
-        .batches
-        .iter()
-        .map(|entry| entry.batch.clone())
-        .collect()
+    snapshot.batches.clone()
 }
 
 #[cfg(test)]
 fn state_batch_keys(
     schema: &SchemaRef,
     key_indices: &[usize],
-    batches: &[DynamicStateBatch],
+    batches: &[RecordBatch],
 ) -> Result<HashSet<Vec<u8>>> {
     let converter = key_row_converter(schema, key_indices).map_err(anyhow::Error::new)?;
     let mut keys = HashSet::new();
-    for entry in batches {
-        collect_batch_keys(&converter, key_indices, entry, &mut keys)?;
+    for batch in batches {
+        collect_batch_keys(&converter, key_indices, batch, &mut keys)?;
     }
     Ok(keys)
 }
@@ -509,16 +520,68 @@ fn state_batch_keys(
 fn collect_batch_keys(
     converter: &RowConverter,
     key_indices: &[usize],
-    entry: &DynamicStateBatch,
+    batch: &RecordBatch,
     keys: &mut HashSet<Vec<u8>>,
 ) -> Result<()> {
     let rows = converter
-        .convert_columns(&project_columns(&entry.batch, key_indices))
+        .convert_columns(&project_columns(batch, key_indices))
         .context("encode dynamic source keys")?;
-    for row_idx in 0..entry.batch.num_rows() {
+    for row_idx in 0..batch.num_rows() {
         keys.insert(rows.row(row_idx).data().to_vec());
     }
     Ok(())
+}
+
+fn compact_keyed_state_rows<'a>(
+    schema: &SchemaRef,
+    rows: impl Iterator<Item = &'a DynamicStateRow>,
+) -> Result<Vec<RecordBatch>> {
+    let mut batches = Vec::new();
+    let mut builders = keyed_snapshot_builders(schema)?;
+    let mut buffered_rows = 0usize;
+
+    for row in rows {
+        append_keyed_state_row(&mut builders, row)?;
+        buffered_rows = buffered_rows.saturating_add(1);
+        if buffered_rows == KEYED_STATE_SNAPSHOT_BATCH_ROWS {
+            batches.push(finish_keyed_snapshot_batch(schema, &mut builders)?);
+            buffered_rows = 0;
+        }
+    }
+
+    if buffered_rows > 0 {
+        batches.push(finish_keyed_snapshot_batch(schema, &mut builders)?);
+    }
+    Ok(batches)
+}
+
+fn keyed_snapshot_builders(schema: &SchemaRef) -> Result<Vec<ScalarColumnBuilder>> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), KEYED_STATE_SNAPSHOT_BATCH_ROWS))
+        .collect()
+}
+
+fn append_keyed_state_row(
+    builders: &mut [ScalarColumnBuilder],
+    row: &DynamicStateRow,
+) -> Result<()> {
+    for (column_idx, builder) in builders.iter_mut().enumerate() {
+        builder.append_array_value(row.batch.column(column_idx).as_ref(), row.row_idx)?;
+    }
+    Ok(())
+}
+
+fn finish_keyed_snapshot_batch(
+    schema: &SchemaRef,
+    builders: &mut [ScalarColumnBuilder],
+) -> Result<RecordBatch> {
+    let arrays = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(Arc::clone(schema), arrays)?)
 }
 
 fn key_row_converter(schema: &SchemaRef, key_indices: &[usize]) -> DFResult<RowConverter> {
@@ -645,10 +708,7 @@ mod tests {
     }
 
     fn touched_key(schema: &SchemaRef, id: i64) -> HashSet<Vec<u8>> {
-        let probe = DynamicStateBatch {
-            generation: 0,
-            batch: batch(Arc::clone(schema), &[(id, 0)]),
-        };
+        let probe = batch(Arc::clone(schema), &[(id, 0)]);
         state_batch_keys(schema, &[0], &[probe]).expect("encode key")
     }
 
@@ -678,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn keyed_delta_replaces_touched_generations_without_history_growth() {
+    fn keyed_delta_replaces_touched_rows_without_history_growth() {
         let schema = schema();
         let provider =
             DynamicStateTableProvider::new_with_key_indices(Arc::clone(&schema), vec![0])
@@ -721,6 +781,29 @@ mod tests {
                 .rows
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn keyed_snapshot_compacts_rows_into_batched_scan_state() {
+        let schema = schema();
+        let provider =
+            DynamicStateTableProvider::new_with_key_indices(Arc::clone(&schema), vec![0])
+                .expect("keyed provider");
+        provider
+            .append_batches(vec![batch(
+                Arc::clone(&schema),
+                &[(1, 10), (2, 20), (3, 30), (4, 40)],
+            )])
+            .expect("seed rows");
+
+        let snapshot = provider.snapshot().expect("snapshot");
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].num_rows(), 4);
+        assert_eq!(
+            snapshot_rows(&provider),
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)]
         );
     }
 }

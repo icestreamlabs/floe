@@ -1,26 +1,26 @@
 pub mod checkpoint;
-pub mod context;
+mod context;
 pub mod dbsp_bridge;
 pub mod dbsp_plan;
 mod delta_batch;
 pub mod delta_consolidation;
 mod encoded_batch;
 pub mod encoding;
-pub mod maintenance;
+mod maintenance;
 mod metrics;
 pub mod mv;
 pub mod mv_changelog;
 pub mod mv_loader;
 pub mod namespaces;
-pub mod operator_state;
+mod operator_state;
 mod scalar_array_builder;
 pub mod source_decoder;
 pub mod source_journal;
 mod source_requirements;
 pub mod stream_types;
 pub mod subscribe;
-pub mod table_provider;
-pub mod vectorized_runtime;
+mod table_provider;
+mod vectorized_runtime;
 mod vectorized_source_delta;
 
 pub use context::FloeQueryContext;
@@ -40,5 +40,6 @@ pub use stream_types::{Diff, Timestamp};
 pub use subscribe::SubscribeExecutionConfig;
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
 pub use vectorized_runtime::{
-    VectorizedExecutionRuntime, VectorizedMaterializedViewPlan, weighted_batch_from_diffs,
+    VectorizedExecutionRuntime, VectorizedMaterializedViewExecutionPolicy,
+    VectorizedMaterializedViewPlan, weighted_batch_from_diffs,
 };

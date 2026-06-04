@@ -203,3 +203,93 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     assert_eq!(int64_values(&source_rows[0], 0), vec![1]);
     assert_eq!(int64_values(&source_rows[0], 1), vec![40]);
 }
+
+#[test]
+fn weighted_batch_from_diffs_rejects_non_unit_weights() {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .expect("source batch");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+
+    let err = weighted_batch_from_diffs(&batch, &weighted_schema, &[2])
+        .expect_err("non-unit diffs should be rejected");
+
+    assert!(
+        err.to_string().contains("diff must be -1, 0, or 1"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn non_incremental_mv_requires_explicit_full_refresh_policy() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new("id", SourceDataType::Int64),
+            SourceColumn::new("amount", SourceDataType::Int64),
+        ],
+    )
+    .expect("source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("total", DataType::Int64, true),
+    ]));
+
+    let result = VectorizedExecutionRuntime::new(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_order_totals",
+            "SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+    )
+    .await;
+
+    let err = match result {
+        Ok(_) => panic!("aggregate MV should require explicit full-refresh policy"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("requires full-refresh"), "{err:#}");
+}
+
+#[tokio::test]
+async fn explicit_full_refresh_policy_allows_non_incremental_mv() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new("id", SourceDataType::Int64),
+            SourceColumn::new("amount", SourceDataType::Int64),
+        ],
+    )
+    .expect("source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("total", DataType::Int64, true),
+    ]));
+
+    VectorizedExecutionRuntime::new(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_order_totals",
+                "SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
+                Arc::clone(&output_schema),
+            )
+            .allow_full_refresh(),
+        ],
+        Arc::clone(&registry),
+    )
+    .await
+    .expect("explicit full-refresh policy should allow aggregate MV planning");
+}

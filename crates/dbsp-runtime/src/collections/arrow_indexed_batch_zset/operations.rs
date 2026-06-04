@@ -308,10 +308,6 @@ where
             self.segment_sequence_key.clone(),
             segment_id.saturating_add(1).to_be_bytes(),
         );
-        if write_lookup_index {
-            write_batch.put(self.range_format_key.clone(), b"v2");
-        }
-
         write_batch.put(
             self.segment_store.key_for_segment(segment_id),
             segment_bytes,

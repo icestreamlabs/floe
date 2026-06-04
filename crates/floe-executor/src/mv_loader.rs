@@ -104,34 +104,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_load_legacy_state_from_slate_when_missing_in_registry() -> Result<()> {
-        let db = test_db("mv-loader-cold").await;
-        let schema = test_schema();
-        seed_view(
-            Arc::clone(&db),
-            &[encoded_i64_row(2), encoded_i64_row(3)],
-            Arc::clone(&schema),
-            false,
-        )
-        .await?;
-
-        let registry = Arc::new(MaterializedViewRegistry::new());
-        registry.set_schema(VIEW_NAME.to_string(), Arc::clone(&schema));
-
-        let mut bridge = DbspBridge::new(Arc::clone(&db)).await?;
-        let session = SessionContext::new();
-        load_or_register_mv(&session, Arc::clone(&registry), &mut bridge, VIEW_NAME).await?;
-
-        let handle = registry.get(VIEW_NAME).expect("view registered");
-        assert!(
-            handle.dbsp_state().is_none(),
-            "legacy DBSP state should not be recovered from SlateDB"
-        );
-        assert_eq!(query_values(&session).await?, Vec::<i64>::new());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn recovers_schema_from_persisted_metadata() -> Result<()> {
         let db = test_db("mv-loader-schema").await;
         let schema = test_schema();

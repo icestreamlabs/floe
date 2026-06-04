@@ -353,9 +353,16 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     }
                     continue;
                 }
-                let apply_result = apply_result
-                    .as_ref()
-                    .expect("materialized transaction should produce apply result");
+                let Some(apply_result) = apply_result.as_ref() else {
+                    let message = format!(
+                        "materialized CDC transaction for source '{}' did not produce an apply result",
+                        cdc_transaction.source_id.as_str()
+                    );
+                    tracing::error!("{message}");
+                    record_runtime_failure(&failure_for_executor, message);
+                    executor_cancel.cancel();
+                    break 'executor;
+                };
                 for table_deltas in apply_result.table_deltas() {
                     let source_name = table_deltas.table_id().as_str();
                     let Some(source_id) = source_id_by_name_for_task.get(source_name).copied()

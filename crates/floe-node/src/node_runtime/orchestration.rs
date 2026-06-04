@@ -452,7 +452,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let storage = storage.expect("storage initialized when not in dry-run");
+    let storage = storage.context("storage initialized when not in dry-run")?;
     let db = storage.db();
     let checkpoint_table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
     let cdc_table_store = CdcTableStore::new(Arc::clone(&checkpoint_table));

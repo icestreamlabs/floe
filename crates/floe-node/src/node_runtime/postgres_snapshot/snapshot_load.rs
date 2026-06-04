@@ -413,9 +413,14 @@ pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
             return Err(err);
         }
 
-        if let Err(err) = snapshot_transaction
-            .take()
-            .expect("snapshot validation transaction is present")
+        let Some(transaction) = snapshot_transaction.take() else {
+            adaptive_concurrency.shutdown().await;
+            abort_snapshot_worker_tasks(worker_handles).await;
+            return Err(anyhow::anyhow!(
+                "snapshot validation transaction is not present"
+            ));
+        };
+        if let Err(err) = transaction
             .commit()
             .await
             .context("commit exported-slot initial Postgres CDC validation transaction")
@@ -496,20 +501,17 @@ pub(super) async fn load_exported_slot_postgres_initial_snapshot_from_client(
             let mut change_batches = Vec::new();
             let mut row_count = 0_usize;
             for schema in &sorted_schemas {
-                let table_snapshot = snapshot_table_change_batches(
-                    snapshot_transaction
-                        .as_ref()
-                        .expect("snapshot transaction is present"),
-                    schema,
-                    settings,
-                )
-                .await?;
+                let transaction = snapshot_transaction
+                    .as_ref()
+                    .context("snapshot transaction is not present")?;
+                let table_snapshot =
+                    snapshot_table_change_batches(transaction, schema, settings).await?;
                 row_count = row_count.saturating_add(table_snapshot.row_count);
                 change_batches.extend(table_snapshot.change_batches);
             }
             snapshot_transaction
                 .take()
-                .expect("snapshot transaction is present")
+                .context("snapshot transaction is not present")?
                 .commit()
                 .await
                 .context("commit exported-slot initial Postgres CDC snapshot transaction")?;

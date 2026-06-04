@@ -140,7 +140,7 @@ async fn mv_loader_supports_as_of_filter() {
 }
 
 #[tokio::test]
-async fn mv_loader_does_not_recover_legacy_state_after_registry_restart() {
+async fn mv_loader_does_not_hydrate_dbsp_state_after_registry_restart() {
     let fixture = build_q1_fixture("mv-loader-restart", vec![(1, 2, 100), (2, 3, 140)]).await;
     let schema = Arc::clone(&fixture.schema);
     let restarted_registry = Arc::new(MaterializedViewRegistry::new());

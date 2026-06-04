@@ -26,20 +26,27 @@ pub(super) struct UnitSourceDelta {
     pub negative: Vec<RecordBatch>,
 }
 
+pub(super) fn validate_unit_source_delta(schema: &SchemaRef, delta: &RecordBatch) -> Result<()> {
+    let weights = source_delta_weights(schema, delta)?;
+    for row_idx in 0..weights.len() {
+        if weights.is_null(row_idx) {
+            bail!("source delta weight column cannot contain NULL");
+        }
+        match weights.value(row_idx) {
+            -1..=1 => {}
+            weight => bail!("source delta weight must be -1, 0, or 1, got {weight}"),
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn apply_source_delta(
     schema: &SchemaRef,
     primary_key_columns: &[String],
     provider: &DynamicStateTableProvider,
     delta: &RecordBatch,
 ) -> Result<Vec<RecordBatch>> {
-    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
-    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
-        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
-    }
-    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
-    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
-        bail!("source delta schema does not match source schema");
-    }
+    validate_unit_source_delta(schema, delta)?;
 
     let old_snapshot = provider.snapshot()?;
     let update = prepare_source_delta(schema, primary_key_columns, delta)?;
@@ -64,14 +71,7 @@ pub(super) fn prepare_source_delta(
     primary_key_columns: &[String],
     delta: &RecordBatch,
 ) -> Result<SourceDeltaUpdate> {
-    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
-    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
-        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
-    }
-    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
-    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
-        bail!("source delta schema does not match source schema");
-    }
+    let weight_idx = validate_source_delta_schema(schema, delta)?;
 
     let key_indices = source_key_indices(schema, primary_key_columns)?;
     let key_effects = source_delta_key_effects(schema, &key_indices, delta, weight_idx)?;
@@ -88,19 +88,8 @@ pub(super) fn unit_source_delta_batches(
     schema: &SchemaRef,
     delta: &RecordBatch,
 ) -> Result<Option<UnitSourceDelta>> {
-    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
-    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
-        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
-    }
-    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
-    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
-        bail!("source delta schema does not match source schema");
-    }
-    let weights = delta
-        .column(weight_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
+    let weight_idx = validate_source_delta_schema(schema, delta)?;
+    let weights = source_delta_weights_at(delta, weight_idx)?;
     let mut positive = BooleanBuilder::with_capacity(delta.num_rows());
     let mut negative = BooleanBuilder::with_capacity(delta.num_rows());
     let mut positive_rows = 0usize;
@@ -264,23 +253,16 @@ pub(super) fn insert_only_source_delta_batch(
     schema: &SchemaRef,
     delta: &RecordBatch,
 ) -> Result<Option<RecordBatch>> {
-    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
-    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
-        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
-    }
-    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
-    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
-        bail!("source delta schema does not match source schema");
-    }
-
-    let weights = delta
-        .column(weight_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
+    let weight_idx = validate_source_delta_schema(schema, delta)?;
+    let weights = source_delta_weights_at(delta, weight_idx)?;
     for row_idx in 0..weights.len() {
-        if weights.is_null(row_idx) || weights.value(row_idx) <= 0 {
-            return Ok(None);
+        if weights.is_null(row_idx) {
+            bail!("source delta weight column cannot contain NULL");
+        }
+        match weights.value(row_idx) {
+            1 => {}
+            -1 | 0 => return Ok(None),
+            weight => bail!("source delta weight must be -1, 0, or 1, got {weight}"),
         }
     }
 
@@ -291,6 +273,31 @@ pub(super) fn insert_only_source_delta_batch(
         .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
         .collect::<Vec<_>>();
     Ok(Some(RecordBatch::try_new(Arc::clone(schema), columns)?))
+}
+
+fn validate_source_delta_schema(schema: &SchemaRef, delta: &RecordBatch) -> Result<usize> {
+    let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
+    if delta.schema().field(weight_idx).data_type() != &DataType::Int64 {
+        bail!("source delta {} column must be Int64", WEIGHT_COLUMN_NAME);
+    }
+    let expected_delta_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
+    if delta.schema().as_ref() != expected_delta_schema.as_ref() {
+        bail!("source delta schema does not match source schema");
+    }
+    Ok(weight_idx)
+}
+
+fn source_delta_weights<'a>(schema: &SchemaRef, delta: &'a RecordBatch) -> Result<&'a Int64Array> {
+    let weight_idx = validate_source_delta_schema(schema, delta)?;
+    source_delta_weights_at(delta, weight_idx)
+}
+
+fn source_delta_weights_at(delta: &RecordBatch, weight_idx: usize) -> Result<&Int64Array> {
+    delta
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("source delta weight column must be Int64"))
 }
 
 fn source_key_indices(schema: &SchemaRef, primary_key_columns: &[String]) -> Result<Vec<usize>> {

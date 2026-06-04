@@ -86,7 +86,6 @@ where
     index_prefix: Vec<u8>,
     reverse_prefix: Vec<u8>,
     range_prefix: Vec<u8>,
-    range_format_key: Vec<u8>,
     segment_sequence_key: Vec<u8>,
     reverse_enabled: bool,
     range_enabled: bool,
@@ -233,9 +232,6 @@ where
         let mut range_prefix = base.clone();
         range_prefix.extend_from_slice(b"rng/");
 
-        let mut range_format_key = base.clone();
-        range_format_key.extend_from_slice(b"range_format");
-
         let mut segment_sequence_key = base;
         segment_sequence_key.extend_from_slice(b"next_segment_id");
 
@@ -256,7 +252,6 @@ where
             index_prefix,
             reverse_prefix,
             range_prefix,
-            range_format_key,
             segment_sequence_key,
             reverse_enabled,
             range_enabled,

@@ -21,7 +21,7 @@ use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_source_delta::{
     apply_source_delta, apply_weighted_snapshot_delta, insert_only_source_delta_batch,
-    prepare_source_delta, unit_source_delta_batches,
+    prepare_source_delta, unit_source_delta_batches, validate_unit_source_delta,
 };
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
@@ -33,6 +33,7 @@ pub struct VectorizedMaterializedViewPlan {
     view_name: String,
     query: String,
     output_schema: SchemaRef,
+    execution_policy: VectorizedMaterializedViewExecutionPolicy,
 }
 
 impl VectorizedMaterializedViewPlan {
@@ -45,8 +46,20 @@ impl VectorizedMaterializedViewPlan {
             view_name: view_name.into(),
             query: query.into(),
             output_schema,
+            execution_policy: VectorizedMaterializedViewExecutionPolicy::IncrementalOnly,
         }
     }
+
+    pub fn allow_full_refresh(mut self) -> Self {
+        self.execution_policy = VectorizedMaterializedViewExecutionPolicy::AllowFullRefresh;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorizedMaterializedViewExecutionPolicy {
+    IncrementalOnly,
+    AllowFullRefresh,
 }
 
 #[derive(Clone)]
@@ -218,6 +231,14 @@ impl VectorizedExecutionRuntime {
                 ),
                 None => None,
             };
+            if incremental.is_none()
+                && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
+            {
+                bail!(
+                    "materialized view '{}' requires full-refresh vectorized execution; only filter/project source plans are currently incremental",
+                    mv.view_name
+                );
+            }
             let execution_mode = if incremental.is_some() {
                 MaterializedViewExecutionMode::IncrementalFilterProject
             } else {
@@ -315,6 +336,8 @@ impl VectorizedExecutionRuntime {
             .get(source_name)
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
+        validate_unit_source_delta(&state.schema, &delta)
+            .with_context(|| format!("validate weighted source delta for '{source_name}'"))?;
         if let Some(insert_batch) = insert_only_source_delta_batch(&state.schema, &delta)? {
             return self.apply_insert_source_batches(
                 source_name,
@@ -809,6 +832,12 @@ pub fn weighted_batch_from_diffs(
             batch.num_rows(),
             diffs.len()
         );
+    }
+    for diff in diffs {
+        match *diff {
+            -1..=1 => {}
+            other => bail!("weighted source batch diff must be -1, 0, or 1, got {other}"),
+        }
     }
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(Arc::new(Int64Array::from(diffs.to_vec())) as ArrayRef);
