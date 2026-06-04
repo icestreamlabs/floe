@@ -2,8 +2,6 @@ pub mod checkpoint;
 pub mod context;
 pub mod dbsp_bridge;
 pub mod dbsp_plan;
-#[cfg(test)]
-mod dbsp_table_environment;
 pub mod delta_batch;
 pub mod delta_consolidation;
 mod encoded_batch;
@@ -22,8 +20,6 @@ mod source_requirements;
 pub mod stream_types;
 pub mod subscribe;
 pub mod table_provider;
-#[cfg(test)]
-mod vectorized_keys;
 pub mod vectorized_runtime;
 mod vectorized_source_delta;
 

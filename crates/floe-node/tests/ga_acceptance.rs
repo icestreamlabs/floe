@@ -186,29 +186,23 @@ async fn wait_for_auction_count_at_least(
     auction: i64,
     min_count: i64,
 ) -> Result<i64> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..80 {
-        match query_auction_count(pg_port, auction).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
-    bail!("timed out waiting for mv_acceptance_bid count >= {min_count} for auction={auction}");
+    node_process::wait_for_count_at_least(
+        format!("mv_acceptance_bid auction={auction}"),
+        min_count,
+        80,
+        || query_auction_count(pg_port, auction),
+    )
+    .await
 }
 
 async fn wait_for_join_count_at_least(pg_port: u16, auction: i64, min_count: i64) -> Result<i64> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        match query_join_count(pg_port, auction).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
-    bail!("timed out waiting for mv_acceptance_join count >= {min_count} for auction={auction}");
+    node_process::wait_for_count_at_least(
+        format!("mv_acceptance_join auction={auction}"),
+        min_count,
+        120,
+        || query_join_count(pg_port, auction),
+    )
+    .await
 }
 
 async fn query_auction_count(pg_port: u16, auction: i64) -> Result<i64> {
@@ -262,18 +256,13 @@ async fn wait_for_mv_price_count_at_least(
     price: i64,
     min_count: i64,
 ) -> Result<i64> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        match query_mv_price_count(pg_port, mv_name, auction, price).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
-    bail!(
-        "timed out waiting for {mv_name} count >= {min_count} for auction={auction}, price={price}"
-    );
+    node_process::wait_for_count_at_least(
+        format!("{mv_name} auction={auction}, price={price}"),
+        min_count,
+        120,
+        || query_mv_price_count(pg_port, mv_name, auction, price),
+    )
+    .await
 }
 
 async fn query_mv_price_count(
@@ -308,16 +297,13 @@ async fn wait_for_auction_seller_count_at_least(
     seller: i64,
     min_count: i64,
 ) -> Result<i64> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        match query_auction_seller_count(pg_port, mv_name, id, seller).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
-    bail!("timed out waiting for {mv_name} count >= {min_count} for id={id}, seller={seller}");
+    node_process::wait_for_count_at_least(
+        format!("{mv_name} id={id}, seller={seller}"),
+        min_count,
+        120,
+        || query_auction_seller_count(pg_port, mv_name, id, seller),
+    )
+    .await
 }
 
 async fn query_auction_seller_count(
@@ -353,18 +339,13 @@ async fn wait_for_join_mv_count_at_least(
     seller: i64,
     min_count: i64,
 ) -> Result<i64> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        match query_join_mv_count(pg_port, mv_name, auction, bidder, seller).await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
-    bail!(
-        "timed out waiting for {mv_name} count >= {min_count} for auction={auction}, bidder={bidder}, seller={seller}"
-    );
+    node_process::wait_for_count_at_least(
+        format!("{mv_name} auction={auction}, bidder={bidder}, seller={seller}"),
+        min_count,
+        120,
+        || query_join_mv_count(pg_port, mv_name, auction, bidder, seller),
+    )
+    .await
 }
 
 async fn query_join_mv_count(

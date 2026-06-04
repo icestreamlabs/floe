@@ -518,6 +518,10 @@ async fn run_full_materialized_view_tick(
     if next_snapshot.is_empty() {
         next_snapshot.push(RecordBatch::new_empty(Arc::clone(&mv.output_schema)));
     }
+    let snapshot_rows = next_snapshot
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
 
     let diff_start = Instant::now();
     let diff = diff_snapshot_batches(
@@ -532,12 +536,15 @@ async fn run_full_materialized_view_tick(
     let handle = registry.register(mv.view_name.clone());
     handle.publish_arrow_version(version, next_snapshot.clone(), diff.batches);
     mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
+    let total_ms = plan_start.elapsed().as_millis() as u64;
+    metrics::observe_full_mv_fallback_tick(snapshot_rows, total_ms);
+    tracing::warn!(
         view = %mv.view_name,
         version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
+        rows = snapshot_rows,
+        total_ms,
         mode = "full",
-        "vectorized materialized view tick completed"
+        "vectorized materialized view used full-snapshot fallback"
     );
     Ok(())
 }

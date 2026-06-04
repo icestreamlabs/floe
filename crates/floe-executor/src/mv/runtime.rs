@@ -79,30 +79,6 @@ impl MaterializedView for MaterializedViewHandle {
                 self.name()
             )
         })?;
-        if let Some((base_version, _target_version, overlay)) =
-            self.encoded_overlay_merged_delta(Some(version_u64))
-        {
-            let mut snapshot = if let Some(state) = self.dbsp_state() {
-                if let Some(base_dbsp_version) = resolve_dbsp_version(self, &state, base_version) {
-                    materialize_dbsp_version(&state, base_dbsp_version).await?
-                } else {
-                    HashMap::new()
-                }
-            } else {
-                HashMap::new()
-            };
-            for (key, diff) in overlay {
-                let previous = snapshot.get(&key).copied().unwrap_or(0);
-                let next = previous.saturating_add(diff);
-                if next <= 0 {
-                    snapshot.remove(&key);
-                } else {
-                    snapshot.insert(key, next);
-                }
-            }
-            return Ok(snapshot);
-        }
-
         if let Some(state) = self.dbsp_state()
             && let Some(dbsp_version) = resolve_dbsp_version(self, &state, version_u64)
         {
@@ -118,16 +94,6 @@ impl MaterializedView for MaterializedViewHandle {
     async fn delta_for(&self, version: i64) -> Result<Vec<(Vec<u8>, i64)>> {
         if let Ok(handle) = self.handle_for(version) {
             return handle.delta_iter().await;
-        }
-
-        let version_u64 = u64::try_from(version).map_err(|_| {
-            anyhow!(
-                "version {version} is out of range for materialized view '{}'.",
-                self.name()
-            )
-        })?;
-        if let Some(delta) = self.encoded_overlay_batch(version_u64) {
-            return Ok(delta);
         }
 
         if self.is_version_published(version) {

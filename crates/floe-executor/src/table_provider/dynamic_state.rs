@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +26,8 @@ use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
 };
+
+use super::scan_exec::partition_record_batches;
 
 const DYNAMIC_STATE_SCAN_PARTITIONS: usize = 16;
 
@@ -139,7 +141,7 @@ impl DynamicStateTableProvider {
     pub fn snapshot(&self) -> Result<Arc<Vec<RecordBatch>>> {
         Ok(Arc::new(effective_snapshot_batches(
             &self.state.load_full(),
-        )?))
+        )))
     }
 
     pub fn exec(&self) -> Arc<DynamicStateExec> {
@@ -164,19 +166,9 @@ impl DynamicStateTableProvider {
     }
 
     fn publish_state(&self, batches: Vec<DynamicStateBatch>) -> Result<()> {
-        let snapshot = DynamicStateSnapshot {
-            key_index: self.build_key_index(&batches)?,
-            batches,
-        };
+        let snapshot = DynamicStateSnapshot { batches };
         self.state.store(Arc::new(snapshot));
         Ok(())
-    }
-
-    fn build_key_index(&self, batches: &[DynamicStateBatch]) -> Result<Option<DynamicKeyIndex>> {
-        let Some(key_indices) = self.key_indices.as_deref() else {
-            return Ok(None);
-        };
-        build_key_index(&self.schema, key_indices, batches).map(Some)
     }
 }
 
@@ -261,18 +253,12 @@ pub struct DynamicStateExec {
 #[derive(Debug, Default)]
 struct DynamicStateSnapshot {
     batches: Vec<DynamicStateBatch>,
-    key_index: Option<DynamicKeyIndex>,
 }
 
 #[derive(Debug, Clone)]
 struct DynamicStateBatch {
     generation: u64,
     batch: RecordBatch,
-}
-
-#[derive(Debug)]
-struct DynamicKeyIndex {
-    latest_generation_by_key: HashMap<Vec<u8>, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -335,7 +321,7 @@ impl DynamicStateExec {
 
         let mut batches = Vec::new();
         let mut remaining = limit;
-        for batch in effective_snapshot_batches(&snapshot)? {
+        for batch in effective_snapshot_batches(&snapshot) {
             if remaining == 0 {
                 break;
             }
@@ -357,7 +343,7 @@ impl DynamicStateExec {
         {
             partition_effective_batches(&snapshot, partition, self.partition_count)?
         } else {
-            effective_snapshot_batches(&snapshot)?
+            effective_snapshot_batches(&snapshot)
         };
         let mut rows = 0usize;
         let mut bytes = 0usize;
@@ -402,24 +388,19 @@ fn partition_effective_batches(
     partition: usize,
     partition_count: usize,
 ) -> DFResult<Vec<RecordBatch>> {
-    let partition_batches = snapshot
+    Ok(partition_record_batches(
+        &effective_snapshot_batches(snapshot),
+        partition,
+        partition_count,
+    ))
+}
+
+fn effective_snapshot_batches(snapshot: &DynamicStateSnapshot) -> Vec<RecordBatch> {
+    snapshot
         .batches
         .iter()
-        .enumerate()
-        .filter_map(|(idx, batch)| (idx % partition_count == partition).then_some(batch.clone()))
-        .collect::<Vec<_>>();
-    effective_state_batch_records(&partition_batches)
-}
-
-fn effective_snapshot_batches(snapshot: &DynamicStateSnapshot) -> DFResult<Vec<RecordBatch>> {
-    if let Some(key_index) = &snapshot.key_index {
-        let _ = key_index.latest_generation_by_key.len();
-    }
-    effective_state_batch_records(&snapshot.batches)
-}
-
-fn effective_state_batch_records(snapshot: &[DynamicStateBatch]) -> DFResult<Vec<RecordBatch>> {
-    Ok(snapshot.iter().map(|entry| entry.batch.clone()).collect())
+        .map(|entry| entry.batch.clone())
+        .collect()
 }
 
 fn filter_state_batches_excluding_keys(
@@ -472,38 +453,6 @@ fn state_batch_keys(
         collect_batch_keys(&converter, key_indices, entry, &mut keys)?;
     }
     Ok(keys)
-}
-
-fn build_key_index(
-    schema: &SchemaRef,
-    key_indices: &[usize],
-    batches: &[DynamicStateBatch],
-) -> Result<DynamicKeyIndex> {
-    let converter = key_row_converter(schema, key_indices).map_err(anyhow::Error::new)?;
-    let mut key_index = DynamicKeyIndex {
-        latest_generation_by_key: HashMap::new(),
-    };
-    for entry in batches {
-        index_batch_keys(&converter, key_indices, entry, &mut key_index)?;
-    }
-    Ok(key_index)
-}
-
-fn index_batch_keys(
-    converter: &RowConverter,
-    key_indices: &[usize],
-    entry: &DynamicStateBatch,
-    key_index: &mut DynamicKeyIndex,
-) -> Result<()> {
-    let rows = converter
-        .convert_columns(&project_columns(&entry.batch, key_indices))
-        .context("encode dynamic source keys")?;
-    for row_idx in 0..entry.batch.num_rows() {
-        key_index
-            .latest_generation_by_key
-            .insert(rows.row(row_idx).data().to_vec(), entry.generation);
-    }
-    Ok(())
 }
 
 fn collect_batch_keys(
