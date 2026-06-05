@@ -339,7 +339,7 @@ fn direct_encoding_can_omit_unneeded_columns() {
 }
 
 #[test]
-fn mask_arrow_batch_for_required_columns_omits_unneeded_columns() {
+fn source_arrow_batch_builder_prunes_execution_columns_only() {
     let definition = SourceDefinition::new(
         "orders",
         vec![
@@ -349,7 +349,12 @@ fn mask_arrow_batch_for_required_columns_omits_unneeded_columns() {
         ],
     )
     .expect("definition");
-    let mut builder = SourceArrowBatchBuilder::new(definition.clone(), 1);
+    let required_columns = Arc::from([true, false, true]);
+    let mut builder = SourceArrowBatchBuilder::new_with_execution_required_columns(
+        definition,
+        1,
+        Some(required_columns),
+    );
     let event = AppendIngestEvent::new(
         "orders",
         json!({
@@ -360,24 +365,22 @@ fn mask_arrow_batch_for_required_columns_omits_unneeded_columns() {
     );
 
     let event_ts = builder.append_event(&event).expect("append event");
-    let batch = builder
+    let batches = builder
         .finish()
         .expect("finish batch")
-        .expect("record batch");
-    let required_columns = Arc::from([true, false, true]);
-    let masked =
-        mask_arrow_batch_for_required_columns(&definition, &batch, Some(&required_columns))
-            .expect("mask batch");
+        .expect("record batches");
 
     assert_eq!(event_ts, Some(1_700_000_000_u64));
-    assert_eq!(batch.num_rows(), 1);
-    let full_note = batch
+    assert_eq!(batches.query.num_rows(), 1);
+    let full_note = batches
+        .query
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("note array");
     assert_eq!(full_note.value(0), "ignored at execution");
-    let masked_note = masked
+    let masked_note = batches
+        .execution
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()

@@ -282,7 +282,7 @@ async fn replay_kafka_source_journal_entry_as_arrow(
                 checksum
             ));
         }
-        let Some(batch) = builder.finish()? else {
+        let Some(batch) = builder.finish_query_batch()? else {
             continue;
         };
         let weighted_schema = floe_executor::delta_consolidation::weighted_snapshot_schema(

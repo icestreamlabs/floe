@@ -21,18 +21,6 @@ async fn join_operator_transient_batches_match_persisted_output() {
     );
 
     let mut persisted = JoinOp::new_batch(
-        RelationState::empty(
-            table.clone(),
-            "join_transient_left_state_persisted".to_string(),
-        )
-        .await
-        .expect("persisted left state"),
-        RelationState::empty(
-            table.clone(),
-            "join_transient_right_state_persisted".to_string(),
-        )
-        .await
-        .expect("persisted right state"),
         IndexedBatchZSet::new(table.clone(), "join_transient_left_index_persisted"),
         IndexedBatchZSet::new(table.clone(), "join_transient_right_index_persisted"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),
@@ -52,18 +40,6 @@ async fn join_operator_transient_batches_match_persisted_output() {
     .with_persist_indexes(false);
 
     let mut transient = JoinOp::new_without_output_batch(
-        RelationState::empty(
-            table.clone(),
-            "join_transient_left_state_transient".to_string(),
-        )
-        .await
-        .expect("transient left state"),
-        RelationState::empty(
-            table.clone(),
-            "join_transient_right_state_transient".to_string(),
-        )
-        .await
-        .expect("transient right state"),
         IndexedBatchZSet::new(table.clone(), "join_transient_left_index_transient"),
         IndexedBatchZSet::new(table.clone(), "join_transient_right_index_transient"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),
@@ -165,18 +141,6 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
     );
 
     let mut handle_path = JoinOp::new_without_output_batch(
-        RelationState::empty(
-            table.clone(),
-            "join_preloaded_left_state_handle".to_string(),
-        )
-        .await
-        .expect("handle left state"),
-        RelationState::empty(
-            table.clone(),
-            "join_preloaded_right_state_handle".to_string(),
-        )
-        .await
-        .expect("handle right state"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_handle"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_handle"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),
@@ -189,18 +153,6 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
     .with_persist_indexes(false);
 
     let mut preloaded_path = JoinOp::new_without_output_batch(
-        RelationState::empty(
-            table.clone(),
-            "join_preloaded_left_state_transient".to_string(),
-        )
-        .await
-        .expect("transient left state"),
-        RelationState::empty(
-            table.clone(),
-            "join_preloaded_right_state_transient".to_string(),
-        )
-        .await
-        .expect("transient right state"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_transient"),
         IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_transient"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),

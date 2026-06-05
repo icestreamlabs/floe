@@ -14,16 +14,6 @@ async fn join_operator_matches_batch_join_over_time() {
             .await
             .expect("right dict"),
     );
-    let left_state_dict = Arc::new(
-        Dictionary::<i64>::with_table(table.clone(), "join_left_state", None)
-            .await
-            .expect("left state dict"),
-    );
-    let right_state_dict = Arc::new(
-        Dictionary::<i64>::with_table(table.clone(), "join_right_state", None)
-            .await
-            .expect("right state dict"),
-    );
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "join_output", None)
             .await
@@ -35,32 +25,6 @@ async fn join_operator_matches_batch_join_over_time() {
             .expect("join integrated dict"),
     );
 
-    let left_state = RelationState {
-        integrated: VersionedZSet::new(
-            left_state_dict.clone(),
-            table.clone(),
-            "join_left_state".to_string(),
-        )
-        .await
-        .expect("left integrated"),
-        latest_handle: ZSetHandle {
-            ns: "join_left_state".to_string(),
-            version: 0,
-        },
-    };
-    let right_state = RelationState {
-        integrated: VersionedZSet::new(
-            right_state_dict.clone(),
-            table.clone(),
-            "join_right_state".to_string(),
-        )
-        .await
-        .expect("right integrated"),
-        latest_handle: ZSetHandle {
-            ns: "join_right_state".to_string(),
-            version: 0,
-        },
-    };
     let output = VersionedZSet::new(out_dict.clone(), table.clone(), "join_output".to_string())
         .await
         .expect("output");
@@ -85,8 +49,6 @@ async fn join_operator_matches_batch_join_over_time() {
     };
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         left_index,
         right_index,
         batch_join_key(left_key),
@@ -203,16 +165,6 @@ async fn join_operator_handles_negative_deltas() {
             .await
             .expect("right dict"),
     );
-    let left_state_dict = Arc::new(
-        Dictionary::<i64>::with_table(table.clone(), "neg_left_state", None)
-            .await
-            .expect("left state dict"),
-    );
-    let right_state_dict = Arc::new(
-        Dictionary::<i64>::with_table(table.clone(), "neg_right_state", None)
-            .await
-            .expect("right state dict"),
-    );
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "neg_output", None)
             .await
@@ -224,32 +176,6 @@ async fn join_operator_handles_negative_deltas() {
             .expect("integrated dict"),
     );
 
-    let left_state = RelationState {
-        integrated: VersionedZSet::new(
-            left_state_dict.clone(),
-            table.clone(),
-            "neg_left_state".to_string(),
-        )
-        .await
-        .expect("left integrated"),
-        latest_handle: ZSetHandle {
-            ns: "neg_left_state".to_string(),
-            version: 0,
-        },
-    };
-    let right_state = RelationState {
-        integrated: VersionedZSet::new(
-            right_state_dict.clone(),
-            table.clone(),
-            "neg_right_state".to_string(),
-        )
-        .await
-        .expect("right integrated"),
-        latest_handle: ZSetHandle {
-            ns: "neg_right_state".to_string(),
-            version: 0,
-        },
-    };
     let output = VersionedZSet::new(out_dict.clone(), table.clone(), "neg_output".to_string())
         .await
         .expect("output");
@@ -272,8 +198,6 @@ async fn join_operator_handles_negative_deltas() {
     let right_key = Arc::new(|value: &i64| Some(*value));
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         left_index,
         right_index,
         batch_join_key(left_key),
@@ -358,48 +282,12 @@ async fn join_operator_skips_null_keys() {
             .await
             .expect("right dict"),
     );
-    let left_state_dict = Arc::new(
-        Dictionary::<Option<i64>>::with_table(table.clone(), "null_left_state", None)
-            .await
-            .expect("left state dict"),
-    );
-    let right_state_dict = Arc::new(
-        Dictionary::<Option<i64>>::with_table(table.clone(), "null_right_state", None)
-            .await
-            .expect("right state dict"),
-    );
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "null_output", None)
             .await
             .expect("out dict"),
     );
 
-    let left_state = RelationState {
-        integrated: VersionedZSet::new(
-            left_state_dict.clone(),
-            table.clone(),
-            "null_left_state".to_string(),
-        )
-        .await
-        .expect("left integrated"),
-        latest_handle: ZSetHandle {
-            ns: "null_left_state".to_string(),
-            version: 0,
-        },
-    };
-    let right_state = RelationState {
-        integrated: VersionedZSet::new(
-            right_state_dict.clone(),
-            table.clone(),
-            "null_right_state".to_string(),
-        )
-        .await
-        .expect("right integrated"),
-        latest_handle: ZSetHandle {
-            ns: "null_right_state".to_string(),
-            version: 0,
-        },
-    };
     let output = VersionedZSet::new(out_dict.clone(), table.clone(), "null_output".to_string())
         .await
         .expect("output");
@@ -409,8 +297,6 @@ async fn join_operator_skips_null_keys() {
     let right_key = Arc::new(|value: &Option<i64>| *value);
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         left_index,
         right_index,
         batch_join_key(left_key),
@@ -464,16 +350,6 @@ async fn join_operator_matches_full_recompute() {
             .await
             .expect("right dict"),
     );
-    let left_state_dict = Arc::new(
-        Dictionary::<i64>::with_table(table.clone(), "recompute_left_state", None)
-            .await
-            .expect("left state dict"),
-    );
-    let right_state_dict = Arc::new(
-        Dictionary::<i64>::with_table(table.clone(), "recompute_right_state", None)
-            .await
-            .expect("right state dict"),
-    );
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "recompute_output", None)
             .await
@@ -485,32 +361,6 @@ async fn join_operator_matches_full_recompute() {
             .expect("integrated dict"),
     );
 
-    let left_state = RelationState {
-        integrated: VersionedZSet::new(
-            left_state_dict.clone(),
-            table.clone(),
-            "recompute_left_state".to_string(),
-        )
-        .await
-        .expect("left integrated"),
-        latest_handle: ZSetHandle {
-            ns: "recompute_left_state".to_string(),
-            version: 0,
-        },
-    };
-    let right_state = RelationState {
-        integrated: VersionedZSet::new(
-            right_state_dict.clone(),
-            table.clone(),
-            "recompute_right_state".to_string(),
-        )
-        .await
-        .expect("right integrated"),
-        latest_handle: ZSetHandle {
-            ns: "recompute_right_state".to_string(),
-            version: 0,
-        },
-    };
     let output = VersionedZSet::new(
         out_dict.clone(),
         table.clone(),
@@ -537,8 +387,6 @@ async fn join_operator_matches_full_recompute() {
     let right_key = Arc::new(|value: &i64| Some(*value));
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         left_index,
         right_index,
         batch_join_key(left_key),

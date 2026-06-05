@@ -117,6 +117,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         let mut first_tick_commit_logged = false;
         let mut tick_buffers = ExecutorTickBuffers::new(
             active_source_definitions_by_id_for_task.as_slice(),
+            required_columns_by_source_id_for_task.as_slice(),
             max_batch_per_source,
             connector_queues.len(),
         );
@@ -574,51 +575,11 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                         continue;
                     };
                     match builder.finish() {
-                        Ok(Some(batch)) => {
-                            let Some(definition) = definitions.get(source_id) else {
-                                let source_name = source_names_by_id_for_task[source_id].as_str();
-                                record_fatal_source_batch_failure(
-                                    commit_acks_by_source,
-                                    &failure_for_executor,
-                                    &executor_cancel,
-                                    format!(
-                                        "failed to finish Arrow ingest batch for unknown source '{source_name}'"
-                                    ),
-                                )
-                                .await;
-                                break 'executor;
-                            };
-                            let execution_batch = match mask_arrow_batch_for_required_columns(
-                                definition,
-                                &batch,
-                                required_columns_by_source_id_for_task
-                                    .get(source_id)
-                                    .and_then(Option::as_ref),
-                            ) {
-                                Ok(batch) => batch,
-                                Err(err) => {
-                                    let source_name =
-                                        source_names_by_id_for_task[source_id].as_str();
-                                    tracing::error!(
-                                        source = %source_name,
-                                        error = %err,
-                                        "failed to build execution Arrow ingest batch"
-                                    );
-                                    record_fatal_source_batch_failure(
-                                        commit_acks_by_source,
-                                        &failure_for_executor,
-                                        &executor_cancel,
-                                        format!(
-                                            "failed to build execution Arrow ingest batch for '{source_name}': {err}"
-                                        ),
-                                    )
-                                    .await;
-                                    break 'executor;
-                                }
-                            };
-                            decoded_rows_len = decoded_rows_len.saturating_add(batch.num_rows());
-                            execution_arrow_batches_by_source[source_id].push(execution_batch);
-                            arrow_batches_by_source[source_id].push(batch);
+                        Ok(Some(batches)) => {
+                            decoded_rows_len =
+                                decoded_rows_len.saturating_add(batches.query.num_rows());
+                            execution_arrow_batches_by_source[source_id].push(batches.execution);
+                            arrow_batches_by_source[source_id].push(batches.query);
                         }
                         Ok(None) => {}
                         Err(err) => {

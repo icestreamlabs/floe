@@ -2,10 +2,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[path = "support/http_ready.rs"]
+mod http_ready;
 #[path = "support/ports.rs"]
 mod ports;
 
 use anyhow::{Context, Result, bail};
+use http_ready::wait_for_healthz;
 use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -126,24 +129,6 @@ async fn http_ingest_subscribe_streams_rows() -> Result<()> {
     let _ = std::fs::remove_file(&sink_path);
 
     test_result
-}
-
-async fn wait_for_healthz(addr: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        match client.get(format!("{addr}/healthz")).send().await {
-            Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(response) if Instant::now() >= deadline => {
-                bail!("healthz returned {}", response.status())
-            }
-            Err(err) if Instant::now() >= deadline => bail!("healthz never became ready: {err}"),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
 }
 
 async fn wait_for_subscribe_rows(path: &Path) -> Result<Vec<Value>> {

@@ -9,7 +9,6 @@ use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
 use dbsp::operators::join::JoinOp;
-use dbsp::relation_state::RelationState;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::stream::runtime::DeltaOperator;
@@ -117,12 +116,6 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
             .expect("right dict"),
     );
 
-    let left_state = RelationState::empty(table.clone(), "bench_left_state".to_string())
-        .await
-        .expect("left state");
-    let right_state = RelationState::empty(table.clone(), "bench_right_state".to_string())
-        .await
-        .expect("right state");
     let output_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "bench_output", None)
             .await
@@ -135,8 +128,6 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
     let right_index = IndexedBatchZSet::new(table.clone(), "bench_right_index");
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         left_index,
         right_index,
         batch_join_key(Arc::new(|value: &i64| Some(*value))),

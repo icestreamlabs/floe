@@ -1,9 +1,12 @@
 use super::*;
-use crate::source_decoder::mask_arrow_batch_for_required_columns;
+use crate::source_decoder::SourceArrowBatchBuilder;
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
-use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceRegistry};
+use floe_core::source::{
+    AppendIngestEvent, SourceColumn, SourceDataType, SourceDefinition, SourceRegistry,
+};
+use serde_json::json;
 
 fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
     let values = batch
@@ -24,19 +27,22 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
         ],
     )
     .expect("source definition");
-    let schema = definition.to_arrow_schema();
-    let full_batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["kept"])),
-        ],
-    )
-    .expect("full source batch");
     let required_columns = Some(Arc::<[bool]>::from(vec![true, false]));
-    let masked_batch =
-        mask_arrow_batch_for_required_columns(&definition, &full_batch, required_columns.as_ref())
-            .expect("mask source batch");
+    let mut builder = SourceArrowBatchBuilder::new_with_execution_required_columns(
+        definition.clone(),
+        1,
+        required_columns,
+    );
+    builder
+        .append_event(&AppendIngestEvent::new(
+            "orders",
+            json!({"id": 1, "note": "kept"}),
+        ))
+        .expect("append source event");
+    let batches = builder
+        .finish()
+        .expect("finish source batches")
+        .expect("source batches");
 
     let mut sources = SourceRegistry::new();
     sources.register(definition);
@@ -57,8 +63,8 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
     runtime
         .append_source_batches_for_execution_and_query(
             "orders",
-            vec![masked_batch],
-            vec![full_batch],
+            vec![batches.execution],
+            vec![batches.query],
         )
         .await
         .expect("append source batches");

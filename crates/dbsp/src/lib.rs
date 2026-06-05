@@ -55,7 +55,7 @@ pub use operators::incremental_aggregate::{
     IncrementalAggregateIndexes, IncrementalAggregateOp, IncrementalAggregateRow,
     IncrementalAggregateSlotKind, IncrementalAggregateSlotState, IncrementalAggregateSlotUpdate,
 };
-pub use operators::join::{JoinInputRetention, JoinOp};
+pub use operators::join::JoinOp;
 pub use operators::range_join::{RangeJoinOp, RangeLookupMode};
 pub use operators::semijoin::{SemiJoinMode, SemiJoinOp};
 pub use operators::top1::PartitionedTop1Op;

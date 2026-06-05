@@ -216,19 +216,37 @@ impl SourceRowDecoder {
 pub struct SourceArrowBatchBuilder {
     definition: SourceDefinition,
     builders: Vec<SourceArrowColumnBuilder>,
+    execution_required_columns: Option<Arc<[bool]>>,
     row_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceArrowBatches {
+    pub execution: RecordBatch,
+    pub query: RecordBatch,
 }
 
 impl SourceArrowBatchBuilder {
     pub fn new(definition: SourceDefinition, capacity: usize) -> Self {
+        Self::new_with_execution_required_columns(definition, capacity, None)
+    }
+
+    pub fn new_with_execution_required_columns(
+        definition: SourceDefinition,
+        capacity: usize,
+        execution_required_columns: Option<Arc<[bool]>>,
+    ) -> Self {
         let builders = definition
             .columns()
             .iter()
             .map(|column| SourceArrowColumnBuilder::new(column.data_type(), capacity))
             .collect();
+        let execution_required_columns = execution_required_columns
+            .filter(|required_columns| !required_columns.iter().all(|required| *required));
         Self {
             definition,
             builders,
+            execution_required_columns,
             row_count: 0,
         }
     }
@@ -255,7 +273,19 @@ impl SourceArrowBatchBuilder {
         Ok(event_ts)
     }
 
-    pub fn finish(&mut self) -> Result<Option<RecordBatch>> {
+    pub fn finish(&mut self) -> Result<Option<SourceArrowBatches>> {
+        let Some(query) = self.finish_query_batch()? else {
+            return Ok(None);
+        };
+        let execution = execution_batch_for_required_columns(
+            &self.definition,
+            &query,
+            self.execution_required_columns.as_ref(),
+        )?;
+        Ok(Some(SourceArrowBatches { execution, query }))
+    }
+
+    pub fn finish_query_batch(&mut self) -> Result<Option<RecordBatch>> {
         if self.row_count == 0 {
             return Ok(None);
         }
@@ -274,7 +304,7 @@ impl SourceArrowBatchBuilder {
     }
 }
 
-pub fn mask_arrow_batch_for_required_columns(
+fn execution_batch_for_required_columns(
     definition: &SourceDefinition,
     batch: &RecordBatch,
     required_columns: Option<&Arc<[bool]>>,

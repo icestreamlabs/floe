@@ -53,7 +53,7 @@ pub struct JoinTransientInputs<L, R, K> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum JoinInputRetention {
+pub(crate) enum JoinInputRetention {
     RetainAll,
     DropMatchedAppendOnly,
 }
@@ -97,10 +97,6 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[cfg(test)]
-    pub(crate) left_state: RelationState<L>,
-    #[cfg(test)]
-    pub(crate) right_state: RelationState<R>,
     pub(crate) left_index: IndexedBatchZSet<K, L>,
     pub(crate) right_index: IndexedBatchZSet<K, R>,
     pub(crate) left_closed_index: IndexedBatchZSet<K, ()>,
@@ -165,8 +161,6 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new_batch(
-        _left_state: RelationState<L>,
-        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_key: BatchJoinKeyExtractor<L, K>,
@@ -179,8 +173,6 @@ where
     ) -> Self {
         let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
         Self::new_batch_with_closed_indexes(
-            _left_state,
-            _right_state,
             left_index,
             right_index,
             IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
@@ -200,8 +192,6 @@ where
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_batch_with_closed_indexes(
-        _left_state: RelationState<L>,
-        _right_state: RelationState<R>,
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_closed_index: IndexedBatchZSet<K, ()>,
@@ -217,10 +207,6 @@ where
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
-            #[cfg(test)]
-            left_state: _left_state,
-            #[cfg(test)]
-            right_state: _right_state,
             left_index,
             right_index,
             left_closed_index,
@@ -245,16 +231,9 @@ where
         }
     }
 
-    pub fn enable_live_output_replayable(&mut self) {
-        if let Some(output) = self.output.as_mut() {
-            output.enable_replayable_persistence();
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub fn new_without_output_batch(
-        _left_state: RelationState<L>,
-        _right_state: RelationState<R>,
+    #[cfg(test)]
+    pub(crate) fn new_without_output_batch(
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_key: BatchJoinKeyExtractor<L, K>,
@@ -266,8 +245,6 @@ where
     ) -> Self {
         let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
         Self::new_without_output_batch_with_closed_indexes(
-            _left_state,
-            _right_state,
             left_index,
             right_index,
             IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
@@ -285,9 +262,8 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_without_output_batch_with_closed_indexes(
-        _left_state: RelationState<L>,
-        _right_state: RelationState<R>,
+    #[cfg(test)]
+    pub(crate) fn new_without_output_batch_with_closed_indexes(
         left_index: IndexedBatchZSet<K, L>,
         right_index: IndexedBatchZSet<K, R>,
         left_closed_index: IndexedBatchZSet<K, ()>,
@@ -302,10 +278,6 @@ where
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
-            #[cfg(test)]
-            left_state: _left_state,
-            #[cfg(test)]
-            right_state: _right_state,
             left_index,
             right_index,
             left_closed_index,
@@ -330,12 +302,14 @@ where
         }
     }
 
-    pub fn with_persist_indexes(mut self, persist_indexes: bool) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_persist_indexes(mut self, persist_indexes: bool) -> Self {
         self.persist_indexes = persist_indexes;
         self
     }
 
-    pub fn with_input_retention(
+    #[cfg(test)]
+    pub(crate) fn with_input_retention(
         mut self,
         left_retention: JoinInputRetention,
         right_retention: JoinInputRetention,
