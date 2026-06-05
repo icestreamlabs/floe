@@ -57,12 +57,6 @@ pub(crate) struct VersionWritePlan {
     pub(crate) manifest: ZSetVersionManifest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VersionedZSetPersistence {
-    Immediate,
-    Replayable,
-}
-
 pub struct VersionedZSet<K>
 where
     K: Archive
@@ -86,5 +80,4 @@ where
     intent_key: Vec<u8>,
     manifest: Option<ZSetVersionManifest>,
     next_segment_id: SegmentId,
-    persistence: VersionedZSetPersistence,
 }

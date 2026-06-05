@@ -48,7 +48,7 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
     sources.register(definition);
     let registry = Arc::new(MaterializedViewRegistry::new());
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    let mut runtime = VectorizedExecutionRuntime::new(
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
             "mv_orders",
@@ -56,6 +56,7 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
             Arc::clone(&output_schema),
         )],
         Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
     )
     .await
     .expect("runtime");
@@ -133,7 +134,7 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
         Field::new("id", DataType::Int64, false),
         Field::new("amount", DataType::Int64, false),
     ]));
-    let mut runtime = VectorizedExecutionRuntime::new(
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
             "mv_orders",
@@ -141,6 +142,7 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
             Arc::clone(&output_schema),
         )],
         Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
     )
     .await
     .expect("runtime");
@@ -208,6 +210,33 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     assert_eq!(source_rows.len(), 1);
     assert_eq!(int64_values(&source_rows[0], 0), vec![1]);
     assert_eq!(int64_values(&source_rows[0], 1), vec![40]);
+}
+
+#[tokio::test]
+async fn source_query_tables_are_not_maintained_by_default() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let runtime = VectorizedExecutionRuntime::new(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders",
+            "SELECT id FROM orders",
+            Arc::clone(&output_schema),
+        )],
+        registry,
+    )
+    .await
+    .expect("runtime");
+
+    assert!(runtime.table_providers().is_empty());
 }
 
 #[test]

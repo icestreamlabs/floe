@@ -249,20 +249,6 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
-        if versioned.uses_replayable_persistence() {
-            anyhow::ensure!(
-                base.is_none(),
-                "replayable versioned ZSet does not support persisted base chaining"
-            );
-            let batch = Arc::new(
-                keyed_deltas
-                    .iter()
-                    .map(|(key, delta)| ((*key).clone(), *delta))
-                    .collect(),
-            );
-            return Ok(versioned.publish_replayable_batch(batch));
-        }
-
         let mut buckets: BTreeMap<u16, Vec<(u64, i64)>> = BTreeMap::new();
         let dict = versioned.dictionary();
         let ids = dict

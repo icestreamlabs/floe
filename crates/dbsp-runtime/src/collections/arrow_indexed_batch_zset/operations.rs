@@ -22,9 +22,6 @@ where
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub async fn restore_committed_checkpoint(&self) -> Result<()> {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return Ok(());
-        }
         let Some(handle) = operator_state_registry::restored_operator_state(&self.namespace) else {
             let next_segment_id = self.read_next_segment_id().await?;
             self.record_checkpoint(next_segment_id);
@@ -97,10 +94,6 @@ where
     where
         I: IntoIterator<Item = (K, V, i64)>,
     {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return self.apply_replayable_deltas(deltas);
-        }
-
         let mut metrics = ApplyDeltaMetrics::default();
         let mut encoded_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
@@ -226,10 +219,6 @@ where
         K: RangeKey,
         I: IntoIterator<Item = (K, V, i64)>,
     {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return self.apply_replayable_deltas(deltas);
-        }
-
         let mut metrics = ApplyDeltaMetrics::default();
         let mut encoded_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
         let mut touched_updates: FastMap<Vec<u8>, ValueWeightMap> = FastMap::default();
@@ -376,21 +365,6 @@ where
             ..LookupMetrics::default()
         };
 
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            let values = self
-                .overlay_by_key
-                .lock()
-                .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?
-                .get(key)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|(_, weight)| *weight != 0)
-                .collect::<Vec<_>>();
-            metrics.returned_rows = values.len();
-            return Ok((values, metrics));
-        }
-
         let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
         if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
             metrics.cache_hits = 1;
@@ -411,17 +385,6 @@ where
     }
 
     pub async fn value_weight_for_key_value(&self, key: &K, value: &V) -> Result<i64> {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return Ok(self
-                .overlay_by_key
-                .lock()
-                .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?
-                .get(key)
-                .and_then(|values| values.get(value))
-                .copied()
-                .unwrap_or(0));
-        }
-
         let key_bytes = encode(key).context("encode Arrow-index lookup key")?;
         let value_bytes = encode(value).context("encode Arrow-index lookup value")?;
         if let Some(cached) = self.lookup_cache_for_key(&key_bytes)? {
@@ -436,39 +399,9 @@ where
         Ok(weight)
     }
 
-    pub fn replayable_snapshot_entries(&self) -> Result<Vec<(K, V, i64)>> {
-        if !matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return Err(anyhow!(
-                "Arrow-index snapshot entries require replayable persistence"
-            ));
-        }
-        Ok(self
-            .overlay_snapshot_by_key()?
-            .into_iter()
-            .flat_map(|(key, values)| {
-                values.into_iter().filter_map(move |(value, weight)| {
-                    (weight != 0).then_some((key.clone(), value, weight))
-                })
-            })
-            .collect())
-    }
-
     pub async fn keys_for_value(&self, value: &V) -> Result<Vec<(K, i64)>> {
         if !self.reverse_enabled {
             return Err(anyhow!("reverse index not enabled"));
-        }
-
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return Ok(self
-                .overlay_by_value
-                .lock()
-                .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?
-                .get(value)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|(_, weight)| *weight != 0)
-                .collect());
         }
 
         let value_bytes = encode(value).context("encode Arrow-index reverse lookup value")?;
@@ -488,28 +421,6 @@ where
     {
         if !self.range_enabled {
             return Err(anyhow!("range index not enabled"));
-        }
-
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            let overlay_snapshot = self.overlay_snapshot_by_key()?;
-            let lower_bytes = lower.encode_range_key();
-            let upper_bytes = upper.encode_range_key();
-            if lower_bytes >= upper_bytes {
-                return Ok(Vec::new());
-            }
-            let mut output = Vec::new();
-            for (key, overlay_values) in overlay_snapshot {
-                let range_key = key.encode_range_key();
-                if range_key < lower_bytes || range_key >= upper_bytes {
-                    continue;
-                }
-                for (value, weight) in overlay_values {
-                    if weight != 0 {
-                        output.push((key.clone(), value, weight));
-                    }
-                }
-            }
-            return Ok(output);
         }
 
         let lower_bytes = lower.encode_range_key();
@@ -605,35 +516,6 @@ where
         let lower_bytes = lower.encode_range_key();
         let upper_bytes = upper.encode_range_key();
         if lower_bytes >= upper_bytes {
-            return Ok((Vec::new(), metrics));
-        }
-
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            let overlay_snapshot = self.overlay_snapshot_by_key()?;
-            let mut candidates = Vec::new();
-            for (key, overlay_values) in overlay_snapshot {
-                let range_key = key.encode_range_key();
-                if range_key < lower_bytes || range_key >= upper_bytes {
-                    continue;
-                }
-                let key_bytes = encode(&key).context("encode Arrow-index overlay range key")?;
-                candidates.push((range_key, key_bytes, key, overlay_values));
-            }
-            candidates
-                .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-
-            for (_, _, key, overlay_values) in candidates {
-                let output = overlay_values
-                    .into_iter()
-                    .filter_map(|(value, weight)| {
-                        (weight != 0).then_some((key.clone(), value, weight))
-                    })
-                    .collect::<Vec<_>>();
-                if !output.is_empty() {
-                    metrics.returned_rows = output.len();
-                    return Ok((output, metrics));
-                }
-            }
             return Ok((Vec::new(), metrics));
         }
 
@@ -748,19 +630,6 @@ where
     }
 
     pub async fn entries(&self) -> Result<Vec<(K, V, i64)>> {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            let overlay_snapshot = self.overlay_snapshot_by_key()?;
-            let mut out = Vec::new();
-            for (key, overlay_values) in overlay_snapshot {
-                for (value, weight) in overlay_values {
-                    if weight != 0 {
-                        out.push((key.clone(), value, weight));
-                    }
-                }
-            }
-            return Ok(out);
-        }
-
         let segment_ids = self
             .segment_store
             .list_segment_ids()

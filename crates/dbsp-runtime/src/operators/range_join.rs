@@ -624,20 +624,6 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
-        if versioned.uses_replayable_persistence() {
-            anyhow::ensure!(
-                base.is_none(),
-                "replayable versioned ZSet does not support persisted base chaining"
-            );
-            let batch = Arc::new(
-                keyed_deltas
-                    .iter()
-                    .map(|(key, delta)| ((*key).clone(), *delta))
-                    .collect(),
-            );
-            return Ok(versioned.publish_replayable_batch(batch));
-        }
-
         let dict = versioned.dictionary();
         let ids = dict
             .intern_many_values_unique(keyed_deltas.iter().map(|(key, _)| *key))

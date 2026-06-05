@@ -12,10 +12,7 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::super::ZSET_PREFIX;
-use super::{
-    CompactionPolicy, SegmentId, VersionChainStats, VersionedZSet, VersionedZSetPersistence,
-    ZSetVersionManifest,
-};
+use super::{CompactionPolicy, SegmentId, VersionChainStats, VersionedZSet, ZSetVersionManifest};
 
 impl CompactionPolicy {
     pub const fn disabled() -> Self {
@@ -69,16 +66,6 @@ where
         table: Arc<dyn KeyValueTable>,
         namespace: impl Into<String>,
     ) -> Result<Self> {
-        Self::new_with_persistence(dict, table, namespace, VersionedZSetPersistence::Immediate)
-            .await
-    }
-
-    pub async fn new_with_persistence(
-        dict: Arc<Dictionary<K>>,
-        table: Arc<dyn KeyValueTable>,
-        namespace: impl Into<String>,
-        persistence: VersionedZSetPersistence,
-    ) -> Result<Self> {
         let namespace = namespace.into();
         let mut manifest_prefix = ZSET_PREFIX.as_bytes().to_vec();
         manifest_prefix.extend_from_slice(namespace.as_bytes());
@@ -107,7 +94,6 @@ where
             intent_key,
             manifest: None,
             next_segment_id: 1,
-            persistence,
         };
 
         versioned.refresh_state().await?;
@@ -173,18 +159,6 @@ where
         } else {
             Some(self.handle_for_version(self.persisted_version))
         }
-    }
-
-    pub fn persistence(&self) -> VersionedZSetPersistence {
-        self.persistence
-    }
-
-    pub fn enable_replayable_persistence(&mut self) {
-        self.persistence = VersionedZSetPersistence::Replayable;
-    }
-
-    pub fn uses_replayable_persistence(&self) -> bool {
-        matches!(self.persistence, VersionedZSetPersistence::Replayable)
     }
 
     #[cfg(test)]

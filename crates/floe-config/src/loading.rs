@@ -14,7 +14,11 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<NodeConfig> {
         "toml" => parse_toml_config(&contents),
         "yaml" | "yml" => serde_yaml::from_str(&contents).context("parse yaml config"),
         "json" => serde_json::from_str(&contents).context("parse json config"),
-        _ => parse_config_fallback(&contents),
+        _ => bail!(
+            "unsupported config extension '{}' for {}; expected .toml, .yaml, .yml, or .json",
+            ext,
+            path.display()
+        ),
     }?;
     validate_node_config(&config).context("validate node config")?;
     Ok(config)
@@ -34,17 +38,4 @@ pub fn load_toml_config(path: impl AsRef<Path>) -> Result<NodeConfig> {
 
 pub fn parse_toml_config(contents: &str) -> Result<NodeConfig> {
     toml::from_str(contents).context("parse toml config")
-}
-
-fn parse_config_fallback(contents: &str) -> Result<NodeConfig> {
-    if let Ok(config) = toml::from_str(contents) {
-        return Ok(config);
-    }
-    if let Ok(config) = serde_json::from_str(contents) {
-        return Ok(config);
-    }
-    if let Ok(config) = serde_yaml::from_str(contents) {
-        return Ok(config);
-    }
-    toml::from_str(contents).context("parse config (tried toml, json, yaml)")
 }
