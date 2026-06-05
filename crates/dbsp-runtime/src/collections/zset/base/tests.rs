@@ -7,7 +7,6 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::handles::ZSetHandleView;
 use object_store::memory::InMemory;
 use slatedb::WriteBatch;
 
@@ -728,72 +727,4 @@ async fn orphan_segment_write_is_not_visible_after_reopen() {
             .is_some(),
         "orphan segment bytes may exist physically but must stay unreachable"
     );
-}
-
-#[tokio::test]
-async fn replayable_head_reads_from_transient_batch_without_persisting() {
-    let db = build_db().await;
-    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(db.clone()));
-    let dict = Arc::new(
-        Dictionary::with_table(table.clone(), "vz_replayable", None)
-            .await
-            .expect("build dictionary"),
-    );
-
-    let mut versioned =
-        VersionedZSet::new(dict.clone(), table.clone(), "vz_replayable".to_string())
-            .await
-            .expect("create versioned zset");
-
-    let persisted_id = dict
-        .intern(&"persisted".to_string())
-        .await
-        .expect("intern persisted key");
-    versioned
-        .create_version(vec![SegmentRecord {
-            id: 1,
-            bucket: 0,
-            deltas: vec![(persisted_id, 1)],
-        }])
-        .await
-        .expect("create persisted version");
-
-    versioned.enable_replayable_persistence();
-    let live_handle = versioned.publish_replayable_batch(Arc::new(vec![
-        ("live".to_string(), 2),
-        ("removed".to_string(), 1),
-        ("removed".to_string(), -1),
-    ]));
-
-    let live_delta = ZSetHandleView::new(
-        dict.clone(),
-        table.clone(),
-        live_handle.ns.clone(),
-        live_handle.version,
-    )
-    .delta_iter()
-    .await
-    .expect("read replayable delta through handle view");
-    assert_eq!(
-        live_delta,
-        vec![
-            ("live".to_string(), 2),
-            ("removed".to_string(), 1),
-            ("removed".to_string(), -1)
-        ]
-    );
-
-    let live_materialized = versioned
-        .load_existing_version(live_handle.version)
-        .await
-        .expect("load replayable version");
-    assert_eq!(live_materialized.get("live"), Some(&2));
-    assert!(!live_materialized.contains_key("removed"));
-
-    let reopened = VersionedZSet::new(dict, table, "vz_replayable".to_string())
-        .await
-        .expect("reopen replayable zset");
-    let reopened_view = reopened.materialize().await.expect("materialize reopened");
-    assert_eq!(reopened_view.get("persisted"), Some(&1));
-    assert!(!reopened_view.contains_key("live"));
 }

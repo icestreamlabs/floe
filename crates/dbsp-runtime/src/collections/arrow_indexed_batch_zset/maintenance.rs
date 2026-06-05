@@ -22,10 +22,7 @@ where
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub async fn compact_l0_to_l1(&self) -> Result<usize> {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable)
-            || self.reverse_enabled
-            || self.range_enabled
-        {
+        if self.reverse_enabled || self.range_enabled {
             return Ok(0);
         }
 
@@ -82,10 +79,7 @@ where
         let Some(threshold) = self.hot_key_compaction_threshold else {
             return Ok(());
         };
-        if matches!(self.persistence, IndexedStatePersistence::Replayable)
-            || self.reverse_enabled
-            || self.range_enabled
-        {
+        if self.reverse_enabled || self.range_enabled {
             return Ok(());
         }
 
@@ -108,9 +102,6 @@ where
     }
 
     pub(super) async fn compact_key_bytes(&self, key_bytes: &[u8]) -> Result<bool> {
-        if matches!(self.persistence, IndexedStatePersistence::Replayable) {
-            return Ok(false);
-        }
         if self.reverse_enabled || self.range_enabled {
             return Ok(false);
         }
@@ -649,97 +640,6 @@ where
             }
         }
         Ok(())
-    }
-
-    pub(super) fn apply_replayable_deltas<I>(&self, deltas: I) -> Result<ApplyDeltaMetrics>
-    where
-        I: IntoIterator<Item = (K, V, i64)>,
-    {
-        let mut metrics = ApplyDeltaMetrics::default();
-        let mut touched_updates: FastMap<K, TypedValueWeightMap<V>> = FastMap::default();
-
-        for (key, value, delta) in deltas {
-            metrics.input_records = metrics.input_records.saturating_add(1);
-            if delta == 0 {
-                continue;
-            }
-            metrics.non_zero_input_records = metrics.non_zero_input_records.saturating_add(1);
-
-            let key_updates = touched_updates.entry(key).or_default();
-            *key_updates.entry(value).or_insert(0) += delta;
-        }
-
-        for updates in touched_updates.values_mut() {
-            updates.retain(|_, weight| *weight != 0);
-        }
-        touched_updates.retain(|_, updates| !updates.is_empty());
-        if touched_updates.is_empty() {
-            return Ok(metrics);
-        }
-
-        self.apply_overlay_updates(&touched_updates)?;
-        metrics.coalesced_records = metrics.non_zero_input_records;
-        Ok(metrics)
-    }
-
-    pub(super) fn apply_overlay_updates(
-        &self,
-        updates: &FastMap<K, TypedValueWeightMap<V>>,
-    ) -> Result<()> {
-        {
-            let mut guard = self
-                .overlay_by_key
-                .lock()
-                .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))?;
-            for (key, key_updates) in updates {
-                let state = guard.entry(key.clone()).or_default();
-                for (value, delta) in key_updates {
-                    let next = state
-                        .get(value)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(*delta);
-                    if next == 0 {
-                        state.remove(value);
-                    } else {
-                        state.insert(value.clone(), next);
-                    }
-                }
-                if state.is_empty() {
-                    guard.remove(key);
-                }
-            }
-        }
-
-        if self.reverse_enabled {
-            let mut guard = self
-                .overlay_by_value
-                .lock()
-                .map_err(|_| anyhow!("Arrow-index overlay-by-value mutex poisoned"))?;
-            for (key, key_updates) in updates {
-                for (value, delta) in key_updates {
-                    let state = guard.entry(value.clone()).or_default();
-                    let next = state.get(key).copied().unwrap_or(0).saturating_add(*delta);
-                    if next == 0 {
-                        state.remove(key);
-                    } else {
-                        state.insert(key.clone(), next);
-                    }
-                    if state.is_empty() {
-                        guard.remove(value);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(super) fn overlay_snapshot_by_key(&self) -> Result<FastMap<K, TypedValueWeightMap<V>>> {
-        self.overlay_by_key
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| anyhow!("Arrow-index overlay-by-key mutex poisoned"))
     }
 
     pub(super) async fn load_persisted_value_weights_for_key(

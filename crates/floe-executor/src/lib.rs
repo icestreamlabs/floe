@@ -38,6 +38,7 @@ pub use stream_types::{Diff, Timestamp};
 pub use subscribe::SubscribeExecutionConfig;
 pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
 pub use vectorized_runtime::{
-    VectorizedExecutionRuntime, VectorizedMaterializedViewExecutionPolicy,
-    VectorizedMaterializedViewPlan, weighted_batch_from_diffs,
+    VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions,
+    VectorizedMaterializedViewExecutionPolicy, VectorizedMaterializedViewPlan,
+    weighted_batch_from_diffs,
 };

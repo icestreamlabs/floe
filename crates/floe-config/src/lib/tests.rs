@@ -1,5 +1,20 @@
 use super::*;
 use floe_sql_parser::{SinkConnector, SinkDefinition};
+use std::path::PathBuf;
+
+fn write_temp_config(extension: &str, contents: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    path.push(format!(
+        "floe-config-test-{}-{suffix}.{extension}",
+        std::process::id()
+    ));
+    std::fs::write(&path, contents).expect("write temp config");
+    path
+}
 
 #[test]
 fn normalize_assigns_unique_names() {
@@ -40,6 +55,47 @@ fn load_config_accepts_toml() {
         "#;
     let config: NodeConfig = toml::from_str(input).expect("parse toml");
     assert_eq!(config.connectors.len(), 1);
+}
+
+#[test]
+fn load_config_accepts_json_file() {
+    let path = write_temp_config(
+        "json",
+        r#"{"connectors":[{"type":"generator","events_per_second":12.5,"max_events":100}]}"#,
+    );
+
+    let config = load_config(&path).expect("load json config");
+    std::fs::remove_file(&path).expect("remove temp config");
+
+    assert_eq!(config.connectors.len(), 1);
+}
+
+#[test]
+fn load_config_accepts_yaml_file() {
+    let path = write_temp_config(
+        "yaml",
+        r#"
+connectors:
+  - type: generator
+    events_per_second: 12.5
+    max_events: 100
+"#,
+    );
+
+    let config = load_config(&path).expect("load yaml config");
+    std::fs::remove_file(&path).expect("remove temp config");
+
+    assert_eq!(config.connectors.len(), 1);
+}
+
+#[test]
+fn load_config_rejects_unknown_extension() {
+    let path = write_temp_config("conf", "connectors = []");
+
+    let err = load_config(&path).expect_err("unknown config extension should fail");
+    std::fs::remove_file(&path).expect("remove temp config");
+
+    assert!(err.to_string().contains("unsupported config extension"));
 }
 
 #[test]

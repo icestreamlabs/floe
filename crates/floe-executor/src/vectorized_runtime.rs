@@ -23,10 +23,16 @@ use crate::vectorized_source_delta::{
     apply_source_delta, apply_weighted_snapshot_delta, insert_only_source_delta_batch,
     prepare_source_delta, unit_source_delta_batches, validate_unit_source_delta,
 };
+use source_state::{
+    camel_case_schema, dynamic_state_provider, incremental_source_for_plan, rename_batches,
+    source_key_indices, source_primary_key_columns,
+};
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
 const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
+
+mod source_state;
 
 #[derive(Debug, Clone)]
 pub struct VectorizedMaterializedViewPlan {
@@ -62,11 +68,23 @@ pub enum VectorizedMaterializedViewExecutionPolicy {
     AllowFullRefresh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VectorizedExecutionRuntimeOptions {
+    pub maintain_source_query_tables: bool,
+}
+
+impl VectorizedExecutionRuntimeOptions {
+    pub fn with_source_query_tables(mut self) -> Self {
+        self.maintain_source_query_tables = true;
+        self
+    }
+}
+
 #[derive(Clone)]
 struct VectorizedSourceState {
     schema: SchemaRef,
     provider: Arc<DynamicStateTableProvider>,
-    query_provider: Arc<DynamicStateTableProvider>,
+    query_provider: Option<Arc<DynamicStateTableProvider>>,
     maintain_execution_state: bool,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
@@ -134,7 +152,23 @@ impl VectorizedExecutionRuntime {
         materialized_views: Vec<VectorizedMaterializedViewPlan>,
         registry: Arc<MaterializedViewRegistry>,
     ) -> Result<Self> {
-        Self::new_with_udfs(sources, materialized_views, registry, Vec::new()).await
+        Self::new_with_options(
+            sources,
+            materialized_views,
+            registry,
+            VectorizedExecutionRuntimeOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn new_with_options(
+        sources: &SourceRegistry,
+        materialized_views: Vec<VectorizedMaterializedViewPlan>,
+        registry: Arc<MaterializedViewRegistry>,
+        options: VectorizedExecutionRuntimeOptions,
+    ) -> Result<Self> {
+        Self::new_with_udfs_and_options(sources, materialized_views, registry, Vec::new(), options)
+            .await
     }
 
     pub async fn new_with_udfs(
@@ -142,6 +176,23 @@ impl VectorizedExecutionRuntime {
         materialized_views: Vec<VectorizedMaterializedViewPlan>,
         registry: Arc<MaterializedViewRegistry>,
         udfs: Vec<ScalarUDF>,
+    ) -> Result<Self> {
+        Self::new_with_udfs_and_options(
+            sources,
+            materialized_views,
+            registry,
+            udfs,
+            VectorizedExecutionRuntimeOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn new_with_udfs_and_options(
+        sources: &SourceRegistry,
+        materialized_views: Vec<VectorizedMaterializedViewPlan>,
+        registry: Arc<MaterializedViewRegistry>,
+        udfs: Vec<ScalarUDF>,
+        options: VectorizedExecutionRuntimeOptions,
     ) -> Result<Self> {
         let ctx = SessionContext::new();
         for udf in udfs.iter().cloned() {
@@ -157,10 +208,11 @@ impl VectorizedExecutionRuntime {
                 Arc::clone(&schema),
                 key_indices.as_deref(),
             )?);
-            let query_provider = Arc::new(dynamic_state_provider(
-                Arc::clone(&schema),
-                key_indices.as_deref(),
-            )?);
+            let query_provider = options
+                .maintain_source_query_tables
+                .then(|| dynamic_state_provider(Arc::clone(&schema), key_indices.as_deref()))
+                .transpose()?
+                .map(Arc::new);
             ctx.register_table(
                 definition.name(),
                 Arc::clone(&provider) as Arc<dyn TableProvider>,
@@ -185,12 +237,17 @@ impl VectorizedExecutionRuntime {
                 } else {
                     (None, None)
                 };
-            let query_alias_provider = alias_schema
-                .as_ref()
-                .map(|schema| {
-                    dynamic_state_provider(Arc::clone(schema), key_indices.as_deref()).map(Arc::new)
-                })
-                .transpose()?;
+            let query_alias_provider = if options.maintain_source_query_tables {
+                alias_schema
+                    .as_ref()
+                    .map(|schema| {
+                        dynamic_state_provider(Arc::clone(schema), key_indices.as_deref())
+                            .map(Arc::new)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
 
             source_states.insert(
                 definition.name().to_string(),
@@ -280,10 +337,12 @@ impl VectorizedExecutionRuntime {
     pub fn table_providers(&self) -> Vec<(String, Arc<dyn TableProvider>)> {
         let mut providers = Vec::new();
         for (source_name, source) in &self.sources {
-            providers.push((
-                source_name.clone(),
-                Arc::clone(&source.query_provider) as Arc<dyn TableProvider>,
-            ));
+            if let Some(query_provider) = source.query_provider.as_ref() {
+                providers.push((
+                    source_name.clone(),
+                    Arc::clone(query_provider) as Arc<dyn TableProvider>,
+                ));
+            }
             if let Some(alias) = source_name.strip_prefix("nexmark_")
                 && let Some(alias_provider) = source.query_alias_provider.as_ref()
             {
@@ -371,15 +430,23 @@ impl VectorizedExecutionRuntime {
         weighted_batches.push(delta.clone());
 
         if state.primary_key_columns.is_empty() {
-            let query_next = apply_source_delta(
-                &state.schema,
-                &state.primary_key_columns,
-                &state.query_provider,
-                &delta,
-            )
-            .await
-            .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
-            state.query_provider.set_batches(query_next.clone())?;
+            if let Some(query_provider) = state.query_provider.as_ref() {
+                let query_next = apply_source_delta(
+                    &state.schema,
+                    &state.primary_key_columns,
+                    query_provider,
+                    &delta,
+                )
+                .await
+                .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
+                query_provider.set_batches(query_next.clone())?;
+                if let (Some(alias_schema), Some(alias_provider)) = (
+                    state.alias_schema.as_ref(),
+                    state.query_alias_provider.as_ref(),
+                ) {
+                    alias_provider.set_batches(rename_batches(&query_next, alias_schema)?)?;
+                }
+            }
             if state.maintain_execution_state {
                 let next = apply_source_delta(
                     &state.schema,
@@ -396,12 +463,6 @@ impl VectorizedExecutionRuntime {
                     alias_provider.set_batches(rename_batches(&next, alias_schema)?)?;
                 }
             }
-            if let (Some(alias_schema), Some(alias_provider)) = (
-                state.alias_schema.as_ref(),
-                state.query_alias_provider.as_ref(),
-            ) {
-                alias_provider.set_batches(rename_batches(&query_next, alias_schema)?)?;
-            }
             return Ok(());
         }
 
@@ -412,9 +473,9 @@ impl VectorizedExecutionRuntime {
             .as_ref()
             .map(|batch| vec![batch.clone()])
             .unwrap_or_default();
-        state
-            .query_provider
-            .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
+        if let Some(query_provider) = state.query_provider.as_ref() {
+            query_provider.apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
+        }
         if state.maintain_execution_state {
             state
                 .provider
@@ -477,7 +538,9 @@ impl VectorizedExecutionRuntime {
         if state.maintain_execution_state {
             state.provider.append_batches(execution_batches.clone())?;
         }
-        state.query_provider.append_batches(query_batches.clone())?;
+        if let Some(query_provider) = state.query_provider.as_ref() {
+            query_provider.append_batches(query_batches.clone())?;
+        }
         if state.maintain_execution_state
             && let (Some(alias_schema), Some(alias_provider)) =
                 (state.alias_schema.as_ref(), state.alias_provider.as_ref())
@@ -822,21 +885,6 @@ fn normalize_batches(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<Ve
         .collect()
 }
 
-fn rename_batches(batches: &[RecordBatch], schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
-    batches
-        .iter()
-        .map(|batch| {
-            if batch.num_columns() != schema.fields().len() {
-                bail!("alias schema column count does not match source batch");
-            }
-            Ok(RecordBatch::try_new(
-                Arc::clone(schema),
-                batch.columns().to_vec(),
-            )?)
-        })
-        .collect()
-}
-
 pub fn weighted_batch_from_diffs(
     batch: &RecordBatch,
     weighted_schema: &SchemaRef,
@@ -858,115 +906,6 @@ pub fn weighted_batch_from_diffs(
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(Arc::new(Int64Array::from(diffs.to_vec())) as ArrayRef);
     Ok(RecordBatch::try_new(Arc::clone(weighted_schema), columns)?)
-}
-
-fn dynamic_state_provider(
-    schema: SchemaRef,
-    key_indices: Option<&[usize]>,
-) -> Result<DynamicStateTableProvider> {
-    match key_indices {
-        Some(indices) if !indices.is_empty() => {
-            DynamicStateTableProvider::new_with_key_indices(schema, indices.to_vec())
-        }
-        _ => Ok(DynamicStateTableProvider::new(schema)),
-    }
-}
-
-fn source_key_indices(
-    schema: &SchemaRef,
-    primary_key_columns: &[String],
-) -> Result<Option<Vec<usize>>> {
-    if primary_key_columns.is_empty() {
-        return Ok(None);
-    }
-    primary_key_columns
-        .iter()
-        .map(|column| {
-            schema.index_of(column).with_context(|| {
-                format!("source primary key column '{column}' missing from schema")
-            })
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
-}
-
-fn incremental_source_for_plan(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> Option<String> {
-    match plan {
-        LogicalPlan::Projection(projection) => {
-            incremental_source_for_plan(projection.input.as_ref(), sources)
-        }
-        LogicalPlan::Filter(filter) => incremental_source_for_plan(filter.input.as_ref(), sources),
-        LogicalPlan::SubqueryAlias(alias) => {
-            incremental_source_for_plan(alias.input.as_ref(), sources)
-        }
-        LogicalPlan::TableScan(scan) => resolve_source_table(scan.table_name.to_string(), sources),
-        _ => None,
-    }
-}
-
-fn resolve_source_table(
-    table_name: String,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> Option<String> {
-    if sources.contains_key(&table_name) {
-        return Some(table_name);
-    }
-    sources
-        .keys()
-        .find(|source_name| source_name.strip_prefix("nexmark_") == Some(table_name.as_str()))
-        .cloned()
-}
-
-fn source_primary_key_columns(definition: &SourceDefinition) -> Vec<String> {
-    definition
-        .property(SOURCE_PRIMARY_KEY_PROPERTY)
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|column| !column.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn camel_case_schema(definition: &SourceDefinition) -> SchemaRef {
-    let fields = definition
-        .columns()
-        .iter()
-        .map(|column| {
-            Field::new(
-                to_camel_case(column.name()),
-                column.data_type().arrow_type(),
-                true,
-            )
-        })
-        .collect::<Vec<_>>();
-    Arc::new(Schema::new(fields))
-}
-
-fn to_camel_case(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut uppercase_next = false;
-    for ch in input.chars() {
-        if ch == '_' {
-            uppercase_next = true;
-            continue;
-        }
-        if uppercase_next {
-            for upper in ch.to_uppercase() {
-                out.push(upper);
-            }
-            uppercase_next = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

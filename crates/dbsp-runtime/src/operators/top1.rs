@@ -375,14 +375,6 @@ where
             return Ok(versioned.handle_for_version(0));
         }
 
-        if versioned.uses_replayable_persistence() {
-            anyhow::ensure!(
-                base.is_none(),
-                "replayable versioned ZSet does not support persisted base chaining"
-            );
-            return Ok(versioned.publish_replayable_batch(Arc::new(staged)));
-        }
-
         let dict = versioned.dictionary();
         let ids = dict
             .intern_many_values_unique(staged.iter().map(|(key, _)| key))

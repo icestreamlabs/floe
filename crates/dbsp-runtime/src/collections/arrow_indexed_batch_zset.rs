@@ -33,17 +33,10 @@ pub const DEFAULT_HOT_KEY_COMPACTION_THRESHOLD: usize = 64;
 
 type FastMap<K, V> = FastHashMap<K, V, RandomState>;
 type ValueWeightMap = FastMap<Vec<u8>, i64>;
-type TypedValueWeightMap<T> = FastMap<T, i64>;
 type RowPosting = (u32, i64);
 type RangePostingKey = (Vec<u8>, Vec<u8>);
 type SegmentPostings = Vec<RowPosting>;
 type SegmentRefsByKey = FastMap<Vec<u8>, FastMap<u64, SegmentPostings>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexedStatePersistence {
-    Immediate,
-    Replayable,
-}
 
 struct CachedSegment {
     values: Vec<Vec<u8>>,
@@ -92,9 +85,6 @@ where
     segment_sequence_lock: AsyncMutex<()>,
     lookup_cache_shards: Vec<Mutex<FastMap<Vec<u8>, ValueWeightMap>>>,
     segment_cache_shards: Vec<Mutex<FastMap<u64, Arc<CachedSegment>>>>,
-    overlay_by_key: Mutex<FastMap<K, TypedValueWeightMap<V>>>,
-    overlay_by_value: Mutex<FastMap<V, TypedValueWeightMap<K>>>,
-    persistence: IndexedStatePersistence,
     hot_key_compaction_threshold: Option<usize>,
     _marker: PhantomData<(K, V)>,
 }
@@ -121,75 +111,15 @@ where
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
     pub fn new(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(
-            table,
-            namespace.into(),
-            false,
-            false,
-            IndexedStatePersistence::Immediate,
-            None,
-        )
-    }
-
-    pub fn new_replayable(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(
-            table,
-            namespace.into(),
-            false,
-            false,
-            IndexedStatePersistence::Replayable,
-            None,
-        )
+        Self::build(table, namespace.into(), false, false, None)
     }
 
     pub fn with_reverse_index(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(
-            table,
-            namespace.into(),
-            true,
-            false,
-            IndexedStatePersistence::Immediate,
-            None,
-        )
-    }
-
-    pub fn with_reverse_index_replayable(
-        table: Arc<dyn KeyValueTable>,
-        namespace: impl Into<String>,
-    ) -> Self {
-        Self::build(
-            table,
-            namespace.into(),
-            true,
-            false,
-            IndexedStatePersistence::Replayable,
-            None,
-        )
+        Self::build(table, namespace.into(), true, false, None)
     }
 
     pub fn with_range_index(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
-        Self::build(
-            table,
-            namespace.into(),
-            false,
-            true,
-            IndexedStatePersistence::Immediate,
-            None,
-        )
-    }
-
-    pub fn with_range_index_replayable(
-        table: Arc<dyn KeyValueTable>,
-        namespace: impl Into<String>,
-    ) -> Self {
-        Self::build(
-            table,
-            namespace.into(),
-            false,
-            true,
-            IndexedStatePersistence::Replayable,
-            None,
-        )
+        Self::build(table, namespace.into(), false, true, None)
     }
 
     pub fn with_hot_key_compaction_threshold(
@@ -202,7 +132,6 @@ where
             namespace.into(),
             false,
             false,
-            IndexedStatePersistence::Immediate,
             Some(threshold.max(1)),
         )
     }
@@ -216,7 +145,6 @@ where
         namespace: String,
         reverse_enabled: bool,
         range_enabled: bool,
-        persistence: IndexedStatePersistence,
         hot_key_compaction_threshold: Option<usize>,
     ) -> Self {
         let namespace_hash = stable_namespace_hash(namespace.as_bytes());
@@ -258,9 +186,6 @@ where
             segment_sequence_lock: AsyncMutex::new(()),
             lookup_cache_shards: make_mutex_shards(LOOKUP_CACHE_SHARDS),
             segment_cache_shards: make_mutex_shards(SEGMENT_CACHE_SHARDS),
-            overlay_by_key: Mutex::new(FastMap::default()),
-            overlay_by_value: Mutex::new(FastMap::default()),
-            persistence,
             hot_key_compaction_threshold,
             _marker: PhantomData,
         }

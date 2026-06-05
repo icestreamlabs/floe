@@ -15,10 +15,9 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::WriteBatch;
 
-use crate::handles::ZSetHandle;
 use crate::storage::dictionary::KeyIntern;
 use crate::storage::encoding::{self, RkyvDeserializer, RkyvSerializer, RkyvValidator};
-use crate::stream::util::{publish_transient_zset_batch, transient_zset_batch};
+use crate::stream::util::transient_zset_batch;
 
 use super::{
     SegmentId, SegmentRecord, VersionChainStats, VersionWritePlan, VersionedZSet,
@@ -139,14 +138,6 @@ where
         self.current_version = plan.version;
         self.persisted_version = plan.version;
         self.manifest = Some(plan.manifest.clone());
-    }
-
-    pub fn publish_replayable_batch(&mut self, deltas: Arc<Vec<(K, i64)>>) -> ZSetHandle {
-        let version = self.current_version.saturating_add(1);
-        self.current_version = version;
-        let handle = self.handle_for_version(version);
-        publish_transient_zset_batch(&handle, deltas);
-        handle
     }
 
     pub async fn chain_stats(&self) -> Result<VersionChainStats> {

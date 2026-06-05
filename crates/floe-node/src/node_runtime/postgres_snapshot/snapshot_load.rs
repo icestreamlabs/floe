@@ -1,5 +1,8 @@
 use super::*;
 
+const POSTGRES_SNAPSHOT_SLOT_HANDOFF_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const POSTGRES_SNAPSHOT_SLOT_HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 pub(in crate::node_runtime) struct InitialPostgresSnapshotConfig<'a> {
     pub(in crate::node_runtime) connection_string: &'a str,
     pub(in crate::node_runtime) slot: &'a str,
@@ -622,7 +625,7 @@ pub(super) async fn connect_postgres_replication_client_with_retry(
         match PostgresReplicationClient::connect(config).await {
             Ok(client) => return Ok(client),
             Err(err)
-                if started_at.elapsed() < Duration::from_secs(5)
+                if started_at.elapsed() < POSTGRES_SNAPSHOT_SLOT_HANDOFF_RETRY_WINDOW
                     && format!("{err:#}").contains("active") =>
             {
                 tracing::debug!(
@@ -631,7 +634,7 @@ pub(super) async fn connect_postgres_replication_client_with_retry(
                     error = %err,
                     "Postgres CDC WAL stream is waiting for exported snapshot slot release"
                 );
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(POSTGRES_SNAPSHOT_SLOT_HANDOFF_RETRY_DELAY).await;
             }
             Err(err) => return Err(err),
         }

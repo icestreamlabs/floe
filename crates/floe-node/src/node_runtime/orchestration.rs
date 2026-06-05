@@ -519,11 +519,12 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut vectorized_runtime = VectorizedExecutionRuntime::new_with_udfs(
+    let mut vectorized_runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &source_registry,
         vectorized_mv_plans,
         Arc::clone(&mv_registry),
         planner_udfs(),
+        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
     )
     .await
     .context("initialize vectorized execution runtime")?;
