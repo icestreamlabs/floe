@@ -5,8 +5,8 @@ use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, col, lit, table_sca
 
 use floe_executor::dbsp_plan::{
     CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, RowSchema,
-    TableDescriptor, nexmark_auction_table, nexmark_bid_table, nexmark_config,
-    nexmark_person_table,
+    TableDescriptor, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
+    nexmark_config, nexmark_person_table,
 };
 use floe_executor::plan_source_requirements;
 
@@ -194,6 +194,69 @@ fn source_requirement_analysis_tracks_right_anti_join_output_side() -> Result<()
     assert_eq!(requirements[0].required_columns, vec![0, 5]);
     assert_eq!(requirements[1].source_name, "nexmark_person");
     assert_eq!(requirements[1].required_columns, vec![0]);
+
+    Ok(())
+}
+
+#[test]
+fn source_requirement_analysis_tracks_topn_inputs() -> Result<()> {
+    let bid_table = nexmark_bid_table();
+    let logical_plan = table_scan(Some(bid_table.name), &schema_for(bid_table), None)?
+        .sort(vec![col("price").sort(false, true)])?
+        .limit(0, Some(5))?
+        .project(vec![col("auction")])?
+        .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let requirements = plan_source_requirements(&plan)?
+        .expect("topn plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0].source_name, "nexmark_bid");
+    assert_eq!(requirements[0].required_columns, vec![0, 2]);
+
+    Ok(())
+}
+
+#[test]
+fn source_requirement_analysis_tracks_distinct_and_alias_sources() -> Result<()> {
+    let bid_alias = nexmark_bid_alias_table();
+    let logical_plan = table_scan(Some(bid_alias.name), &schema_for(bid_alias), None)?
+        .project(vec![col("auction"), col("price")])?
+        .distinct()?
+        .project(vec![col("auction")])?
+        .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let requirements = plan_source_requirements(&plan)?
+        .expect("distinct plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0].source_name, "nexmark_bid");
+    assert_eq!(requirements[0].required_columns, vec![0, 2]);
+
+    Ok(())
+}
+
+#[test]
+fn source_requirement_analysis_tracks_union_inputs() -> Result<()> {
+    let bid_table = nexmark_bid_table();
+    let bid_alias = nexmark_bid_alias_table();
+    let left = table_scan(Some(bid_table.name), &schema_for(bid_table), None)?
+        .project(vec![col("auction"), col("price")])?
+        .build()?;
+    let right = table_scan(Some(bid_alias.name), &schema_for(bid_alias), None)?
+        .project(vec![col("auction"), col("price")])?
+        .build()?;
+    let logical_plan = LogicalPlanBuilder::from(left)
+        .union(right)?
+        .project(vec![col("auction")])?
+        .build()?;
+
+    let plan = planner().build(&logical_plan)?;
+    let requirements = plan_source_requirements(&plan)?
+        .expect("union plan should support source requirement analysis");
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0].source_name, "nexmark_bid");
+    assert_eq!(requirements[0].required_columns, vec![0]);
 
     Ok(())
 }

@@ -29,7 +29,7 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
         match &node.kind {
             DbspNodeKind::Source(source) => {
                 required_columns_by_source
-                    .entry(source.table.name.to_string())
+                    .entry(source.table.source_name().to_string())
                     .or_default()
                     .extend(required_columns);
             }
@@ -236,6 +236,50 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                     pending.push_back(input_idx);
                 }
             }
+            DbspNodeKind::TopN(topn) => {
+                let input_idx = first_input(node, "topn")?;
+                let mut input_columns = required_columns;
+                for partition_expr in topn.partition_by() {
+                    add_required_expression_columns(
+                        partition_expr,
+                        topn.output_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                for order_expr in topn.order_by() {
+                    add_required_expression_columns(
+                        order_expr.expression(),
+                        topn.output_schema().as_ref(),
+                        &mut input_columns,
+                    )?;
+                }
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
+            DbspNodeKind::Union(_) => {
+                if node.inputs.is_empty() {
+                    bail!("union source requirement analysis expected at least one input");
+                }
+                for input_idx in &node.inputs {
+                    if extend_required_columns(
+                        &mut required_columns_by_node,
+                        *input_idx,
+                        required_columns.clone(),
+                    ) {
+                        pending.push_back(*input_idx);
+                    }
+                }
+            }
+            DbspNodeKind::Distinct(distinct) => {
+                let input_idx = first_input(node, "distinct")?;
+                let input_columns = (0..distinct.output_schema().len()).collect();
+                if extend_required_columns(&mut required_columns_by_node, input_idx, input_columns)
+                {
+                    pending.push_back(input_idx);
+                }
+            }
             DbspNodeKind::Passthrough | DbspNodeKind::Sink(_) => {
                 let operator = match &node.kind {
                     DbspNodeKind::Passthrough => "passthrough",
@@ -251,7 +295,6 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                     pending.push_back(input_idx);
                 }
             }
-            _ => return Ok(None),
         }
     }
 

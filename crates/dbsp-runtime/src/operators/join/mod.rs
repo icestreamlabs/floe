@@ -1,5 +1,6 @@
 mod op;
 
+#[cfg(test)]
 pub(crate) use op::JoinTransientInputs;
 pub use op::{JoinInputRetention, JoinOp};
 

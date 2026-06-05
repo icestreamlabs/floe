@@ -39,6 +39,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
+    #[cfg(test)]
     pub(crate) async fn on_step_transient_with_inputs(
         &mut self,
         ts: i64,

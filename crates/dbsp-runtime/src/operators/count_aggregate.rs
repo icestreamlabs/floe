@@ -43,9 +43,23 @@ pub struct CountAggregateRow<K, D> {
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct DistinctGroupKey<K> {
-    pub(crate) group_key: K,
-    pub(crate) slot: u32,
+pub struct DistinctGroupKey<K> {
+    group_key: K,
+    slot: u32,
+}
+
+impl<K> DistinctGroupKey<K> {
+    pub fn new(group_key: K, slot: u32) -> Self {
+        Self { group_key, slot }
+    }
+
+    pub fn group_key(&self) -> &K {
+        &self.group_key
+    }
+
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -148,7 +162,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     D::Archived: RkyvDeserialize<D, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub(crate) fn new_batch(
+    pub fn new_batch(
         state: RelationState<(K, GroupedCountState)>,
         table: Arc<dyn KeyValueTable>,
         row_evaluator: BatchRowEvaluator<V, K, D>,
@@ -597,125 +611,6 @@ where
         }
 
         Ok(output_deltas)
-    }
-
-    pub(crate) async fn evict_keys_where<F>(
-        &mut self,
-        predicate: F,
-    ) -> Result<HashMap<(K, Vec<i64>), i64>>
-    where
-        F: Fn(&K) -> bool,
-    {
-        self.ensure_state_cache()
-            .await
-            .context("load grouped-count cache for eviction")?;
-
-        let keys_to_evict = self
-            .state_cache
-            .as_ref()
-            .context("grouped-count cache missing during eviction")?
-            .keys()
-            .filter(|key| predicate(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        if keys_to_evict.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        if let Some(distinct_index) = self.distinct_index.as_ref() {
-            let distinct_slots = self
-                .slot_kinds
-                .iter()
-                .enumerate()
-                .filter_map(|(slot_idx, kind)| {
-                    matches!(kind, CountAggregateSlotKind::Distinct).then_some(slot_idx as u32)
-                })
-                .collect::<Vec<_>>();
-            let mut distinct_updates = Vec::new();
-            for key in &keys_to_evict {
-                for slot in &distinct_slots {
-                    let distinct_key = DistinctGroupKey {
-                        group_key: key.clone(),
-                        slot: *slot,
-                    };
-                    let values = distinct_index
-                        .values_for_key(&distinct_key)
-                        .await
-                        .context("load grouped-count distinct values for eviction")?;
-                    for (value, weight) in values {
-                        if weight != 0 {
-                            distinct_updates.push((distinct_key.clone(), value, -weight));
-                        }
-                    }
-                }
-            }
-
-            if !distinct_updates.is_empty() {
-                distinct_index
-                    .apply_deltas(distinct_updates)
-                    .await
-                    .context("evict grouped-count distinct index entries")?;
-            }
-        }
-
-        let mut state_deltas: HashMap<(K, GroupedCountState), i64> = HashMap::new();
-        let mut output_deltas: HashMap<(K, Vec<i64>), i64> = HashMap::new();
-        {
-            let state_cache = self
-                .state_cache
-                .as_ref()
-                .context("grouped-count cache missing during eviction")?;
-            for key in &keys_to_evict {
-                let Some(old_state) = state_cache.get(key).cloned() else {
-                    continue;
-                };
-                state_deltas.insert((key.clone(), old_state.clone()), -1);
-                output_deltas.insert((key.clone(), old_state.counts.clone()), -1);
-            }
-        }
-
-        if state_deltas.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let base_version = self.state.base_version_for_update();
-        let new_integrated_handle = Self::apply_deltas_to_versioned(
-            &mut self.state.integrated,
-            &state_deltas,
-            base_version,
-            "integrated",
-        )
-        .await
-        .context("evict grouped-count integrated state")?;
-        self.state.update_handle(new_integrated_handle);
-
-        if let Some(state_cache) = self.state_cache.as_mut() {
-            for key in keys_to_evict {
-                state_cache.remove(&key);
-            }
-        }
-
-        Ok(output_deltas)
-    }
-
-    pub(crate) async fn persist_output_deltas(
-        &mut self,
-        output_deltas: &HashMap<(K, Vec<i64>), i64>,
-    ) -> Result<ZSetHandle> {
-        Self::apply_deltas_to_versioned(&mut self.output, output_deltas, None, "output")
-            .await
-            .context("persist grouped-count output delta")
-    }
-
-    pub(crate) fn empty_output_handle(&self) -> ZSetHandle {
-        self.output.handle_for_version(0)
-    }
-
-    pub(crate) async fn state_entry_count(&mut self) -> Result<usize> {
-        self.ensure_state_cache()
-            .await
-            .context("load grouped-count cache for state size")?;
-        Ok(self.state_cache.as_ref().map_or(0, HashMap::len))
     }
 }
 

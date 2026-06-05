@@ -31,8 +31,6 @@ regex = "1.11"
 [dev-dependencies]
 criterion = "0.5"
 arrow-schema = { workspace = true }
-floe-cdc = { path = "../floe-cdc" }
-floe-cdc-core = { path = "../floe-cdc-core" }
 nexmark = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 proptest = "1.5"

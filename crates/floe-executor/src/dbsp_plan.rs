@@ -729,7 +729,7 @@ fn required_sources(plan: &CircuitPlan) -> BTreeSet<String> {
     plan.nodes
         .iter()
         .filter_map(|node| match &node.kind {
-            DbspNodeKind::Source(source) => Some(source.table.name.to_string()),
+            DbspNodeKind::Source(source) => Some(source.table.source_name().to_string()),
             _ => None,
         })
         .collect()

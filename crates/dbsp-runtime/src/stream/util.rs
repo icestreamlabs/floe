@@ -260,68 +260,6 @@ where
     Stream::with_table(table, namespace, group).await
 }
 
-pub(crate) async fn build_exact_stream_from_values<T>(
-    table: Arc<dyn KeyValueTable>,
-    group: Arc<dyn AbelianGroup<T>>,
-    prefix: &str,
-    frontier: i64,
-    horizon: i64,
-    values: &[T],
-    tail_default: T,
-) -> Result<Stream<T>>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    let mut result = build_derived_stream(table, group, prefix).await?;
-
-    if let Some(first) = values.first() {
-        set_default_in_place(&mut result, first.clone());
-
-        for t in 1..=frontier {
-            push_value_in_place(&mut result, values[t as usize].clone());
-        }
-
-        if first != &tail_default {
-            set_default_at_in_place(&result, frontier + 1, tail_default.clone());
-        }
-
-        if horizon > frontier {
-            for t in (frontier + 1)..=horizon {
-                set_value_at_in_place(&result, t, values[t as usize].clone());
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-pub(crate) async fn publish_scheduled_value<T>(stream: &mut Stream<T>, ts: i64) -> Result<()>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    let value = stream
-        .get(ts)
-        .await
-        .with_context(|| format!("load scheduled stream value at {ts}"))?;
-    push_value_in_place(stream, value);
-    stream.flush().await?;
-    Ok(())
-}
-
 // Use this for operators that require the full integrated ZSet snapshot.
 pub async fn materialize_zset_handle<K>(
     table: Arc<dyn KeyValueTable>,
@@ -510,6 +448,7 @@ where
     stream.set_default_in_place(value);
 }
 
+#[cfg(test)]
 pub(crate) fn set_default_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
 where
     T: Archive

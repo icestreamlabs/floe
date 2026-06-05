@@ -154,6 +154,7 @@ where
         state.pending_state = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn set_default_at_in_place(&self, timestamp: i64, value: T) {
         let mut state = self.write_state();
         state.pending_defaults.insert(timestamp, value.clone());

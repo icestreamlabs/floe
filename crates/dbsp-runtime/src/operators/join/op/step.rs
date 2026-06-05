@@ -327,7 +327,9 @@ where
                     .context("join output persistence requested without configured output zset")?
                     .handle_for_version(0);
                 Ok(Some(JoinStepResult {
+                    #[cfg(test)]
                     delta_batch: Arc::new(Vec::new()),
+                    _output: std::marker::PhantomData,
                     persisted_handle: Some(empty_handle),
                 }))
             } else {
@@ -377,7 +379,9 @@ where
 
         self.logical_work.finish_tick(work);
         Ok(Some(JoinStepResult {
+            #[cfg(test)]
             delta_batch,
+            _output: std::marker::PhantomData,
             persisted_handle,
         }))
     }

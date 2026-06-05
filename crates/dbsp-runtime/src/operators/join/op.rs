@@ -39,7 +39,9 @@ struct JoinMapMetrics {
 }
 
 pub(crate) struct JoinStepResult<O> {
+    #[cfg(test)]
     pub(crate) delta_batch: Arc<Vec<(O, i64)>>,
+    pub(crate) _output: std::marker::PhantomData<O>,
     pub(crate) persisted_handle: Option<ZSetHandle>,
 }
 

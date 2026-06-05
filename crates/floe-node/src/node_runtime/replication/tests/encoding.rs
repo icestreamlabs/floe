@@ -37,26 +37,8 @@ fn materialized_transaction_filters_non_materialized_batches() {
 
 #[test]
 fn pipeline_snapshot_records_use_read_operation() {
-    let plan = ReplicationPipelineRuntimePlan {
-        name: "p".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: CdcTableId::new("orders").unwrap(),
-        schema: schema(CdcTableId::new("orders").unwrap()),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::DebeziumJson,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: false,
-    };
+    let mut plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
+    plan.format = ReplicationPipelineRuntimeFormat::DebeziumJson;
     let schema = schema(plan.table_id.clone());
     let batch = ChangeBatch::new(
         plan.table_id.clone(),
@@ -84,26 +66,9 @@ fn pipeline_snapshot_records_use_read_operation() {
 
 #[test]
 fn pipeline_debezium_records_are_buffered_as_encoded_kafka_payloads() {
-    let plan = ReplicationPipelineRuntimePlan {
-        name: "p".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: CdcTableId::new("orders").unwrap(),
-        schema: schema(CdcTableId::new("orders").unwrap()),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::DebeziumJson,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: true,
-    };
+    let mut plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
+    plan.format = ReplicationPipelineRuntimeFormat::DebeziumJson;
+    plan.include_transaction_metadata = true;
     let schema = schema(plan.table_id.clone());
     let batch = ChangeBatch::new(
         plan.table_id.clone(),
@@ -214,26 +179,7 @@ fn pipeline_debezium_records_validate_actual_kafka_shape() {
 
 #[test]
 fn pipeline_floe_json_records_encode_compact_row_messages() {
-    let plan = ReplicationPipelineRuntimePlan {
-        name: "p".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: CdcTableId::new("orders").unwrap(),
-        schema: schema(CdcTableId::new("orders").unwrap()),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::FloeJson,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: false,
-    };
+    let plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
     let schema = schema(plan.table_id.clone());
     let batch = ChangeBatch::new(
         plan.table_id.clone(),
@@ -315,26 +261,8 @@ fn kafka_json_encoders_cover_string_backed_postgres_types_and_timestamps() {
         vec![batch.clone()],
     )
     .unwrap();
-    let mut plan = ReplicationPipelineRuntimePlan {
-        name: "orders_pipe".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: table_id.clone(),
-        schema: schema.clone(),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::FloeJson,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: false,
-    };
+    let mut plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
+    plan.schema = schema.clone();
 
     let floe_records =
         encode_pipeline_buffer_records(&plan, &schema, &batch, &transaction).unwrap();
@@ -591,26 +519,8 @@ fn postgres_target_sql_casts_string_backed_native_types() {
 
 #[test]
 fn pipeline_arrow_ipc_records_encode_batches_without_json() {
-    let plan = ReplicationPipelineRuntimePlan {
-        name: "p".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: CdcTableId::new("orders").unwrap(),
-        schema: schema(CdcTableId::new("orders").unwrap()),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::ArrowIpc,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: false,
-    };
+    let mut plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
+    plan.format = ReplicationPipelineRuntimeFormat::ArrowIpc;
     let schema = schema(plan.table_id.clone());
     let batch = ChangeBatch::new(
         plan.table_id.clone(),
@@ -653,26 +563,8 @@ fn pipeline_arrow_ipc_records_encode_batches_without_json() {
 
 #[test]
 fn pipeline_arrow_ipc_records_encode_columnar_snapshot_without_json() {
-    let plan = ReplicationPipelineRuntimePlan {
-        name: "p".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: CdcTableId::new("orders").unwrap(),
-        schema: schema(CdcTableId::new("orders").unwrap()),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::ArrowIpc,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: false,
-    };
+    let mut plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
+    plan.format = ReplicationPipelineRuntimeFormat::ArrowIpc;
     let schema = schema(plan.table_id.clone());
     let rows = CdcColumnarRowBatch::new(vec![
         CdcColumnarColumn::Int64(vec![Some(1), Some(2)]),
@@ -713,26 +605,8 @@ fn pipeline_arrow_ipc_records_encode_columnar_snapshot_without_json() {
 
 #[test]
 fn pipeline_transaction_records_include_all_matching_snapshot_chunks() {
-    let plan = ReplicationPipelineRuntimePlan {
-        name: "p".to_string(),
-        source_name: "pg_main".to_string(),
-        source_connection: "postgres://floe:secret@localhost/postgres".to_string(),
-        database_name: "postgres".to_string(),
-        upstream_table: "public.orders".to_string(),
-        table_id: CdcTableId::new("orders").unwrap(),
-        schema: schema(CdcTableId::new("orders").unwrap()),
-        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
-        target: ReplicationPipelineRuntimeTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders".to_string(),
-        },
-        format: ReplicationPipelineRuntimeFormat::ArrowIpc,
-        buffer_mode: ReplicationPipelineRuntimeBufferMode::Durable,
-        buffer_policy: CatalogReplicationBufferPolicy::default(),
-        error_policy: CatalogReplicationErrorPolicy::default(),
-        emit_tombstones: false,
-        include_transaction_metadata: false,
-    };
+    let mut plan = test_plan("p", CdcTableId::new("orders").unwrap(), "public.orders");
+    plan.format = ReplicationPipelineRuntimeFormat::ArrowIpc;
     let schema = schema(plan.table_id.clone());
     let first_rows = CdcColumnarRowBatch::new(vec![
         CdcColumnarColumn::Int64(vec![Some(1)]),

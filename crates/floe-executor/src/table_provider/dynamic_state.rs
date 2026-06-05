@@ -142,10 +142,21 @@ impl DynamicStateTableProvider {
 
     pub(crate) fn snapshot(&self) -> Result<Arc<Vec<RecordBatch>>> {
         if let Some(keyed_state) = self.keyed_state.as_ref() {
-            let mut keyed_state = keyed_state
-                .write()
-                .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
-            let snapshot = keyed_state.snapshot(&self.schema)?;
+            let snapshot = {
+                let keyed_state = keyed_state
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
+                keyed_state.cached_snapshot()
+            };
+            let snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => {
+                    let mut keyed_state = keyed_state.write().map_err(|_| {
+                        anyhow::anyhow!("dynamic state keyed storage lock poisoned")
+                    })?;
+                    keyed_state.snapshot(&self.schema)?
+                }
+            };
             return Ok(Arc::new(effective_snapshot_batches(snapshot.as_ref())));
         }
         Ok(Arc::new(effective_snapshot_batches(
@@ -310,6 +321,10 @@ struct DynamicKeyedState {
 }
 
 impl DynamicKeyedState {
+    fn cached_snapshot(&self) -> Option<Arc<DynamicStateSnapshot>> {
+        self.snapshot.as_ref().map(Arc::clone)
+    }
+
     fn snapshot(&mut self, schema: &SchemaRef) -> Result<Arc<DynamicStateSnapshot>> {
         if let Some(snapshot) = self.snapshot.as_ref() {
             return Ok(Arc::clone(snapshot));
@@ -403,12 +418,27 @@ impl DynamicStateExec {
 
     fn snapshot_batches(&self) -> DFResult<Arc<DynamicStateSnapshot>> {
         if let Some(keyed_state) = self.keyed_state.as_ref() {
-            let mut keyed_state = keyed_state.write().map_err(|_| {
-                DataFusionError::Execution("dynamic state keyed storage lock poisoned".to_string())
-            })?;
-            return keyed_state
-                .snapshot(&self.schema)
-                .map_err(|err| DataFusionError::Execution(err.to_string()));
+            let snapshot = {
+                let keyed_state = keyed_state.read().map_err(|_| {
+                    DataFusionError::Execution(
+                        "dynamic state keyed storage lock poisoned".to_string(),
+                    )
+                })?;
+                keyed_state.cached_snapshot()
+            };
+            return match snapshot {
+                Some(snapshot) => Ok(snapshot),
+                None => {
+                    let mut keyed_state = keyed_state.write().map_err(|_| {
+                        DataFusionError::Execution(
+                            "dynamic state keyed storage lock poisoned".to_string(),
+                        )
+                    })?;
+                    keyed_state
+                        .snapshot(&self.schema)
+                        .map_err(|err| DataFusionError::Execution(err.to_string()))
+                }
+            };
         }
         Ok(self.state.load_full())
     }

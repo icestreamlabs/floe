@@ -114,9 +114,23 @@ pub struct IncrementalAggregateRow<K> {
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct DistinctGroupKey<K> {
-    pub(crate) group_key: K,
-    pub(crate) slot: u32,
+pub struct DistinctGroupKey<K> {
+    group_key: K,
+    slot: u32,
+}
+
+impl<K> DistinctGroupKey<K> {
+    pub fn new(group_key: K, slot: u32) -> Self {
+        Self { group_key, slot }
+    }
+
+    pub fn group_key(&self) -> &K {
+        &self.group_key
+    }
+
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
 }
 
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -380,7 +394,7 @@ where
     logical_work: metrics::LogicalWorkCollector,
 }
 
-pub(crate) struct IncrementalAggregateIndexes<K, V>
+pub struct IncrementalAggregateIndexes<K, V>
 where
     K: Archive
         + Clone
@@ -427,7 +441,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    pub(crate) fn new(
+    pub fn new(
         distinct: Option<IndexedBatchZSet<DistinctGroupKey<K>, AggregateValue>>,
         input: Option<IndexedBatchZSet<K, V>>,
         extrema: Option<IndexedBatchZSet<OrderedBytes, V>>,

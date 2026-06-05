@@ -67,6 +67,7 @@ struct VectorizedSourceState {
     schema: SchemaRef,
     provider: Arc<DynamicStateTableProvider>,
     query_provider: Arc<DynamicStateTableProvider>,
+    maintain_execution_state: bool,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
     query_alias_provider: Option<Arc<DynamicStateTableProvider>>,
@@ -197,6 +198,7 @@ impl VectorizedExecutionRuntime {
                     schema,
                     provider,
                     query_provider,
+                    maintain_execution_state: false,
                     alias_schema,
                     alias_provider,
                     query_alias_provider,
@@ -206,6 +208,7 @@ impl VectorizedExecutionRuntime {
         }
 
         let mut mv_states = Vec::with_capacity(materialized_views.len());
+        let mut requires_full_refresh_execution_state = false;
         for mv in materialized_views {
             registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
             let df = ctx
@@ -242,6 +245,7 @@ impl VectorizedExecutionRuntime {
             let execution_mode = if incremental.is_some() {
                 MaterializedViewExecutionMode::IncrementalFilterProject
             } else {
+                requires_full_refresh_execution_state = true;
                 MaterializedViewExecutionMode::FullRefresh
             };
             let plan = df
@@ -256,6 +260,11 @@ impl VectorizedExecutionRuntime {
                 incremental,
                 execution_mode,
             });
+        }
+        if requires_full_refresh_execution_state {
+            for source in source_states.values_mut() {
+                source.maintain_execution_state = true;
+            }
         }
 
         Ok(Self {
@@ -362,14 +371,6 @@ impl VectorizedExecutionRuntime {
         weighted_batches.push(delta.clone());
 
         if state.primary_key_columns.is_empty() {
-            let next = apply_source_delta(
-                &state.schema,
-                &state.primary_key_columns,
-                &state.provider,
-                &delta,
-            )
-            .await
-            .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
             let query_next = apply_source_delta(
                 &state.schema,
                 &state.primary_key_columns,
@@ -378,12 +379,22 @@ impl VectorizedExecutionRuntime {
             )
             .await
             .with_context(|| format!("apply query-visible source delta for '{source_name}'"))?;
-            state.provider.set_batches(next.clone())?;
             state.query_provider.set_batches(query_next.clone())?;
-            if let (Some(alias_schema), Some(alias_provider)) =
-                (state.alias_schema.as_ref(), state.alias_provider.as_ref())
-            {
-                alias_provider.set_batches(rename_batches(&next, alias_schema)?)?;
+            if state.maintain_execution_state {
+                let next = apply_source_delta(
+                    &state.schema,
+                    &state.primary_key_columns,
+                    &state.provider,
+                    &delta,
+                )
+                .await
+                .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
+                state.provider.set_batches(next.clone())?;
+                if let (Some(alias_schema), Some(alias_provider)) =
+                    (state.alias_schema.as_ref(), state.alias_provider.as_ref())
+                {
+                    alias_provider.set_batches(rename_batches(&next, alias_schema)?)?;
+                }
             }
             if let (Some(alias_schema), Some(alias_provider)) = (
                 state.alias_schema.as_ref(),
@@ -402,18 +413,20 @@ impl VectorizedExecutionRuntime {
             .map(|batch| vec![batch.clone()])
             .unwrap_or_default();
         state
-            .provider
-            .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
-        state
             .query_provider
             .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
-        if let (Some(alias_schema), Some(alias_provider)) =
-            (state.alias_schema.as_ref(), state.alias_provider.as_ref())
-        {
-            alias_provider.apply_keyed_delta(
-                &update.touched_keys,
-                rename_batches(&positive_batches, alias_schema)?,
-            )?;
+        if state.maintain_execution_state {
+            state
+                .provider
+                .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
+            if let (Some(alias_schema), Some(alias_provider)) =
+                (state.alias_schema.as_ref(), state.alias_provider.as_ref())
+            {
+                alias_provider.apply_keyed_delta(
+                    &update.touched_keys,
+                    rename_batches(&positive_batches, alias_schema)?,
+                )?;
+            }
         }
         if let (Some(alias_schema), Some(alias_provider)) = (
             state.alias_schema.as_ref(),
@@ -461,10 +474,13 @@ impl VectorizedExecutionRuntime {
         if execution_batches.is_empty() && query_batches.is_empty() {
             return Ok(());
         }
-        state.provider.append_batches(execution_batches.clone())?;
+        if state.maintain_execution_state {
+            state.provider.append_batches(execution_batches.clone())?;
+        }
         state.query_provider.append_batches(query_batches.clone())?;
-        if let (Some(alias_schema), Some(alias_provider)) =
-            (state.alias_schema.as_ref(), state.alias_provider.as_ref())
+        if state.maintain_execution_state
+            && let (Some(alias_schema), Some(alias_provider)) =
+                (state.alias_schema.as_ref(), state.alias_provider.as_ref())
         {
             alias_provider.append_batches(rename_batches(&execution_batches, alias_schema)?)?;
         }
