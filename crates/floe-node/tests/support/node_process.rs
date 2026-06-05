@@ -9,6 +9,11 @@ use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, interval};
 
+#[path = "http_ready.rs"]
+mod http_ready;
+
+pub(crate) use http_ready::wait_for_healthz;
+
 pub(crate) async fn spawn_node(
     config_path: &Path,
     data_dir: &Path,
@@ -66,24 +71,6 @@ pub(crate) async fn stop_child(child: &mut Child, signal: &str) {
             .status();
     }
     let _ = child.wait().await;
-}
-
-pub(crate) async fn wait_for_healthz(addr: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(6);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        match client.get(format!("{addr}/healthz")).send().await {
-            Ok(response) if response.status() == StatusCode::OK => return Ok(()),
-            Ok(response) if Instant::now() >= deadline => {
-                bail!("healthz returned {}", response.status())
-            }
-            Err(err) if Instant::now() >= deadline => bail!("healthz never became ready: {err}"),
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
 }
 
 pub(crate) async fn post_bid_with_extra(

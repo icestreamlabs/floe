@@ -69,11 +69,8 @@ where
         }
     }
 
-    pub fn enable_live_output_replayable(&mut self) {
-        self.output.enable_replayable_persistence();
-    }
-
-    pub fn enable_append_only_input(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn enable_append_only_input(&mut self) {
         self.append_only_input = true;
     }
 

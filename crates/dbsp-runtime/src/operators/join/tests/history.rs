@@ -5,22 +5,8 @@ async fn run_join_history_invariance_probe(
 ) -> crate::metrics::LogicalWorkSnapshot {
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
-    let left_state = RelationState::empty(
-        table.clone(),
-        format!("history_probe_left_state_{unrelated_history_rows}"),
-    )
-    .await
-    .expect("left state");
-    let right_state = RelationState::empty(
-        table.clone(),
-        format!("history_probe_right_state_{unrelated_history_rows}"),
-    )
-    .await
-    .expect("right state");
 
     let mut op = JoinOp::new_without_output_batch(
-        left_state,
-        right_state,
         IndexedBatchZSet::new(
             table.clone(),
             format!("history_probe_left_index_{unrelated_history_rows}"),
@@ -144,12 +130,6 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
             .expect("right dict"),
     );
 
-    let left_state = RelationState::empty(table.clone(), "join_canonical_left_state".to_string())
-        .await
-        .expect("left state");
-    let right_state = RelationState::empty(table.clone(), "join_canonical_right_state".to_string())
-        .await
-        .expect("right state");
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "join_canonical_output", None)
             .await
@@ -164,8 +144,6 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
     .expect("output zset");
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         IndexedBatchZSet::new(table.clone(), "join_canonical_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_canonical_right_index"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),
@@ -196,15 +174,6 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
         .await
         .expect("join step")
         .expect("join output");
-
-    assert!(
-        op.left_state.integrated.current_handle().is_none(),
-        "left relation snapshots should not be persisted on the join critical path"
-    );
-    assert!(
-        op.right_state.integrated.current_handle().is_none(),
-        "right relation snapshots should not be persisted on the join critical path"
-    );
 
     let mut left_entries = op
         .left_index

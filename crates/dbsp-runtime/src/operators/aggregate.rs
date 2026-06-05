@@ -294,10 +294,6 @@ where
     pub fn spec(&self) -> &AggregateSpec<K, V, A> {
         &self.spec
     }
-
-    pub fn enable_live_state_replayable(&mut self) {
-        self.inner.state.enable_live_replayable();
-    }
 }
 
 #[async_trait]

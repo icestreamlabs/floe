@@ -15,12 +15,6 @@ async fn join_operator_can_drop_matched_append_only_left_rows() {
             .expect("right dict"),
     );
 
-    let left_state = RelationState::empty(table.clone(), "join_drop_left_state".to_string())
-        .await
-        .expect("left state");
-    let right_state = RelationState::empty(table.clone(), "join_drop_right_state".to_string())
-        .await
-        .expect("right state");
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "join_drop_output", None)
             .await
@@ -31,8 +25,6 @@ async fn join_operator_can_drop_matched_append_only_left_rows() {
         .expect("output zset");
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         IndexedBatchZSet::new(table.clone(), "join_drop_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_drop_right_index"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),
@@ -124,12 +116,6 @@ async fn join_operator_can_drop_closed_append_only_left_keys() {
             .await
             .expect("left dict"),
     );
-    let left_state = RelationState::empty(table.clone(), "join_closed_left_state".to_string())
-        .await
-        .expect("left state");
-    let right_state = RelationState::empty(table.clone(), "join_closed_right_state".to_string())
-        .await
-        .expect("right state");
     let out_dict = Arc::new(
         Dictionary::<i64>::with_table(table.clone(), "join_closed_output", None)
             .await
@@ -140,8 +126,6 @@ async fn join_operator_can_drop_closed_append_only_left_keys() {
         .expect("output zset");
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         IndexedBatchZSet::new(table.clone(), "join_closed_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_closed_right_index"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),
@@ -246,12 +230,6 @@ async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
             .await
             .expect("out dict"),
     );
-    let left_state = RelationState::empty(table.clone(), "join_inmemory_left_state".to_string())
-        .await
-        .expect("left state");
-    let right_state = RelationState::empty(table.clone(), "join_inmemory_right_state".to_string())
-        .await
-        .expect("right state");
     let output = VersionedZSet::new(
         out_dict.clone(),
         table.clone(),
@@ -261,8 +239,6 @@ async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
     .expect("output zset");
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         IndexedBatchZSet::new(table.clone(), "join_inmemory_left_index"),
         IndexedBatchZSet::new(table.clone(), "join_inmemory_right_index"),
         batch_join_key(Arc::new(|value: &i64| Some(*value))),

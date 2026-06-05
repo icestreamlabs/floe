@@ -97,14 +97,6 @@ where
         }
     }
 
-    pub fn enable_live_state_replayable(&mut self) {
-        self.state.enable_live_replayable();
-    }
-
-    pub fn enable_live_output_replayable(&mut self) {
-        self.output.enable_replayable_persistence();
-    }
-
     #[cfg(test)]
     pub(crate) fn last_logical_work(&self) -> metrics::LogicalWorkSnapshot {
         self.logical_work.last_tick()

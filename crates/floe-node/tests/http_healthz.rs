@@ -1,16 +1,17 @@
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "support/http_ready.rs"]
+mod http_ready;
 #[path = "support/ports.rs"]
 mod ports;
 
 use anyhow::{Context, Result, bail};
+use http_ready::wait_for_healthz;
 use ports::find_unused_port;
-use reqwest::StatusCode;
 use serde_json::json;
 use tokio::process::Command;
-use tokio::time::{Instant, interval};
 
 #[tokio::test]
 async fn http_healthz_reports_ready_during_runtime() -> Result<()> {
@@ -49,53 +50,42 @@ async fn http_healthz_reports_ready_during_runtime() -> Result<()> {
         .context("spawn floe-node binary")?;
 
     let test_result = async {
+        wait_for_healthz(&http_addr).await?;
         let client = reqwest::Client::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut poll = interval(Duration::from_millis(100));
-        loop {
-            match client.get(format!("{http_addr}/healthz")).send().await {
-                Ok(response) if response.status() == StatusCode::OK => {
-                    let body: serde_json::Value =
-                        response.json().await.context("decode healthz json")?;
-                    if body.get("process_alive").and_then(|v| v.as_bool()) != Some(true) {
-                        bail!("healthz did not report process_alive=true: {body}");
-                    }
-                    let readyz = client
-                        .get(format!("{http_addr}/readyz"))
-                        .send()
-                        .await
-                        .context("request readyz")?;
-                    if readyz.status() != StatusCode::OK {
-                        bail!("readyz returned {}", readyz.status());
-                    }
-                    let readyz_body: serde_json::Value =
-                        readyz.json().await.context("decode readyz json")?;
-                    if readyz_body.get("executor_alive").and_then(|v| v.as_bool()) != Some(true) {
-                        bail!("readyz did not report executor_alive=true: {readyz_body}");
-                    }
-                    if readyz_body
-                        .get("storage_reachable")
-                        .and_then(|v| v.as_bool())
-                        != Some(true)
-                    {
-                        bail!("readyz did not report storage_reachable=true: {readyz_body}");
-                    }
-                    if readyz_body.get("runtime_ready").and_then(|v| v.as_bool()) != Some(true) {
-                        bail!("readyz did not report runtime_ready=true: {readyz_body}");
-                    }
-                    return Ok(());
-                }
-                Ok(response) if Instant::now() >= deadline => {
-                    bail!("healthz returned {}", response.status())
-                }
-                Err(err) if Instant::now() >= deadline => {
-                    bail!("healthz never became ready: {err}")
-                }
-                Ok(_) | Err(_) => {
-                    poll.tick().await;
-                }
-            }
+        let body: serde_json::Value = client
+            .get(format!("{http_addr}/healthz"))
+            .send()
+            .await
+            .context("request healthz")?
+            .json()
+            .await
+            .context("decode healthz json")?;
+        if body.get("process_alive").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("healthz did not report process_alive=true: {body}");
         }
+        let readyz = client
+            .get(format!("{http_addr}/readyz"))
+            .send()
+            .await
+            .context("request readyz")?;
+        if !readyz.status().is_success() {
+            bail!("readyz returned {}", readyz.status());
+        }
+        let readyz_body: serde_json::Value = readyz.json().await.context("decode readyz json")?;
+        if readyz_body.get("executor_alive").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("readyz did not report executor_alive=true: {readyz_body}");
+        }
+        if readyz_body
+            .get("storage_reachable")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+        {
+            bail!("readyz did not report storage_reachable=true: {readyz_body}");
+        }
+        if readyz_body.get("runtime_ready").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("readyz did not report runtime_ready=true: {readyz_body}");
+        }
+        Ok(())
     }
     .await;
 
@@ -137,42 +127,32 @@ async fn admin_healthz_is_available_without_http_ingest() -> Result<()> {
         .context("spawn floe-node binary")?;
 
     let test_result = async {
+        wait_for_healthz(&admin_addr).await?;
         let client = reqwest::Client::new();
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let mut poll = interval(Duration::from_millis(100));
-        loop {
-            match client.get(format!("{admin_addr}/healthz")).send().await {
-                Ok(response) if response.status() == StatusCode::OK => {
-                    let body: serde_json::Value =
-                        response.json().await.context("decode admin healthz json")?;
-                    if body.get("process_alive").and_then(|v| v.as_bool()) != Some(true) {
-                        bail!("admin healthz did not report process_alive=true: {body}");
-                    }
-                    let metrics = client
-                        .get(format!("{admin_addr}/metrics"))
-                        .send()
-                        .await
-                        .context("request admin metrics")?;
-                    if metrics.status() != StatusCode::OK {
-                        bail!("admin metrics returned {}", metrics.status());
-                    }
-                    let metrics_body = metrics.text().await.context("decode metrics body")?;
-                    if !metrics_body.contains("floe_ingest_queue_depth") {
-                        bail!("admin metrics did not include floe_ingest_queue_depth");
-                    }
-                    return Ok(());
-                }
-                Ok(response) if Instant::now() >= deadline => {
-                    bail!("admin healthz returned {}", response.status())
-                }
-                Err(err) if Instant::now() >= deadline => {
-                    bail!("admin healthz never became ready: {err}")
-                }
-                Ok(_) | Err(_) => {
-                    poll.tick().await;
-                }
-            }
+        let body: serde_json::Value = client
+            .get(format!("{admin_addr}/healthz"))
+            .send()
+            .await
+            .context("request admin healthz")?
+            .json()
+            .await
+            .context("decode admin healthz json")?;
+        if body.get("process_alive").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("admin healthz did not report process_alive=true: {body}");
         }
+        let metrics = client
+            .get(format!("{admin_addr}/metrics"))
+            .send()
+            .await
+            .context("request admin metrics")?;
+        if !metrics.status().is_success() {
+            bail!("admin metrics returned {}", metrics.status());
+        }
+        let metrics_body = metrics.text().await.context("decode metrics body")?;
+        if !metrics_body.contains("floe_ingest_queue_depth") {
+            bail!("admin metrics did not include floe_ingest_queue_depth");
+        }
+        Ok(())
     }
     .await;
 

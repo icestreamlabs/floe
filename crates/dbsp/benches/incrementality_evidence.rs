@@ -11,7 +11,6 @@ use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
 use dbsp::operators::join::JoinOp;
-use dbsp::relation_state::RelationState;
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::stream::runtime::DeltaOperator;
@@ -133,19 +132,11 @@ async fn build_join_state(unrelated_history: usize, affected_fanout: usize) -> J
             .await
             .expect("output dict"),
     );
-    let left_state = RelationState::empty(table.clone(), format!("{prefix}_left_state"))
-        .await
-        .expect("left state");
-    let right_state = RelationState::empty(table.clone(), format!("{prefix}_right_state"))
-        .await
-        .expect("right state");
     let output = VersionedZSet::new(output_dict, table.clone(), output_ns)
         .await
         .expect("output zset");
 
     let mut op = JoinOp::new_batch(
-        left_state,
-        right_state,
         IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
         IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
         batch_join_key(Arc::new(join_key)),
