@@ -455,18 +455,12 @@ where
             .to_vec();
         cursor = key_end;
 
-        let segment_bytes = key
-            .get(cursor..cursor + 8)
-            .ok_or_else(|| anyhow!("Arrow-index key missing segment id"))?;
-        cursor += 8;
+        let segment_id = read_u64(key, &mut cursor, "Arrow-index key segment id")?;
         if cursor != key.len() {
             return Err(anyhow!("Arrow-index key has trailing bytes"));
         }
 
-        Ok((
-            key_bytes,
-            u64::from_be_bytes(segment_bytes.try_into().unwrap()),
-        ))
+        Ok((key_bytes, segment_id))
     }
 
     pub(super) fn decode_reverse_key(&self, key: &[u8]) -> Result<(Vec<u8>, u64)> {
@@ -484,18 +478,12 @@ where
             .to_vec();
         cursor = value_end;
 
-        let segment_bytes = key
-            .get(cursor..cursor + 8)
-            .ok_or_else(|| anyhow!("Arrow-index reverse key missing segment id"))?;
-        cursor += 8;
+        let segment_id = read_u64(key, &mut cursor, "Arrow-index reverse key segment id")?;
         if cursor != key.len() {
             return Err(anyhow!("Arrow-index reverse key has trailing bytes"));
         }
 
-        Ok((
-            value_bytes,
-            u64::from_be_bytes(segment_bytes.try_into().unwrap()),
-        ))
+        Ok((value_bytes, segment_id))
     }
 
     pub(super) fn decode_range_key<T>(&self, key: &[u8]) -> Result<(Vec<u8>, u64)>
@@ -522,18 +510,12 @@ where
             .to_vec();
         cursor = key_end;
 
-        let segment_bytes = key
-            .get(cursor..cursor + 8)
-            .ok_or_else(|| anyhow!("Arrow-index range key missing segment id"))?;
-        cursor += 8;
+        let segment_id = read_u64(key, &mut cursor, "Arrow-index range key segment id")?;
         if cursor != key.len() {
             return Err(anyhow!("Arrow-index range key has trailing bytes"));
         }
 
-        Ok((
-            key_bytes,
-            u64::from_be_bytes(segment_bytes.try_into().unwrap()),
-        ))
+        Ok((key_bytes, segment_id))
     }
 
     pub(super) fn decode_range_components<T>(&self, key: &[u8]) -> Result<(Vec<u8>, Vec<u8>, u64)>
@@ -565,19 +547,12 @@ where
             .to_vec();
         cursor = key_end;
 
-        let segment_bytes = key
-            .get(cursor..cursor + 8)
-            .ok_or_else(|| anyhow!("Arrow-index range key missing segment id"))?;
-        cursor += 8;
+        let segment_id = read_u64(key, &mut cursor, "Arrow-index range key segment id")?;
         if cursor != key.len() {
             return Err(anyhow!("Arrow-index range key has trailing bytes"));
         }
 
-        Ok((
-            range_key_bytes,
-            key_bytes,
-            u64::from_be_bytes(segment_bytes.try_into().unwrap()),
-        ))
+        Ok((range_key_bytes, key_bytes, segment_id))
     }
 
     pub(super) async fn ensure_range_layout(&self) -> Result<()> {

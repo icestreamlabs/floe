@@ -131,9 +131,7 @@ where
                     start_lsn = ?config.start_lsn(),
                     "Postgres CDC stream failed; reconnecting from durable checkpoint"
                 );
-                if !policy.retry_delay.is_zero() {
-                    tokio::time::sleep(policy.retry_delay).await;
-                }
+                wait_for_postgres_cdc_apply_reconnect(policy.retry_delay).await;
             }
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -145,4 +143,11 @@ where
             }
         }
     }
+}
+
+async fn wait_for_postgres_cdc_apply_reconnect(delay: Duration) {
+    if delay.is_zero() {
+        return;
+    }
+    tokio::time::sleep(delay).await;
 }

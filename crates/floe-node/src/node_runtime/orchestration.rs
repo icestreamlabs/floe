@@ -519,12 +519,18 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let maintain_source_query_tables = !run_args.disable_pgwire;
+    let vectorized_runtime_options = if maintain_source_query_tables {
+        VectorizedExecutionRuntimeOptions::default().with_source_query_tables()
+    } else {
+        VectorizedExecutionRuntimeOptions::default()
+    };
     let mut vectorized_runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &source_registry,
         vectorized_mv_plans,
         Arc::clone(&mv_registry),
         planner_udfs(),
-        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
+        vectorized_runtime_options,
     )
     .await
     .context("initialize vectorized execution runtime")?;
@@ -691,6 +697,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &definitions,
         &all_required_sources,
         required_columns_by_source_id,
+        maintain_source_query_tables,
         &kafka_metadata_journal_required_sources,
         &source_journal_required_sources,
         &postgres_cdc_runtime_plans_by_connector,
@@ -804,6 +811,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             ),
             required_columns_by_source_id: Arc::clone(
                 &runtime_source_indexes.required_columns_by_source_id,
+            ),
+            query_batches_by_source_id: Arc::clone(
+                &runtime_source_indexes.query_batches_by_source_id,
             ),
             materialized_source_ids: Arc::clone(&runtime_source_indexes.materialized_source_ids),
             source_names_by_id: Arc::clone(&runtime_source_indexes.source_names_by_id),

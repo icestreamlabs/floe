@@ -40,6 +40,7 @@ pub(super) async fn run_http_sink(config: HttpSinkConfig<'_>) -> Result<()> {
         batch_policy: config.batch_policy,
         retry_policy: config.retry_policy,
         checkpoint_tx: config.checkpoint_tx,
+        cancel: config.changelog.cancel.clone(),
     })
     .await;
     let producer_result = producer_task
@@ -62,6 +63,7 @@ pub(super) struct HttpWorkerConfig<'a> {
     pub(super) batch_policy: BatchPolicy,
     pub(super) retry_policy: RetryPolicy,
     pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
+    pub(super) cancel: CancellationToken,
 }
 
 pub(super) async fn run_http_worker(config: HttpWorkerConfig<'_>) -> Result<()> {
@@ -73,6 +75,7 @@ pub(super) async fn run_http_worker(config: HttpWorkerConfig<'_>) -> Result<()> 
         retry_policy: config.retry_policy,
         tracker: Arc::clone(&config.tracker),
         checkpoint_tx: config.checkpoint_tx,
+        cancel: config.cancel,
     };
     run_buffered_sink_worker(config.rx, config.tracker, config.batch_policy, backend).await
 }
@@ -85,6 +88,7 @@ struct HttpSinkBackend<'a> {
     retry_policy: RetryPolicy,
     tracker: Arc<SinkQueueTracker>,
     checkpoint_tx: Option<SinkCheckpointSender>,
+    cancel: CancellationToken,
 }
 
 impl BufferedSinkBackend for HttpSinkBackend<'_> {
@@ -103,6 +107,7 @@ impl BufferedSinkBackend for HttpSinkBackend<'_> {
                 retry_policy: self.retry_policy,
                 tracker: &self.tracker,
                 checkpoint_tx: &self.checkpoint_tx,
+                cancel: &self.cancel,
             },
             buffer,
             buffer_bytes,
@@ -120,6 +125,7 @@ pub(super) struct HttpFlushContext<'a> {
     retry_policy: RetryPolicy,
     tracker: &'a SinkQueueTracker,
     checkpoint_tx: &'a Option<SinkCheckpointSender>,
+    cancel: &'a CancellationToken,
 }
 
 async fn flush_http_buffer(
@@ -151,6 +157,7 @@ async fn flush_http_buffer(
         context.url,
         buffer,
         context.retry_policy,
+        context.cancel,
     )
     .await?;
     let mut flushed_version = flush_version.unwrap_or(-1);
@@ -181,6 +188,7 @@ pub(super) async fn post_http_batch_with_retry(
     url: &str,
     batch: &[SinkRecord],
     retry_policy: RetryPolicy,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     let payload = if batch.len() == 1 {
         batch[0].json.clone()
@@ -208,7 +216,8 @@ pub(super) async fn post_http_batch_with_retry(
                     return Err(anyhow!("http sink request failed after retries: {err}"));
                 }
                 metrics::inc_sink_retry(sink_name, "http");
-                tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
+                wait_for_sink_retry_backoff(retry_policy.backoff_for_failure(attempt), cancel)
+                    .await?;
             }
         }
     }

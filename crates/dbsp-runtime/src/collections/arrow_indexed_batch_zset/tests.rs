@@ -415,3 +415,23 @@ async fn arrow_indexed_segments_store_only_values() {
     values.sort_unstable();
     assert_eq!(values, vec![(10, 1), (11, 1)]);
 }
+
+#[test]
+fn arrow_indexed_segment_suffix_decode_rejects_short_keys() {
+    let err = super::segment_id_from_key_suffix(&[1, 2, 3]).expect_err("short key should fail");
+    assert!(
+        err.to_string().contains("missing segment id suffix"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn arrow_indexed_u64_payload_decode_rejects_trailing_bytes() {
+    let mut payload = 7_u64.to_be_bytes().to_vec();
+    payload.push(0);
+    let err = super::decode_u64_payload(&payload).expect_err("trailing byte should fail");
+    assert!(
+        err.to_string().contains("trailing bytes"),
+        "unexpected error: {err:#}"
+    );
+}

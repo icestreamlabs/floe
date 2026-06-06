@@ -65,7 +65,7 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
         .append_source_batches_for_execution_and_query(
             "orders",
             vec![batches.execution],
-            vec![batches.query],
+            vec![batches.query.expect("query batch")],
         )
         .await
         .expect("append source batches");

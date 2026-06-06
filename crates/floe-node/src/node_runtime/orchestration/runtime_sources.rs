@@ -4,6 +4,7 @@ pub(super) struct RuntimeSourceIndexes {
     pub(super) source_names_by_id: Arc<Vec<String>>,
     pub(super) active_source_definitions_by_id: Arc<Vec<Option<SourceDefinition>>>,
     pub(super) required_columns_by_source_id: Arc<Vec<Option<Arc<[bool]>>>>,
+    pub(super) query_batches_by_source_id: Arc<Vec<bool>>,
     pub(super) materialized_source_ids: Arc<Vec<bool>>,
     pub(super) kafka_metadata_journal_source_ids: Arc<Vec<usize>>,
     pub(super) source_journal_required_sources_for_task: Arc<BTreeSet<String>>,
@@ -16,6 +17,7 @@ pub(super) fn build_runtime_source_indexes(
     definitions: &[SourceDefinition],
     all_required_sources: &BTreeSet<String>,
     required_columns_by_source_id: Vec<Option<Arc<[bool]>>>,
+    maintain_source_query_tables: bool,
     kafka_metadata_journal_required_sources: &BTreeSet<String>,
     source_journal_required_sources: &BTreeSet<String>,
     postgres_cdc_runtime_plans_by_connector: &HashMap<String, PostgresCdcRuntimePlan>,
@@ -38,6 +40,14 @@ pub(super) fn build_runtime_source_indexes(
                 .collect(),
         ),
         required_columns_by_source_id: Arc::new(required_columns_by_source_id),
+        query_batches_by_source_id: Arc::new(
+            definitions
+                .iter()
+                .map(|definition| {
+                    maintain_source_query_tables && all_required_sources.contains(definition.name())
+                })
+                .collect(),
+        ),
         materialized_source_ids: Arc::new(
             definitions
                 .iter()

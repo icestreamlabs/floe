@@ -371,9 +371,9 @@ fn source_arrow_batch_builder_prunes_execution_columns_only() {
         .expect("record batches");
 
     assert_eq!(event_ts, Some(1_700_000_000_u64));
-    assert_eq!(batches.query.num_rows(), 1);
-    let full_note = batches
-        .query
+    let query = batches.query.expect("query batch");
+    assert_eq!(query.num_rows(), 1);
+    let full_note = query
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
@@ -386,6 +386,50 @@ fn source_arrow_batch_builder_prunes_execution_columns_only() {
         .downcast_ref::<StringArray>()
         .expect("masked note array");
     assert!(!masked_note.is_null(0));
+    assert_eq!(masked_note.value(0), "");
+}
+
+#[test]
+fn source_arrow_batch_builder_can_skip_query_batches() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("note", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("created_at", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("definition");
+    let required_columns = Arc::from([true, false, false]);
+    let mut builder = SourceArrowBatchBuilder::new_with_execution_required_columns_and_query_batch(
+        definition,
+        1,
+        Some(required_columns),
+        false,
+    );
+    let event = AppendIngestEvent::new(
+        "orders",
+        json!({
+            "id": 42,
+            "note": "not materialized",
+            "created_at": 1_700_000_000_i64
+        }),
+    );
+
+    let event_ts = builder.append_event(&event).expect("append event");
+    let batches = builder
+        .finish()
+        .expect("finish batch")
+        .expect("record batches");
+
+    assert_eq!(event_ts, Some(1_700_000_000_u64));
+    assert!(batches.query.is_none());
+    let masked_note = batches
+        .execution
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("masked note array");
     assert_eq!(masked_note.value(0), "");
 }
 

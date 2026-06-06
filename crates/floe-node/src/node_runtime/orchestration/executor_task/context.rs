@@ -23,6 +23,7 @@ pub(in crate::node_runtime::orchestration) struct ExecutorSourceContext {
         Arc<Vec<Option<SourceDefinition>>>,
     pub(in crate::node_runtime::orchestration) required_columns_by_source_id:
         Arc<Vec<Option<Arc<[bool]>>>>,
+    pub(in crate::node_runtime::orchestration) query_batches_by_source_id: Arc<Vec<bool>>,
     pub(in crate::node_runtime::orchestration) materialized_source_ids: Arc<Vec<bool>>,
     pub(in crate::node_runtime::orchestration) source_names_by_id: Arc<Vec<String>>,
     pub(in crate::node_runtime::orchestration) source_id_by_name: HashMap<String, usize>,

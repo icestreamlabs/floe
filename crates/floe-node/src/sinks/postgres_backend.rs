@@ -57,15 +57,20 @@ pub(super) async fn run_postgres_sink(config: PostgresSinkConfig<'_>) -> Result<
 
     while let Some(batch) = stream.next().await {
         let batch = batch?;
-        apply_postgres_batch_with_retry(&mut writer, &batch, config.retry_policy)
-            .await
-            .with_context(|| {
-                format!(
-                    "apply MV changelog version {} to Postgres sink '{sink_name}'",
-                    batch.version,
-                    sink_name = config.sink_name
-                )
-            })?;
+        apply_postgres_batch_with_retry(
+            &mut writer,
+            &batch,
+            config.retry_policy,
+            &config.changelog.cancel,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "apply MV changelog version {} to Postgres sink '{sink_name}'",
+                batch.version,
+                sink_name = config.sink_name
+            )
+        })?;
         publish_sink_cursor(
             &config.checkpoint_tx,
             SinkCursor {
@@ -85,6 +90,7 @@ async fn apply_postgres_batch_with_retry(
     writer: &mut PostgresSinkWriter,
     batch: &MvChangelogBatch,
     retry_policy: RetryPolicy,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     for attempt in 0..retry_policy.max_attempts {
         match writer.apply_batch(batch).await {
@@ -100,7 +106,7 @@ async fn apply_postgres_batch_with_retry(
                     error = %err,
                     "Postgres sink batch apply failed; retrying"
                 );
-                tokio::time::sleep(backoff).await;
+                wait_for_sink_retry_backoff(backoff, cancel).await?;
             }
         }
     }

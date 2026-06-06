@@ -8,12 +8,12 @@ mod event_wait;
 use buffers::ExecutorTickBuffers;
 use checkpoint::{
     CdcOnlyTickCommit, ExecutorCheckpointState, IngestMetrics, PersistExecutorFinalCheckpoint,
-    PersistTickCheckpoint, apply_decoded_source_batches, build_kafka_metadata_journal_batches,
-    build_source_journal_batches, drain_sink_checkpoint_updates, notify_kafka_commit_senders,
-    persist_cdc_only_tick_commit, persist_executor_final_checkpoint, persist_tick_checkpoint,
-    publish_watermark_debug_state, record_fatal_source_batch_failure, record_fatal_tick_failure,
-    record_ingest_queue_metrics, update_checkpoint_source_offsets,
-    wait_for_tick_materialized_views,
+    PersistTickCheckpoint, SourceJournalBatchBuildInput, apply_decoded_source_batches,
+    build_kafka_metadata_journal_batches, build_source_journal_batches,
+    drain_sink_checkpoint_updates, notify_kafka_commit_senders, persist_cdc_only_tick_commit,
+    persist_executor_final_checkpoint, persist_tick_checkpoint, publish_watermark_debug_state,
+    record_fatal_source_batch_failure, record_fatal_tick_failure, record_ingest_queue_metrics,
+    update_checkpoint_source_offsets, wait_for_tick_materialized_views,
 };
 pub(super) use context::{
     ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
@@ -41,6 +41,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
     let ExecutorSourceContext {
         active_source_definitions_by_id,
         required_columns_by_source_id,
+        query_batches_by_source_id,
         materialized_source_ids,
         source_names_by_id,
         source_id_by_name,
@@ -83,6 +84,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         Arc::clone(&cdc_stateful_table_ids_by_source_id);
     let active_source_definitions_by_id_for_task = Arc::clone(&active_source_definitions_by_id);
     let required_columns_by_source_id_for_task = Arc::clone(&required_columns_by_source_id);
+    let query_batches_by_source_id_for_task = Arc::clone(&query_batches_by_source_id);
     let materialized_source_ids_for_task = Arc::clone(&materialized_source_ids);
     let source_names_by_id_for_task = Arc::clone(&source_names_by_id);
     let watermark_for_task = Arc::clone(&event_watermark);
@@ -118,6 +120,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         let mut tick_buffers = ExecutorTickBuffers::new(
             active_source_definitions_by_id_for_task.as_slice(),
             required_columns_by_source_id_for_task.as_slice(),
+            query_batches_by_source_id_for_task.as_slice(),
             max_batch_per_source,
             connector_queues.len(),
         );
@@ -577,9 +580,11 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     match builder.finish() {
                         Ok(Some(batches)) => {
                             decoded_rows_len =
-                                decoded_rows_len.saturating_add(batches.query.num_rows());
+                                decoded_rows_len.saturating_add(batches.execution.num_rows());
                             execution_arrow_batches_by_source[source_id].push(batches.execution);
-                            arrow_batches_by_source[source_id].push(batches.query);
+                            if let Some(query) = batches.query {
+                                arrow_batches_by_source[source_id].push(query);
+                            }
                         }
                         Ok(None) => {}
                         Err(err) => {
@@ -685,12 +690,15 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 continue;
             }
             if let Err(err) = build_source_journal_batches(
-                &source_names_by_id_for_task,
-                &definitions,
-                &source_journal_required_sources_for_task,
-                arrow_batches_by_source,
-                weighted_arrow_batches_by_source,
-                tick_source_max_event_ts,
+                SourceJournalBatchBuildInput {
+                    source_names_by_id: &source_names_by_id_for_task,
+                    definitions: &definitions,
+                    required_sources: &source_journal_required_sources_for_task,
+                    execution_arrow_batches_by_source,
+                    arrow_batches_by_source,
+                    weighted_arrow_batches_by_source,
+                    tick_source_max_event_ts,
+                },
                 vectorized_source_journal_batches,
             ) {
                 let message = err.to_string();
