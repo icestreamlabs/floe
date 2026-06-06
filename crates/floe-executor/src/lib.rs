@@ -32,7 +32,9 @@ pub use mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 pub use mv::runtime::MaterializedView;
 pub use mv_loader::load_or_register_mv;
 pub use operator_state::OperatorStateHandle;
-pub use source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches, SourceRowDecoder};
+pub use source_decoder::{
+    SourceArrowBatchBuilder, SourceArrowBatchMode, SourceArrowBatches, SourceRowDecoder,
+};
 pub use source_requirements::{PlanSourceRequirements, plan_source_requirements};
 pub use stream_types::{Diff, Timestamp};
 pub use subscribe::SubscribeExecutionConfig;

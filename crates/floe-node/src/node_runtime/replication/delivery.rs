@@ -11,6 +11,7 @@ use super::target_state::{
     failed_target_state, replication_pipeline_uses_dlq, target_kind,
 };
 use super::{ReplicationPipelineRuntime, current_unix_time_ms};
+use tokio_util::sync::CancellationToken;
 
 impl ReplicationPipelineRuntime {
     pub(super) async fn deliver_manifest_records(
@@ -20,8 +21,9 @@ impl ReplicationPipelineRuntime {
         storage: &SlateCatalog,
         manifest: &CdcBufferedTransactionManifest,
         records: &[CdcBufferRecord],
+        cancel: &CancellationToken,
     ) -> anyhow::Result<usize> {
-        match self.send_records_to_target(plan, records).await {
+        match self.send_records_to_target(plan, records, cancel).await {
             Ok(target_state) => {
                 self.mark_manifest_delivered(plan, buffer_store, storage, manifest, target_state)
                     .await
@@ -51,6 +53,7 @@ impl ReplicationPipelineRuntime {
         &self,
         plan: &ReplicationPipelineRuntimePlan,
         records: &[CdcBufferRecord],
+        cancel: &CancellationToken,
     ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
         let started_at = std::time::Instant::now();
         let result = match &plan.target {
@@ -61,7 +64,7 @@ impl ReplicationPipelineRuntime {
                     .ok_or_else(|| {
                         anyhow!("replication pipeline '{}' has no Kafka writer", plan.name)
                     })?;
-                writer.send_records(records).await
+                writer.send_records(records, cancel).await
             }
             ReplicationPipelineRuntimeTarget::Postgres { .. } => {
                 let writer = self

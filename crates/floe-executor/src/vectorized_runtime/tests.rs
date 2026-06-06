@@ -1,5 +1,5 @@
 use super::*;
-use crate::source_decoder::SourceArrowBatchBuilder;
+use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
@@ -61,12 +61,11 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
     .await
     .expect("runtime");
 
+    let SourceArrowBatches::ExecutionAndQuery { execution, query } = batches else {
+        panic!("expected execution and query batches");
+    };
     runtime
-        .append_source_batches_for_execution_and_query(
-            "orders",
-            vec![batches.execution],
-            vec![batches.query.expect("query batch")],
-        )
+        .append_source_batches_for_execution_and_query("orders", vec![execution], vec![query])
         .await
         .expect("append source batches");
     runtime.run_tick(1).await.expect("run vectorized tick");
@@ -148,7 +147,11 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     .expect("runtime");
 
     runtime
-        .append_source_batch("orders", initial)
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial.clone()],
+            vec![initial],
+        )
         .await
         .expect("append initial source rows");
     runtime.run_tick(1).await.expect("initial tick");

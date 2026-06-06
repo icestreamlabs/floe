@@ -50,9 +50,9 @@ use floe_executor::source_journal::{
 };
 use floe_executor::{
     DbspMaintenance, FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
-    SourceArrowBatchBuilder, SubscribeExecutionConfig, ValidatedPlan, VectorizedExecutionRuntime,
-    VectorizedExecutionRuntimeOptions, VectorizedMaterializedViewPlan, plan_source_requirements,
-    validate_dbsp_plan, weighted_batch_from_diffs,
+    SourceArrowBatchBuilder, SourceArrowBatchMode, SubscribeExecutionConfig, ValidatedPlan,
+    VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions, VectorizedMaterializedViewPlan,
+    plan_source_requirements, validate_dbsp_plan, weighted_batch_from_diffs,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};

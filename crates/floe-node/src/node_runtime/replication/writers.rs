@@ -18,6 +18,7 @@ use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
 use rdkafka::types::RDKafkaTopic;
 use tokio_postgres::{Statement, types::ToSql};
+use tokio_util::sync::CancellationToken;
 
 use super::super::ReplicationPipelineRuntimeBufferMode;
 use super::target_state::TargetStateBuilder;
@@ -54,11 +55,17 @@ fn replication_kafka_queue_retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis(REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(factor))
 }
 
-async fn wait_for_replication_kafka_queue_retry(backoff: Duration) {
+async fn wait_for_replication_kafka_queue_retry(
+    backoff: Duration,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
     if backoff.is_zero() {
-        return;
+        return Ok(());
     }
-    tokio::time::sleep(backoff).await;
+    tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow!("replication pipeline Kafka enqueue canceled before retry")),
+        _ = tokio::time::sleep(backoff) => Ok(()),
+    }
 }
 
 impl KafkaNativeTopic {
@@ -309,20 +316,28 @@ impl KafkaReplicationPipelineWriter {
     pub(super) async fn send_records(
         &self,
         records: &[CdcBufferRecord],
+        cancel: &CancellationToken,
     ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
         let perf_enabled = self.perf_log;
         let perf_started_at = perf_enabled.then(Instant::now);
         let enqueue_started_at = perf_enabled.then(Instant::now);
         let delivery_state = KafkaDeliveryBatchState::new(records.len(), self.partition_offsets);
         for record in records {
-            self.enqueue_record_with_retry(record, Arc::clone(&delivery_state))
+            if cancel.is_cancelled() {
+                return Err(anyhow!("replication pipeline Kafka send canceled"));
+            }
+            self.enqueue_record_with_retry(record, Arc::clone(&delivery_state), cancel)
                 .await?;
         }
         let enqueue_elapsed = enqueue_started_at
             .map(|started_at| started_at.elapsed())
             .unwrap_or(Duration::ZERO);
         let delivery_wait_started_at = perf_enabled.then(Instant::now);
-        let offsets_by_partition = match delivery_state.wait(REPLICATION_KAFKA_SEND_TIMEOUT).await {
+        let delivery_result = tokio::select! {
+            _ = cancel.cancelled() => Err(anyhow!("replication pipeline Kafka delivery wait canceled")),
+            result = delivery_state.wait(REPLICATION_KAFKA_SEND_TIMEOUT) => result,
+        };
+        let offsets_by_partition = match delivery_result {
             Ok(offsets) => offsets,
             Err(err) => {
                 tracing::warn!(
@@ -362,14 +377,18 @@ impl KafkaReplicationPipelineWriter {
         &self,
         record: &CdcBufferRecord,
         delivery_state: Arc<KafkaDeliveryBatchState>,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         if record.headers().is_empty() {
             return self
-                .enqueue_record_direct_with_retry(record, delivery_state)
+                .enqueue_record_direct_with_retry(record, delivery_state, cancel)
                 .await;
         }
 
         for attempt in 0..REPLICATION_KAFKA_RETRY_ATTEMPTS {
+            if cancel.is_cancelled() {
+                return Err(anyhow!("replication pipeline Kafka enqueue canceled"));
+            }
             let attempt_number = attempt + 1;
             let mut kafka_record =
                 BaseRecord::<[u8], [u8], Arc<KafkaDeliveryBatchState>>::with_opaque_to(
@@ -415,7 +434,7 @@ impl KafkaReplicationPipelineWriter {
                         "replication pipeline Kafka producer queue is full; retrying"
                     );
                     self.producer.poll(Duration::from_millis(0));
-                    wait_for_replication_kafka_queue_retry(backoff).await;
+                    wait_for_replication_kafka_queue_retry(backoff, cancel).await?;
                 }
                 Err((err, _record)) if is_kafka_queue_full(&err) => {
                     tracing::warn!(
@@ -458,8 +477,12 @@ impl KafkaReplicationPipelineWriter {
         &self,
         record: &CdcBufferRecord,
         delivery_state: Arc<KafkaDeliveryBatchState>,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         for attempt in 0..REPLICATION_KAFKA_RETRY_ATTEMPTS {
+            if cancel.is_cancelled() {
+                return Err(anyhow!("replication pipeline Kafka enqueue canceled"));
+            }
             let attempt_number = attempt + 1;
             match self.enqueue_record_direct(record, Arc::clone(&delivery_state)) {
                 Ok(()) => return Ok(()),
@@ -480,7 +503,7 @@ impl KafkaReplicationPipelineWriter {
                         "replication pipeline Kafka producer queue is full; retrying"
                     );
                     self.producer.poll(Duration::from_millis(0));
-                    wait_for_replication_kafka_queue_retry(backoff).await;
+                    wait_for_replication_kafka_queue_retry(backoff, cancel).await?;
                 }
                 Err(err) if is_kafka_queue_full(&err) => {
                     tracing::warn!(

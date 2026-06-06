@@ -282,7 +282,11 @@ impl ReplicationPipelineRuntime {
             )
             .await?
             .unwrap_or(entry);
-        match self.send_records_to_target(plan, &records).await {
+        let retry_cancel = CancellationToken::new();
+        match self
+            .send_records_to_target(plan, &records, &retry_cancel)
+            .await
+        {
             Ok(_) => {
                 crate::metrics::inc_cdc_replication_dlq_replay(&pipeline_name, "success");
                 self.clear_last_target_error(&plan.name);
