@@ -576,7 +576,8 @@ pub(super) async fn start_buffered_postgres_wal_stream(
     .with_context(|| {
         format!("configure Postgres CDC WAL stream from snapshot LSN {snapshot_lsn}")
     })?;
-    let replication = connect_postgres_replication_client_with_retry(&replication_config).await?;
+    let replication =
+        connect_postgres_replication_client_with_retry(&replication_config, &cancel).await?;
     let capacity = replication_config.buffer_events();
     let slot = slot.to_string();
     let (sender, receiver) = mpsc::channel(capacity);
@@ -617,6 +618,7 @@ pub(super) async fn start_buffered_postgres_wal_stream(
 
 pub(super) async fn connect_postgres_replication_client_with_retry(
     config: &PostgresCdcConfig,
+    cancel: &CancellationToken,
 ) -> Result<PostgresReplicationClient> {
     let started_at = Instant::now();
     let mut attempts = 0_u32;
@@ -634,10 +636,17 @@ pub(super) async fn connect_postgres_replication_client_with_retry(
                     error = %err,
                     "Postgres CDC WAL stream is waiting for exported snapshot slot release"
                 );
-                tokio::time::sleep(POSTGRES_SNAPSHOT_SLOT_HANDOFF_RETRY_DELAY).await;
+                wait_for_snapshot_slot_handoff_retry(cancel).await?;
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+async fn wait_for_snapshot_slot_handoff_retry(cancel: &CancellationToken) -> Result<()> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow!("cancelled before Postgres snapshot slot handoff retry")),
+        _ = tokio::time::sleep(POSTGRES_SNAPSHOT_SLOT_HANDOFF_RETRY_DELAY) => Ok(()),
     }
 }
 

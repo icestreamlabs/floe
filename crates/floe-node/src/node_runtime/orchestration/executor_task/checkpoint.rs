@@ -269,21 +269,26 @@ pub(super) async fn persist_cdc_only_tick_commit(
     Ok(())
 }
 
+pub(super) struct SourceJournalBatchBuildInput<'a> {
+    pub(super) source_names_by_id: &'a [String],
+    pub(super) definitions: &'a [SourceDefinition],
+    pub(super) required_sources: &'a BTreeSet<String>,
+    pub(super) execution_arrow_batches_by_source: &'a [Vec<RecordBatch>],
+    pub(super) arrow_batches_by_source: &'a [Vec<RecordBatch>],
+    pub(super) weighted_arrow_batches_by_source: &'a [Vec<RecordBatch>],
+    pub(super) tick_source_max_event_ts: &'a [Option<i64>],
+}
+
 pub(super) fn build_source_journal_batches(
-    source_names_by_id: &[String],
-    definitions: &[SourceDefinition],
-    required_sources: &BTreeSet<String>,
-    arrow_batches_by_source: &[Vec<RecordBatch>],
-    weighted_arrow_batches_by_source: &[Vec<RecordBatch>],
-    tick_source_max_event_ts: &[Option<i64>],
+    input: SourceJournalBatchBuildInput<'_>,
     output: &mut Vec<VectorizedSourceJournalTransientBatch>,
 ) -> anyhow::Result<()> {
-    for source_id in 0..source_names_by_id.len() {
-        let source_name = source_names_by_id[source_id].as_str();
-        if !required_sources.contains(source_name) {
+    for source_id in 0..input.source_names_by_id.len() {
+        let source_name = input.source_names_by_id[source_id].as_str();
+        if !input.required_sources.contains(source_name) {
             continue;
         }
-        let Some(definition) = definitions.get(source_id) else {
+        let Some(definition) = input.definitions.get(source_id) else {
             continue;
         };
         let source_schema = definition.to_arrow_schema();
@@ -292,11 +297,20 @@ pub(super) fn build_source_journal_batches(
                 .with_context(|| {
                     format!("failed to build vectorized source journal schema for '{source_name}'")
                 })?;
+        let append_batches = if input.arrow_batches_by_source[source_id].is_empty() {
+            input.execution_arrow_batches_by_source[source_id].as_slice()
+        } else {
+            input.arrow_batches_by_source[source_id].as_slice()
+        };
         let mut journal_batches = Vec::with_capacity(
-            arrow_batches_by_source[source_id].len()
-                + weighted_arrow_batches_by_source[source_id].len(),
+            append_batches.len() + input.weighted_arrow_batches_by_source[source_id].len(),
         );
-        for batch in &arrow_batches_by_source[source_id] {
+        for batch in append_batches {
+            if batch.schema().as_ref() != source_schema.as_ref() {
+                return Err(anyhow!(
+                    "source journal batch schema does not match source '{source_name}'"
+                ));
+            }
             let weighted =
                 floe_executor::delta_consolidation::add_weight_column(batch, &weighted_schema, 1)
                     .with_context(|| {
@@ -304,11 +318,15 @@ pub(super) fn build_source_journal_batches(
                 })?;
             journal_batches.push(weighted);
         }
-        journal_batches.extend(weighted_arrow_batches_by_source[source_id].iter().cloned());
+        journal_batches.extend(
+            input.weighted_arrow_batches_by_source[source_id]
+                .iter()
+                .cloned(),
+        );
         if !journal_batches.is_empty() {
             output.push((
                 source_id,
-                tick_source_max_event_ts[source_id],
+                input.tick_source_max_event_ts[source_id],
                 journal_batches,
             ));
         }
@@ -750,4 +768,49 @@ pub(super) fn record_ingest_queue_metrics(metrics_input: IngestMetrics<'_>) {
         per_connector = ?per_connector,
         "ingest batch metrics"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Int64Array;
+
+    use super::*;
+
+    #[test]
+    fn source_journal_batches_use_execution_batches_when_query_batches_are_disabled() {
+        let definition = SourceDefinition::new(
+            "orders",
+            vec![SourceColumn::new("id", SourceDataType::Int64)],
+        )
+        .expect("source definition");
+        let schema = definition.to_arrow_schema();
+        let execution_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                .expect("record batch");
+        let mut required_sources = BTreeSet::new();
+        required_sources.insert("orders".to_string());
+        let mut output = Vec::new();
+
+        build_source_journal_batches(
+            SourceJournalBatchBuildInput {
+                source_names_by_id: &["orders".to_string()],
+                definitions: &[definition],
+                required_sources: &required_sources,
+                execution_arrow_batches_by_source: &[vec![execution_batch]],
+                arrow_batches_by_source: &[Vec::new()],
+                weighted_arrow_batches_by_source: &[Vec::new()],
+                tick_source_max_event_ts: &[Some(123)],
+            },
+            &mut output,
+        )
+        .expect("source journal batches");
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].0, 0);
+        assert_eq!(output[0].1, Some(123));
+        assert_eq!(output[0].2.len(), 1);
+        assert_eq!(output[0].2[0].num_rows(), 1);
+    }
 }

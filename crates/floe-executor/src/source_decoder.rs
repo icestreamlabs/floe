@@ -215,15 +215,16 @@ impl SourceRowDecoder {
 
 pub struct SourceArrowBatchBuilder {
     definition: SourceDefinition,
-    builders: Vec<SourceArrowColumnBuilder>,
+    builders: Vec<Option<SourceArrowColumnBuilder>>,
     execution_required_columns: Option<Arc<[bool]>>,
+    build_query_batch: bool,
     row_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct SourceArrowBatches {
     pub execution: RecordBatch,
-    pub query: RecordBatch,
+    pub query: Option<RecordBatch>,
 }
 
 impl SourceArrowBatchBuilder {
@@ -236,17 +237,41 @@ impl SourceArrowBatchBuilder {
         capacity: usize,
         execution_required_columns: Option<Arc<[bool]>>,
     ) -> Self {
+        Self::new_with_execution_required_columns_and_query_batch(
+            definition,
+            capacity,
+            execution_required_columns,
+            true,
+        )
+    }
+
+    pub fn new_with_execution_required_columns_and_query_batch(
+        definition: SourceDefinition,
+        capacity: usize,
+        execution_required_columns: Option<Arc<[bool]>>,
+        build_query_batch: bool,
+    ) -> Self {
+        let execution_required_columns = execution_required_columns
+            .filter(|required_columns| !required_columns.iter().all(|required| *required));
         let builders = definition
             .columns()
             .iter()
-            .map(|column| SourceArrowColumnBuilder::new(column.data_type(), capacity))
+            .enumerate()
+            .map(|(idx, column)| {
+                let required_for_execution = execution_required_columns
+                    .as_ref()
+                    .and_then(|required_columns| required_columns.get(idx))
+                    .copied()
+                    .unwrap_or(true);
+                (build_query_batch || required_for_execution)
+                    .then(|| SourceArrowColumnBuilder::new(column.data_type(), capacity))
+            })
             .collect();
-        let execution_required_columns = execution_required_columns
-            .filter(|required_columns| !required_columns.iter().all(|required| *required));
         Self {
             definition,
             builders,
             execution_required_columns,
+            build_query_batch,
             row_count: 0,
         }
     }
@@ -267,33 +292,79 @@ impl SourceArrowBatchBuilder {
         let mut event_ts = None;
         for (builder, column) in self.builders.iter_mut().zip(self.definition.columns()) {
             let value = object.get(column.name());
-            builder.append_json_value(column, value, &mut event_ts)?;
+            if let Some(builder) = builder.as_mut() {
+                builder.append_json_value(column, value, &mut event_ts)?;
+            } else {
+                observe_skipped_event_timestamp(column, value, &mut event_ts);
+            }
         }
         self.row_count += 1;
         Ok(event_ts)
     }
 
     pub fn finish(&mut self) -> Result<Option<SourceArrowBatches>> {
-        let Some(query) = self.finish_query_batch()? else {
+        if self.build_query_batch {
+            let Some(query) = self.finish_query_batch()? else {
+                return Ok(None);
+            };
+            let execution = execution_batch_for_required_columns(
+                &self.definition,
+                &query,
+                self.execution_required_columns.as_ref(),
+            )?;
+            return Ok(Some(SourceArrowBatches {
+                execution,
+                query: Some(query),
+            }));
+        }
+
+        let Some(execution) = self.finish_execution_batch()? else {
             return Ok(None);
         };
-        let execution = execution_batch_for_required_columns(
-            &self.definition,
-            &query,
-            self.execution_required_columns.as_ref(),
-        )?;
-        Ok(Some(SourceArrowBatches { execution, query }))
+        Ok(Some(SourceArrowBatches {
+            execution,
+            query: None,
+        }))
     }
 
     pub fn finish_query_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if !self.build_query_batch {
+            bail!(
+                "source '{}' builder was configured without query batches",
+                self.definition.name()
+            );
+        }
+        self.finish_batch(FinishBatchMode::Query)
+    }
+
+    fn finish_execution_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.finish_batch(FinishBatchMode::Execution)
+    }
+
+    fn finish_batch(&mut self, mode: FinishBatchMode) -> Result<Option<RecordBatch>> {
         if self.row_count == 0 {
             return Ok(None);
         }
-        let arrays = self
+        let mut arrays = Vec::with_capacity(self.definition.columns().len());
+        for (idx, (builder, column)) in self
             .builders
             .iter_mut()
-            .map(SourceArrowColumnBuilder::finish)
-            .collect::<Result<Vec<_>>>()?;
+            .zip(self.definition.columns())
+            .enumerate()
+        {
+            let array = match builder.as_mut() {
+                Some(builder) => builder.finish()?,
+                None if mode == FinishBatchMode::Execution => {
+                    skipped_arrow_column(column, self.row_count)?
+                }
+                None => bail!(
+                    "source '{}' query batch is missing builder for column {}",
+                    self.definition.name(),
+                    idx
+                ),
+            };
+            arrays.push(array);
+        }
         let batch = RecordBatch::try_new(self.definition.to_arrow_schema(), arrays)?;
         self.row_count = 0;
         Ok(Some(batch))
@@ -302,6 +373,12 @@ impl SourceArrowBatchBuilder {
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishBatchMode {
+    Execution,
+    Query,
 }
 
 fn execution_batch_for_required_columns(
@@ -350,6 +427,25 @@ fn skipped_arrow_column(column: &SourceColumn, row_count: usize) -> Result<Array
         builder.append_skipped_value(column)?;
     }
     builder.finish()
+}
+
+fn observe_skipped_event_timestamp(
+    column: &SourceColumn,
+    value: Option<&Value>,
+    event_ts: &mut Option<Timestamp>,
+) {
+    if event_ts.is_some() || !matches!(column.data_type(), SourceDataType::TimestampMillis) {
+        return;
+    }
+    let Some(value) = value else {
+        return;
+    };
+    let Some(number) = value.as_i64() else {
+        return;
+    };
+    if number >= 0 {
+        *event_ts = Some(number as u64);
+    }
 }
 
 impl SourceArrowColumnBuilder {

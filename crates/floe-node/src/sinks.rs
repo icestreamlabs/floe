@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -122,6 +123,31 @@ impl RetryPolicy {
             1_u64 << failure_idx
         };
         Duration::from_millis(base_ms.saturating_mul(factor).min(max_ms))
+    }
+}
+
+#[derive(Debug)]
+struct SinkRetryCanceledError;
+
+impl fmt::Display for SinkRetryCanceledError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sink canceled")
+    }
+}
+
+impl std::error::Error for SinkRetryCanceledError {}
+
+fn is_sink_canceled_error(err: &anyhow::Error) -> bool {
+    is_mv_changelog_canceled_error(err) || err.downcast_ref::<SinkRetryCanceledError>().is_some()
+}
+
+async fn wait_for_sink_retry_backoff(delay: Duration, cancel: &CancellationToken) -> Result<()> {
+    if delay.is_zero() {
+        return Ok(());
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow::Error::new(SinkRetryCanceledError)),
+        _ = tokio::time::sleep(delay) => Ok(()),
     }
 }
 
@@ -263,7 +289,7 @@ pub fn spawn_sinks(
             )
             .await
             {
-                if is_mv_changelog_canceled_error(&err) {
+                if is_sink_canceled_error(&err) {
                     tracing::info!(sink = %name, "sink canceled");
                 } else {
                     tracing::error!(sink = %name, error = %err, "sink failed");

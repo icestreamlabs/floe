@@ -218,14 +218,7 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
                     error = %err,
                     "Postgres CDC stream failed; reconnecting from durable checkpoint"
                 );
-                if !backoff.is_zero() {
-                    tokio::select! {
-                        _ = context.cancel.cancelled() => {
-                            return Err(anyhow!("cancelled before Postgres CDC reconnect"));
-                        }
-                        _ = tokio::time::sleep(backoff) => {}
-                    }
-                }
+                wait_for_postgres_cdc_reconnect(backoff, context.cancel).await?;
             }
             Err(err) => {
                 metrics::record_postgres_cdc_source_connected(
@@ -251,6 +244,19 @@ async fn run_native_postgres_cdc_wal_stream_with_reconnect(
                 });
             }
         }
+    }
+}
+
+async fn wait_for_postgres_cdc_reconnect(
+    backoff: Duration,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    if backoff.is_zero() {
+        return Ok(());
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => Err(anyhow!("cancelled before Postgres CDC reconnect")),
+        _ = tokio::time::sleep(backoff) => Ok(()),
     }
 }
 

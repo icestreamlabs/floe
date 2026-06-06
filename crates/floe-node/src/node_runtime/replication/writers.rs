@@ -49,6 +49,18 @@ unsafe impl Send for KafkaNativeTopic {}
 // produce calls that share a topic handle through the owning producer.
 unsafe impl Sync for KafkaNativeTopic {}
 
+fn replication_kafka_queue_retry_backoff(attempt: usize) -> Duration {
+    let factor = 1_u64 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16);
+    Duration::from_millis(REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(factor))
+}
+
+async fn wait_for_replication_kafka_queue_retry(backoff: Duration) {
+    if backoff.is_zero() {
+        return;
+    }
+    tokio::time::sleep(backoff).await;
+}
+
 impl KafkaNativeTopic {
     fn new(
         producer: &ThreadedProducer<KafkaReplicationPipelineContext>,
@@ -390,14 +402,12 @@ impl KafkaReplicationPipelineWriter {
                     if is_kafka_queue_full(&err)
                         && attempt_number < REPLICATION_KAFKA_RETRY_ATTEMPTS =>
                 {
-                    let delay_ms = REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(
-                        1_u64 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16),
-                    );
+                    let backoff = replication_kafka_queue_retry_backoff(attempt);
                     tracing::warn!(
                         topic = %self.topic,
                         attempt = attempt_number,
                         max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
-                        retry_delay_ms = delay_ms,
+                        retry_delay_ms = backoff.as_millis() as u64,
                         record_bytes = record.byte_len(),
                         key_bytes = record.key().map(|key| key.len()),
                         value_bytes = record.value().map(|value| value.len()),
@@ -405,7 +415,7 @@ impl KafkaReplicationPipelineWriter {
                         "replication pipeline Kafka producer queue is full; retrying"
                     );
                     self.producer.poll(Duration::from_millis(0));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    wait_for_replication_kafka_queue_retry(backoff).await;
                 }
                 Err((err, _record)) if is_kafka_queue_full(&err) => {
                     tracing::warn!(
@@ -457,14 +467,12 @@ impl KafkaReplicationPipelineWriter {
                     if is_kafka_queue_full(&err)
                         && attempt_number < REPLICATION_KAFKA_RETRY_ATTEMPTS =>
                 {
-                    let delay_ms = REPLICATION_KAFKA_RETRY_BASE_MS.saturating_mul(
-                        1_u64 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16),
-                    );
+                    let backoff = replication_kafka_queue_retry_backoff(attempt);
                     tracing::warn!(
                         topic = %self.topic,
                         attempt = attempt_number,
                         max_attempts = REPLICATION_KAFKA_RETRY_ATTEMPTS,
-                        retry_delay_ms = delay_ms,
+                        retry_delay_ms = backoff.as_millis() as u64,
                         record_bytes = record.byte_len(),
                         key_bytes = record.key().map(|key| key.len()),
                         value_bytes = record.value().map(|value| value.len()),
@@ -472,7 +480,7 @@ impl KafkaReplicationPipelineWriter {
                         "replication pipeline Kafka producer queue is full; retrying"
                     );
                     self.producer.poll(Duration::from_millis(0));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    wait_for_replication_kafka_queue_retry(backoff).await;
                 }
                 Err(err) if is_kafka_queue_full(&err) => {
                     tracing::warn!(

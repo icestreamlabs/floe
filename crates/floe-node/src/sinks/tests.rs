@@ -258,6 +258,7 @@ async fn http_retry_reuses_same_idempotency_key() {
     });
 
     let client = Client::new();
+    let cancel = CancellationToken::new();
     let rows = vec![SinkRecord {
         version: 11,
         row_idx: 4,
@@ -273,6 +274,7 @@ async fn http_retry_reuses_same_idempotency_key() {
         &rows,
         RetryPolicy::new(3, Duration::from_millis(10), Duration::from_millis(50))
             .expect("retry policy"),
+        &cancel,
     )
     .await
     .expect("http sink retry");
@@ -322,6 +324,7 @@ async fn http_sink_crash_mid_batch_emits_no_request_before_flush() {
             retry_policy: RetryPolicy::new(3, Duration::from_millis(10), Duration::from_millis(20))
                 .expect("retry policy"),
             checkpoint_tx: None,
+            cancel: CancellationToken::new(),
         })
         .await
     });

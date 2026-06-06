@@ -309,50 +309,62 @@ fn encode_len(len: usize) -> Result<[u8; 4]> {
 }
 
 fn read_len(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
-    let end = cursor
-        .checked_add(4)
-        .ok_or_else(|| anyhow!("Arrow-index length overflow"))?;
-    let chunk = bytes
-        .get(*cursor..end)
-        .ok_or_else(|| anyhow!("Arrow-index length truncated"))?;
-    *cursor = end;
-    Ok(u32::from_be_bytes(chunk.try_into().unwrap()) as usize)
+    Ok(read_u32_at(bytes, cursor, "Arrow-index length")? as usize)
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
-    let end = cursor
-        .checked_add(4)
-        .ok_or_else(|| anyhow!("Arrow-index u32 overflow"))?;
-    let chunk = bytes
-        .get(*cursor..end)
-        .ok_or_else(|| anyhow!("Arrow-index u32 truncated"))?;
-    *cursor = end;
-    Ok(u32::from_be_bytes(chunk.try_into().unwrap()))
+    read_u32_at(bytes, cursor, "Arrow-index u32")
+}
+
+fn read_u32_at(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<u32> {
+    Ok(u32::from_be_bytes(read_exact_at(bytes, cursor, label)?))
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<u64> {
+    Ok(u64::from_be_bytes(read_exact_at(bytes, cursor, label)?))
 }
 
 fn read_i64(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
+    Ok(i64::from_be_bytes(read_exact_at(
+        bytes,
+        cursor,
+        "Arrow-index i64",
+    )?))
+}
+
+fn read_exact_at<const N: usize>(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<[u8; N]> {
     let end = cursor
-        .checked_add(8)
-        .ok_or_else(|| anyhow!("Arrow-index i64 overflow"))?;
+        .checked_add(N)
+        .ok_or_else(|| anyhow!("{label} overflow"))?;
     let chunk = bytes
         .get(*cursor..end)
-        .ok_or_else(|| anyhow!("Arrow-index i64 truncated"))?;
+        .ok_or_else(|| anyhow!("{label} truncated"))?;
     *cursor = end;
-    Ok(i64::from_be_bytes(chunk.try_into().unwrap()))
+    chunk
+        .try_into()
+        .map_err(|_| anyhow!("{label} expected {N} bytes"))
 }
 
 fn decode_u64_payload(bytes: &[u8]) -> Result<u64> {
-    let chunk = bytes
-        .get(0..8)
-        .ok_or_else(|| anyhow!("expected 8 bytes for Arrow-index u64 payload"))?;
-    Ok(u64::from_be_bytes(chunk.try_into().unwrap()))
+    let mut cursor = 0;
+    let value = read_u64(bytes, &mut cursor, "Arrow-index u64 payload")?;
+    if cursor != bytes.len() {
+        return Err(anyhow!("Arrow-index u64 payload has trailing bytes"));
+    }
+    Ok(value)
 }
 
 fn segment_id_from_key_suffix(key: &[u8]) -> Result<u64> {
+    if key.len() < 8 {
+        return Err(anyhow!("Arrow-index key missing segment id suffix"));
+    }
     let segment_bytes = key
-        .get(key.len().saturating_sub(8)..)
+        .get(key.len() - 8..)
         .ok_or_else(|| anyhow!("Arrow-index key missing segment id suffix"))?;
-    Ok(u64::from_be_bytes(segment_bytes.try_into().unwrap()))
+    segment_bytes
+        .try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_| anyhow!("Arrow-index segment id suffix expected 8 bytes"))
 }
 
 #[cfg(test)]

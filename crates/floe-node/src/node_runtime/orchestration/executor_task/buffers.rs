@@ -27,6 +27,7 @@ impl ExecutorTickBuffers {
     pub(super) fn new(
         active_source_definitions_by_id: &[Option<SourceDefinition>],
         required_columns_by_source_id: &[Option<Arc<[bool]>>],
+        query_batches_by_source_id: &[bool],
         max_batch_per_source: usize,
         connector_count: usize,
     ) -> Self {
@@ -49,12 +50,16 @@ impl ExecutorTickBuffers {
                 .enumerate()
                 .map(|(source_id, definition)| {
                     definition.as_ref().map(|definition| {
-                        SourceArrowBatchBuilder::new_with_execution_required_columns(
+                        SourceArrowBatchBuilder::new_with_execution_required_columns_and_query_batch(
                             definition.clone(),
                             max_batch_per_source,
                             required_columns_by_source_id
                                 .get(source_id)
                                 .and_then(Clone::clone),
+                            query_batches_by_source_id
+                                .get(source_id)
+                                .copied()
+                                .unwrap_or(false),
                         )
                     })
                 })

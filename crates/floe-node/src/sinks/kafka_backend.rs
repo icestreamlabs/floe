@@ -114,6 +114,7 @@ pub(super) async fn run_kafka_sink(config: KafkaSinkConfig<'_>) -> Result<()> {
         retry_policy: config.retry_policy,
         checkpoint_tx: config.checkpoint_tx,
         kafka_eos,
+        cancel: config.changelog.cancel.clone(),
     })
     .await;
     let producer_result = producer_task
@@ -137,6 +138,7 @@ pub(super) struct KafkaWorkerConfig<'a> {
     pub(super) retry_policy: RetryPolicy,
     pub(super) checkpoint_tx: Option<SinkCheckpointSender>,
     pub(super) kafka_eos: Option<KafkaEosConfig>,
+    pub(super) cancel: CancellationToken,
 }
 
 pub(super) async fn run_kafka_worker(config: KafkaWorkerConfig<'_>) -> Result<()> {
@@ -149,6 +151,7 @@ pub(super) async fn run_kafka_worker(config: KafkaWorkerConfig<'_>) -> Result<()
         tracker: Arc::clone(&config.tracker),
         checkpoint_tx: config.checkpoint_tx,
         kafka_eos: config.kafka_eos,
+        cancel: config.cancel,
     };
     run_buffered_sink_worker(config.rx, config.tracker, config.batch_policy, backend).await
 }
@@ -162,6 +165,7 @@ struct KafkaSinkBackend<'a> {
     tracker: Arc<SinkQueueTracker>,
     checkpoint_tx: Option<SinkCheckpointSender>,
     kafka_eos: Option<KafkaEosConfig>,
+    cancel: CancellationToken,
 }
 
 impl BufferedSinkBackend for KafkaSinkBackend<'_> {
@@ -181,6 +185,7 @@ impl BufferedSinkBackend for KafkaSinkBackend<'_> {
                 tracker: &self.tracker,
                 checkpoint_tx: &self.checkpoint_tx,
                 kafka_eos: self.kafka_eos.as_ref(),
+                cancel: &self.cancel,
             },
             buffer,
             buffer_bytes,
@@ -199,6 +204,7 @@ struct KafkaFlushContext<'a> {
     tracker: &'a SinkQueueTracker,
     checkpoint_tx: &'a Option<SinkCheckpointSender>,
     kafka_eos: Option<&'a KafkaEosConfig>,
+    cancel: &'a CancellationToken,
 }
 
 async fn flush_kafka_buffer(
@@ -230,6 +236,7 @@ async fn flush_kafka_buffer(
             flushed_version,
             retry_policy: context.retry_policy,
             eos,
+            cancel: context.cancel,
         })
         .await?;
     } else {
@@ -239,6 +246,7 @@ async fn flush_kafka_buffer(
             context.topic,
             buffer,
             context.retry_policy,
+            context.cancel,
         )
         .await?;
     }
@@ -289,6 +297,7 @@ struct KafkaTransactionalBatch<'a> {
     flushed_version: i64,
     retry_policy: RetryPolicy,
     eos: &'a KafkaEosConfig,
+    cancel: &'a CancellationToken,
 }
 
 async fn send_kafka_transactional_batch_with_retry(
@@ -301,7 +310,11 @@ async fn send_kafka_transactional_batch_with_retry(
                     "kafka sink failed to begin transaction after retries: {err}"
                 ));
             }
-            tokio::time::sleep(batch.retry_policy.backoff_for_failure(attempt)).await;
+            wait_for_sink_retry_backoff(
+                batch.retry_policy.backoff_for_failure(attempt),
+                batch.cancel,
+            )
+            .await?;
             continue;
         }
 
@@ -344,7 +357,11 @@ async fn send_kafka_transactional_batch_with_retry(
                 return Err(err);
             }
             metrics::inc_sink_retry(batch.sink_name, "kafka");
-            tokio::time::sleep(batch.retry_policy.backoff_for_failure(attempt)).await;
+            wait_for_sink_retry_backoff(
+                batch.retry_policy.backoff_for_failure(attempt),
+                batch.cancel,
+            )
+            .await?;
             continue;
         }
 
@@ -364,7 +381,11 @@ async fn send_kafka_transactional_batch_with_retry(
                     ));
                 }
                 metrics::inc_sink_retry(batch.sink_name, "kafka");
-                tokio::time::sleep(batch.retry_policy.backoff_for_failure(attempt)).await;
+                wait_for_sink_retry_backoff(
+                    batch.retry_policy.backoff_for_failure(attempt),
+                    batch.cancel,
+                )
+                .await?;
             }
         }
     }
@@ -577,6 +598,7 @@ pub(super) async fn send_kafka_batch_with_retry(
     topic: &str,
     rows: &[SinkRecord],
     retry_policy: RetryPolicy,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -634,7 +656,7 @@ pub(super) async fn send_kafka_batch_with_retry(
         }
         metrics::inc_sink_retry(sink_name, "kafka");
         pending = retry_rows;
-        tokio::time::sleep(retry_policy.backoff_for_failure(attempt)).await;
+        wait_for_sink_retry_backoff(retry_policy.backoff_for_failure(attempt), cancel).await?;
     }
     unreachable!("retry loop should return or fail");
 }
