@@ -7,10 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use floe_cdc_core::{
@@ -55,12 +55,14 @@ static CHANGELOG_BATCH_LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 mod file_backend;
 mod http_backend;
+mod json;
 mod kafka_backend;
 mod postgres_backend;
 mod worker;
 
 use file_backend::*;
 use http_backend::*;
+use json::{changelog_row_to_json, format_decimal128};
 use kafka_backend::*;
 use postgres_backend::*;
 use worker::*;
@@ -124,6 +126,25 @@ impl RetryPolicy {
         };
         Duration::from_millis(base_ms.saturating_mul(factor).min(max_ms))
     }
+}
+
+fn sink_batch_policy(batch_rows: Option<usize>, batch_bytes: Option<usize>) -> Result<BatchPolicy> {
+    BatchPolicy::new(
+        batch_rows.unwrap_or(DEFAULT_BATCH_ROWS),
+        batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES),
+    )
+}
+
+fn sink_retry_policy(
+    retry_max_attempts: Option<usize>,
+    retry_base_ms: Option<u64>,
+    retry_max_backoff_ms: Option<u64>,
+) -> Result<RetryPolicy> {
+    RetryPolicy::new(
+        retry_max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
+        Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
+        Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
+    )
 }
 
 #[derive(Debug)]
@@ -343,16 +364,10 @@ async fn run_sink(
         } => {
             let encoding =
                 kafka_sink_encoding(&sink.name, &mv, format.as_deref(), key_columns.as_deref())?;
-            let batch_policy = BatchPolicy::new(
-                batch_rows.unwrap_or(DEFAULT_BATCH_ROWS),
-                batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES),
-            )?;
+            let batch_policy = sink_batch_policy(batch_rows, batch_bytes)?;
             let queue_capacity = queue_capacity.unwrap_or(DEFAULT_SINK_QUEUE_CAPACITY);
-            let retry_policy = RetryPolicy::new(
-                retry_max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
-                Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
-                Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
-            )?;
+            let retry_policy =
+                sink_retry_policy(retry_max_attempts, retry_base_ms, retry_max_backoff_ms)?;
             run_kafka_sink(KafkaSinkConfig {
                 sink_name: &sink.name,
                 changelog: ChangelogSourceConfig {
@@ -386,10 +401,7 @@ async fn run_sink(
             queue_capacity,
             ..
         } => {
-            let batch_policy = BatchPolicy::new(
-                batch_rows.unwrap_or(DEFAULT_BATCH_ROWS),
-                batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES),
-            )?;
+            let batch_policy = sink_batch_policy(batch_rows, batch_bytes)?;
             let queue_capacity = queue_capacity.unwrap_or(DEFAULT_SINK_QUEUE_CAPACITY);
             run_file_sink(FileSinkConfig {
                 sink_name: &sink.name,
@@ -423,14 +435,10 @@ async fn run_sink(
             ..
         } => {
             let rows_threshold = batch_rows.or(batch_size).unwrap_or(DEFAULT_BATCH_ROWS);
-            let batch_policy =
-                BatchPolicy::new(rows_threshold, batch_bytes.unwrap_or(DEFAULT_BATCH_BYTES))?;
+            let batch_policy = sink_batch_policy(Some(rows_threshold), batch_bytes)?;
             let queue_capacity = queue_capacity.unwrap_or(DEFAULT_SINK_QUEUE_CAPACITY);
-            let retry_policy = RetryPolicy::new(
-                retry_max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
-                Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
-                Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
-            )?;
+            let retry_policy =
+                sink_retry_policy(retry_max_attempts, retry_base_ms, retry_max_backoff_ms)?;
             run_http_sink(HttpSinkConfig {
                 sink_name: &sink.name,
                 changelog: ChangelogSourceConfig {
@@ -461,11 +469,8 @@ async fn run_sink(
             retry_max_backoff_ms,
             ..
         } => {
-            let retry_policy = RetryPolicy::new(
-                retry_max_attempts.unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS),
-                Duration::from_millis(retry_base_ms.unwrap_or(DEFAULT_RETRY_BASE_MS)),
-                Duration::from_millis(retry_max_backoff_ms.unwrap_or(DEFAULT_RETRY_MAX_BACKOFF_MS)),
-            )?;
+            let retry_policy =
+                sink_retry_policy(retry_max_attempts, retry_base_ms, retry_max_backoff_ms)?;
             run_postgres_sink(PostgresSinkConfig {
                 sink_name: &sink.name,
                 changelog: ChangelogSourceConfig {
@@ -904,122 +909,5 @@ fn arrow_numeric_string_value(array: &dyn Array, row_idx: usize) -> Result<Strin
     )
 }
 
-fn changelog_row_to_json(
-    batch: &MvChangelogBatch,
-    row_idx: usize,
-    schema: &SchemaRef,
-) -> Result<serde_json::Value> {
-    let mut object = serde_json::Map::new();
-    object.insert(
-        "__mv_version".to_string(),
-        serde_json::Value::from(batch.version),
-    );
-    object.insert(
-        "__op".to_string(),
-        serde_json::Value::from(batch.diffs.get(row_idx).copied().unwrap_or(0)),
-    );
-    if let Some(time) = batch.version_time {
-        object.insert("__time".to_string(), serde_json::Value::from(time));
-    } else {
-        object.insert("__time".to_string(), serde_json::Value::Null);
-    }
-
-    for (col_idx, field) in schema.fields().iter().enumerate() {
-        let array = batch.batch.column(col_idx);
-        let value = array_value_to_json(array, row_idx)?;
-        object.insert(field.name().clone(), value);
-    }
-
-    Ok(serde_json::Value::Object(object))
-}
-
-fn array_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::Value> {
-    if array.is_null(row_idx) {
-        return Ok(serde_json::Value::Null);
-    }
-
-    if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Int8Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Int16Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Int32Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt8Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt16Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt32Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx) as f64));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx).to_string()));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx).to_string()));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<TimestampSecondArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Date32Array>() {
-        return Ok(serde_json::Value::from(values.value(row_idx)));
-    }
-    if let Some(values) = array.as_any().downcast_ref::<Decimal128Array>() {
-        let scale = match values.data_type() {
-            DataType::Decimal128(_, scale) => *scale,
-            _ => 0,
-        };
-        return Ok(serde_json::Value::String(format_decimal128(
-            values.value(row_idx),
-            scale,
-        )));
-    }
-
-    bail!(
-        "unsupported sink column type for JSON conversion: {:?}",
-        array.data_type()
-    )
-}
-
-fn format_decimal128(value: i128, scale: i8) -> String {
-    if scale <= 0 {
-        return value.to_string();
-    }
-    let scale = scale as u32;
-    let factor = 10_i128.pow(scale);
-    let sign = if value < 0 { "-" } else { "" };
-    let magnitude = value.abs();
-    let whole = magnitude / factor;
-    let fraction = magnitude % factor;
-    format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
-}
 #[cfg(test)]
 mod tests;

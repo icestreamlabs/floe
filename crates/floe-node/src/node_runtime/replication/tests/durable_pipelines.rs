@@ -5,6 +5,7 @@ async fn durable_pipeline_buffers_source_progress_when_target_is_down() {
     let table_id = CdcTableId::new("orders").unwrap();
     let plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
     let runtime = test_runtime_with_plan(plan.clone());
+    let cancel = CancellationToken::new();
     let storage = SlateCatalog::in_memory().await.unwrap();
     let schemas = HashMap::from([(plan.table_id.clone(), plan.schema.clone())]);
     let source_id = CdcSourceId::new("pg_main").unwrap();
@@ -43,14 +44,14 @@ async fn durable_pipeline_buffers_source_progress_when_target_is_down() {
 
     assert_eq!(
         runtime
-            .run_transaction(&source_id, &schemas, &first, Some(&storage))
+            .run_transaction(&source_id, &schemas, &first, Some(&storage), &cancel)
             .await
             .expect("buffer first transaction"),
         1
     );
     assert_eq!(
         runtime
-            .run_transaction(&source_id, &schemas, &second, Some(&storage))
+            .run_transaction(&source_id, &schemas, &second, Some(&storage), &cancel)
             .await
             .expect("buffer second transaction"),
         1
@@ -103,7 +104,7 @@ async fn durable_pipeline_buffers_source_progress_when_target_is_down() {
     let restarted = test_runtime_with_plan(plan.clone());
     assert_eq!(
         restarted
-            .replay_buffered(&storage)
+            .replay_buffered(&storage, &cancel)
             .await
             .expect("replay buffered transactions"),
         0
@@ -134,6 +135,7 @@ async fn distinct_pipeline_failure_does_not_skip_unrelated_durable_pipeline() {
     };
 
     let runtime = test_runtime_with_plans(vec![fail_fast_plan.clone(), durable_plan.clone()]);
+    let cancel = CancellationToken::new();
     let storage = SlateCatalog::in_memory().await.unwrap();
     let schemas = HashMap::from([(table_id.clone(), durable_plan.schema.clone())]);
     let source_id = CdcSourceId::new("pg_main").unwrap();
@@ -155,7 +157,7 @@ async fn distinct_pipeline_failure_does_not_skip_unrelated_durable_pipeline() {
     .unwrap();
 
     let error = runtime
-        .run_transaction(&source_id, &schemas, &transaction, Some(&storage))
+        .run_transaction(&source_id, &schemas, &transaction, Some(&storage), &cancel)
         .await
         .expect_err("fail-fast target should make the source transaction fail");
     assert!(error.to_string().contains("has no Kafka writer"));
@@ -218,6 +220,7 @@ async fn durable_pipeline_dead_letters_and_advances_when_policy_allows() {
         None,
     );
     let runtime = test_runtime_with_plan(plan.clone());
+    let cancel = CancellationToken::new();
     let storage = SlateCatalog::in_memory().await.unwrap();
     let schemas = HashMap::from([(plan.table_id.clone(), plan.schema.clone())]);
     let source_id = CdcSourceId::new("pg_main").unwrap();
@@ -240,7 +243,7 @@ async fn durable_pipeline_dead_letters_and_advances_when_policy_allows() {
 
     assert_eq!(
         runtime
-            .run_transaction(&source_id, &schemas, &transaction, Some(&storage))
+            .run_transaction(&source_id, &schemas, &transaction, Some(&storage), &cancel)
             .await
             .expect("dead-letter transaction"),
         1
@@ -307,6 +310,7 @@ async fn replay_dead_letters_pending_buffer_when_policy_allows() {
         None,
     );
     let runtime = test_runtime_with_plan(plan.clone());
+    let cancel = CancellationToken::new();
     let storage = SlateCatalog::in_memory().await.unwrap();
     let transaction = TransactionBatch::new(
         CdcSourceId::new("pg_main").unwrap(),
@@ -338,7 +342,7 @@ async fn replay_dead_letters_pending_buffer_when_policy_allows() {
 
     assert_eq!(
         runtime
-            .replay_buffered(&storage)
+            .replay_buffered(&storage, &cancel)
             .await
             .expect("dead-letter pending transaction"),
         1
@@ -431,9 +435,10 @@ async fn restart_replays_pending_buffer_to_dlq_and_retries_dlq_entry() {
     );
 
     let restarted_runtime = test_runtime_with_plan(plan.clone());
+    let cancel = CancellationToken::new();
     assert_eq!(
         restarted_runtime
-            .replay_buffered(&storage)
+            .replay_buffered(&storage, &cancel)
             .await
             .expect("restart replay should dead-letter pending transaction"),
         1
@@ -621,6 +626,7 @@ async fn durable_pipeline_stops_source_progress_when_buffer_cap_remains_exceeded
     let mut plan = test_plan("orders_pipe", table_id.clone(), "public.orders");
     plan.buffer_policy = CatalogReplicationBufferPolicy::new(None, None, Some(1), None);
     let runtime = test_runtime_with_plan(plan.clone());
+    let cancel = CancellationToken::new();
     let storage = SlateCatalog::in_memory().await.unwrap();
     let schemas = HashMap::from([(plan.table_id.clone(), plan.schema.clone())]);
     let source_id = CdcSourceId::new("pg_main").unwrap();
@@ -659,13 +665,13 @@ async fn durable_pipeline_stops_source_progress_when_buffer_cap_remains_exceeded
 
     assert_eq!(
         runtime
-            .run_transaction(&source_id, &schemas, &first, Some(&storage))
+            .run_transaction(&source_id, &schemas, &first, Some(&storage), &cancel)
             .await
             .expect("buffer first transaction"),
         1
     );
     let error = runtime
-        .run_transaction(&source_id, &schemas, &second, Some(&storage))
+        .run_transaction(&source_id, &schemas, &second, Some(&storage), &cancel)
         .await
         .expect_err("second transaction should trip the pending object cap");
     assert!(error.to_string().contains("durable buffer limit exceeded"));

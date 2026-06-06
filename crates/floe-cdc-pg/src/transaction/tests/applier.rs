@@ -163,40 +163,35 @@ async fn applier_does_not_persist_or_feedback_when_table_apply_fails() {
 }
 
 #[tokio::test]
-async fn apply_loop_ignores_idle_events_and_feedbacks_after_commit() {
+async fn applier_ignores_idle_events_and_feedbacks_after_commit() {
     let source_id = CdcSourceId::new("pg_main").expect("source id");
     let table_store = test_store("pg-cdc-loop-feedback").await;
     let mut applier = PostgresCdcEventApplier::new(source_id, table_store, orders_schemas());
-    let feedbacks = Arc::new(Mutex::new(Vec::new()));
-    let mut stream = FakeStream::new(
-        [
-            FakeStep::Event(PostgresReplicationEvent::KeepAlive {
-                wal_end: PostgresLsn::from_u64(11),
-                reply_requested: true,
-                server_time_micros: 1,
-            }),
-            FakeStep::Event(xlog(relation_message(RELATION_ID, "orders"))),
-            FakeStep::Event(begin(60)),
-            FakeStep::Event(xlog(insert_message(RELATION_ID, 11, "open"))),
-            FakeStep::Event(PostgresReplicationEvent::Message {
-                transactional: false,
-                lsn: PostgresLsn::from_u64(12),
-                prefix: "noop".to_string(),
-                content: Bytes::new(),
-            }),
-            FakeStep::Event(commit(80)),
-            FakeStep::End,
-        ],
-        Arc::clone(&feedbacks),
-    );
+    let mut feedbacks = Vec::new();
+    for event in [
+        PostgresReplicationEvent::KeepAlive {
+            wal_end: PostgresLsn::from_u64(11),
+            reply_requested: true,
+            server_time_micros: 1,
+        },
+        xlog(relation_message(RELATION_ID, "orders")),
+        begin(60),
+        xlog(insert_message(RELATION_ID, 11, "open")),
+        PostgresReplicationEvent::Message {
+            transactional: false,
+            lsn: PostgresLsn::from_u64(12),
+            prefix: "noop".to_string(),
+            content: Bytes::new(),
+        },
+        commit(80),
+    ] {
+        let outcome = applier.accept_event(event).await.expect("accept event");
+        if let Some(feedback_lsn) = outcome.feedback_lsn() {
+            feedbacks.push(feedback_lsn);
+        }
+    }
 
-    run_postgres_cdc_apply_loop(&mut stream, &mut applier)
-        .await
-        .expect("run apply loop");
-    assert_eq!(
-        *feedbacks.lock().expect("feedback lock"),
-        vec![PostgresLsn::from_u64(80)]
-    );
+    assert_eq!(feedbacks, vec![PostgresLsn::from_u64(80)]);
 }
 
 #[tokio::test]

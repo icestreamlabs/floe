@@ -1,6 +1,4 @@
 use super::*;
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
 use bytes::Bytes;
 use dbsp_storage::storage::{KeyValueTable, SlateTable};
 use floe_cdc::CdcTableStore;
@@ -11,10 +9,8 @@ use floe_cdc_core::{
 use floe_core::RowValue;
 use object_store::memory::InMemory;
 use slatedb::Db;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::Duration;
 
 use crate::pgoutput_test_messages::{
     TEST_PG_INT8_OID as PG_INT8_OID, TEST_PG_TEXT_OID as PG_TEXT_OID,
@@ -24,10 +20,7 @@ use crate::pgoutput_test_messages::{
     relation_message_with_identity_and_column_specs, truncate_message,
 };
 use crate::transaction::schema_evolution::POSTGRES_SCHEMA_HISTORY_LIMIT;
-use crate::{
-    PgOutputMessage, PostgresCdcConfig, PostgresLsn, PostgresReplicationEvent,
-    decode_pgoutput_message,
-};
+use crate::{PgOutputMessage, PostgresLsn, PostgresReplicationEvent, decode_pgoutput_message};
 
 const RELATION_ID: u32 = 42;
 const OTHER_RELATION_ID: u32 = 43;
@@ -133,84 +126,8 @@ async fn test_store(name: &str) -> CdcTableStore {
     CdcTableStore::new(table)
 }
 
-enum FakeStep {
-    Event(PostgresReplicationEvent),
-    End,
-    Error(&'static str),
-}
-
-struct FakeStream {
-    steps: VecDeque<FakeStep>,
-    feedbacks: Arc<Mutex<Vec<PostgresLsn>>>,
-}
-
-impl FakeStream {
-    fn new(
-        steps: impl IntoIterator<Item = FakeStep>,
-        feedbacks: Arc<Mutex<Vec<PostgresLsn>>>,
-    ) -> Self {
-        Self {
-            steps: steps.into_iter().collect(),
-            feedbacks,
-        }
-    }
-}
-
-#[async_trait]
-impl PostgresReplicationStream for FakeStream {
-    async fn recv_event(&mut self) -> Result<Option<PostgresReplicationEvent>> {
-        match self.steps.pop_front().unwrap_or(FakeStep::End) {
-            FakeStep::Event(event) => Ok(Some(event)),
-            FakeStep::End => Ok(None),
-            FakeStep::Error(message) => Err(anyhow!(message)),
-        }
-    }
-
-    fn update_applied_lsn(&mut self, lsn: PostgresLsn) {
-        self.feedbacks.lock().expect("feedback lock").push(lsn);
-    }
-}
-
-#[derive(Clone)]
-struct FakeFactory {
-    streams: Arc<Mutex<VecDeque<FakeStream>>>,
-    configs: Arc<Mutex<Vec<PostgresCdcConfig>>>,
-}
-
-impl FakeFactory {
-    fn new(streams: impl IntoIterator<Item = FakeStream>) -> Self {
-        Self {
-            streams: Arc::new(Mutex::new(streams.into_iter().collect())),
-            configs: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn configs(&self) -> Vec<PostgresCdcConfig> {
-        self.configs.lock().expect("configs lock").clone()
-    }
-}
-
-#[async_trait]
-impl PostgresReplicationClientFactory for FakeFactory {
-    type Stream = FakeStream;
-
-    async fn connect(&self, config: &PostgresCdcConfig) -> Result<Self::Stream> {
-        self.configs
-            .lock()
-            .expect("configs lock")
-            .push(config.clone());
-        self.streams
-            .lock()
-            .expect("streams lock")
-            .pop_front()
-            .ok_or_else(|| anyhow!("no fake stream configured"))
-    }
-}
-
 #[path = "tests/applier.rs"]
 mod applier;
-#[path = "tests/reconnect.rs"]
-mod reconnect;
 #[path = "tests/schema_policy.rs"]
 mod schema_policy;
 #[path = "tests/transaction_grouping.rs"]

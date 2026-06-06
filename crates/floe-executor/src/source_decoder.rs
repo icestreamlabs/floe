@@ -217,14 +217,55 @@ pub struct SourceArrowBatchBuilder {
     definition: SourceDefinition,
     builders: Vec<Option<SourceArrowColumnBuilder>>,
     execution_required_columns: Option<Arc<[bool]>>,
-    build_query_batch: bool,
+    batch_mode: SourceArrowBatchMode,
     row_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceArrowBatchMode {
+    ExecutionAndQuery,
+    ExecutionOnly,
+}
+
+impl SourceArrowBatchMode {
+    fn includes_query_batch(self) -> bool {
+        matches!(self, Self::ExecutionAndQuery)
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct SourceArrowBatches {
-    pub execution: RecordBatch,
-    pub query: Option<RecordBatch>,
+pub enum SourceArrowBatches {
+    ExecutionAndQuery {
+        execution: RecordBatch,
+        query: RecordBatch,
+    },
+    ExecutionOnly {
+        execution: RecordBatch,
+    },
+}
+
+impl SourceArrowBatches {
+    pub fn execution(&self) -> &RecordBatch {
+        match self {
+            Self::ExecutionAndQuery { execution, .. } | Self::ExecutionOnly { execution } => {
+                execution
+            }
+        }
+    }
+
+    pub fn query(&self) -> Option<&RecordBatch> {
+        match self {
+            Self::ExecutionAndQuery { query, .. } => Some(query),
+            Self::ExecutionOnly { .. } => None,
+        }
+    }
+
+    pub fn into_parts(self) -> (RecordBatch, Option<RecordBatch>) {
+        match self {
+            Self::ExecutionAndQuery { execution, query } => (execution, Some(query)),
+            Self::ExecutionOnly { execution } => (execution, None),
+        }
+    }
 }
 
 impl SourceArrowBatchBuilder {
@@ -237,22 +278,23 @@ impl SourceArrowBatchBuilder {
         capacity: usize,
         execution_required_columns: Option<Arc<[bool]>>,
     ) -> Self {
-        Self::new_with_execution_required_columns_and_query_batch(
+        Self::new_with_execution_required_columns_and_batch_mode(
             definition,
             capacity,
             execution_required_columns,
-            true,
+            SourceArrowBatchMode::ExecutionAndQuery,
         )
     }
 
-    pub fn new_with_execution_required_columns_and_query_batch(
+    pub fn new_with_execution_required_columns_and_batch_mode(
         definition: SourceDefinition,
         capacity: usize,
         execution_required_columns: Option<Arc<[bool]>>,
-        build_query_batch: bool,
+        batch_mode: SourceArrowBatchMode,
     ) -> Self {
         let execution_required_columns = execution_required_columns
             .filter(|required_columns| !required_columns.iter().all(|required| *required));
+        let includes_query_batch = batch_mode.includes_query_batch();
         let builders = definition
             .columns()
             .iter()
@@ -263,7 +305,7 @@ impl SourceArrowBatchBuilder {
                     .and_then(|required_columns| required_columns.get(idx))
                     .copied()
                     .unwrap_or(true);
-                (build_query_batch || required_for_execution)
+                (includes_query_batch || required_for_execution)
                     .then(|| SourceArrowColumnBuilder::new(column.data_type(), capacity))
             })
             .collect();
@@ -271,7 +313,7 @@ impl SourceArrowBatchBuilder {
             definition,
             builders,
             execution_required_columns,
-            build_query_batch,
+            batch_mode,
             row_count: 0,
         }
     }
@@ -303,7 +345,7 @@ impl SourceArrowBatchBuilder {
     }
 
     pub fn finish(&mut self) -> Result<Option<SourceArrowBatches>> {
-        if self.build_query_batch {
+        if self.batch_mode.includes_query_batch() {
             let Some(query) = self.finish_query_batch()? else {
                 return Ok(None);
             };
@@ -312,23 +354,20 @@ impl SourceArrowBatchBuilder {
                 &query,
                 self.execution_required_columns.as_ref(),
             )?;
-            return Ok(Some(SourceArrowBatches {
+            return Ok(Some(SourceArrowBatches::ExecutionAndQuery {
                 execution,
-                query: Some(query),
+                query,
             }));
         }
 
         let Some(execution) = self.finish_execution_batch()? else {
             return Ok(None);
         };
-        Ok(Some(SourceArrowBatches {
-            execution,
-            query: None,
-        }))
+        Ok(Some(SourceArrowBatches::ExecutionOnly { execution }))
     }
 
     pub fn finish_query_batch(&mut self) -> Result<Option<RecordBatch>> {
-        if !self.build_query_batch {
+        if !self.batch_mode.includes_query_batch() {
             bail!(
                 "source '{}' builder was configured without query batches",
                 self.definition.name()

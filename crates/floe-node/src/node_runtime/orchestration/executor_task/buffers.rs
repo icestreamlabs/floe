@@ -50,16 +50,22 @@ impl ExecutorTickBuffers {
                 .enumerate()
                 .map(|(source_id, definition)| {
                     definition.as_ref().map(|definition| {
-                        SourceArrowBatchBuilder::new_with_execution_required_columns_and_query_batch(
+                        let batch_mode = if query_batches_by_source_id
+                            .get(source_id)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            SourceArrowBatchMode::ExecutionAndQuery
+                        } else {
+                            SourceArrowBatchMode::ExecutionOnly
+                        };
+                        SourceArrowBatchBuilder::new_with_execution_required_columns_and_batch_mode(
                             definition.clone(),
                             max_batch_per_source,
                             required_columns_by_source_id
                                 .get(source_id)
                                 .and_then(Clone::clone),
-                            query_batches_by_source_id
-                                .get(source_id)
-                                .copied()
-                                .unwrap_or(false),
+                            batch_mode,
                         )
                     })
                 })

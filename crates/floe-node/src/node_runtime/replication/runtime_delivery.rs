@@ -1,6 +1,16 @@
 use super::reconciliation::record_replication_buffer_append;
 use super::*;
 
+struct BufferLimitAppendInput<'a> {
+    plan: &'a ReplicationPipelineRuntimePlan,
+    buffer_store: &'a CdcBufferStore,
+    storage: &'a SlateCatalog,
+    incoming_bytes: usize,
+    incoming_records: usize,
+    has_pending: bool,
+    cancel: &'a CancellationToken,
+}
+
 impl ReplicationPipelineRuntime {
     pub(in crate::node_runtime) async fn run_transaction(
         &self,
@@ -8,6 +18,7 @@ impl ReplicationPipelineRuntime {
         schemas: &HashMap<CdcTableId, CdcTableSchema>,
         transaction: &TransactionBatch,
         storage: Option<&SlateCatalog>,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<usize> {
         let Some(plans) = self.pipelines_by_source.get(source_id) else {
             return Ok(0);
@@ -26,7 +37,7 @@ impl ReplicationPipelineRuntime {
             let chunk_count = chunks.len();
             for chunk in chunks {
                 written = written.saturating_add(
-                    self.run_transaction_for_plans(plans, schemas, &chunk, storage, false)
+                    self.run_transaction_for_plans(plans, schemas, &chunk, storage, false, cancel)
                         .await?,
                 );
             }
@@ -69,7 +80,14 @@ impl ReplicationPipelineRuntime {
                 .any(|plan| plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::Durable)
         {
             let written = self
-                .run_transaction_for_plans(plans, schemas, transaction, Some(storage), false)
+                .run_transaction_for_plans(
+                    plans,
+                    schemas,
+                    transaction,
+                    Some(storage),
+                    false,
+                    cancel,
+                )
                 .await?;
             let flush_started_at = Instant::now();
             storage
@@ -99,7 +117,7 @@ impl ReplicationPipelineRuntime {
             return Ok(written);
         }
 
-        self.run_transaction_for_plans(plans, schemas, transaction, storage, true)
+        self.run_transaction_for_plans(plans, schemas, transaction, storage, true, cancel)
             .await
     }
 
@@ -110,6 +128,7 @@ impl ReplicationPipelineRuntime {
         transaction: &TransactionBatch,
         storage: Option<&SlateCatalog>,
         await_durable_buffer_append: bool,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<usize> {
         let ordered_plans = ordered_replication_plans_for_transaction(plans, transaction);
         if ordered_plans.len() > 1 && replication_pipeline_targets_are_distinct(plans) {
@@ -120,6 +139,7 @@ impl ReplicationPipelineRuntime {
                     transaction,
                     storage,
                     await_durable_buffer_append,
+                    cancel,
                 )
             }))
             .await;
@@ -139,6 +159,7 @@ impl ReplicationPipelineRuntime {
                     transaction,
                     storage,
                     await_durable_buffer_append,
+                    cancel,
                 )
                 .await?,
             );
@@ -154,6 +175,7 @@ impl ReplicationPipelineRuntime {
         transaction: &TransactionBatch,
         storage: Option<&SlateCatalog>,
         await_durable_buffer_append: bool,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<usize> {
         let perf_enabled = self.settings.perf_log;
         let perf_started_at = perf_enabled.then(Instant::now);
@@ -177,7 +199,10 @@ impl ReplicationPipelineRuntime {
             0
         };
         if plan.buffer_mode == ReplicationPipelineRuntimeBufferMode::NoBuffer {
-            if let Err(err) = self.send_records_to_target(plan, &buffered_records).await {
+            if let Err(err) = self
+                .send_records_to_target(plan, &buffered_records, cancel)
+                .await
+            {
                 self.record_target_write_failure(plan, &err);
                 let Some(storage) = storage else {
                     return Err(err);
@@ -259,14 +284,15 @@ impl ReplicationPipelineRuntime {
                 prepare_replication_buffer_append(plan, transaction, buffered_records)?;
             let incoming_bytes = estimated_buffer_payload_bytes(prepared_append.target_records());
             let incoming_records = prepared_append.append.record_count();
-            self.enforce_buffer_limits_before_append(
+            self.enforce_buffer_limits_before_append(BufferLimitAppendInput {
                 plan,
-                &buffer_store,
+                buffer_store: &buffer_store,
                 storage,
                 incoming_bytes,
                 incoming_records,
-                had_pending,
-            )
+                has_pending: had_pending,
+                cancel,
+            })
             .await?;
             let has_pending_after_guardrail = if had_pending {
                 !buffer_store
@@ -313,7 +339,7 @@ impl ReplicationPipelineRuntime {
                     .with_context(|| {
                         format!("persist replication pipeline '{}' checkpoint", plan.name)
                     })?;
-                self.replay_pending_for_plan(plan, &buffer_store, storage)
+                self.replay_pending_for_plan(plan, &buffer_store, storage, cancel)
                     .await?;
                 record_buffer_stats(&buffer_store, &plan.name).await?;
                 log_replication_pipeline_perf(
@@ -332,7 +358,7 @@ impl ReplicationPipelineRuntime {
 
             let target_send_started_at = perf_enabled.then(Instant::now);
             match self
-                .send_records_to_target(plan, prepared_append.target_records())
+                .send_records_to_target(plan, prepared_append.target_records(), cancel)
                 .await
             {
                 Ok(target_state) => {
@@ -471,7 +497,10 @@ impl ReplicationPipelineRuntime {
                 }
             }
         } else {
-            if let Err(err) = self.send_records_to_target(plan, &buffered_records).await {
+            if let Err(err) = self
+                .send_records_to_target(plan, &buffered_records, cancel)
+                .await
+            {
                 self.record_target_write_failure(plan, &err);
                 return Err(err);
             }
@@ -492,13 +521,17 @@ impl ReplicationPipelineRuntime {
 
     async fn enforce_buffer_limits_before_append(
         &self,
-        plan: &ReplicationPipelineRuntimePlan,
-        buffer_store: &CdcBufferStore,
-        storage: &SlateCatalog,
-        incoming_bytes: usize,
-        incoming_records: usize,
-        has_pending: bool,
+        input: BufferLimitAppendInput<'_>,
     ) -> anyhow::Result<()> {
+        let BufferLimitAppendInput {
+            plan,
+            buffer_store,
+            storage,
+            incoming_bytes,
+            incoming_records,
+            has_pending,
+            cancel,
+        } = input;
         let limits = effective_replication_buffer_limits(
             plan,
             ReplicationBufferLimits::from_config(self.settings.buffer_limits),
@@ -568,7 +601,7 @@ impl ReplicationPipelineRuntime {
         );
 
         let delivered = self
-            .replay_pending_for_plan(plan, buffer_store, storage)
+            .replay_pending_for_plan(plan, buffer_store, storage, cancel)
             .await?;
         if delivered > 0 {
             self.spawn_cleanup_delivered_if_due(plan, buffer_store);

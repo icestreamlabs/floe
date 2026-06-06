@@ -270,6 +270,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                             schemas,
                             &cdc_transaction_batch,
                             Some(&storage_for_replication_task),
+                            &executor_cancel,
                         )
                         .await
                     {
@@ -579,10 +580,11 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     };
                     match builder.finish() {
                         Ok(Some(batches)) => {
+                            let (execution, query) = batches.into_parts();
                             decoded_rows_len =
-                                decoded_rows_len.saturating_add(batches.execution.num_rows());
-                            execution_arrow_batches_by_source[source_id].push(batches.execution);
-                            if let Some(query) = batches.query {
+                                decoded_rows_len.saturating_add(execution.num_rows());
+                            execution_arrow_batches_by_source[source_id].push(execution);
+                            if let Some(query) = query {
                                 arrow_batches_by_source[source_id].push(query);
                             }
                         }

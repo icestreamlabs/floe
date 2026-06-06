@@ -355,23 +355,6 @@ impl VectorizedExecutionRuntime {
         providers
     }
 
-    pub async fn append_source_batch(
-        &mut self,
-        source_name: &str,
-        batch: RecordBatch,
-    ) -> Result<()> {
-        self.append_source_batches(source_name, vec![batch]).await
-    }
-
-    pub async fn append_source_batches(
-        &mut self,
-        source_name: &str,
-        batches: Vec<RecordBatch>,
-    ) -> Result<()> {
-        self.append_source_batches_for_execution_and_query(source_name, batches.clone(), batches)
-            .await
-    }
-
     pub async fn append_source_batches_for_execution_and_query(
         &mut self,
         source_name: &str,

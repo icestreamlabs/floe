@@ -88,7 +88,7 @@ pub(super) async fn start_runtime_services(
         .await
         .context("refresh initial CDC replication debug state")?;
     let replayed_replication_records = replication_pipeline_runtime
-        .replay_buffered(&config.storage)
+        .replay_buffered(&config.storage, &config.runtime_cancel)
         .await
         .context("replay buffered replication pipeline records")?;
     replication_pipeline_runtime

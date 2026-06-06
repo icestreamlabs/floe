@@ -4,13 +4,14 @@ impl ReplicationPipelineRuntime {
     pub(in crate::node_runtime) async fn replay_buffered(
         &self,
         storage: &SlateCatalog,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<usize> {
         let buffer_store = storage.cdc_buffer_store();
         let mut delivered = 0usize;
         for plans in self.pipelines_by_source.values() {
             for plan in plans {
                 delivered = delivered.saturating_add(
-                    self.replay_pending_for_plan(plan, &buffer_store, storage)
+                    self.replay_pending_for_plan(plan, &buffer_store, storage, cancel)
                         .await?,
                 );
                 self.cleanup_delivered_if_due(plan, &buffer_store).await?;

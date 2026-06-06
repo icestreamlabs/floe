@@ -13,6 +13,7 @@ use super::perf::{log_replication_replay_delivery_perf, log_replication_replay_p
 use super::runtime_state::ReplicationReplayStateGuard;
 use super::target_state::target_kind;
 use super::{ReplicationPipelineRuntime, encoding};
+use tokio_util::sync::CancellationToken;
 
 const REPLICATION_BUFFER_REPLAY_LIMIT: usize = 1024;
 
@@ -22,6 +23,7 @@ impl ReplicationPipelineRuntime {
         plan: &ReplicationPipelineRuntimePlan,
         buffer_store: &CdcBufferStore,
         storage: &SlateCatalog,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<usize> {
         let _replay_guard = ReplicationReplayStateGuard::new(self, &plan.name);
         let mut delivered_records = 0usize;
@@ -55,7 +57,7 @@ impl ReplicationPipelineRuntime {
                     .await?;
             let delivery_started_at = Instant::now();
             let delivered = self
-                .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records)
+                .deliver_manifest_records(plan, buffer_store, storage, &manifest, &records, cancel)
                 .await?;
             let delivery_elapsed = delivery_started_at.elapsed();
             crate::metrics::observe_cdc_buffer_replay_phase_latency_ms(

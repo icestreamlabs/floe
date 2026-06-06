@@ -371,7 +371,9 @@ fn source_arrow_batch_builder_prunes_execution_columns_only() {
         .expect("record batches");
 
     assert_eq!(event_ts, Some(1_700_000_000_u64));
-    let query = batches.query.expect("query batch");
+    let SourceArrowBatches::ExecutionAndQuery { execution, query } = batches else {
+        panic!("expected execution and query batches");
+    };
     assert_eq!(query.num_rows(), 1);
     let full_note = query
         .column(1)
@@ -379,8 +381,7 @@ fn source_arrow_batch_builder_prunes_execution_columns_only() {
         .downcast_ref::<StringArray>()
         .expect("note array");
     assert_eq!(full_note.value(0), "ignored at execution");
-    let masked_note = batches
-        .execution
+    let masked_note = execution
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
@@ -401,11 +402,11 @@ fn source_arrow_batch_builder_can_skip_query_batches() {
     )
     .expect("definition");
     let required_columns = Arc::from([true, false, false]);
-    let mut builder = SourceArrowBatchBuilder::new_with_execution_required_columns_and_query_batch(
+    let mut builder = SourceArrowBatchBuilder::new_with_execution_required_columns_and_batch_mode(
         definition,
         1,
         Some(required_columns),
-        false,
+        SourceArrowBatchMode::ExecutionOnly,
     );
     let event = AppendIngestEvent::new(
         "orders",
@@ -423,9 +424,10 @@ fn source_arrow_batch_builder_can_skip_query_batches() {
         .expect("record batches");
 
     assert_eq!(event_ts, Some(1_700_000_000_u64));
-    assert!(batches.query.is_none());
-    let masked_note = batches
-        .execution
+    let SourceArrowBatches::ExecutionOnly { execution } = batches else {
+        panic!("expected execution-only batch");
+    };
+    let masked_note = execution
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
