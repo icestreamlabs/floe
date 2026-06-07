@@ -36,6 +36,7 @@ impl DbspExpression {
         &self.expr
     }
 
+    // DataFusion still surfaces wildcard expressions through this enum shape.
     #[allow(deprecated)]
     fn validate_supported(expr: &Expr, df_schema: &DFSchema) -> Result<()> {
         match expr {

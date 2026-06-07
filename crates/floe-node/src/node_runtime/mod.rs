@@ -339,10 +339,9 @@ fn record_postgres_cdc_debug_connection_state(
             state.postgres_sources.len() - 1
         }
     };
-    let source_state = state
-        .postgres_sources
-        .get_mut(source_idx)
-        .expect("Postgres CDC debug source index is valid");
+    let Some(source_state) = state.postgres_sources.get_mut(source_idx) else {
+        return;
+    };
     source_state.slot = Some(slot.to_string());
     source_state.connected = connected;
     source_state.reconnect_attempts = reconnect_attempts;
@@ -389,10 +388,9 @@ async fn record_postgres_schema_evolution_observations(
                 state.postgres_sources.len() - 1
             }
         };
-        let source_state = state
-            .postgres_sources
-            .get_mut(source_idx)
-            .expect("Postgres CDC debug source index is valid");
+        let Some(source_state) = state.postgres_sources.get_mut(source_idx) else {
+            continue;
+        };
         source_state.schema_evolution_policy = observation.policy().as_str().to_string();
         source_state.latest_schema_evolution = Some(postgres_schema_evolution_debug_state(
             &observation,
@@ -432,10 +430,9 @@ fn record_postgres_cdc_debug_lsn(
             state.postgres_sources.len() - 1
         }
     };
-    let source_state = state
-        .postgres_sources
-        .get_mut(source_idx)
-        .expect("Postgres CDC debug source index is valid");
+    let Some(source_state) = state.postgres_sources.get_mut(source_idx) else {
+        return;
+    };
     source_state.slot = Some(slot.to_string());
     if let Some(upstream_lsn) = upstream_lsn {
         let upstream_lsn = source_state

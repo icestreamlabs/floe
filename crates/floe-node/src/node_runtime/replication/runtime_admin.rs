@@ -201,16 +201,16 @@ impl ReplicationPipelineRuntime {
         let Some(plan) = self.plan_by_name(pipeline_name) else {
             return Ok(None);
         };
-        let mut entries = storage
-            .replication_pipeline_dlq_entries(pipeline_name)
-            .await?;
-        entries.retain(|entry| entry.status() == ReplicationPipelineDlqStatus::Pending);
-        entries.sort_by(|left, right| {
-            left.created_at_unix_ms()
-                .cmp(&right.created_at_unix_ms())
-                .then_with(|| left.dlq_id().cmp(right.dlq_id()))
-        });
-        entries.truncate(limit);
+        let entries = storage
+            .replication_pipeline_dlq_entries_page(
+                pipeline_name,
+                Some(ReplicationPipelineDlqStatus::Pending),
+                0,
+                limit,
+                current_unix_time_ms(),
+            )
+            .await?
+            .into_entries();
 
         let mut outcome = ReplicationPipelineDlqRetryBatchOutcome {
             pipeline: pipeline_name.to_string(),

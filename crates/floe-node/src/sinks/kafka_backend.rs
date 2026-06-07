@@ -389,7 +389,9 @@ async fn send_kafka_transactional_batch_with_retry(
             }
         }
     }
-    unreachable!("transaction retry loop should return or fail");
+    Err(anyhow!(
+        "kafka sink transaction failed because retry policy allowed zero attempts"
+    ))
 }
 
 async fn send_kafka_transactional_rows(
@@ -658,7 +660,9 @@ pub(super) async fn send_kafka_batch_with_retry(
         pending = retry_rows;
         wait_for_sink_retry_backoff(retry_policy.backoff_for_failure(attempt), cancel).await?;
     }
-    unreachable!("retry loop should return or fail");
+    Err(anyhow!(
+        "kafka sink delivery failed because retry policy allowed zero attempts"
+    ))
 }
 
 fn kafka_record<'a>(topic: &'a str, row: &'a SinkRecord) -> FutureRecord<'a, str, str> {

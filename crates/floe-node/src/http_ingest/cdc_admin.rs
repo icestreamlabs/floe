@@ -41,11 +41,17 @@ pub(super) async fn debug_cdc_replication_dlq_list_admin(
         )
             .into_response();
     };
-    let mut entries = match storage
-        .replication_pipeline_dlq_entries(&query.pipeline)
+    let page = match storage
+        .replication_pipeline_dlq_entries_page(
+            &query.pipeline,
+            query.status,
+            offset,
+            limit,
+            current_unix_time_ms(),
+        )
         .await
     {
-        Ok(entries) => entries,
+        Ok(page) => page,
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,25 +60,9 @@ pub(super) async fn debug_cdc_replication_dlq_list_admin(
                 .into_response();
         }
     };
-    if let Some(status) = query.status {
-        entries.retain(|entry| entry.status() == status);
-    }
-    entries.sort_by(|left, right| {
-        left.created_at_unix_ms()
-            .cmp(&right.created_at_unix_ms())
-            .then_with(|| left.dlq_id().cmp(right.dlq_id()))
-    });
-    let oldest_pending_age_ms = entries
-        .iter()
-        .filter(|entry| entry.status() == ReplicationPipelineDlqStatus::Pending)
-        .map(|entry| current_unix_time_ms().saturating_sub(entry.created_at_unix_ms()))
-        .min();
-    let total_matching = entries.len();
-    let entries = entries
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
+    let total_matching = page.total_matching();
+    let oldest_pending_age_ms = page.oldest_pending_age_ms();
+    let entries = page.into_entries();
     let response = CdcReplicationDlqListResponse {
         pipeline: query.pipeline,
         status: query.status,

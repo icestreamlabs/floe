@@ -157,8 +157,8 @@ fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -
     }
 
     let array: ArrayRef = match values {
-        CdcColumnarColumn::Int64(values) => Arc::new(Int64Array::from(values.clone())),
-        CdcColumnarColumn::Bool(values) => Arc::new(BooleanArray::from(values.clone())),
+        CdcColumnarColumn::Int64(values) => Arc::new(int64_array_from_options(values)),
+        CdcColumnarColumn::Bool(values) => Arc::new(bool_array_from_options(values)),
         CdcColumnarColumn::Utf8(values) => {
             let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 16);
             for value in values {
@@ -170,15 +170,15 @@ fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -
             Arc::new(builder.finish())
         }
         CdcColumnarColumn::TimestampMillis(values) => {
-            Arc::new(TimestampMillisecondArray::from(values.clone()))
+            Arc::new(timestamp_millis_array_from_options(values))
         }
-        CdcColumnarColumn::DateDays(values) => Arc::new(Date32Array::from(values.clone())),
+        CdcColumnarColumn::DateDays(values) => Arc::new(date32_array_from_options(values)),
         CdcColumnarColumn::Decimal128 {
             precision,
             scale,
             values,
         } => Arc::new(
-            Decimal128Array::from(values.clone())
+            decimal128_array_from_options(values)
                 .with_precision_and_scale(*precision, *scale)
                 .context("build Decimal128 CDC snapshot Arrow column")?,
         ),
@@ -194,6 +194,61 @@ fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -
         }
     };
     Ok(array)
+}
+
+fn int64_array_from_options(values: &[Option<i64>]) -> Int64Array {
+    let mut builder = Int64Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn bool_array_from_options(values: &[Option<bool>]) -> BooleanArray {
+    let mut builder = BooleanBuilder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn timestamp_millis_array_from_options(values: &[Option<i64>]) -> TimestampMillisecondArray {
+    let mut builder = TimestampMillisecondBuilder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn date32_array_from_options(values: &[Option<i32>]) -> Date32Array {
+    let mut builder = Date32Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn decimal128_array_from_options(values: &[Option<i128>]) -> Decimal128Array {
+    let mut builder = Decimal128Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
 }
 
 enum CdcArrowColumnBuilder {

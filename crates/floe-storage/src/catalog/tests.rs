@@ -336,6 +336,82 @@ async fn replication_pipeline_dlq_stats_count_statuses_without_loading_entries()
 }
 
 #[tokio::test]
+async fn replication_pipeline_dlq_page_filters_orders_and_paginates() {
+    let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+    for (dlq_id, created_at) in [
+        ("entry-c", 1_300_u64),
+        ("entry-a", 1_000_u64),
+        ("entry-b", 1_200_u64),
+        ("entry-d", 1_400_u64),
+    ] {
+        let entry = ReplicationPipelineDlqEntry::new(
+            "pg_orders_to_kafka",
+            dlq_id,
+            "pg_main",
+            CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
+            Some(CdcTransactionId::new(format!("tx-{dlq_id}")).expect("transaction")),
+            "target_delivery",
+            "target unavailable",
+            1,
+            None,
+            Some("kafka_records".to_string()),
+            1024,
+            BTreeMap::new(),
+            created_at,
+        )
+        .expect("dlq entry");
+        catalog
+            .put_replication_pipeline_dlq_entry(entry)
+            .await
+            .expect("persist dlq entry");
+    }
+    catalog
+        .update_replication_pipeline_dlq_entry_status(
+            "pg_orders_to_kafka",
+            "entry-b",
+            ReplicationPipelineDlqStatus::Replayed,
+            1_500,
+        )
+        .await
+        .expect("replay entry");
+
+    let page = catalog
+        .replication_pipeline_dlq_entries_page("pg_orders_to_kafka", None, 1, 2, 2_000)
+        .await
+        .expect("dlq page");
+    assert_eq!(page.total_matching(), 4);
+    assert_eq!(page.oldest_pending_age_ms(), Some(1_000));
+    assert_eq!(
+        page.entries()
+            .iter()
+            .map(ReplicationPipelineDlqEntry::dlq_id)
+            .collect::<Vec<_>>(),
+        vec!["entry-b", "entry-c"]
+    );
+
+    let pending_page = catalog
+        .replication_pipeline_dlq_entries_page(
+            "pg_orders_to_kafka",
+            Some(ReplicationPipelineDlqStatus::Pending),
+            0,
+            10,
+            2_000,
+        )
+        .await
+        .expect("pending page");
+    assert_eq!(pending_page.total_matching(), 3);
+    assert_eq!(pending_page.oldest_pending_age_ms(), Some(1_000));
+    assert_eq!(
+        pending_page
+            .entries()
+            .iter()
+            .map(ReplicationPipelineDlqEntry::dlq_id)
+            .collect::<Vec<_>>(),
+        vec!["entry-a", "entry-c", "entry-d"]
+    );
+}
+
+#[tokio::test]
 async fn roundtrip_postgres_replication_pipeline_target() {
     let catalog = SlateCatalog::in_memory().await.expect("open catalog");
     let pipeline = ReplicationPipelineDefinition::new(

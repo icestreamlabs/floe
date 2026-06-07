@@ -225,12 +225,8 @@ fn arrow_ipc_columnar_array(
         column.data_type()
     );
     let array: ArrayRef = match values {
-        CdcColumnarColumn::Int64(values) => {
-            Arc::new(arrow_array::Int64Array::from(values[start..end].to_vec()))
-        }
-        CdcColumnarColumn::Bool(values) => {
-            Arc::new(arrow_array::BooleanArray::from(values[start..end].to_vec()))
-        }
+        CdcColumnarColumn::Int64(values) => Arc::new(int64_array_from_options(&values[start..end])),
+        CdcColumnarColumn::Bool(values) => Arc::new(bool_array_from_options(&values[start..end])),
         CdcColumnarColumn::Utf8(values) => {
             let mut builder = StringBuilder::with_capacity(end - start, (end - start) * 16);
             for value in &values[start..end] {
@@ -241,18 +237,18 @@ fn arrow_ipc_columnar_array(
             }
             Arc::new(builder.finish())
         }
-        CdcColumnarColumn::TimestampMillis(values) => Arc::new(
-            arrow_array::TimestampMillisecondArray::from(values[start..end].to_vec()),
-        ),
+        CdcColumnarColumn::TimestampMillis(values) => {
+            Arc::new(timestamp_millis_array_from_options(&values[start..end]))
+        }
         CdcColumnarColumn::DateDays(values) => {
-            Arc::new(arrow_array::Date32Array::from(values[start..end].to_vec()))
+            Arc::new(date32_array_from_options(&values[start..end]))
         }
         CdcColumnarColumn::Decimal128 {
             precision,
             scale,
             values,
         } => Arc::new(
-            Decimal128Array::from(values[start..end].to_vec())
+            decimal128_array_from_options(&values[start..end])
                 .with_precision_and_scale(*precision, *scale)
                 .context("build Decimal128 Arrow IPC snapshot column")?,
         ),
@@ -268,6 +264,63 @@ fn arrow_ipc_columnar_array(
         }
     };
     Ok(array)
+}
+
+fn int64_array_from_options(values: &[Option<i64>]) -> arrow_array::Int64Array {
+    let mut builder = Int64Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn bool_array_from_options(values: &[Option<bool>]) -> arrow_array::BooleanArray {
+    let mut builder = BooleanBuilder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn timestamp_millis_array_from_options(
+    values: &[Option<i64>],
+) -> arrow_array::TimestampMillisecondArray {
+    let mut builder = TimestampMillisecondBuilder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn date32_array_from_options(values: &[Option<i32>]) -> arrow_array::Date32Array {
+    let mut builder = Date32Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
+}
+
+fn decimal128_array_from_options(values: &[Option<i128>]) -> Decimal128Array {
+    let mut builder = Decimal128Builder::with_capacity(values.len());
+    for value in values {
+        match value {
+            Some(value) => builder.append_value(*value),
+            None => builder.append_null(),
+        }
+    }
+    builder.finish()
 }
 
 fn arrow_ipc_schema(schema: &CdcTableSchema) -> Arc<ArrowSchema> {
