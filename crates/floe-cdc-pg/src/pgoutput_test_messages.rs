@@ -7,17 +7,17 @@ pub(crate) const TEST_PG_INT4_OID: u32 = 23;
 pub(crate) const TEST_PG_INT8_OID: u32 = 20;
 pub(crate) const TEST_PG_TEXT_OID: u32 = 25;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct PgOutputTestColumn {
-    name: &'static str,
+    name: String,
     type_oid: u32,
     is_key: bool,
 }
 
 impl PgOutputTestColumn {
-    pub(crate) const fn new(name: &'static str, type_oid: u32, is_key: bool) -> Self {
+    pub(crate) fn new(name: impl Into<String>, type_oid: u32, is_key: bool) -> Self {
         Self {
-            name,
+            name: name.into(),
             type_oid,
             is_key,
         }
@@ -124,7 +124,7 @@ pub(crate) fn relation_message_with_identity_and_columns(
 
     for column in columns {
         put_u8(&mut out, u8::from(column.is_key));
-        put_cstring(&mut out, column.name);
+        put_cstring(&mut out, &column.name);
         put_u32(&mut out, column.type_oid);
         put_i32(&mut out, -1);
     }
@@ -132,27 +132,27 @@ pub(crate) fn relation_message_with_identity_and_columns(
     Bytes::from(out)
 }
 
-pub(crate) fn relation_message_with_column_specs(
+pub(crate) fn relation_message_with_column_specs<N: AsRef<str>>(
     relation_id: u32,
     table: &str,
-    columns: &[(&'static str, u32, bool)],
+    columns: &[(N, u32, bool)],
 ) -> Bytes {
     let columns: Vec<PgOutputTestColumn> = columns
         .iter()
-        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(name, *type_oid, *is_key))
+        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(name.as_ref(), *type_oid, *is_key))
         .collect();
     relation_message_with_columns(relation_id, table, &columns)
 }
 
-pub(crate) fn relation_message_with_identity_and_column_specs(
+pub(crate) fn relation_message_with_identity_and_column_specs<N: AsRef<str>>(
     relation_id: u32,
     table: &str,
     replica_identity: u8,
-    columns: &[(&'static str, u32, bool)],
+    columns: &[(N, u32, bool)],
 ) -> Bytes {
     let columns: Vec<PgOutputTestColumn> = columns
         .iter()
-        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(name, *type_oid, *is_key))
+        .map(|(name, type_oid, is_key)| PgOutputTestColumn::new(name.as_ref(), *type_oid, *is_key))
         .collect();
     relation_message_with_identity_and_columns(relation_id, table, replica_identity, &columns)
 }

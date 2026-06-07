@@ -5,14 +5,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod node_process;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/wait.rs"]
+mod wait;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use node_process::{post_bid_with_extra, spawn_node, stop_child, wait_for_healthz};
 use ports::find_unused_port;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::time::{Instant, interval};
 use tokio_postgres::NoTls;
+use wait::wait_until;
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_smoke AS \
      SELECT auction, bidder, price FROM nexmark_bid";
@@ -282,20 +284,19 @@ struct SourceBidRow {
 }
 
 async fn wait_for_source_bid(pg_port: u16, auction: i64) -> Result<SourceBidRow> {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        match query_source_bid(pg_port, auction).await {
-            Ok(Some(row)) => return Ok(row),
-            Ok(None) | Err(_) if Instant::now() < deadline => {
-                poll.tick().await;
+    wait_until(
+        format!("source journal row for auction {auction}"),
+        Duration::from_secs(8),
+        Duration::from_millis(100),
+        || async {
+            match query_source_bid(pg_port, auction).await {
+                Ok(Some(row)) => Ok(Some(row)),
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
             }
-            Ok(None) => bail!("timed out waiting for source journal row for auction {auction}"),
-            Err(err) => {
-                bail!("timed out waiting for source journal row for auction {auction}: {err}")
-            }
-        }
-    }
+        },
+    )
+    .await
 }
 
 async fn query_source_bid(pg_port: u16, auction: i64) -> Result<Option<SourceBidRow>> {

@@ -367,11 +367,11 @@ fn schema_history_is_bounded_for_repeated_relation_versions() {
     );
 
     for added in 0..(POSTGRES_SCHEMA_HISTORY_LIMIT + 8) {
-        let mut borrowed = vec![("id", PG_INT8_OID, true), ("status", PG_TEXT_OID, false)];
-        borrowed.extend((0..added).map(|idx| {
-            let name: &'static str = Box::leak(format!("note_{idx}").into_boxed_str());
-            (name, PG_TEXT_OID, false)
-        }));
+        let mut borrowed = vec![
+            ("id".to_string(), PG_INT8_OID, true),
+            ("status".to_string(), PG_TEXT_OID, false),
+        ];
+        borrowed.extend((0..added).map(|idx| (format!("note_{idx}"), PG_TEXT_OID, false)));
         assembler
             .accept_event(xlog(relation_message_with_columns(
                 RELATION_ID,

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use floe_cdc_core::{
     CdcChange, CdcRow, CdcRowKey, CdcSourcePosition, CdcTableSchema, CdcTransactionId, ChangeBatch,
 };
-use floe_core::{RowValue, catalog::ColumnType};
+use floe_core::{RowValue, catalog::ColumnType, decimal::format_decimal128};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,19 +673,6 @@ fn row_value_to_json(value: &RowValue, data_type: &floe_core::catalog::ColumnTyp
         },
         RowValue::Numeric(value) => Value::String(value.clone()),
     }
-}
-
-fn format_decimal128(value: i128, scale: i8) -> String {
-    if scale <= 0 {
-        return value.to_string();
-    }
-    let scale = scale as u32;
-    let factor = 10_i128.pow(scale);
-    let sign = if value < 0 { "-" } else { "" };
-    let magnitude = value.abs();
-    let whole = magnitude / factor;
-    let fraction = magnitude % factor;
-    format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
 }
 
 fn current_unix_time_ms() -> i64 {

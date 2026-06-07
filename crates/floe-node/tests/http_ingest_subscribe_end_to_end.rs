@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod http_ready;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/wait.rs"]
+mod wait;
 
 use anyhow::{Context, Result, bail};
 use http_ready::wait_for_healthz;
@@ -13,7 +15,7 @@ use ports::find_unused_port;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::process::Command;
-use tokio::time::{Instant, interval};
+use wait::wait_until;
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_http_ingest AS \
      SELECT auction, bidder, price FROM nexmark_bid";
@@ -132,41 +134,31 @@ async fn http_ingest_subscribe_streams_rows() -> Result<()> {
 }
 
 async fn wait_for_subscribe_rows(path: &Path) -> Result<Vec<Value>> {
-    let deadline = Instant::now() + Duration::from_secs(6);
-    let mut poll = interval(Duration::from_millis(100));
-    let mut attempts = 0usize;
-    loop {
-        match tokio::fs::read_to_string(path).await {
-            Ok(contents) => {
-                let mut rows = Vec::new();
-                for line in contents.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
+    wait_until(
+        format!("subscribe sink output in {}", path.to_string_lossy()),
+        Duration::from_secs(6),
+        Duration::from_millis(100),
+        || async {
+            match tokio::fs::read_to_string(path).await {
+                Ok(contents) => {
+                    let mut rows = Vec::new();
+                    for line in contents.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let value: Value =
+                            serde_json::from_str(line).context("parse subscribe row json")?;
+                        rows.push(value);
                     }
-                    let value: Value =
-                        serde_json::from_str(line).context("parse subscribe row json")?;
-                    rows.push(value);
+                    Ok((!rows.is_empty()).then_some(rows))
                 }
-                if !rows.is_empty() {
-                    return Ok(rows);
-                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err.into()),
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-        attempts = attempts.saturating_add(1);
-        if attempts == 30 {
-            tracing::warn!("waiting for subscribe sink output");
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "subscribe sink output never appeared in {}",
-                path.to_string_lossy()
-            );
-        }
-        poll.tick().await;
-    }
+        },
+    )
+    .await
 }
 
 fn temp_path(name: &str) -> PathBuf {

@@ -13,7 +13,7 @@ use floe_executor::plan_source_requirements;
 #[test]
 fn plans_scan_then_project() -> Result<()> {
     let logical_plan = table_scan(
-        Some(nexmark_person_table().name),
+        Some(nexmark_person_table().name()),
         &schema_for(nexmark_person_table()),
         None,
     )?
@@ -39,7 +39,7 @@ fn plans_scan_then_filter() -> Result<()> {
     let predicate = col("bidder")
         .eq(lit(42i64))
         .and(col("price").gt(lit(10i64)));
-    let logical_plan = table_scan(Some(bid_table.name), &schema_for(bid_table), None)?
+    let logical_plan = table_scan(Some(bid_table.name()), &schema_for(bid_table), None)?
         .filter(predicate)?
         .build()?;
 
@@ -58,13 +58,13 @@ fn plans_scan_then_filter() -> Result<()> {
 #[test]
 fn plans_join_with_single_key() -> Result<()> {
     let right_plan = table_scan(
-        Some(nexmark_person_table().name),
+        Some(nexmark_person_table().name()),
         &schema_for(nexmark_person_table()),
         None,
     )?
     .build()?;
     let logical_plan = table_scan(
-        Some(nexmark_auction_table().name),
+        Some(nexmark_auction_table().name()),
         &schema_for(nexmark_auction_table()),
         None,
     )?
@@ -100,7 +100,7 @@ fn plans_join_with_single_key() -> Result<()> {
 #[test]
 fn source_requirement_analysis_tracks_filter_projection_inputs() -> Result<()> {
     let logical_plan = table_scan(
-        Some(nexmark_bid_table().name),
+        Some(nexmark_bid_table().name()),
         &schema_for(nexmark_bid_table()),
         None,
     )?
@@ -121,14 +121,14 @@ fn source_requirement_analysis_tracks_filter_projection_inputs() -> Result<()> {
 #[test]
 fn source_requirement_analysis_tracks_join_inputs() -> Result<()> {
     let auction_scan = table_scan(
-        Some(nexmark_auction_table().name),
+        Some(nexmark_auction_table().name()),
         &schema_for(nexmark_auction_table()),
         None,
     )?
     .filter(col("category").eq(lit(10i64)))?
     .build()?;
     let logical_plan = table_scan(
-        Some(nexmark_bid_table().name),
+        Some(nexmark_bid_table().name()),
         &schema_for(nexmark_bid_table()),
         None,
     )?
@@ -164,13 +164,13 @@ fn source_requirement_analysis_tracks_join_inputs() -> Result<()> {
 #[test]
 fn source_requirement_analysis_tracks_right_anti_join_output_side() -> Result<()> {
     let auction_scan = table_scan(
-        Some(nexmark_auction_table().name),
+        Some(nexmark_auction_table().name()),
         &schema_for(nexmark_auction_table()),
         None,
     )?
     .build()?;
     let logical_plan = table_scan(
-        Some(nexmark_person_table().name),
+        Some(nexmark_person_table().name()),
         &schema_for(nexmark_person_table()),
         None,
     )?
@@ -201,7 +201,7 @@ fn source_requirement_analysis_tracks_right_anti_join_output_side() -> Result<()
 #[test]
 fn source_requirement_analysis_tracks_topn_inputs() -> Result<()> {
     let bid_table = nexmark_bid_table();
-    let logical_plan = table_scan(Some(bid_table.name), &schema_for(bid_table), None)?
+    let logical_plan = table_scan(Some(bid_table.name()), &schema_for(bid_table), None)?
         .sort(vec![col("price").sort(false, true)])?
         .limit(0, Some(5))?
         .project(vec![col("auction")])?
@@ -220,7 +220,7 @@ fn source_requirement_analysis_tracks_topn_inputs() -> Result<()> {
 #[test]
 fn source_requirement_analysis_tracks_distinct_and_alias_sources() -> Result<()> {
     let bid_alias = nexmark_bid_alias_table();
-    let logical_plan = table_scan(Some(bid_alias.name), &schema_for(bid_alias), None)?
+    let logical_plan = table_scan(Some(bid_alias.name()), &schema_for(bid_alias), None)?
         .project(vec![col("auction"), col("price")])?
         .distinct()?
         .project(vec![col("auction")])?
@@ -240,10 +240,10 @@ fn source_requirement_analysis_tracks_distinct_and_alias_sources() -> Result<()>
 fn source_requirement_analysis_tracks_union_inputs() -> Result<()> {
     let bid_table = nexmark_bid_table();
     let bid_alias = nexmark_bid_alias_table();
-    let left = table_scan(Some(bid_table.name), &schema_for(bid_table), None)?
+    let left = table_scan(Some(bid_table.name()), &schema_for(bid_table), None)?
         .project(vec![col("auction"), col("price")])?
         .build()?;
-    let right = table_scan(Some(bid_alias.name), &schema_for(bid_alias), None)?
+    let right = table_scan(Some(bid_alias.name()), &schema_for(bid_alias), None)?
         .project(vec![col("auction"), col("price")])?
         .build()?;
     let logical_plan = LogicalPlanBuilder::from(left)
@@ -264,13 +264,13 @@ fn source_requirement_analysis_tracks_union_inputs() -> Result<()> {
 #[test]
 fn join_filter_pushdown_prunes_join_inputs() -> Result<()> {
     let auction_scan = table_scan(
-        Some(nexmark_auction_table().name),
+        Some(nexmark_auction_table().name()),
         &schema_for(nexmark_auction_table()),
         None,
     )?
     .build()?;
     let logical_plan = table_scan(
-        Some(nexmark_bid_table().name),
+        Some(nexmark_bid_table().name()),
         &schema_for(nexmark_bid_table()),
         None,
     )?
@@ -365,13 +365,13 @@ fn join_filter_pushdown_prunes_join_inputs() -> Result<()> {
 #[test]
 fn mixed_join_filter_stays_above_join() -> Result<()> {
     let auction_scan = table_scan(
-        Some(nexmark_auction_table().name),
+        Some(nexmark_auction_table().name()),
         &schema_for(nexmark_auction_table()),
         None,
     )?
     .build()?;
     let logical_plan = table_scan(
-        Some(nexmark_bid_table().name),
+        Some(nexmark_bid_table().name()),
         &schema_for(nexmark_bid_table()),
         None,
     )?
@@ -440,7 +440,7 @@ fn missing_table_raises_planner_error() {
 #[test]
 fn recursive_plans_are_rejected_until_guarded_feedback_is_supported() -> Result<()> {
     let schema = schema_for(nexmark_person_table());
-    let static_term = table_scan(Some(nexmark_person_table().name), &schema, None)?
+    let static_term = table_scan(Some(nexmark_person_table().name()), &schema, None)?
         .project(vec![col("id")])?
         .build()?;
     let recursive_term = static_term.clone();

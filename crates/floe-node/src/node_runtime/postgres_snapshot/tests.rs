@@ -7,6 +7,7 @@ use super::*;
 use floe_cdc_core::{CdcChange, CdcColumn, CdcPrimaryKey, UpstreamTableRef};
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
+use floe_core::decimal::parse_decimal_text_to_i128;
 use std::sync::Arc;
 
 #[test]

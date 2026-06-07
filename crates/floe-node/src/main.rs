@@ -1,3 +1,4 @@
+mod arrow_json;
 mod cli;
 mod http_ingest;
 mod metrics;
