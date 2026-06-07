@@ -18,7 +18,7 @@ fn validates_simple_filter_plan() -> Result<()> {
     let planner = planner();
     let plan = bidder_filter_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_bidder")?;
 
@@ -47,20 +47,20 @@ fn validates_join_plan_with_available_sources() -> Result<()> {
     let planner = planner();
     let plan = join_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_person_table().name.to_string());
-    sources.insert(nexmark_auction_table().name.to_string());
+    sources.insert(nexmark_person_table().name().to_string());
+    sources.insert(nexmark_auction_table().name().to_string());
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_join")?;
     assert_eq!(validated.required_sources.len(), 2);
     assert!(
         validated
             .required_sources
-            .contains(nexmark_person_table().name)
+            .contains(nexmark_person_table().name())
     );
     assert!(
         validated
             .required_sources
-            .contains(nexmark_auction_table().name)
+            .contains(nexmark_auction_table().name())
     );
     assert!(!validated.root_is_sink);
     assert!(validated.fan_in_nodes.iter().any(|id| {
@@ -76,7 +76,7 @@ fn accepts_topn_operator() -> Result<()> {
     let planner = planner();
     let plan = topn_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_topn")?;
     assert_eq!(validated.root_node, plan.root);
@@ -88,7 +88,7 @@ fn accepts_union_operator() -> Result<()> {
     let planner = planner();
     let plan = union_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_union")?;
     assert_eq!(validated.root_node, plan.root);
@@ -105,7 +105,7 @@ fn accepts_passthrough_operator() -> Result<()> {
     let planner = planner();
     let plan = passthrough_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_passthrough")?;
     assert_eq!(validated.root_node, plan.root);
@@ -116,7 +116,7 @@ fn accepts_passthrough_operator() -> Result<()> {
 fn accepts_window_aggregate_operator() -> Result<()> {
     let plan = window_aggregate_plan()?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_window")?;
     assert_eq!(validated.root_node, plan.root);
@@ -128,8 +128,8 @@ fn detects_join_fan_in_mismatch() -> Result<()> {
     let planner = planner();
     let mut plan = join_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_person_table().name.to_string());
-    sources.insert(nexmark_auction_table().name.to_string());
+    sources.insert(nexmark_person_table().name().to_string());
+    sources.insert(nexmark_auction_table().name().to_string());
 
     let join_id = plan
         .nodes
@@ -173,7 +173,7 @@ fn rejects_bad_namespace() -> Result<()> {
     let planner = planner();
     let plan = bidder_filter_plan(&planner)?;
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let err = validate_dbsp_plan(&plan, &sources, "mv/bad").unwrap_err();
     assert!(
@@ -197,7 +197,7 @@ fn detects_cycles_in_plan() -> Result<()> {
     root_node.inputs.push(root_id);
 
     let mut sources = BTreeSet::new();
-    sources.insert(nexmark_bid_table().name.to_string());
+    sources.insert(nexmark_bid_table().name().to_string());
 
     let err = validate_dbsp_plan(&plan, &sources, "mv_cycle").unwrap_err();
     assert!(err.to_string().contains("cycle involving node"));
@@ -207,7 +207,7 @@ fn detects_cycles_in_plan() -> Result<()> {
 fn bidder_filter_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let bid = nexmark_bid_table();
     let predicate = col("price").gt(lit(10i64));
-    let logical_plan = table_scan(Some(bid.name), &schema_for(bid), None)?
+    let logical_plan = table_scan(Some(bid.name()), &schema_for(bid), None)?
         .filter(predicate)?
         .project(vec![col("bidder")])?
         .build()?;
@@ -218,8 +218,8 @@ fn join_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let auction = nexmark_auction_table();
     let person = nexmark_person_table();
 
-    let right = table_scan(Some(person.name), &schema_for(person), None)?.build()?;
-    let logical_plan = table_scan(Some(auction.name), &schema_for(auction), None)?
+    let right = table_scan(Some(person.name()), &schema_for(person), None)?.build()?;
+    let logical_plan = table_scan(Some(auction.name()), &schema_for(auction), None)?
         .join(
             right,
             JoinType::Inner,
@@ -235,7 +235,7 @@ fn join_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
 
 fn topn_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let bid = nexmark_bid_table();
-    let logical_plan = table_scan(Some(bid.name), &schema_for(bid), None)?
+    let logical_plan = table_scan(Some(bid.name()), &schema_for(bid), None)?
         .sort(vec![col("price").sort(true, true)])?
         .limit(0, Some(5))?
         .build()?;
@@ -244,15 +244,15 @@ fn topn_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
 
 fn union_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let bid = nexmark_bid_table();
-    let left = table_scan(Some(bid.name), &schema_for(bid), None)?.build()?;
-    let right = table_scan(Some(bid.name), &schema_for(bid), None)?.build()?;
+    let left = table_scan(Some(bid.name()), &schema_for(bid), None)?.build()?;
+    let right = table_scan(Some(bid.name()), &schema_for(bid), None)?.build()?;
     let logical_plan = LogicalPlanBuilder::from(left).union(right)?.build()?;
     Ok(planner.build(&logical_plan)?)
 }
 
 fn passthrough_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let bid = nexmark_bid_table();
-    let logical_plan = table_scan(Some(bid.name), &schema_for(bid), None)?
+    let logical_plan = table_scan(Some(bid.name()), &schema_for(bid), None)?
         .sort(vec![col("price").sort(true, true)])?
         .build()?;
     Ok(planner.build(&logical_plan)?)

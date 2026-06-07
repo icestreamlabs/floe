@@ -1,12 +1,12 @@
+use anyhow::{Result, ensure};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use floe_cdc::{CdcRowDelta, CdcTableDeltas};
 use floe_cdc_core::{CdcRow, CdcTableId};
 use floe_core::RowValue;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 use floe_executor::SourceRowDecoder;
-use floe_node_core::cdc_delta_encoder::{
-    CdcArrowDeltaBatch, encode_cdc_arrow_delta_batch, encode_cdc_table_deltas,
-};
+use floe_executor::stream_types::EncodedDelta;
+use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 
 fn source_definition() -> SourceDefinition {
     SourceDefinition::new(
@@ -54,6 +54,38 @@ fn deltas(batch_size: usize) -> CdcTableDeltas {
         })
         .collect();
     CdcTableDeltas::new(CdcTableId::new("nexmark_bid").expect("table id"), changes)
+}
+
+fn encode_cdc_table_deltas(
+    decoder: &SourceRowDecoder,
+    table_deltas: &CdcTableDeltas,
+) -> Result<Vec<EncodedDelta>> {
+    let arrow_batch = CdcArrowDeltaBatch::from_table_deltas(decoder.definition(), table_deltas)?;
+    encode_cdc_arrow_delta_batch(decoder, &arrow_batch)
+}
+
+fn encode_cdc_arrow_delta_batch(
+    decoder: &SourceRowDecoder,
+    arrow_batch: &CdcArrowDeltaBatch,
+) -> Result<Vec<EncodedDelta>> {
+    ensure!(
+        arrow_batch.table_id().as_str() == decoder.definition().name(),
+        "CDC Arrow table '{}' cannot be encoded with source decoder '{}'",
+        arrow_batch.table_id().as_str(),
+        decoder.definition().name()
+    );
+    let encoded_rows = decoder.encode_arrow_batch(arrow_batch.record_batch())?;
+    ensure!(
+        encoded_rows.len() == arrow_batch.diffs().len(),
+        "CDC Arrow batch row count {} does not match diff count {}",
+        encoded_rows.len(),
+        arrow_batch.diffs().len()
+    );
+    Ok(encoded_rows
+        .into_iter()
+        .zip(arrow_batch.diffs())
+        .map(|((row, _), diff)| (row, *diff))
+        .collect())
 }
 
 fn bench_postgres_cdc_arrow_encoder(c: &mut Criterion) {

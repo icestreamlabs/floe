@@ -3,13 +3,15 @@ use std::time::Duration;
 
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/wait.rs"]
+mod wait;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ports::find_unused_port;
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::time::{Instant, interval};
 use tokio_postgres::NoTls;
+use wait::wait_until;
 
 const MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_bid_passthrough AS \
      SELECT auction, bidder, price FROM nexmark_bid";
@@ -73,46 +75,42 @@ async fn floe_node_streams_mv_rows_over_pgwire() -> Result<()> {
 }
 
 async fn wait_for_pgwire(addr: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut poll = interval(Duration::from_millis(100));
-    let mut attempts = 0usize;
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(err) if Instant::now() < deadline => {
-                attempts = attempts.saturating_add(1);
-                if attempts == 25 {
-                    tracing::warn!(error = %err, "waiting for pgwire listener");
+    wait_until(
+        "pgwire listener",
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        || async {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    drop(stream);
+                    Ok(Some(()))
                 }
-                poll.tick().await;
+                Err(err) => {
+                    tracing::debug!(error = %err, "waiting for pgwire listener");
+                    Ok(None)
+                }
             }
-            Err(err) => bail!("pgwire listener never became ready: {err}"),
-        }
-    }
+        },
+    )
+    .await
 }
 
 async fn wait_for_bid_rows(client: &tokio_postgres::Client) -> Result<Vec<tokio_postgres::Row>> {
     let sql = "SELECT auction, bidder, price FROM mv_bid_passthrough LIMIT 5";
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        match client.query(sql, &[]).await {
-            Ok(rows) if !rows.is_empty() => return Ok(rows),
-            Ok(_) if Instant::now() < deadline => {
-                poll.tick().await;
-            }
-            Err(err) => {
-                // Connection is ready but the mv may not be registered yet.
-                tracing::debug!(error = %err, "query attempt failed");
-                if Instant::now() >= deadline {
-                    return Err(anyhow!("timed out waiting for rows from {sql}: {err}"));
+    wait_until(
+        format!("rows from {sql}"),
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || async {
+            match client.query(sql, &[]).await {
+                Ok(rows) if !rows.is_empty() => Ok(Some(rows)),
+                Ok(_) => Ok(None),
+                Err(err) => {
+                    tracing::debug!(error = %err, "query attempt failed");
+                    Err(err.into())
                 }
-                poll.tick().await;
             }
-            Ok(_) => return Err(anyhow!("timed out waiting for rows from {sql}")),
-        }
-    }
+        },
+    )
+    .await
 }

@@ -43,7 +43,8 @@ impl PlannerConfig {
     }
 
     pub fn register_owned_table(&mut self, table: TableDescriptor) {
-        self.tables.insert(table.name.to_string(), Arc::new(table));
+        self.tables
+            .insert(table.name().to_string(), Arc::new(table));
     }
 
     pub fn with_disabled_optimizer_rule(mut self, rule_name: impl Into<String>) -> Self {

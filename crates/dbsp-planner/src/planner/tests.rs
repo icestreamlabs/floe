@@ -70,7 +70,7 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     ] {
         let provider: Arc<dyn TableProvider> =
             Arc::new(EmptyTable::new(table.schema().to_arrow_schema()));
-        ctx.register_table(table.name, provider)
+        ctx.register_table(table.name(), provider)
             .expect("register nexmark table");
     }
     let passthrough_ts: ScalarFunctionImplementation = Arc::new(
@@ -134,7 +134,7 @@ async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
 }
 
 fn qualified(table: &'static TableDescriptor, column: &str) -> String {
-    format!("{}.{}", table.name, column)
+    format!("{}.{}", table.name(), column)
 }
 
 fn select_predicate_in_unary_chain(

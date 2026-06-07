@@ -1,4 +1,5 @@
 use super::*;
+use floe_core::decimal::format_decimal128;
 
 pub(in crate::node_runtime::replication) struct PostgresReplicationPipelineWriter {
     connection: String,
@@ -525,10 +526,7 @@ fn postgres_param_from_json(
             let text = if let Some(value) = value.as_str() {
                 value.to_string()
             } else {
-                encoding::format_decimal128_for_json(
-                    i128::from(json_i64(column.name(), value)?),
-                    *scale,
-                )
+                format_decimal128(i128::from(json_i64(column.name(), value)?), *scale)
             };
             Ok(PostgresParamValue::Text(Some(text)))
         }

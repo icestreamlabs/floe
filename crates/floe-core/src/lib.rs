@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod decimal;
 pub mod encoding;
 pub mod source;
 

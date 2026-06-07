@@ -5,11 +5,11 @@ fn plans_inner_join() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let left = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let right = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
@@ -61,11 +61,11 @@ fn plans_half_open_range_join_without_equi_keys() {
     )
     .expect("events descriptor");
 
-    let left = LogicalPlanBuilder::scan(windows.name, table_source_owned(&windows), None)
+    let left = LogicalPlanBuilder::scan(windows.name(), table_source_owned(&windows), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(events.name, table_source_owned(&events), None)
+    let right = LogicalPlanBuilder::scan(events.name(), table_source_owned(&events), None)
         .unwrap()
         .build()
         .unwrap();
@@ -108,11 +108,11 @@ fn plans_asof_join_without_equi_keys() {
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
     let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
 
-    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let left = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+    let right = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .build()
         .unwrap();
@@ -182,11 +182,11 @@ fn infers_join_key_predicates_for_opposite_input() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let left = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let right = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
@@ -239,11 +239,11 @@ fn infers_join_key_predicates_for_ambiguous_equivalence_class() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let left = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let right = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
@@ -332,11 +332,11 @@ fn plans_left_outer_join_with_nullable_right_columns() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let left = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let right = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
@@ -384,11 +384,11 @@ fn plans_right_outer_join_with_nullable_left_columns() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let left = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let right = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
@@ -432,11 +432,11 @@ fn plans_full_outer_join_with_nullable_both_sides() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let left = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let right = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
@@ -486,11 +486,11 @@ fn plans_left_semi_join_with_left_schema_output() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let left = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let right = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
@@ -528,11 +528,11 @@ fn plans_right_anti_join_with_right_schema_output() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let left = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let right = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
@@ -570,11 +570,11 @@ fn plans_multi_column_join() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
 
-    let left = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let left = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .build()
         .unwrap();
-    let right = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let right = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .build()
         .unwrap();
@@ -609,7 +609,7 @@ async fn plans_three_way_join_as_binary_join_composition() {
     let person = dbsp_circuit::circuit::tables::nexmark_person_table();
     let auction = dbsp_circuit::circuit::tables::nexmark_auction_table();
     let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
-    let auction_plan = LogicalPlanBuilder::scan(auction.name, table_source(auction), None)
+    let auction_plan = LogicalPlanBuilder::scan(auction.name(), table_source(auction), None)
         .unwrap()
         .project(vec![
             col(qualified(auction, "id")).alias("auction_id"),
@@ -618,7 +618,7 @@ async fn plans_three_way_join_as_binary_join_composition() {
         .unwrap()
         .build()
         .unwrap();
-    let bid_plan = LogicalPlanBuilder::scan(bid.name, table_source(bid), None)
+    let bid_plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
             col(qualified(bid, "auction")).alias("bid_auction"),
@@ -627,7 +627,7 @@ async fn plans_three_way_join_as_binary_join_composition() {
         .unwrap()
         .build()
         .unwrap();
-    let plan = LogicalPlanBuilder::scan(person.name, table_source(person), None)
+    let plan = LogicalPlanBuilder::scan(person.name(), table_source(person), None)
         .unwrap()
         .project(vec![col(qualified(person, "id")).alias("person_id")])
         .unwrap()

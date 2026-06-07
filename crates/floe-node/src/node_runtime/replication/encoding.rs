@@ -18,6 +18,7 @@ use floe_cdc_core::{
 use floe_config::{ReplicationArrowIpcCompressionConfig, ReplicationEncodingConfig};
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
+use floe_core::decimal::append_decimal128_text;
 use floe_node_core::debezium_encoder::{
     DebeziumBatchEncodeOptions, DebeziumEncodeContext, DebeziumEncodedRecord,
     DebeziumEnvelopeConfig, encode_debezium_change_batch_with_options,
@@ -772,38 +773,6 @@ fn append_decimal128_json_string(out: &mut Vec<u8>, value: i128, scale: i8) -> a
     append_decimal128_text(out, value, scale)?;
     out.push(b'"');
     Ok(())
-}
-
-fn append_decimal128_text(out: &mut Vec<u8>, value: i128, scale: i8) -> anyhow::Result<()> {
-    if scale <= 0 {
-        write!(out, "{value}")?;
-        return Ok(());
-    }
-    let scale = scale as u32;
-    let factor = 10_u128
-        .checked_pow(scale)
-        .ok_or_else(|| anyhow!("Decimal128 scale {scale} is too large"))?;
-    if value < 0 {
-        out.push(b'-');
-    }
-    let magnitude = value.unsigned_abs();
-    let whole = magnitude / factor;
-    let fraction = magnitude % factor;
-    write!(out, "{whole}.{fraction:0width$}", width = scale as usize)?;
-    Ok(())
-}
-
-pub(super) fn format_decimal128_for_json(value: i128, scale: i8) -> String {
-    if scale <= 0 {
-        return value.to_string();
-    }
-    let scale = scale as u32;
-    let factor = 10_i128.pow(scale);
-    let sign = if value < 0 { "-" } else { "" };
-    let magnitude = value.abs();
-    let whole = magnitude / factor;
-    let fraction = magnitude % factor;
-    format!("{sign}{whole}.{fraction:0width$}", width = scale as usize)
 }
 
 pub(super) fn encode_debezium_pipeline_records(

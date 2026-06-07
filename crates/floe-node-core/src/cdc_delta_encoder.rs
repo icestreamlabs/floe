@@ -2,20 +2,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
-    Decimal128Builder, Int64Array, Int64Builder, RecordBatch, StringArray, StringBuilder,
+    ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
+    Decimal128Builder, Int64Array, Int64Builder, RecordBatch, StringBuilder,
     TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
 use datafusion::arrow::datatypes::DataType;
 use floe_cdc::CdcTableDeltas;
-use floe_cdc_core::{
-    CdcColumnarColumn, CdcColumnarRowBatch, CdcRowKey, CdcTableId, CdcTableSchema,
-};
+use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcTableId};
 use floe_core::RowValue;
-use floe_core::catalog::ColumnType;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
-use floe_executor::SourceRowDecoder;
-use floe_executor::stream_types::EncodedDelta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CdcDeltaOperation {
@@ -201,72 +196,6 @@ fn columnar_values_to_arrow(values: &CdcColumnarColumn, column: &SourceColumn) -
     Ok(array)
 }
 
-pub fn encode_cdc_table_deltas(
-    decoder: &SourceRowDecoder,
-    table_deltas: &CdcTableDeltas,
-) -> Result<Vec<EncodedDelta>> {
-    let arrow_batch = CdcArrowDeltaBatch::from_table_deltas(decoder.definition(), table_deltas)?;
-    encode_cdc_arrow_delta_batch(decoder, &arrow_batch)
-}
-
-pub fn encode_cdc_arrow_delta_batch(
-    decoder: &SourceRowDecoder,
-    arrow_batch: &CdcArrowDeltaBatch,
-) -> Result<Vec<EncodedDelta>> {
-    ensure!(
-        arrow_batch.table_id().as_str() == decoder.definition().name(),
-        "CDC Arrow table '{}' cannot be encoded with source decoder '{}'",
-        arrow_batch.table_id().as_str(),
-        decoder.definition().name()
-    );
-    let encoded_rows = decoder.encode_arrow_batch(arrow_batch.record_batch())?;
-    ensure!(
-        encoded_rows.len() == arrow_batch.diffs().len(),
-        "CDC Arrow batch row count {} does not match diff count {}",
-        encoded_rows.len(),
-        arrow_batch.diffs().len()
-    );
-    Ok(encoded_rows
-        .into_iter()
-        .zip(arrow_batch.diffs())
-        .map(|((row, _), diff)| (row, *diff))
-        .collect())
-}
-
-pub fn encode_cdc_arrow_primary_keys(
-    schema: &CdcTableSchema,
-    arrow_batch: &CdcArrowDeltaBatch,
-) -> Result<Vec<CdcRowKey>> {
-    ensure!(
-        schema.table_id() == arrow_batch.table_id(),
-        "CDC Arrow table '{}' cannot be key-encoded with schema '{}'",
-        arrow_batch.table_id().as_str(),
-        schema.table_id().as_str()
-    );
-    let key_indices = schema.primary_key_indices();
-    let mut keys = Vec::with_capacity(arrow_batch.len());
-    for row_idx in 0..arrow_batch.len() {
-        let mut values = Vec::with_capacity(key_indices.len());
-        for column_idx in &key_indices {
-            let column = &schema.columns()[*column_idx];
-            let value = arrow_row_value(
-                arrow_batch.record_batch().column(*column_idx).as_ref(),
-                row_idx,
-                column.data_type(),
-            )?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "CDC Arrow primary-key column '{}' cannot be NULL",
-                    column.name()
-                )
-            })?;
-            values.push(value);
-        }
-        keys.push(CdcRowKey::new(values)?);
-    }
-    Ok(keys)
-}
-
 enum CdcArrowColumnBuilder {
     Int64(Int64Builder),
     Bool(BooleanBuilder),
@@ -393,78 +322,12 @@ fn operation_from_diff(diff: i64) -> Result<CdcDeltaOperation> {
     }
 }
 
-fn arrow_row_value(
-    array: &dyn Array,
-    row_idx: usize,
-    data_type: &ColumnType,
-) -> Result<Option<RowValue>> {
-    if array.is_null(row_idx) {
-        return Ok(None);
-    }
-    match data_type {
-        ColumnType::Int64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .context("CDC Arrow column is not Int64")?;
-            Ok(Some(RowValue::Int64(array.value(row_idx))))
-        }
-        ColumnType::Bool => {
-            let array = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .context("CDC Arrow column is not Boolean")?;
-            Ok(Some(RowValue::Bool(array.value(row_idx))))
-        }
-        ColumnType::Utf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("CDC Arrow column is not Utf8")?;
-            Ok(Some(RowValue::Utf8(array.value(row_idx).to_string())))
-        }
-        ColumnType::TimestampMillis => {
-            let array = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .context("CDC Arrow column is not TimestampMillis")?;
-            Ok(Some(RowValue::TimestampMillis(array.value(row_idx))))
-        }
-        ColumnType::DateDays => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .context("CDC Arrow column is not Date32")?;
-            Ok(Some(RowValue::DateDays(array.value(row_idx))))
-        }
-        ColumnType::Decimal128 { .. } => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .context("CDC Arrow column is not Decimal128")?;
-            Ok(Some(RowValue::Decimal128(array.value(row_idx))))
-        }
-        ColumnType::Numeric => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("CDC Arrow column is not Numeric/Utf8")?;
-            Ok(Some(RowValue::Numeric(array.value(row_idx).to_string())))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use floe_cdc::{CdcRowDelta, CdcTableDeltas};
-    use floe_cdc_core::{
-        CdcColumn, CdcColumnarColumn, CdcColumnarRowBatch, CdcPrimaryKey, CdcRow, CdcTableId,
-        UpstreamTableRef,
-    };
+    use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcRow, CdcTableId};
     use floe_core::RowValue;
-    use floe_core::catalog::ColumnType;
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
-    use floe_executor::encoding::{EncodedRowScalar, decode_all_encoded_row_scalars};
 
     use super::*;
 
@@ -481,24 +344,6 @@ mod tests {
             ],
         )
         .expect("source definition")
-    }
-
-    fn orders_schema() -> CdcTableSchema {
-        CdcTableSchema::new(
-            CdcTableId::new("orders").expect("table id"),
-            UpstreamTableRef::new("public", "orders").expect("upstream"),
-            vec![
-                CdcColumn::new("tenant_id", ColumnType::Int64, false).expect("tenant"),
-                CdcColumn::new("id", ColumnType::Int64, false).expect("id"),
-                CdcColumn::new("amount", ColumnType::Int64, false).expect("amount"),
-                CdcColumn::new("note", ColumnType::Utf8, true).expect("note"),
-                CdcColumn::new("event_time", ColumnType::TimestampMillis, false)
-                    .expect("event time"),
-                CdcColumn::new("active", ColumnType::Bool, false).expect("active"),
-            ],
-            CdcPrimaryKey::new(["tenant_id", "id"]).expect("primary key"),
-        )
-        .expect("schema")
     }
 
     fn row(
@@ -546,39 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_cdc_table_deltas_through_arrow_batch() {
-        let decoder = SourceRowDecoder::new(orders_definition());
-        let encoded = encode_cdc_table_deltas(&decoder, &deltas()).expect("encode deltas");
-
-        assert_eq!(encoded.len(), 2);
-        assert_eq!(encoded[0].1, 1);
-        assert_eq!(encoded[1].1, -1);
-        assert_eq!(
-            decode_all_encoded_row_scalars(&encoded[0].0).expect("decode insert"),
-            vec![
-                Some(EncodedRowScalar::Int64(7)),
-                Some(EncodedRowScalar::Int64(1)),
-                Some(EncodedRowScalar::Int64(500)),
-                Some(EncodedRowScalar::Utf8("new".to_string())),
-                Some(EncodedRowScalar::TimestampMillis(1000)),
-                Some(EncodedRowScalar::Bool(true)),
-            ]
-        );
-        assert_eq!(
-            decode_all_encoded_row_scalars(&encoded[1].0).expect("decode delete"),
-            vec![
-                Some(EncodedRowScalar::Int64(7)),
-                Some(EncodedRowScalar::Int64(2)),
-                Some(EncodedRowScalar::Int64(100)),
-                None,
-                Some(EncodedRowScalar::TimestampMillis(2000)),
-                Some(EncodedRowScalar::Bool(false)),
-            ]
-        );
-    }
-
-    #[test]
-    fn encodes_columnar_snapshot_deltas_through_arrow_batch() {
+    fn builds_columnar_snapshot_arrow_batch() {
         let rows = CdcColumnarRowBatch::new(vec![
             CdcColumnarColumn::Int64(vec![Some(7), Some(7)]),
             CdcColumnarColumn::Int64(vec![Some(1), Some(2)]),
@@ -590,52 +403,18 @@ mod tests {
         .expect("columnar rows");
         let deltas =
             CdcTableDeltas::snapshot_insert(CdcTableId::new("orders").expect("table id"), rows);
-        let decoder = SourceRowDecoder::new(orders_definition());
+        let batch =
+            CdcArrowDeltaBatch::from_table_deltas(&orders_definition(), &deltas).expect("batch");
 
-        let encoded = encode_cdc_table_deltas(&decoder, &deltas).expect("encode snapshot deltas");
-
-        assert_eq!(encoded.len(), 2);
-        assert_eq!(encoded[0].1, 1);
-        assert_eq!(encoded[1].1, 1);
-        assert_eq!(
-            decode_all_encoded_row_scalars(&encoded[1].0).expect("decode snapshot row"),
-            vec![
-                Some(EncodedRowScalar::Int64(7)),
-                Some(EncodedRowScalar::Int64(2)),
-                Some(EncodedRowScalar::Int64(100)),
-                None,
-                Some(EncodedRowScalar::TimestampMillis(2000)),
-                Some(EncodedRowScalar::Bool(false)),
-            ]
-        );
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.operations(), &[CdcDeltaOperation::Insert; 2]);
+        assert_eq!(batch.diffs(), &[1, 1]);
+        assert_eq!(batch.record_batch().num_columns(), 6);
+        assert_eq!(batch.record_batch().num_rows(), 2);
     }
 
     #[test]
-    fn encodes_composite_primary_keys_from_arrow_columns() {
-        let arrow_batch = CdcArrowDeltaBatch::from_table_deltas(&orders_definition(), &deltas())
-            .expect("arrow batch");
-
-        let keys = encode_cdc_arrow_primary_keys(&orders_schema(), &arrow_batch)
-            .expect("encode primary keys");
-
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].values(), &[RowValue::Int64(7), RowValue::Int64(1)]);
-        assert_eq!(keys[1].values(), &[RowValue::Int64(7), RowValue::Int64(2)]);
-    }
-
-    #[test]
-    fn rejects_mismatched_cdc_table_and_decoder() {
-        let decoder = SourceRowDecoder::new(
-            SourceDefinition::new(
-                "orders",
-                vec![SourceColumn::new_nullable(
-                    "id",
-                    SourceDataType::Int64,
-                    false,
-                )],
-            )
-            .expect("source definition"),
-        );
+    fn rejects_mismatched_cdc_table_and_definition() {
         let deltas = CdcTableDeltas::new(
             CdcTableId::new("customers").expect("table id"),
             vec![CdcRowDelta::insert(
@@ -643,7 +422,8 @@ mod tests {
             )],
         );
 
-        let err = encode_cdc_table_deltas(&decoder, &deltas).expect_err("mismatch should fail");
+        let err = CdcArrowDeltaBatch::from_table_deltas(&orders_definition(), &deltas)
+            .expect_err("mismatch should fail");
         assert!(err.to_string().contains("cannot be converted"));
     }
 }

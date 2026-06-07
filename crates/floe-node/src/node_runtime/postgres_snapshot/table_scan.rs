@@ -1,5 +1,7 @@
 use super::*;
 
+use floe_core::decimal::parse_decimal_text_to_i128;
+
 pub(super) async fn snapshot_table_chunks(
     transaction: &tokio_postgres::Transaction<'_>,
     schema: &CdcTableSchema,
@@ -482,60 +484,6 @@ impl SnapshotColumnBuilder {
             Self::Numeric(values) => CdcColumnarColumn::Numeric(values),
         }
     }
-}
-
-pub(super) fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
-    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
-    let value = value.trim();
-    ensure!(!value.is_empty(), "decimal value cannot be empty");
-
-    let (negative, digits) = value
-        .strip_prefix('-')
-        .map(|rest| (true, rest))
-        .unwrap_or_else(|| {
-            value
-                .strip_prefix('+')
-                .map(|rest| (false, rest))
-                .unwrap_or((false, value))
-        });
-
-    let mut parsed = 0_i128;
-    let mut saw_digit = false;
-    let mut saw_decimal = false;
-    let mut fraction_len = 0_usize;
-    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
-
-    for byte in digits.bytes() {
-        match byte {
-            b'0'..=b'9' => {
-                saw_digit = true;
-                if saw_decimal {
-                    fraction_len = fraction_len.saturating_add(1);
-                    ensure!(
-                        fraction_len <= scale_usize,
-                        "decimal value '{value}' has more fractional digits than scale {scale}"
-                    );
-                }
-                parsed = parsed
-                    .checked_mul(10)
-                    .and_then(|acc| acc.checked_add(i128::from(byte - b'0')))
-                    .with_context(|| format!("decimal value '{value}' exceeds i128 range"))?;
-            }
-            b'.' if !saw_decimal => {
-                saw_decimal = true;
-            }
-            _ => bail!("invalid decimal value '{value}'"),
-        }
-    }
-
-    ensure!(saw_digit, "decimal value '{value}' has no digits");
-    for _ in 0..scale_usize.saturating_sub(fraction_len) {
-        parsed = parsed
-            .checked_mul(10)
-            .with_context(|| format!("decimal value '{value}' exceeds i128 range"))?;
-    }
-
-    Ok(if negative { -parsed } else { parsed })
 }
 
 pub(super) fn snapshot_int64_value(

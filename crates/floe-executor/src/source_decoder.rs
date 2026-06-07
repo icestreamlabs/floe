@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
     Decimal128Builder, Int64Array, Int64Builder, RecordBatch, StringArray, StringBuilder,
     TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
+use floe_core::decimal::parse_decimal_text_to_i128;
 use floe_core::source::{AppendIngestEvent, SourceDataType, SourceDefinition};
 use floe_core::{RowValue, source::SourceColumn};
 use serde_json::Value;
@@ -990,30 +991,6 @@ fn encode_typed_null(buf: &mut Vec<u8>, data_type: &SourceDataType) {
         SourceDataType::Decimal128 { .. } => buf.push(0x0C),
         SourceDataType::Numeric => buf.push(0x06),
     }
-}
-
-fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
-    let scale = u32::try_from(scale).context("Decimal128 scale cannot be negative")?;
-    let value = value.trim();
-    let (negative, unsigned) = value
-        .strip_prefix('-')
-        .map(|rest| (true, rest))
-        .unwrap_or((false, value));
-    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    let mut digits = String::with_capacity(whole.len() + scale as usize);
-    digits.push_str(whole);
-    let scale_usize = usize::try_from(scale).expect("u32 scale fits usize");
-    ensure!(
-        fraction.len() <= scale_usize,
-        "decimal value '{value}' has more fractional digits than scale {scale}"
-    );
-    digits.push_str(fraction);
-    digits.extend(std::iter::repeat_n('0', scale_usize - fraction.len()));
-    let parsed = digits
-        .parse::<i128>()
-        .with_context(|| format!("decode decimal value '{value}'"))?;
-    Ok(if negative { -parsed } else { parsed })
 }
 
 #[cfg(test)]

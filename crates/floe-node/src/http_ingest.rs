@@ -14,13 +14,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use datafusion::arrow::datatypes::TimeUnit;
 use floe_executor::MaterializedViewRegistry;
 use floe_executor::mv_changelog::{
     MvChangelogBatch, MvChangelogParams, MvChangelogStream, execute_mv_changelog,

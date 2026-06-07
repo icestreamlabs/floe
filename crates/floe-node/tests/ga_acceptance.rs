@@ -5,8 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod node_process;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/wait.rs"]
+mod wait;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -23,8 +25,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::mpsc;
-use tokio::time::{interval, timeout};
+use tokio::time::timeout;
 use tokio_postgres::NoTls;
+use wait::wait_until;
 
 const BID_MV_SQL: &str = "CREATE MATERIALIZED VIEW mv_acceptance_bid AS \
      SELECT auction, bidder, price FROM nexmark_bid";
@@ -83,20 +86,22 @@ fn payload_to_rows(payload: Value) -> Vec<Value> {
 async fn wait_for_admin_metrics_contains(admin_port: u16, needle: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{admin_port}/metrics");
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        match client.get(&url).send().await {
-            Ok(response) if response.status() == StatusCode::OK => {
-                let body = response.text().await.context("read admin metrics body")?;
-                if body.contains(needle) {
-                    return Ok(());
+    wait_until(
+        format!("admin metrics to contain {needle}"),
+        Duration::from_secs(12),
+        Duration::from_millis(100),
+        || async {
+            match client.get(&url).send().await {
+                Ok(response) if response.status() == StatusCode::OK => {
+                    let body = response.text().await.context("read admin metrics body")?;
+                    Ok(body.contains(needle).then_some(()))
                 }
+                Ok(_) => Ok(None),
+                Err(err) => Err(err.into()),
             }
-            Ok(_) | Err(_) => {}
-        }
-        poll.tick().await;
-    }
-    bail!("timed out waiting for admin metrics to contain {needle}");
+        },
+    )
+    .await
 }
 
 async fn post_bid(addr: &str, auction: i64, bidder: i64, price: i64) -> Result<()> {
@@ -383,22 +388,25 @@ async fn wait_for_bidder_aggregate(
     expected_count: i64,
     expected_total: i64,
 ) -> Result<(i64, i64)> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        match query_bidder_aggregate(pg_port, mv_name, bidder).await {
-            Ok(Some((bid_count, total_price)))
-                if bid_count == expected_count && total_price == expected_total =>
-            {
-                return Ok((bid_count, total_price));
+    wait_until(
+        format!(
+            "{mv_name} aggregate bidder={bidder} count={expected_count} total={expected_total}"
+        ),
+        Duration::from_secs(12),
+        Duration::from_millis(100),
+        || async {
+            match query_bidder_aggregate(pg_port, mv_name, bidder).await {
+                Ok(Some((bid_count, total_price)))
+                    if bid_count == expected_count && total_price == expected_total =>
+                {
+                    Ok(Some((bid_count, total_price)))
+                }
+                Ok(_) => Ok(None),
+                Err(err) => Err(err),
             }
-            Ok(_) | Err(_) => {
-                poll.tick().await;
-            }
-        }
-    }
-    bail!(
-        "timed out waiting for {mv_name} aggregate bidder={bidder} count={expected_count} total={expected_total}"
-    );
+        },
+    )
+    .await
 }
 
 async fn query_bidder_aggregate(
@@ -478,37 +486,35 @@ async fn wait_for_postgres_sink_row(
     amount: i64,
     note: Option<&str>,
 ) -> Result<()> {
-    let mut last_seen = None;
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        let rows = client
-            .query(
-                &format!("SELECT amount, note FROM {table} WHERE id = $1"),
-                &[&id],
-            )
-            .await
-            .with_context(|| format!("query Postgres sink table {table}"))?;
-        match rows.as_slice() {
-            [row] => {
-                let row_amount = row.try_get::<_, i64>(0).context("decode sink amount")?;
-                let row_note = row
-                    .try_get::<_, Option<String>>(1)
-                    .context("decode sink note")?;
-                if row_amount == amount && row_note.as_deref() == note {
-                    return Ok(());
+    wait_until(
+        format!("Postgres sink table {table} id={id} amount={amount} note={note:?}"),
+        Duration::from_secs(12),
+        Duration::from_millis(100),
+        || async {
+            let rows = client
+                .query(
+                    &format!("SELECT amount, note FROM {table} WHERE id = $1"),
+                    &[&id],
+                )
+                .await
+                .with_context(|| format!("query Postgres sink table {table}"))?;
+            match rows.as_slice() {
+                [row] => {
+                    let row_amount = row.try_get::<_, i64>(0).context("decode sink amount")?;
+                    let row_note = row
+                        .try_get::<_, Option<String>>(1)
+                        .context("decode sink note")?;
+                    if row_amount == amount && row_note.as_deref() == note {
+                        Ok(Some(()))
+                    } else {
+                        Err(anyhow!("last seen amount={row_amount}, note={row_note:?}"))
+                    }
                 }
-                last_seen = Some(format!("amount={row_amount}, note={row_note:?}"));
+                rows => Err(anyhow!("last seen {} rows", rows.len())),
             }
-            rows => {
-                last_seen = Some(format!("{} rows", rows.len()));
-            }
-        }
-        poll.tick().await;
-    }
-    bail!(
-        "timed out waiting for Postgres sink table {table} id={id} amount={amount} note={note:?}; last seen: {:?}",
-        last_seen
+        },
     )
+    .await
 }
 
 async fn wait_for_postgres_sink_typed_row(
@@ -520,49 +526,49 @@ async fn wait_for_postgres_sink_typed_row(
     amount: &str,
     note: Option<&str>,
 ) -> Result<()> {
-    let mut last_seen = None;
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT active, order_date::text, amount::text, note FROM {table} WHERE id = $1"
-                ),
-                &[&id],
-            )
-            .await
-            .with_context(|| format!("query Postgres typed sink table {table}"))?;
-        match rows.as_slice() {
-            [row] => {
-                let row_active = row.try_get::<_, bool>(0).context("decode sink active")?;
-                let row_order_date = row
-                    .try_get::<_, String>(1)
-                    .context("decode sink order_date")?;
-                let row_amount = row.try_get::<_, String>(2).context("decode sink amount")?;
-                let row_note = row
-                    .try_get::<_, Option<String>>(3)
-                    .context("decode sink note")?;
-                if row_active == active
-                    && row_order_date == order_date
-                    && row_amount == amount
-                    && row_note.as_deref() == note
-                {
-                    return Ok(());
+    wait_until(
+        format!(
+            "Postgres typed sink table {table} id={id} active={active} order_date={order_date} amount={amount} note={note:?}"
+        ),
+        Duration::from_secs(12),
+        Duration::from_millis(100),
+        || async {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT active, order_date::text, amount::text, note FROM {table} WHERE id = $1"
+                    ),
+                    &[&id],
+                )
+                .await
+                .with_context(|| format!("query Postgres typed sink table {table}"))?;
+            match rows.as_slice() {
+                [row] => {
+                    let row_active = row.try_get::<_, bool>(0).context("decode sink active")?;
+                    let row_order_date = row
+                        .try_get::<_, String>(1)
+                        .context("decode sink order_date")?;
+                    let row_amount = row.try_get::<_, String>(2).context("decode sink amount")?;
+                    let row_note = row
+                        .try_get::<_, Option<String>>(3)
+                        .context("decode sink note")?;
+                    if row_active == active
+                        && row_order_date == order_date
+                        && row_amount == amount
+                        && row_note.as_deref() == note
+                    {
+                        Ok(Some(()))
+                    } else {
+                        Err(anyhow!(
+                            "last seen active={row_active}, order_date={row_order_date}, amount={row_amount}, note={row_note:?}"
+                        ))
+                    }
                 }
-                last_seen = Some(format!(
-                    "active={row_active}, order_date={row_order_date}, amount={row_amount}, note={row_note:?}"
-                ));
+                rows => Err(anyhow!("last seen {} rows", rows.len())),
             }
-            rows => {
-                last_seen = Some(format!("{} rows", rows.len()));
-            }
-        }
-        poll.tick().await;
-    }
-    bail!(
-        "timed out waiting for Postgres typed sink table {table} id={id} active={active} order_date={order_date} amount={amount} note={note:?}; last seen: {:?}",
-        last_seen
+        },
     )
+    .await
 }
 
 async fn wait_for_postgres_sink_absent(
@@ -570,22 +576,27 @@ async fn wait_for_postgres_sink_absent(
     table: &str,
     id: i64,
 ) -> Result<()> {
-    let mut poll = interval(Duration::from_millis(100));
-    for _ in 0..120 {
-        let row = client
-            .query_one(
-                &format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE id = $1"),
-                &[&id],
-            )
-            .await
-            .with_context(|| format!("query Postgres sink table {table} absence"))?;
-        let count = row.try_get::<_, i64>(0).context("decode sink count")?;
-        if count == 0 {
-            return Ok(());
-        }
-        poll.tick().await;
-    }
-    bail!("timed out waiting for Postgres sink table {table} id={id} to be absent")
+    wait_until(
+        format!("Postgres sink table {table} id={id} to be absent"),
+        Duration::from_secs(12),
+        Duration::from_millis(100),
+        || async {
+            let row = client
+                .query_one(
+                    &format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE id = $1"),
+                    &[&id],
+                )
+                .await
+                .with_context(|| format!("query Postgres sink table {table} absence"))?;
+            let count = row.try_get::<_, i64>(0).context("decode sink count")?;
+            if count == 0 {
+                Ok(Some(()))
+            } else {
+                Err(anyhow!("last seen count={count}"))
+            }
+        },
+    )
+    .await
 }
 
 async fn wait_for_rows_matching(

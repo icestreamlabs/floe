@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{metrics, runtime_failure};
 use floe_config::{SinkConfig, SinkSpec};
+use floe_core::decimal::format_decimal128;
 
 const DEFAULT_SINK_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_BATCH_ROWS: usize = 1;
@@ -62,7 +63,7 @@ mod worker;
 
 use file_backend::*;
 use http_backend::*;
-use json::{changelog_row_to_json, format_decimal128};
+use json::changelog_row_to_json;
 use kafka_backend::*;
 use postgres_backend::*;
 use worker::*;
