@@ -29,6 +29,23 @@ pub(super) fn pending_stats_key(pipeline_name: &str) -> Vec<u8> {
     key
 }
 
+pub(super) fn pending_time_index_prefix(pipeline_name: &str) -> Vec<u8> {
+    let mut key = pipeline_prefix(pipeline_name);
+    key.extend_from_slice(b"pending_by_time/");
+    key
+}
+
+pub(super) fn pending_time_index_key(
+    pipeline_name: &str,
+    buffered_at_unix_ms: u64,
+    transaction_key: &str,
+) -> Vec<u8> {
+    let mut key = pending_time_index_prefix(pipeline_name);
+    key.extend_from_slice(format!("{buffered_at_unix_ms:020}/").as_bytes());
+    key.extend_from_slice(transaction_key.as_bytes());
+    key
+}
+
 pub(super) fn pending_manifest_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
     let mut key = pending_manifest_prefix(pipeline_name);
     key.extend_from_slice(transaction_key.as_bytes());

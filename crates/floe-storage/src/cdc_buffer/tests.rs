@@ -401,6 +401,24 @@ async fn stats_track_overwritten_and_delivered_pending_manifest() {
 }
 
 #[tokio::test]
+async fn stats_oldest_pending_uses_buffer_time_for_opaque_positions() {
+    let store = test_store("cdc-buffer-stats-opaque-oldest").await;
+    store
+        .append_transaction(&opaque_append("z-position", 1000, vec![record(1)]))
+        .await
+        .expect("append older opaque position");
+    store
+        .append_transaction(&opaque_append("a-position", 1900, vec![record(2)]))
+        .await
+        .expect("append newer opaque position");
+
+    let stats = store.stats("pipe", 2000).await.expect("stats");
+
+    assert_eq!(stats.pending_transactions(), 2);
+    assert_eq!(stats.oldest_pending_age_ms(), Some(1000));
+}
+
+#[tokio::test]
 async fn integrity_report_detects_missing_and_orphan_payload_objects() {
     let store = test_store("cdc-buffer-integrity").await;
     let append = append("0/10", 1000, vec![record(1)]);
@@ -560,6 +578,23 @@ fn append(lsn: &str, buffered_at_unix_ms: u64, records: Vec<CdcBufferRecord>) ->
         "orders",
         CdcSourcePosition::postgres(lsn, None).expect("position"),
         Some(CdcTransactionId::new(format!("tx-{lsn}")).expect("tx")),
+        records,
+        buffered_at_unix_ms,
+    )
+    .expect("append")
+}
+
+fn opaque_append(
+    position: &str,
+    buffered_at_unix_ms: u64,
+    records: Vec<CdcBufferRecord>,
+) -> CdcBufferAppend {
+    CdcBufferAppend::new(
+        "pipe",
+        "opaque_main",
+        "orders",
+        CdcSourcePosition::opaque(position).expect("position"),
+        Some(CdcTransactionId::new(format!("tx-{position}")).expect("tx")),
         records,
         buffered_at_unix_ms,
     )

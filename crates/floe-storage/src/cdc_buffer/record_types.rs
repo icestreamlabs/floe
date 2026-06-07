@@ -381,6 +381,26 @@ pub(super) fn stage_pending_stats(
     Ok(())
 }
 
+pub(super) fn stage_pending_time_index(
+    batch: &mut WriteBatch,
+    manifest: &CdcBufferedTransactionManifest,
+) {
+    batch.put(
+        pending_time_index_key_for_manifest(manifest),
+        manifest.buffered_at_unix_ms().to_be_bytes(),
+    );
+}
+
+pub(super) fn pending_time_index_key_for_manifest(
+    manifest: &CdcBufferedTransactionManifest,
+) -> Vec<u8> {
+    pending_time_index_key(
+        manifest.pipeline_name(),
+        manifest.buffered_at_unix_ms(),
+        manifest.transaction_key(),
+    )
+}
+
 pub(super) async fn write_batch(db: &Db, batch: WriteBatch, await_durable: bool) -> Result<()> {
     db.write_with_options(
         batch,

@@ -17,7 +17,7 @@ mod payload_codec;
 use keys::{
     delivered_manifest_key, delivered_manifest_prefix, delivery_frontier_key, payload_object_key,
     payload_object_prefix, pending_manifest_key, pending_manifest_prefix, pending_stats_key,
-    source_frontier_key, transaction_key,
+    pending_time_index_key, pending_time_index_prefix, source_frontier_key, transaction_key,
 };
 pub use payload_codec::{decode_cdc_buffer_records_payload, encode_cdc_buffer_records_payload};
 use payload_codec::{
@@ -235,20 +235,24 @@ impl CdcBufferStore {
         let mut pending_stats = self
             .load_or_rebuild_pending_stats(&append.pipeline_name)
             .await?;
-        if let Some(existing) = self
-            .pending_manifest_from_key(pending_key.clone())
-            .await
-            .context("load existing CDC buffer pending manifest before append")?
-        {
-            pending_stats.subtract_manifest(&existing);
+        let existing_pending_manifest =
+            self.pending_manifest_from_key(pending_key.clone())
+                .await
+                .context("load existing CDC buffer pending manifest before append")?;
+        if let Some(existing) = existing_pending_manifest.as_ref() {
+            pending_stats.subtract_manifest(existing);
         }
         pending_stats.add_counts(record_count, payload_bytes);
 
         let mut batch = WriteBatch::new();
+        if let Some(existing) = existing_pending_manifest.as_ref() {
+            batch.delete(pending_time_index_key_for_manifest(existing));
+        }
         batch.put(
             pending_key,
             serde_json::to_vec(&manifest).context("encode CDC buffer transaction manifest")?,
         );
+        stage_pending_time_index(&mut batch, &manifest);
         stage_pending_stats(&mut batch, &append.pipeline_name, &pending_stats)?;
         let frontier = CdcBufferFrontier {
             pipeline_name: append.pipeline_name.clone(),
@@ -371,16 +375,19 @@ impl CdcBufferStore {
         let mut pending_stats = self
             .load_or_rebuild_pending_stats(manifest.pipeline_name())
             .await?;
-        if let Some(existing) = self
-            .pending_manifest_from_key(pending_key.clone())
-            .await
-            .context("load existing CDC buffer pending manifest before delivery")?
-        {
-            pending_stats.subtract_manifest(&existing);
+        let existing_pending_manifest =
+            self.pending_manifest_from_key(pending_key.clone())
+                .await
+                .context("load existing CDC buffer pending manifest before delivery")?;
+        if let Some(existing) = existing_pending_manifest.as_ref() {
+            pending_stats.subtract_manifest(existing);
         }
 
         let mut batch = WriteBatch::new();
         batch.delete(pending_key);
+        if let Some(existing) = existing_pending_manifest.as_ref() {
+            batch.delete(pending_time_index_key_for_manifest(existing));
+        }
         batch.put(
             delivered_manifest_key(
                 manifest.pipeline_name(),
@@ -429,11 +436,13 @@ impl CdcBufferStore {
 
     pub async fn stats(&self, pipeline_name: &str, now_unix_ms: u64) -> Result<CdcBufferStats> {
         let pending_stats = self.load_or_rebuild_pending_stats(pipeline_name).await?;
-        let oldest_pending_age_ms = self
-            .pending_transactions(pipeline_name, 1)
-            .await?
-            .first()
-            .map(|manifest| now_unix_ms.saturating_sub(manifest.buffered_at_unix_ms()));
+        let oldest_pending_age_ms = if pending_stats.pending_transactions == 0 {
+            None
+        } else {
+            self.oldest_pending_buffered_at_unix_ms(pipeline_name)
+                .await?
+                .map(|buffered_at| now_unix_ms.saturating_sub(buffered_at))
+        };
         Ok(CdcBufferStats {
             pending_transactions: pending_stats.pending_transactions,
             pending_objects: pending_stats.pending_transactions,
@@ -447,32 +456,54 @@ impl CdcBufferStore {
         &self,
         pipeline_name: &str,
     ) -> Result<CdcBufferPendingStats> {
-        if let Some(stats) = load_json(
+        let loaded_stats = load_json::<CdcBufferPendingStats>(
             &self.db,
             pending_stats_key(pipeline_name),
             "CDC buffer pending stats",
         )
-        .await?
-        {
-            return Ok(stats);
+        .await?;
+        if let Some(stats) = loaded_stats {
+            let has_required_time_index = stats.pending_transactions == 0
+                || self
+                    .oldest_pending_buffered_at_unix_ms(pipeline_name)
+                    .await?
+                    .is_some();
+            if has_required_time_index {
+                return Ok(stats);
+            }
         }
 
         let stats = self.rebuild_pending_stats(pipeline_name).await?;
-        let mut batch = WriteBatch::new();
-        stage_pending_stats(&mut batch, pipeline_name, &stats)?;
-        write_batch(self.db.as_ref(), batch, false)
-            .await
-            .context("persist rebuilt CDC buffer pending stats")?;
         Ok(stats)
     }
 
     async fn rebuild_pending_stats(&self, pipeline_name: &str) -> Result<CdcBufferPendingStats> {
         let manifests = self.pending_transactions(pipeline_name, usize::MAX).await?;
         let mut stats = CdcBufferPendingStats::default();
+        let mut batch = WriteBatch::new();
         for manifest in manifests {
             stats.add_manifest(&manifest);
+            stage_pending_time_index(&mut batch, &manifest);
         }
+        stage_pending_stats(&mut batch, pipeline_name, &stats)?;
+        write_batch(self.db.as_ref(), batch, false)
+            .await
+            .context("persist rebuilt CDC buffer pending indexes")?;
         Ok(stats)
+    }
+
+    async fn oldest_pending_buffered_at_unix_ms(&self, pipeline_name: &str) -> Result<Option<u64>> {
+        let entries = scan_prefix_limit(&self.db, &pending_time_index_prefix(pipeline_name), 1)
+            .await
+            .context("scan CDC buffer pending time index")?;
+        let Some((_, value)) = entries.into_iter().next() else {
+            return Ok(None);
+        };
+        let bytes: [u8; 8] = value
+            .as_slice()
+            .try_into()
+            .context("decode CDC buffer pending time index timestamp")?;
+        Ok(Some(u64::from_be_bytes(bytes)))
     }
 
     async fn pending_manifest_from_key(
