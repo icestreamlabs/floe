@@ -8,6 +8,7 @@ anyhow = { workspace = true }
 dbsp-storage = { path = "../dbsp-storage" }
 floe-cdc-core = { path = "../floe-cdc-core" }
 floe-core = { path = "../floe-core" }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }

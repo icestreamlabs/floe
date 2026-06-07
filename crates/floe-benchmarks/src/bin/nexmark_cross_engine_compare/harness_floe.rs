@@ -274,7 +274,7 @@ impl Harness {
             .arg("-X")
             .arg("POST")
             .arg(format!(
-                "http://127.0.0.1:{}/debug/storage/flush",
+                "http://127.0.0.1:{}/ops/storage/flush",
                 self.config.floe_admin_http_port
             ))
             .stdout(Stdio::from(stdout))

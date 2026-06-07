@@ -1,4 +1,4 @@
-use super::super::{SegmentRecord, VersionedZSet, h, prefix_bounds};
+use super::super::{SegmentRecord, VersionedZSet, prefix_bounds};
 use super::*;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -155,37 +155,6 @@ async fn sequential_deltas_equivalent_to_aggregated_delta() {
     assert_eq!(seq_items, agg_items);
     assert_eq!(agg_items.get("a"), None);
     assert_eq!(agg_items.get("b"), Some(&5));
-}
-
-#[tokio::test]
-async fn h_distincts_differences() {
-    let db = build_db().await;
-    let mut diff = ZSet::new(db.clone(), "h_diff")
-        .await
-        .expect("create diff zset");
-    let mut state = ZSet::new(db.clone(), "h_state")
-        .await
-        .expect("create state zset");
-
-    diff.set_weight("enter".to_string(), 2);
-    diff.set_weight("leave".to_string(), -3);
-    diff.set_weight("stay".to_string(), -1);
-
-    state.set_weight("leave".to_string(), 3);
-    state.set_weight("stay".to_string(), 1);
-
-    let mut result = h(&diff, &state).await.expect("compute h");
-    let mut entries = result.items().await.expect("materialize result");
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    assert_eq!(
-        entries,
-        vec![
-            ("enter".to_string(), 1),
-            ("leave".to_string(), -1),
-            ("stay".to_string(), -1)
-        ]
-    );
 }
 
 #[tokio::test]

@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
-use tokio::time::{Instant, interval};
+
+use crate::wait::wait_until;
 
 #[path = "http_ready.rs"]
 mod http_ready;
@@ -109,18 +110,20 @@ pub(crate) async fn wait_for_jsonl_rows_matching(
     attempts: usize,
     predicate: impl Fn(&Value) -> bool,
 ) -> Result<Vec<Value>> {
-    let deadline = Instant::now() + Duration::from_millis(100 * attempts as u64);
-    let mut poll = interval(Duration::from_millis(100));
-    loop {
-        let rows = read_jsonl_rows(path).await?;
-        if rows.iter().any(&predicate) {
-            return Ok(rows);
-        }
-        if Instant::now() >= deadline {
-            bail!("predicate did not match rows in {}", path.to_string_lossy());
-        }
-        poll.tick().await;
-    }
+    wait_until(
+        format!("predicate match in {}", path.to_string_lossy()),
+        Duration::from_millis(100 * attempts as u64),
+        Duration::from_millis(100),
+        || async {
+            let rows = read_jsonl_rows(path).await?;
+            if rows.iter().any(&predicate) {
+                Ok(Some(rows))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
 }
 
 pub(crate) async fn wait_for_count_at_least<F, Fut>(
@@ -133,33 +136,25 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<i64>>,
 {
-    let mut poll = interval(Duration::from_millis(100));
-    let mut last_count = None;
-    let mut last_error = None;
-    for _ in 0..attempts {
-        match query_count().await {
-            Ok(count) if count >= min_count => return Ok(count),
-            Ok(count) => {
-                last_count = Some(count);
-                last_error = None;
-            }
-            Err(err) => {
-                last_error = Some(err);
-            }
-        }
-        poll.tick().await;
-    }
-
     let label = label.as_ref();
-    match (last_count, last_error) {
-        (Some(count), _) => {
-            bail!("timed out waiting for {label} count >= {min_count}; last count {count}")
-        }
-        (None, Some(err)) => {
-            bail!("timed out waiting for {label} count >= {min_count}: {err}")
-        }
-        (None, None) => bail!("timed out waiting for {label} count >= {min_count}"),
-    }
+    wait_until(
+        format!("{label} count >= {min_count}"),
+        Duration::from_millis(100 * attempts as u64),
+        Duration::from_millis(100),
+        || {
+            let count = query_count();
+            async move {
+                match count.await {
+                    Ok(count) if count >= min_count => Ok(Some(count)),
+                    Ok(count) => {
+                        bail!("{label} count {count} below {min_count}")
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        },
+    )
+    .await
 }
 
 pub(crate) async fn read_jsonl_rows(path: &Path) -> Result<Vec<Value>> {

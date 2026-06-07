@@ -342,12 +342,8 @@ async fn admin_cdc_replication_dlq_lists_inspects_and_discards_entries() {
             get(debug_cdc_replication_dlq_list_admin),
         )
         .route(
-            "/debug/cdc/replication/dlq/retry",
-            post(debug_cdc_replication_dlq_retry_batch_admin),
-        )
-        .route(
             "/ops/cdc/replication/dlq/retry",
-            post(debug_cdc_replication_dlq_retry_batch_admin),
+            post(ops_cdc_replication_dlq_retry_batch_admin),
         )
         .route(
             "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
@@ -358,16 +354,12 @@ async fn admin_cdc_replication_dlq_lists_inspects_and_discards_entries() {
             get(debug_cdc_replication_dlq_entry_admin),
         )
         .route(
-            "/debug/cdc/replication/dlq/:pipeline/:dlq_id/discard",
-            post(debug_cdc_replication_dlq_discard_admin),
-        )
-        .route(
             "/ops/cdc/replication/dlq/:pipeline/:dlq_id/discard",
-            post(debug_cdc_replication_dlq_discard_admin),
+            post(ops_cdc_replication_dlq_discard_admin),
         )
         .route(
             "/ops/cdc/replication/dlq/:pipeline/:dlq_id/retry",
-            post(debug_cdc_replication_dlq_retry_admin),
+            post(ops_cdc_replication_dlq_retry_admin),
         )
         .with_state(state);
 
@@ -457,7 +449,7 @@ async fn admin_cdc_replication_reconcile_validates_bounds_and_runtime() {
     let app = Router::new()
         .route(
             "/ops/cdc/replication/:pipeline/reconcile",
-            post(debug_cdc_replication_reconcile_admin),
+            post(ops_cdc_replication_reconcile_admin),
         )
         .with_state(state);
 
@@ -508,4 +500,46 @@ async fn admin_mv_endpoint_selects_single_registered_mv() {
     let response = app.oneshot(request).await.expect("response");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_mv_endpoint_requires_query_when_multiple_views_exist() {
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    registry.register("mv_one");
+    registry.register("mv_two");
+    let state = HttpAdminState {
+        cancel: CancellationToken::new(),
+        health: HttpIngestHealth {
+            executor_running: Arc::new(AtomicBool::new(true)),
+            storage_reachable: Arc::new(AtomicBool::new(true)),
+            runtime_ready: Arc::new(AtomicBool::new(true)),
+            watermark_debug: None,
+            cdc_replication_debug: None,
+        },
+        storage_db: None,
+        storage_catalog: None,
+        replication_runtime: None,
+        materialized_views: Some(registry),
+    };
+    let app = Router::new()
+        .route("/mv", get(subscribe_sse_admin))
+        .with_state(state);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/mv")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        value["error"],
+        "mv query parameter is required when multiple materialized views are registered"
+    );
 }

@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod http_ready;
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/wait.rs"]
+mod wait;
 
 use anyhow::{Context, Result, bail};
 use http_ready::wait_for_healthz;

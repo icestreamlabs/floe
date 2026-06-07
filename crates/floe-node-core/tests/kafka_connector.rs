@@ -64,19 +64,21 @@ async fn kafka_connector_ingests_messages() {
     let ctx = ConnectorContext::new(tx);
     connector.init(&ctx).await.expect("connector init");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut poll = tokio::time::interval(Duration::from_millis(50));
-    let mut emitted = 0usize;
-    while tokio::time::Instant::now() < deadline {
-        match connector.tick(&ctx).await.expect("connector tick") {
-            ConnectorTick::Emitted(count) => emitted = emitted.saturating_add(count),
-            ConnectorTick::Idle | ConnectorTick::Finished => {}
+    let emitted = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut emitted = 0usize;
+        loop {
+            match connector.tick(&ctx).await.expect("connector tick") {
+                ConnectorTick::Emitted(count) => emitted = emitted.saturating_add(count),
+                ConnectorTick::Idle | ConnectorTick::Finished => {}
+            }
+            if emitted > 0 {
+                break emitted;
+            }
         }
-        if emitted > 0 {
-            break;
-        }
-        poll.tick().await;
-    }
+    })
+    .await
+    .expect("connector did not emit test message");
+    assert!(emitted > 0);
 
     let batch = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await

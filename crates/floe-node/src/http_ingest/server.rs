@@ -56,12 +56,8 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
             get(debug_cdc_replication_dlq_list_admin),
         )
         .route(
-            "/debug/cdc/replication/dlq/retry",
-            post(debug_cdc_replication_dlq_retry_batch_admin),
-        )
-        .route(
             "/ops/cdc/replication/dlq/retry",
-            post(debug_cdc_replication_dlq_retry_batch_admin),
+            post(ops_cdc_replication_dlq_retry_batch_admin),
         )
         .route(
             "/debug/cdc/replication/dlq/:pipeline/:dlq_id",
@@ -72,30 +68,18 @@ pub async fn run_admin_server(config: HttpAdminConfig, cancel: CancellationToken
             get(debug_cdc_replication_dlq_entry_admin),
         )
         .route(
-            "/debug/cdc/replication/dlq/:pipeline/:dlq_id/discard",
-            post(debug_cdc_replication_dlq_discard_admin),
-        )
-        .route(
             "/ops/cdc/replication/dlq/:pipeline/:dlq_id/discard",
-            post(debug_cdc_replication_dlq_discard_admin),
-        )
-        .route(
-            "/debug/cdc/replication/dlq/:pipeline/:dlq_id/retry",
-            post(debug_cdc_replication_dlq_retry_admin),
+            post(ops_cdc_replication_dlq_discard_admin),
         )
         .route(
             "/ops/cdc/replication/dlq/:pipeline/:dlq_id/retry",
-            post(debug_cdc_replication_dlq_retry_admin),
-        )
-        .route(
-            "/debug/cdc/replication/:pipeline/reconcile",
-            post(debug_cdc_replication_reconcile_admin),
+            post(ops_cdc_replication_dlq_retry_admin),
         )
         .route(
             "/ops/cdc/replication/:pipeline/reconcile",
-            post(debug_cdc_replication_reconcile_admin),
+            post(ops_cdc_replication_reconcile_admin),
         )
-        .route("/debug/storage/flush", post(debug_storage_flush_admin))
+        .route("/ops/storage/flush", post(ops_storage_flush_admin))
         .route("/mv", get(subscribe_sse_admin))
         .route("/metrics", get(metrics))
         .with_state(state);
