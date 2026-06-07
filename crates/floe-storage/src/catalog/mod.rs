@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::io::Cursor;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -93,6 +94,37 @@ pub struct ReplicationPipelineDlqStats {
     replayed_entries: usize,
     discarded_entries: usize,
     oldest_pending_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationPipelineDlqPage {
+    entries: Vec<ReplicationPipelineDlqEntry>,
+    total_matching: usize,
+    oldest_pending_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct OrderedDlqEntry(ReplicationPipelineDlqEntry);
+
+impl Ord for OrderedDlqEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_dlq_entries(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for OrderedDlqEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compare_dlq_entries(
+    left: &ReplicationPipelineDlqEntry,
+    right: &ReplicationPipelineDlqEntry,
+) -> Ordering {
+    left.created_at_unix_ms()
+        .cmp(&right.created_at_unix_ms())
+        .then_with(|| left.dlq_id().cmp(right.dlq_id()))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -607,6 +639,72 @@ impl SlateCatalog {
                 })
             })
             .collect()
+    }
+
+    pub async fn replication_pipeline_dlq_entries_page(
+        &self,
+        pipeline_name: &str,
+        status: Option<ReplicationPipelineDlqStatus>,
+        offset: usize,
+        limit: usize,
+        now_unix_ms: u64,
+    ) -> Result<ReplicationPipelineDlqPage> {
+        ensure!(limit > 0, "DLQ page limit must be greater than zero");
+
+        let prefix = replication_pipeline_dlq_entry_prefix(pipeline_name);
+        let mut iter = self
+            .db
+            .scan_with_options(keys::prefix_bounds(&prefix), &ScanOptions::default())
+            .await
+            .map_err(map_slate_err)?;
+        let page_end = offset.saturating_add(limit);
+        let mut selected = BinaryHeap::with_capacity(page_end.min(limit));
+        let mut total_matching = 0usize;
+        let mut oldest_pending_age_ms = None;
+
+        while let Some(kv) = iter.next().await.map_err(map_slate_err)? {
+            let entry: ReplicationPipelineDlqEntry = serde_json::from_slice(&kv.value)
+                .with_context(|| {
+                    format!(
+                        "failed to deserialize replication pipeline '{pipeline_name}' DLQ entry"
+                    )
+                })?;
+            if status.is_none_or(|wanted| wanted == ReplicationPipelineDlqStatus::Pending)
+                && entry.status() == ReplicationPipelineDlqStatus::Pending
+            {
+                let age_ms = now_unix_ms.saturating_sub(entry.created_at_unix_ms());
+                oldest_pending_age_ms = Some(
+                    oldest_pending_age_ms.map_or(age_ms, |existing: u64| existing.max(age_ms)),
+                );
+            }
+            if status.is_none_or(|wanted| entry.status() == wanted) {
+                if page_end > 0 {
+                    if selected.len() < page_end {
+                        selected.push(OrderedDlqEntry(entry));
+                    } else if selected
+                        .peek()
+                        .is_some_and(|largest| compare_dlq_entries(&entry, &largest.0).is_lt())
+                    {
+                        selected.pop();
+                        selected.push(OrderedDlqEntry(entry));
+                    }
+                }
+                total_matching = total_matching.saturating_add(1);
+            }
+        }
+
+        let mut entries = selected
+            .into_sorted_vec()
+            .into_iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>();
+        entries.truncate(page_end.min(total_matching));
+        let entries = entries.into_iter().skip(offset).collect();
+        Ok(ReplicationPipelineDlqPage {
+            entries,
+            total_matching,
+            oldest_pending_age_ms,
+        })
     }
 
     pub async fn replication_pipeline_dlq_stats(

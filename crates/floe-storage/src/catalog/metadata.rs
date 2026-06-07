@@ -286,6 +286,24 @@ impl ReplicationPipelineDlqStats {
     }
 }
 
+impl ReplicationPipelineDlqPage {
+    pub fn entries(&self) -> &[ReplicationPipelineDlqEntry] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<ReplicationPipelineDlqEntry> {
+        self.entries
+    }
+
+    pub fn total_matching(&self) -> usize {
+        self.total_matching
+    }
+
+    pub fn oldest_pending_age_ms(&self) -> Option<u64> {
+        self.oldest_pending_age_ms
+    }
+}
+
 impl ReplicationPipelineDlqStatus {
     pub fn as_str(self) -> &'static str {
         match self {

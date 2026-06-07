@@ -71,7 +71,16 @@ pub(super) async fn subscribe_sse_admin(
                     )
                         .into_response();
                 }
-                1 => handles.into_iter().next().expect("one MV handle"),
+                1 => {
+                    let Some(handle) = handles.into_iter().next() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "materialized view registry returned an inconsistent handle set"})),
+                        )
+                            .into_response();
+                    };
+                    handle
+                }
                 _ => {
                     return (
                         StatusCode::BAD_REQUEST,
