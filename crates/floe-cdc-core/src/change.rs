@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ids::{CdcSourceId, CdcTableId, CdcTransactionId};
 use crate::position::CdcSourcePosition;
@@ -92,8 +94,13 @@ pub struct ChangeBatch {
     table_id: CdcTableId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     changes: Vec<CdcChange>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    snapshot_insert_rows: Option<CdcColumnarRowBatch>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_snapshot_insert_rows",
+        deserialize_with = "deserialize_snapshot_insert_rows"
+    )]
+    snapshot_insert_rows: Option<Arc<CdcColumnarRowBatch>>,
 }
 
 impl ChangeBatch {
@@ -114,7 +121,7 @@ impl ChangeBatch {
         Ok(Self {
             table_id,
             changes: Vec::new(),
-            snapshot_insert_rows: Some(rows),
+            snapshot_insert_rows: Some(Arc::new(rows)),
         })
     }
 
@@ -127,13 +134,13 @@ impl ChangeBatch {
     }
 
     pub fn snapshot_insert_rows(&self) -> Option<&CdcColumnarRowBatch> {
-        self.snapshot_insert_rows.as_ref()
+        self.snapshot_insert_rows.as_deref()
     }
 
     pub fn change_count(&self) -> usize {
         self.snapshot_insert_rows
             .as_ref()
-            .map(CdcColumnarRowBatch::row_count)
+            .map(|rows| rows.row_count())
             .unwrap_or(self.changes.len())
     }
 
@@ -161,6 +168,25 @@ impl ChangeBatch {
         }
         Ok(())
     }
+}
+
+fn serialize_snapshot_insert_rows<S>(
+    rows: &Option<Arc<CdcColumnarRowBatch>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    rows.as_deref().serialize(serializer)
+}
+
+fn deserialize_snapshot_insert_rows<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Arc<CdcColumnarRowBatch>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<CdcColumnarRowBatch>::deserialize(deserializer).map(|rows| rows.map(Arc::new))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
