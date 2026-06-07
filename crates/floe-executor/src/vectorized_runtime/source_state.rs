@@ -100,7 +100,7 @@ pub(super) fn camel_case_schema(definition: &SourceDefinition) -> SchemaRef {
             Field::new(
                 to_camel_case(column.name()),
                 column.data_type().arrow_type(),
-                true,
+                column.nullable(),
             )
         })
         .collect::<Vec<_>>();
@@ -125,4 +125,30 @@ fn to_camel_case(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
+
+    use super::*;
+
+    #[test]
+    fn camel_case_schema_preserves_source_nullability() {
+        let definition = SourceDefinition::new(
+            "nexmark_order",
+            vec![
+                SourceColumn::new_nullable("order_id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note_text", SourceDataType::Utf8, true),
+            ],
+        )
+        .expect("source definition");
+
+        let schema = camel_case_schema(&definition);
+
+        assert_eq!(schema.field(0).name(), "orderId");
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "noteText");
+        assert!(schema.field(1).is_nullable());
+    }
 }

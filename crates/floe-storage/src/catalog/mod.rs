@@ -87,6 +87,14 @@ pub struct ReplicationPipelineDlqEntry {
     last_updated_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicationPipelineDlqStats {
+    pending_entries: usize,
+    replayed_entries: usize,
+    discarded_entries: usize,
+    oldest_pending_age_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicationPipelineDlqStatus {
@@ -599,6 +607,30 @@ impl SlateCatalog {
                 })
             })
             .collect()
+    }
+
+    pub async fn replication_pipeline_dlq_stats(
+        &self,
+        pipeline_name: &str,
+        now_unix_ms: u64,
+    ) -> Result<ReplicationPipelineDlqStats> {
+        let prefix = replication_pipeline_dlq_entry_prefix(pipeline_name);
+        let mut iter = self
+            .db
+            .scan_with_options(keys::prefix_bounds(&prefix), &ScanOptions::default())
+            .await
+            .map_err(map_slate_err)?;
+        let mut stats = ReplicationPipelineDlqStats::default();
+        while let Some(kv) = iter.next().await.map_err(map_slate_err)? {
+            let entry: ReplicationPipelineDlqEntry = serde_json::from_slice(&kv.value)
+                .with_context(|| {
+                    format!(
+                        "failed to deserialize replication pipeline '{pipeline_name}' DLQ entry"
+                    )
+                })?;
+            stats.record_entry(&entry, now_unix_ms);
+        }
+        Ok(stats)
     }
 
     pub async fn update_replication_pipeline_dlq_entry_status(

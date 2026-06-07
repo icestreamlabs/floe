@@ -54,6 +54,7 @@ impl ReplicationPipelineRuntime {
             kafka_writers_by_pipeline,
             postgres_writers_by_pipeline,
             buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
+            integrity_report_cache_by_pipeline: Mutex::new(HashMap::new()),
             replay_state_by_pipeline: Mutex::new(HashMap::new()),
             backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
             last_target_error_by_pipeline: Mutex::new(HashMap::new()),

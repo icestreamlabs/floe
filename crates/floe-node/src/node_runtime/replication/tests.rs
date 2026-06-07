@@ -100,6 +100,7 @@ fn test_runtime_with_plans(
         kafka_writers_by_pipeline: HashMap::new(),
         postgres_writers_by_pipeline: HashMap::new(),
         buffer_cleanup_last_by_pipeline: Mutex::new(HashMap::new()),
+        integrity_report_cache_by_pipeline: Mutex::new(HashMap::new()),
         replay_state_by_pipeline: Mutex::new(HashMap::new()),
         backpressure_state_by_pipeline: Mutex::new(HashMap::new()),
         last_target_error_by_pipeline: Mutex::new(HashMap::new()),

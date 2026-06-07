@@ -23,6 +23,12 @@ pub(super) fn pending_manifest_prefix(pipeline_name: &str) -> Vec<u8> {
     key
 }
 
+pub(super) fn pending_stats_key(pipeline_name: &str) -> Vec<u8> {
+    let mut key = pipeline_prefix(pipeline_name);
+    key.extend_from_slice(b"stats/pending");
+    key
+}
+
 pub(super) fn pending_manifest_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
     let mut key = pending_manifest_prefix(pipeline_name);
     key.extend_from_slice(transaction_key.as_bytes());

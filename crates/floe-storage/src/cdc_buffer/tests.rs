@@ -367,6 +367,40 @@ async fn stats_account_payload_bytes_separately_from_manifest_metadata() {
 }
 
 #[tokio::test]
+async fn stats_track_overwritten_and_delivered_pending_manifest() {
+    let store = test_store("cdc-buffer-stats-overwrite").await;
+    store
+        .append_transaction(&append("0/10", 1000, vec![record(1), record(2)]))
+        .await
+        .expect("append original");
+    let replacement = store
+        .append_transaction(&append("0/10", 1200, vec![record(3)]))
+        .await
+        .expect("append replacement");
+
+    let stats = store.stats("pipe", 1500).await.expect("stats");
+    assert_eq!(stats.pending_transactions(), 1);
+    assert_eq!(stats.pending_objects(), 1);
+    assert_eq!(stats.pending_records(), 1);
+    assert_eq!(stats.pending_bytes(), replacement.payload_bytes());
+    assert_eq!(stats.oldest_pending_age_ms(), Some(300));
+
+    store
+        .mark_delivered(&replacement, 1600)
+        .await
+        .expect("mark delivered");
+    let stats = store
+        .stats("pipe", 1700)
+        .await
+        .expect("stats after delivery");
+    assert_eq!(stats.pending_transactions(), 0);
+    assert_eq!(stats.pending_objects(), 0);
+    assert_eq!(stats.pending_records(), 0);
+    assert_eq!(stats.pending_bytes(), 0);
+    assert_eq!(stats.oldest_pending_age_ms(), None);
+}
+
+#[tokio::test]
 async fn integrity_report_detects_missing_and_orphan_payload_objects() {
     let store = test_store("cdc-buffer-integrity").await;
     let append = append("0/10", 1000, vec![record(1)]);
