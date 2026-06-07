@@ -119,7 +119,7 @@ pub(super) async fn debug_cdc_replication_dlq_entry_admin(
     }
 }
 
-pub(super) async fn debug_cdc_replication_dlq_discard_admin(
+pub(super) async fn ops_cdc_replication_dlq_discard_admin(
     State(state): State<HttpAdminState>,
     Path((pipeline, dlq_id)): Path<(String, String)>,
     payload: Option<Json<CdcReplicationDlqActionRequest>>,
@@ -169,7 +169,7 @@ pub(super) async fn debug_cdc_replication_dlq_discard_admin(
     }
 }
 
-pub(super) async fn debug_cdc_replication_dlq_retry_admin(
+pub(super) async fn ops_cdc_replication_dlq_retry_admin(
     State(state): State<HttpAdminState>,
     Path((pipeline, dlq_id)): Path<(String, String)>,
     payload: Option<Json<CdcReplicationDlqActionRequest>>,
@@ -213,7 +213,7 @@ pub(super) async fn debug_cdc_replication_dlq_retry_admin(
     }
 }
 
-pub(super) async fn debug_cdc_replication_dlq_retry_batch_admin(
+pub(super) async fn ops_cdc_replication_dlq_retry_batch_admin(
     State(state): State<HttpAdminState>,
     Query(query): Query<CdcReplicationDlqBatchRetryQuery>,
     payload: Option<Json<CdcReplicationDlqActionRequest>>,
@@ -268,7 +268,7 @@ pub(super) async fn debug_cdc_replication_dlq_retry_batch_admin(
     }
 }
 
-pub(super) async fn debug_cdc_replication_reconcile_admin(
+pub(super) async fn ops_cdc_replication_reconcile_admin(
     State(state): State<HttpAdminState>,
     Path(pipeline): Path<String>,
     Query(query): Query<CdcReplicationReconcileQuery>,

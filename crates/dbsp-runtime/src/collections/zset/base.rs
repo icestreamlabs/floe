@@ -103,10 +103,6 @@ where
         })
     }
 
-    pub(super) fn table(&self) -> Arc<dyn KeyValueTable> {
-        self.table.clone()
-    }
-
     pub async fn contains(&mut self, key: &K) -> Result<bool> {
         Ok(self.get_weight(key).await? != 0)
     }

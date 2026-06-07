@@ -16,7 +16,7 @@ pub mod stream;
 pub use dbsp_storage::storage;
 
 pub use algebra::AbelianGroup;
-pub use collections::{OrderedBytes, ZSet, h};
+pub use collections::{OrderedBytes, ZSet};
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use metrics::{LogicalWorkCollector, LogicalWorkSnapshot};
 pub use operator_state_registry::{

@@ -37,7 +37,7 @@ pub use circuit::{
     nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
     nexmark_person_alias_table, nexmark_person_table,
 };
-pub use collections::{ZSet, h};
+pub use collections::ZSet;
 pub use dbsp_runtime::{LogicalWorkCollector, LogicalWorkSnapshot};
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use operator_state_registry::{

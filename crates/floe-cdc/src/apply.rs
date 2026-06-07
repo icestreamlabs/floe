@@ -7,12 +7,15 @@ use floe_cdc_core::{
     CdcChange, CdcCheckpoint, CdcColumnarRowBatch, CdcRow, CdcRowKey, CdcSourceId, CdcTableId,
     CdcTableSchema, ChangeBatch, TransactionBatch,
 };
+use futures::stream::{self, StreamExt, TryStreamExt};
 use slatedb::WriteBatch;
 
 use crate::codec::{decode_cdc_row_state, encode_cdc_columnar_row_state, encode_cdc_row_state};
 use crate::deltas::{CdcApplyResult, CdcRowDelta, CdcTableDeltas};
 use crate::json::decode_json;
 use crate::keys::{checkpoint_key, row_key_bytes};
+
+const CDC_OLD_ROW_PREFETCH_CONCURRENCY: usize = 64;
 
 #[derive(Clone)]
 pub struct CdcTableStore {
@@ -429,27 +432,41 @@ impl CdcTableStore {
         &self,
         storage_keys: &[Vec<u8>],
     ) -> Result<HashMap<Vec<u8>, Option<CdcRow>>> {
-        let mut rows = HashMap::with_capacity(storage_keys.len());
-        for storage_key in storage_keys {
-            rows.insert(
-                storage_key.clone(),
-                self.load_row_by_storage_key(storage_key).await?,
-            );
+        if storage_keys.is_empty() {
+            return Ok(HashMap::new());
         }
-        Ok(rows)
+
+        let table = Arc::clone(&self.table);
+        stream::iter(storage_keys.iter().cloned())
+            .map(|storage_key| {
+                let table = Arc::clone(&table);
+                async move {
+                    let row = load_row_by_storage_key_from_table(table.as_ref(), &storage_key)
+                        .await
+                        .with_context(|| {
+                            format!("load prefetched CDC row state for key {:?}", storage_key)
+                        })?;
+                    Ok::<_, anyhow::Error>((storage_key, row))
+                }
+            })
+            .buffer_unordered(CDC_OLD_ROW_PREFETCH_CONCURRENCY)
+            .try_collect::<HashMap<_, _>>()
+            .await
     }
 
     async fn load_row_by_storage_key(&self, storage_key: &[u8]) -> Result<Option<CdcRow>> {
-        let Some(bytes) = self
-            .table
-            .get(storage_key)
-            .await
-            .context("load CDC row state")?
-        else {
-            return Ok(None);
-        };
-        decode_cdc_row_state(&bytes).map(Some)
+        load_row_by_storage_key_from_table(self.table.as_ref(), storage_key).await
     }
+}
+
+async fn load_row_by_storage_key_from_table(
+    table: &dyn KeyValueTable,
+    storage_key: &[u8],
+) -> Result<Option<CdcRow>> {
+    let Some(bytes) = table.get(storage_key).await.context("load CDC row state")? else {
+        return Ok(None);
+    };
+    decode_cdc_row_state(&bytes).map(Some)
 }
 
 fn row_with_overlay(

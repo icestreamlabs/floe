@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) async fn debug_storage_flush_admin(
+pub(super) async fn ops_storage_flush_admin(
     State(state): State<HttpAdminState>,
 ) -> impl IntoResponse {
     let Some(db) = &state.storage_db else {
@@ -50,12 +50,39 @@ pub(super) async fn subscribe_sse_admin(
         )
             .into_response();
     }
-    let Some(handle) = registry.handles().into_iter().next() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "no materialized view registered"})),
-        )
-            .into_response();
+    let handle = match query.mv.as_deref() {
+        Some(mv_name) => match registry.get(mv_name) {
+            Some(handle) => handle,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("materialized view '{mv_name}' not found")})),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            let handles = registry.handles();
+            match handles.len() {
+                0 => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "no materialized view registered"})),
+                    )
+                        .into_response();
+                }
+                1 => handles.into_iter().next().expect("one MV handle"),
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "mv query parameter is required when multiple materialized views are registered"
+                        })),
+                    )
+                    .into_response();
+                }
+            }
+        }
     };
     let mv = handle.name().to_string();
 

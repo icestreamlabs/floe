@@ -174,6 +174,7 @@ struct IngestQuery {
 
 #[derive(Deserialize)]
 struct SubscribeQuery {
+    mv: Option<String>,
     with_snapshot: Option<bool>,
     as_of: Option<i64>,
 }
