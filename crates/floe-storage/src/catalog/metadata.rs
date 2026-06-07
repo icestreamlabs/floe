@@ -249,6 +249,43 @@ impl ReplicationPipelineDlqEntry {
     }
 }
 
+impl ReplicationPipelineDlqStats {
+    pub fn pending_entries(&self) -> usize {
+        self.pending_entries
+    }
+
+    pub fn replayed_entries(&self) -> usize {
+        self.replayed_entries
+    }
+
+    pub fn discarded_entries(&self) -> usize {
+        self.discarded_entries
+    }
+
+    pub fn oldest_pending_age_ms(&self) -> Option<u64> {
+        self.oldest_pending_age_ms
+    }
+
+    pub(super) fn record_entry(&mut self, entry: &ReplicationPipelineDlqEntry, now_unix_ms: u64) {
+        match entry.status() {
+            ReplicationPipelineDlqStatus::Pending => {
+                self.pending_entries = self.pending_entries.saturating_add(1);
+                let age_ms = now_unix_ms.saturating_sub(entry.created_at_unix_ms());
+                self.oldest_pending_age_ms = Some(
+                    self.oldest_pending_age_ms
+                        .map_or(age_ms, |oldest| std::cmp::max(oldest, age_ms)),
+                );
+            }
+            ReplicationPipelineDlqStatus::Replayed => {
+                self.replayed_entries = self.replayed_entries.saturating_add(1);
+            }
+            ReplicationPipelineDlqStatus::Discarded => {
+                self.discarded_entries = self.discarded_entries.saturating_add(1);
+            }
+        }
+    }
+}
+
 impl ReplicationPipelineDlqStatus {
     pub fn as_str(self) -> &'static str {
         match self {

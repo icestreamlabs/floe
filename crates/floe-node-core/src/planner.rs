@@ -137,6 +137,8 @@ fn dbsp_supported_arrow_type(data_type: &DataType) -> bool {
             | DataType::Utf8
             | DataType::Boolean
             | DataType::Timestamp(TimeUnit::Millisecond, None)
+            | DataType::Date32
+            | DataType::Decimal128(_, _)
     )
 }
 
@@ -565,7 +567,7 @@ pub fn camel_case_schema(definition: &floe_core::source::SourceDefinition) -> Ar
             Field::new(
                 to_camel_case(column.name()),
                 column.data_type().arrow_type(),
-                true,
+                column.nullable(),
             )
         })
         .collect();
@@ -753,6 +755,38 @@ mod tests {
             logical_plan.contains("orders"),
             "logical plan was: {logical_plan}"
         );
+    }
+
+    #[test]
+    fn supported_arrow_type_guard_covers_dbsp_scalar_types() {
+        assert!(dbsp_supported_arrow_type(&DataType::Int64));
+        assert!(dbsp_supported_arrow_type(&DataType::Utf8));
+        assert!(dbsp_supported_arrow_type(&DataType::Boolean));
+        assert!(dbsp_supported_arrow_type(&DataType::Timestamp(
+            TimeUnit::Millisecond,
+            None
+        )));
+        assert!(dbsp_supported_arrow_type(&DataType::Date32));
+        assert!(dbsp_supported_arrow_type(&DataType::Decimal128(38, 9)));
+    }
+
+    #[test]
+    fn camel_case_schema_preserves_source_nullability() {
+        let definition = SourceDefinition::new(
+            "nexmark_order",
+            vec![
+                SourceColumn::new_nullable("order_id", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("note_text", SourceDataType::Utf8, true),
+            ],
+        )
+        .expect("source definition");
+
+        let schema = camel_case_schema(&definition);
+
+        assert_eq!(schema.field(0).name(), "orderId");
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "noteText");
+        assert!(schema.field(1).is_nullable());
     }
 
     #[tokio::test]

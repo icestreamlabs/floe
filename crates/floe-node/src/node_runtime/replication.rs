@@ -8,9 +8,9 @@ use floe_config::ReplicationConfig as FloeReplicationConfig;
 #[cfg(test)]
 use floe_storage::CdcBufferRecord;
 use floe_storage::{
-    CdcBufferPayloadFormat, CdcBufferStore, CdcBufferedTransactionManifest,
-    ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry, ReplicationPipelineDlqStatus,
-    SlateCatalog, decode_cdc_buffer_records_payload,
+    CdcBufferIntegrityReport, CdcBufferPayloadFormat, CdcBufferStore,
+    CdcBufferedTransactionManifest, ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry,
+    ReplicationPipelineDlqStatus, SlateCatalog, decode_cdc_buffer_records_payload,
 };
 use futures::future::join_all;
 use serde::Serialize;
@@ -82,10 +82,17 @@ pub(crate) struct ReplicationPipelineRuntime {
     kafka_writers_by_pipeline: HashMap<String, Arc<writers::KafkaReplicationPipelineWriter>>,
     postgres_writers_by_pipeline: HashMap<String, Arc<writers::PostgresReplicationPipelineWriter>>,
     buffer_cleanup_last_by_pipeline: Mutex<HashMap<String, u64>>,
+    integrity_report_cache_by_pipeline: Mutex<HashMap<String, CachedIntegrityReport>>,
     replay_state_by_pipeline: Mutex<HashMap<String, bool>>,
     backpressure_state_by_pipeline: Mutex<HashMap<String, bool>>,
     last_target_error_by_pipeline: Mutex<HashMap<String, String>>,
     settings: FloeReplicationConfig,
+}
+
+#[derive(Debug, Clone)]
+struct CachedIntegrityReport {
+    observed_at_unix_ms: u64,
+    report: CdcBufferIntegrityReport,
 }
 
 fn current_unix_time_ms() -> u64 {

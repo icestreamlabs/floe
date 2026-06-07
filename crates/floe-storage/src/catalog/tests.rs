@@ -279,6 +279,63 @@ async fn roundtrip_replication_pipeline_and_checkpoint() {
 }
 
 #[tokio::test]
+async fn replication_pipeline_dlq_stats_count_statuses_without_loading_entries() {
+    let catalog = SlateCatalog::in_memory().await.expect("open catalog");
+    for (idx, created_at) in [(1, 1_000_u64), (2, 1_200_u64), (3, 1_500_u64)] {
+        let entry = ReplicationPipelineDlqEntry::new(
+            "pg_orders_to_kafka",
+            format!("entry-{idx}"),
+            "pg_main",
+            CdcSourcePosition::postgres(&format!("0/{:X}", 0x16B6C50 + idx), None)
+                .expect("position"),
+            Some(CdcTransactionId::new(format!("tx-{idx}")).expect("transaction")),
+            "target_delivery",
+            "target unavailable",
+            1,
+            None,
+            Some("kafka_records".to_string()),
+            1024,
+            BTreeMap::new(),
+            created_at,
+        )
+        .expect("dlq entry");
+        catalog
+            .put_replication_pipeline_dlq_entry(entry)
+            .await
+            .expect("persist dlq entry");
+    }
+    catalog
+        .update_replication_pipeline_dlq_entry_status(
+            "pg_orders_to_kafka",
+            "entry-2",
+            ReplicationPipelineDlqStatus::Replayed,
+            1_600,
+        )
+        .await
+        .expect("replay entry");
+    catalog
+        .update_replication_pipeline_dlq_entry_status_with_reason(
+            "pg_orders_to_kafka",
+            "entry-3",
+            ReplicationPipelineDlqStatus::Discarded,
+            Some("duplicate".to_string()),
+            1_700,
+        )
+        .await
+        .expect("discard entry");
+
+    let stats = catalog
+        .replication_pipeline_dlq_stats("pg_orders_to_kafka", 2_000)
+        .await
+        .expect("dlq stats");
+
+    assert_eq!(stats.pending_entries(), 1);
+    assert_eq!(stats.replayed_entries(), 1);
+    assert_eq!(stats.discarded_entries(), 1);
+    assert_eq!(stats.oldest_pending_age_ms(), Some(1_000));
+}
+
+#[tokio::test]
 async fn roundtrip_postgres_replication_pipeline_target() {
     let catalog = SlateCatalog::in_memory().await.expect("open catalog");
     let pipeline = ReplicationPipelineDefinition::new(

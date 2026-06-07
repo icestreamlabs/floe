@@ -369,6 +369,18 @@ pub(super) async fn load_json<T: for<'de> Deserialize<'de>>(
         .map(Some)
 }
 
+pub(super) fn stage_pending_stats(
+    batch: &mut WriteBatch,
+    pipeline_name: &str,
+    stats: &CdcBufferPendingStats,
+) -> Result<()> {
+    batch.put(
+        pending_stats_key(pipeline_name),
+        serde_json::to_vec(stats).context("encode CDC buffer pending stats")?,
+    );
+    Ok(())
+}
+
 pub(super) async fn write_batch(db: &Db, batch: WriteBatch, await_durable: bool) -> Result<()> {
     db.write_with_options(
         batch,

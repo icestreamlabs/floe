@@ -16,8 +16,8 @@ mod payload_codec;
 
 use keys::{
     delivered_manifest_key, delivered_manifest_prefix, delivery_frontier_key, payload_object_key,
-    payload_object_prefix, pending_manifest_key, pending_manifest_prefix, source_frontier_key,
-    transaction_key,
+    payload_object_prefix, pending_manifest_key, pending_manifest_prefix, pending_stats_key,
+    source_frontier_key, transaction_key,
 };
 pub use payload_codec::{decode_cdc_buffer_records_payload, encode_cdc_buffer_records_payload};
 use payload_codec::{
@@ -129,6 +129,31 @@ pub struct CdcBufferStats {
     oldest_pending_age_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct CdcBufferPendingStats {
+    pending_transactions: usize,
+    pending_records: usize,
+    pending_bytes: usize,
+}
+
+impl CdcBufferPendingStats {
+    fn add_counts(&mut self, records: usize, bytes: usize) {
+        self.pending_transactions = self.pending_transactions.saturating_add(1);
+        self.pending_records = self.pending_records.saturating_add(records);
+        self.pending_bytes = self.pending_bytes.saturating_add(bytes);
+    }
+
+    fn add_manifest(&mut self, manifest: &CdcBufferedTransactionManifest) {
+        self.add_counts(manifest.record_count(), manifest.payload_bytes());
+    }
+
+    fn subtract_manifest(&mut self, manifest: &CdcBufferedTransactionManifest) {
+        self.pending_transactions = self.pending_transactions.saturating_sub(1);
+        self.pending_records = self.pending_records.saturating_sub(manifest.record_count());
+        self.pending_bytes = self.pending_bytes.saturating_sub(manifest.payload_bytes());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdcBufferCleanupSummary {
     deleted_transactions: usize,
@@ -206,11 +231,25 @@ impl CdcBufferStore {
             buffered_at_unix_ms: append.buffered_at_unix_ms,
             delivered_at_unix_ms: None,
         };
+        let pending_key = pending_manifest_key(&append.pipeline_name, &transaction_key);
+        let mut pending_stats = self
+            .load_or_rebuild_pending_stats(&append.pipeline_name)
+            .await?;
+        if let Some(existing) = self
+            .pending_manifest_from_key(pending_key.clone())
+            .await
+            .context("load existing CDC buffer pending manifest before append")?
+        {
+            pending_stats.subtract_manifest(&existing);
+        }
+        pending_stats.add_counts(record_count, payload_bytes);
+
         let mut batch = WriteBatch::new();
         batch.put(
-            pending_manifest_key(&append.pipeline_name, &transaction_key),
+            pending_key,
             serde_json::to_vec(&manifest).context("encode CDC buffer transaction manifest")?,
         );
+        stage_pending_stats(&mut batch, &append.pipeline_name, &pending_stats)?;
         let frontier = CdcBufferFrontier {
             pipeline_name: append.pipeline_name.clone(),
             source_position: append.source_position.clone(),
@@ -327,11 +366,21 @@ impl CdcBufferStore {
         await_durable: bool,
     ) -> Result<CdcBufferedTransactionManifest> {
         let delivered = manifest.clone().with_delivered_at(delivered_at_unix_ms);
+        let pending_key =
+            pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key());
+        let mut pending_stats = self
+            .load_or_rebuild_pending_stats(manifest.pipeline_name())
+            .await?;
+        if let Some(existing) = self
+            .pending_manifest_from_key(pending_key.clone())
+            .await
+            .context("load existing CDC buffer pending manifest before delivery")?
+        {
+            pending_stats.subtract_manifest(&existing);
+        }
+
         let mut batch = WriteBatch::new();
-        batch.delete(pending_manifest_key(
-            manifest.pipeline_name(),
-            manifest.transaction_key(),
-        ));
+        batch.delete(pending_key);
         batch.put(
             delivered_manifest_key(
                 manifest.pipeline_name(),
@@ -350,6 +399,7 @@ impl CdcBufferStore {
             delivery_frontier_key(manifest.pipeline_name()),
             serde_json::to_vec(&frontier).context("encode CDC buffer delivery frontier")?,
         );
+        stage_pending_stats(&mut batch, manifest.pipeline_name(), &pending_stats)?;
         write_batch(self.db.as_ref(), batch, await_durable)
             .await
             .context("mark CDC buffer transaction delivered")?;
@@ -378,28 +428,63 @@ impl CdcBufferStore {
     }
 
     pub async fn stats(&self, pipeline_name: &str, now_unix_ms: u64) -> Result<CdcBufferStats> {
-        let manifests = self.pending_transactions(pipeline_name, usize::MAX).await?;
-        let pending_transactions = manifests.len();
-        let pending_objects = manifests.len();
-        let pending_records = manifests
-            .iter()
-            .map(CdcBufferedTransactionManifest::record_count)
-            .sum();
-        let pending_bytes = manifests
-            .iter()
-            .map(CdcBufferedTransactionManifest::payload_bytes)
-            .sum();
-        let oldest_pending_age_ms = manifests
-            .iter()
-            .map(|manifest| now_unix_ms.saturating_sub(manifest.buffered_at_unix_ms()))
-            .max();
+        let pending_stats = self.load_or_rebuild_pending_stats(pipeline_name).await?;
+        let oldest_pending_age_ms = self
+            .pending_transactions(pipeline_name, 1)
+            .await?
+            .first()
+            .map(|manifest| now_unix_ms.saturating_sub(manifest.buffered_at_unix_ms()));
         Ok(CdcBufferStats {
-            pending_transactions,
-            pending_objects,
-            pending_records,
-            pending_bytes,
+            pending_transactions: pending_stats.pending_transactions,
+            pending_objects: pending_stats.pending_transactions,
+            pending_records: pending_stats.pending_records,
+            pending_bytes: pending_stats.pending_bytes,
             oldest_pending_age_ms,
         })
+    }
+
+    async fn load_or_rebuild_pending_stats(
+        &self,
+        pipeline_name: &str,
+    ) -> Result<CdcBufferPendingStats> {
+        if let Some(stats) = load_json(
+            &self.db,
+            pending_stats_key(pipeline_name),
+            "CDC buffer pending stats",
+        )
+        .await?
+        {
+            return Ok(stats);
+        }
+
+        let stats = self.rebuild_pending_stats(pipeline_name).await?;
+        let mut batch = WriteBatch::new();
+        stage_pending_stats(&mut batch, pipeline_name, &stats)?;
+        write_batch(self.db.as_ref(), batch, false)
+            .await
+            .context("persist rebuilt CDC buffer pending stats")?;
+        Ok(stats)
+    }
+
+    async fn rebuild_pending_stats(&self, pipeline_name: &str) -> Result<CdcBufferPendingStats> {
+        let manifests = self.pending_transactions(pipeline_name, usize::MAX).await?;
+        let mut stats = CdcBufferPendingStats::default();
+        for manifest in manifests {
+            stats.add_manifest(&manifest);
+        }
+        Ok(stats)
+    }
+
+    async fn pending_manifest_from_key(
+        &self,
+        key: Vec<u8>,
+    ) -> Result<Option<CdcBufferedTransactionManifest>> {
+        let Some(value) = self.db.get(key).await.map_err(map_slate_err)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice::<CdcBufferedTransactionManifest>(&value)
+            .context("decode CDC buffer pending manifest")
+            .map(Some)
     }
 
     pub async fn cleanup_delivered(
