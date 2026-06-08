@@ -86,6 +86,7 @@ impl Harness {
             self.expected_observation_counts(&load_plan, &table_row_counts)?;
         let node_started = Instant::now();
         self.start_floe_node()?;
+        let counter_started = expected_kafka_messages.map(|_| Instant::now());
         let mut counter = self.start_counter(expected_kafka_messages)?;
         let sink_wait_started = Instant::now();
         let live_write_seconds = self.write_live_changes(&load_plan)?;
@@ -124,6 +125,7 @@ impl Harness {
         let observed_kafka_messages = counter_metrics
             .get("cdc_counter.observed_messages")
             .map(str::to_string);
+        let counter_seconds = counter_started.map(|started| started.elapsed().as_secs_f64());
         let summary = RunSummary {
             initial_rows: load_plan.initial_rows,
             live_insert_rows: load_plan.live_insert_rows,
@@ -140,6 +142,7 @@ impl Harness {
             live_write_seconds,
             end_to_end_seconds,
             sink_wait_seconds,
+            counter_seconds,
             counter_metrics,
             artifact_paths: self.artifacts.clone(),
         };
@@ -598,23 +601,40 @@ impl Harness {
 
     fn start_floe_node(&mut self) -> Result<()> {
         println!("Starting Floe node");
-        write_file(&self.artifacts.node_resource_log, "")?;
         let stdout = File::create(&self.artifacts.node_stdout)?;
         let stderr = File::create(&self.artifacts.node_stderr)?;
         let sql = fs::read_to_string(&self.config.sql_path)?;
-        let child = Command::new(self.config.target_binary("floe-node"))
+        let config_path = self
+            .config
+            .config_path
+            .to_str()
+            .context("config path not UTF-8")?;
+        let flush_interval_ms = self.config.slatedb_flush_interval_ms.to_string();
+        let mut command = if Path::new("/usr/bin/time").exists() {
+            let mut command = Command::new("/usr/bin/time");
+            command
+                .args(["-v", "-o"])
+                .arg(&self.artifacts.node_resource_log)
+                .arg(self.config.target_binary("floe-node"));
+            command
+        } else {
+            write_file(
+                &self.artifacts.node_resource_log,
+                "resource collection unavailable: /usr/bin/time not found\n",
+            )?;
+            Command::new(self.config.target_binary("floe-node"))
+        };
+        configure_process_group(&mut command);
+        let child = command
             .args([
                 "run",
                 "--config",
-                self.config
-                    .config_path
-                    .to_str()
-                    .context("config path not UTF-8")?,
+                config_path,
                 "--mv-query",
                 &sql,
                 "--slatedb-await-durable=false",
                 "--slatedb-flush-interval-ms",
-                &self.config.slatedb_flush_interval_ms.to_string(),
+                &flush_interval_ms,
                 "--ingest-batch-size",
                 "16384",
                 "--ingest-batch-per-source",
@@ -959,8 +979,7 @@ impl Harness {
 
     fn stop_node(&mut self) {
         if let Some(mut child) = self.node_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_process_group(&mut child, Duration::from_secs(10));
         }
     }
 

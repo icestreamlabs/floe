@@ -581,21 +581,27 @@ impl Harness {
         log("starting Floe native benchmark process");
         let stdout = File::create(artifact_dir.join("floe-node.stdout.log"))?;
         let stderr = File::create(artifact_dir.join("floe-node.stderr.log"))?;
-        let child = Command::new(self.config.release_binary("floe-node"))
+        let pgwire_addr = format!("127.0.0.1:{}", self.config.floe_pg_port);
+        let l0_sst_bytes = self.config.floe_l0_sst_bytes.to_string();
+        let max_unflushed_bytes = self.config.floe_max_unflushed_bytes.to_string();
+        let config_path = config_path.to_str().context("config path is not UTF-8")?;
+        let mut command = Command::new(self.config.release_binary("floe-node"));
+        configure_process_group(&mut command);
+        let child = command
             .args([
                 "run",
                 "--pgwire-addr",
-                &format!("127.0.0.1:{}", self.config.floe_pg_port),
+                &pgwire_addr,
                 "--admin-port",
                 "0",
                 "--slatedb-await-durable",
                 "false",
                 "--slatedb-l0-sst-bytes",
-                &self.config.floe_l0_sst_bytes.to_string(),
+                &l0_sst_bytes,
                 "--slatedb-max-unflushed-bytes",
-                &self.config.floe_max_unflushed_bytes.to_string(),
+                &max_unflushed_bytes,
                 "--config",
-                config_path.to_str().context("config path is not UTF-8")?,
+                config_path,
                 "--mv-query",
                 &mv_program,
             ])
@@ -953,8 +959,7 @@ impl Harness {
 
     fn stop_floe_process(&mut self) {
         if let Some(mut child) = self.floe_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_process_group(&mut child, Duration::from_secs(10));
         }
     }
 

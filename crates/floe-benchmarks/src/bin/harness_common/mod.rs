@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -81,6 +81,14 @@ where
         command.current_dir(cwd);
     }
     command
+}
+
+pub fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 }
 
 pub fn command_success<I, S>(
@@ -209,6 +217,56 @@ where
             return Ok(false);
         }
         thread::park_timeout(interval.min(remaining));
+    }
+}
+
+pub fn terminate_child_process_group(child: &mut Child, graceful_timeout: Duration) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+
+    signal_child_process_group(child, "INT");
+    if wait_for_child_exit(child, graceful_timeout) {
+        return;
+    }
+
+    signal_child_process_group(child, "TERM");
+    if wait_for_child_exit(child, Duration::from_secs(2)) {
+        return;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::park_timeout(Duration::from_millis(100).min(remaining));
+    }
+}
+
+fn signal_child_process_group(child: &Child, signal: &str) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args([format!("-{signal}"), process_group])
+            .status();
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (child, signal);
     }
 }
 

@@ -221,7 +221,10 @@ pub(super) async fn post_http_batch_with_retry(
             }
         }
     }
-    unreachable!("retry loop should return or fail");
+    metrics::inc_sink_failure(sink_name, "http");
+    Err(anyhow!(
+        "http sink request failed: retry policy max_attempts is zero"
+    ))
 }
 
 pub(super) fn build_http_idempotency_keys(batch: &[SinkRecord]) -> (String, String) {
