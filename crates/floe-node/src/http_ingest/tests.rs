@@ -4,6 +4,7 @@ use super::sse_json::*;
 use super::*;
 use axum::body::Body;
 use axum::http::{Request, header};
+use floe_storage::ReplicationPipelineDlqEntryParts;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tower::util::ServiceExt;
@@ -272,47 +273,53 @@ async fn debug_cdc_replication_admin_returns_snapshot() {
 #[tokio::test]
 async fn admin_cdc_replication_dlq_lists_inspects_and_discards_entries() {
     let storage = SlateCatalog::in_memory().await.expect("storage");
-    let dlq_entry = ReplicationPipelineDlqEntry::new(
-        "orders_pipe",
-        "entry-1",
-        "pg_main",
-        floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
-        Some(floe_cdc_core::CdcTransactionId::new("pg-xid-1").expect("transaction")),
-        "postgres_delivery",
-        "permission denied",
-        1,
-        Some("payloads/entry-1.bin".to_string()),
-        Some("kafka_records".to_string()),
-        128,
-        BTreeMap::from([(
+    let dlq_entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+        pipeline_name: "orders_pipe".to_string(),
+        dlq_id: "entry-1".to_string(),
+        source_name: "pg_main".to_string(),
+        source_position: floe_cdc_core::CdcSourcePosition::postgres("0/16B6C50", None)
+            .expect("position"),
+        transaction_id: Some(
+            floe_cdc_core::CdcTransactionId::new("pg-xid-1").expect("transaction"),
+        ),
+        error_class: "postgres_delivery".to_string(),
+        error_message: "permission denied".to_string(),
+        attempt_count: 1,
+        payload_object_key: Some("payloads/entry-1.bin".to_string()),
+        payload_format: Some("kafka_records".to_string()),
+        payload_bytes: 128,
+        target_state: BTreeMap::from([(
             "target.delivery.status".to_string(),
             "dead_lettered".to_string(),
         )]),
-        current_unix_time_ms(),
-    )
+        created_at_unix_ms: current_unix_time_ms(),
+    })
     .expect("dlq entry");
     storage
         .put_replication_pipeline_dlq_entry(dlq_entry)
         .await
         .expect("persist dlq entry");
-    let second_entry = ReplicationPipelineDlqEntry::new(
-        "orders_pipe",
-        "entry-2",
-        "pg_main",
-        floe_cdc_core::CdcSourcePosition::postgres("0/16B6C60", None).expect("position"),
-        Some(floe_cdc_core::CdcTransactionId::new("pg-xid-2").expect("transaction")),
-        "postgres_delivery",
-        "permission denied",
-        1,
-        Some("payloads/entry-2.bin".to_string()),
-        Some("kafka_records".to_string()),
-        128,
-        BTreeMap::from([(
+    let second_entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+        pipeline_name: "orders_pipe".to_string(),
+        dlq_id: "entry-2".to_string(),
+        source_name: "pg_main".to_string(),
+        source_position: floe_cdc_core::CdcSourcePosition::postgres("0/16B6C60", None)
+            .expect("position"),
+        transaction_id: Some(
+            floe_cdc_core::CdcTransactionId::new("pg-xid-2").expect("transaction"),
+        ),
+        error_class: "postgres_delivery".to_string(),
+        error_message: "permission denied".to_string(),
+        attempt_count: 1,
+        payload_object_key: Some("payloads/entry-2.bin".to_string()),
+        payload_format: Some("kafka_records".to_string()),
+        payload_bytes: 128,
+        target_state: BTreeMap::from([(
             "target.delivery.status".to_string(),
             "dead_lettered".to_string(),
         )]),
-        current_unix_time_ms().saturating_add(1),
-    )
+        created_at_unix_ms: current_unix_time_ms().saturating_add(1),
+    })
     .expect("second dlq entry");
     storage
         .put_replication_pipeline_dlq_entry(second_entry)

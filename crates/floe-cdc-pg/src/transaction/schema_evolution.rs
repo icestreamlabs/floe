@@ -55,18 +55,29 @@ pub struct PostgresSchemaEvolutionObservation {
     observed_schema_version: u64,
 }
 
+pub(super) struct PostgresSchemaEvolutionObservationParts {
+    pub(super) table_id: CdcTableId,
+    pub(super) upstream_table: UpstreamTableRef,
+    pub(super) policy: PostgresSchemaEvolutionPolicy,
+    pub(super) outcome: PostgresSchemaEvolutionOutcome,
+    pub(super) added_columns: Vec<String>,
+    pub(super) reason: Option<String>,
+    pub(super) catalog_schema_version: u64,
+    pub(super) observed_schema_version: u64,
+}
+
 impl PostgresSchemaEvolutionObservation {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        table_id: CdcTableId,
-        upstream_table: UpstreamTableRef,
-        policy: PostgresSchemaEvolutionPolicy,
-        outcome: PostgresSchemaEvolutionOutcome,
-        added_columns: Vec<String>,
-        reason: Option<String>,
-        catalog_schema_version: u64,
-        observed_schema_version: u64,
-    ) -> Self {
+    pub(super) fn new(parts: PostgresSchemaEvolutionObservationParts) -> Self {
+        let PostgresSchemaEvolutionObservationParts {
+            table_id,
+            upstream_table,
+            policy,
+            outcome,
+            added_columns,
+            reason,
+            catalog_schema_version,
+            observed_schema_version,
+        } = parts;
         Self {
             table_id,
             upstream_table,

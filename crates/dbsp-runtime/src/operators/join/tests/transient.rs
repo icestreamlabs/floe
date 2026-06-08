@@ -20,35 +20,38 @@ async fn join_operator_transient_batches_match_persisted_output() {
             .expect("out dict"),
     );
 
-    let mut persisted = JoinOp::new_batch(
-        IndexedBatchZSet::new(table.clone(), "join_transient_left_index_persisted"),
-        IndexedBatchZSet::new(table.clone(), "join_transient_right_index_persisted"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        VersionedZSet::new(
-            out_dict.clone(),
-            table.clone(),
-            "join_transient_output".to_string(),
-        )
-        .await
-        .expect("persisted output"),
-        None,
-    )
+    let mut persisted = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_transient_left_index_persisted"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_transient_right_index_persisted"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(
+            VersionedZSet::new(
+                out_dict.clone(),
+                table.clone(),
+                "join_transient_output".to_string(),
+            )
+            .await
+            .expect("persisted output"),
+        ),
+        integrated: None,
+    })
     .with_persist_indexes(false);
 
-    let mut transient = JoinOp::new_without_output_batch(
-        IndexedBatchZSet::new(table.clone(), "join_transient_left_index_transient"),
-        IndexedBatchZSet::new(table.clone(), "join_transient_right_index_transient"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        None,
-    )
+    let mut transient = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_transient_left_index_transient"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_transient_right_index_transient"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: None,
+        integrated: None,
+    })
     .with_persist_indexes(false);
 
     let right_seed = stage_version(
@@ -140,28 +143,30 @@ async fn join_operator_preloaded_transient_inputs_match_handle_path() {
             .expect("right dict"),
     );
 
-    let mut handle_path = JoinOp::new_without_output_batch(
-        IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_handle"),
-        IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_handle"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        None,
-    )
+    let mut handle_path = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_handle"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_handle"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: None,
+        integrated: None,
+    })
     .with_persist_indexes(false);
 
-    let mut preloaded_path = JoinOp::new_without_output_batch(
-        IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_transient"),
-        IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_transient"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        None,
-    )
+    let mut preloaded_path = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_preloaded_left_index_transient"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_preloaded_right_index_transient"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: None,
+        integrated: None,
+    })
     .with_persist_indexes(false);
 
     let empty_left = empty_handle("join_preloaded_left_stream");

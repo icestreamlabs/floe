@@ -1,5 +1,6 @@
 use super::reconciliation::record_replication_buffer_append;
 use super::*;
+use crate::node_runtime::replication::buffer::ReplicationBufferBackpressureEvent;
 
 struct BufferLimitAppendInput<'a> {
     plan: &'a ReplicationPipelineRuntimePlan,
@@ -545,16 +546,16 @@ impl ReplicationPipelineRuntime {
             if let Some(violation) =
                 buffer_limit_violation(0, 0, 0, None, incoming_bytes, incoming_records, limits)
             {
-                log_replication_buffer_backpressure(
+                log_replication_buffer_backpressure(ReplicationBufferBackpressureEvent {
                     plan,
-                    "incoming_transaction",
-                    None,
+                    phase: "incoming_transaction",
+                    stats: None,
                     incoming_bytes,
                     incoming_records,
                     limits,
                     violation,
-                    None,
-                );
+                    delivered_records: None,
+                });
                 self.set_source_backpressure_state(&plan.name, true);
                 return Err(anyhow!(
                     "replication pipeline '{}' durable buffer limit exceeded: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",
@@ -642,16 +643,16 @@ impl ReplicationPipelineRuntime {
             limits,
         ) {
             violation = current_violation;
-            log_replication_buffer_backpressure(
+            log_replication_buffer_backpressure(ReplicationBufferBackpressureEvent {
                 plan,
-                "after_guardrail_drain",
-                Some(&stats),
+                phase: "after_guardrail_drain",
+                stats: Some(&stats),
                 incoming_bytes,
                 incoming_records,
                 limits,
                 violation,
-                Some(delivered),
-            );
+                delivered_records: Some(delivered),
+            });
             self.set_source_backpressure_state(&plan.name, true);
             return Err(anyhow!(
                 "replication pipeline '{}' durable buffer limit exceeded after draining: {violation}; refusing to append more CDC data so the source applies backpressure through its replication slot",

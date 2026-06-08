@@ -19,6 +19,7 @@ use dbsp_circuit::circuit::plan::{
     DbspAggregateFunction, DbspJoinType, DbspNodeKind, DbspWindowPolicy,
 };
 use dbsp_circuit::circuit::schema::Field;
+use dbsp_circuit::circuit::tables as nexmark_tables;
 use dbsp_circuit::circuit::tables::TableDescriptor;
 use dbsp_circuit::circuit::types::DbspScalarType;
 
@@ -27,13 +28,47 @@ use super::{CircuitPlanner, PlannerConfig};
 
 fn planner_config() -> PlannerConfig {
     let mut config = PlannerConfig::new();
-    config.register_table(dbsp_circuit::circuit::tables::nexmark_person_table());
-    config.register_table(dbsp_circuit::circuit::tables::nexmark_person_alias_table());
-    config.register_table(dbsp_circuit::circuit::tables::nexmark_auction_table());
-    config.register_table(dbsp_circuit::circuit::tables::nexmark_auction_alias_table());
-    config.register_table(dbsp_circuit::circuit::tables::nexmark_bid_table());
-    config.register_table(dbsp_circuit::circuit::tables::nexmark_bid_alias_table());
+    config.register_table(nexmark_person_table());
+    config.register_table(nexmark_person_alias_table());
+    config.register_table(nexmark_auction_table());
+    config.register_table(nexmark_auction_alias_table());
+    config.register_table(nexmark_bid_table());
+    config.register_table(nexmark_bid_alias_table());
     config
+}
+
+fn static_table(
+    table: anyhow::Result<&'static TableDescriptor>,
+    label: &str,
+) -> &'static TableDescriptor {
+    match table {
+        Ok(table) => table,
+        Err(error) => panic!("invalid {label} table descriptor: {error}"),
+    }
+}
+
+fn nexmark_person_table() -> &'static TableDescriptor {
+    static_table(nexmark_tables::nexmark_person_table(), "nexmark_person")
+}
+
+fn nexmark_person_alias_table() -> &'static TableDescriptor {
+    static_table(nexmark_tables::nexmark_person_alias_table(), "person")
+}
+
+fn nexmark_auction_table() -> &'static TableDescriptor {
+    static_table(nexmark_tables::nexmark_auction_table(), "nexmark_auction")
+}
+
+fn nexmark_auction_alias_table() -> &'static TableDescriptor {
+    static_table(nexmark_tables::nexmark_auction_alias_table(), "auction")
+}
+
+fn nexmark_bid_table() -> &'static TableDescriptor {
+    static_table(nexmark_tables::nexmark_bid_table(), "nexmark_bid")
+}
+
+fn nexmark_bid_alias_table() -> &'static TableDescriptor {
+    static_table(nexmark_tables::nexmark_bid_alias_table(), "bid")
 }
 
 fn table_source(table: &'static TableDescriptor) -> Arc<dyn TableSource> {
@@ -61,12 +96,12 @@ fn null_ts_value(len: usize) -> ColumnarValue {
 async fn sql_plan(sql: &str) -> datafusion::logical_expr::LogicalPlan {
     let ctx = SessionContext::new();
     for table in [
-        dbsp_circuit::circuit::tables::nexmark_person_table(),
-        dbsp_circuit::circuit::tables::nexmark_person_alias_table(),
-        dbsp_circuit::circuit::tables::nexmark_auction_table(),
-        dbsp_circuit::circuit::tables::nexmark_auction_alias_table(),
-        dbsp_circuit::circuit::tables::nexmark_bid_table(),
-        dbsp_circuit::circuit::tables::nexmark_bid_alias_table(),
+        nexmark_person_table(),
+        nexmark_person_alias_table(),
+        nexmark_auction_table(),
+        nexmark_auction_alias_table(),
+        nexmark_bid_table(),
+        nexmark_bid_alias_table(),
     ] {
         let provider: Arc<dyn TableProvider> =
             Arc::new(EmptyTable::new(table.schema().to_arrow_schema()));

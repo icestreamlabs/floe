@@ -2,9 +2,9 @@ mod op;
 
 #[cfg(test)]
 pub(crate) use op::JoinInputRetention;
-pub use op::JoinOp;
 #[cfg(test)]
 pub(crate) use op::JoinTransientInputs;
+pub use op::{JoinBatchConfig, JoinClosedIndexConfig, JoinOp};
 
 #[cfg(test)]
 mod tests;

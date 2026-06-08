@@ -14,9 +14,9 @@ use crate::{
 use super::router::PostgresTableRouter;
 use super::schema_evolution::{
     PostgresObservedSchemaVersion, PostgresSchemaEvolutionObservation,
-    PostgresSchemaEvolutionOutcome, PostgresSchemaEvolutionPolicy, SchemaEvolution,
-    classify_schema_evolution, project_change_to_schema, push_schema_history,
-    schema_versions_for_schemas,
+    PostgresSchemaEvolutionObservationParts, PostgresSchemaEvolutionOutcome,
+    PostgresSchemaEvolutionPolicy, SchemaEvolution, classify_schema_evolution,
+    project_change_to_schema, push_schema_history, schema_versions_for_schemas,
 };
 
 pub struct PostgresTransactionAssembler {
@@ -170,14 +170,16 @@ impl PostgresTransactionAssembler {
                     relation.replica_identity()
                 );
                 self.record_schema_evolution_observation(PostgresSchemaEvolutionObservation::new(
-                    table_id.clone(),
-                    upstream_table.clone(),
-                    self.schema_policy,
-                    PostgresSchemaEvolutionOutcome::Incompatible,
-                    Vec::new(),
-                    Some(reason.clone()),
-                    catalog_schema_version,
-                    catalog_schema_version,
+                    PostgresSchemaEvolutionObservationParts {
+                        table_id: table_id.clone(),
+                        upstream_table: upstream_table.clone(),
+                        policy: self.schema_policy,
+                        outcome: PostgresSchemaEvolutionOutcome::Incompatible,
+                        added_columns: Vec::new(),
+                        reason: Some(reason.clone()),
+                        catalog_schema_version,
+                        observed_schema_version: catalog_schema_version,
+                    },
                 ));
                 bail!(
                     "Postgres CDC schema for table '{}' is incompatible with catalog schema: {reason}",
@@ -189,14 +191,16 @@ impl PostgresTransactionAssembler {
         if let Err(err) = self.accept_replica_identity(&table_id, relation.replica_identity()) {
             let reason = err.to_string();
             self.record_schema_evolution_observation(PostgresSchemaEvolutionObservation::new(
-                table_id.clone(),
-                upstream_table.clone(),
-                self.schema_policy,
-                PostgresSchemaEvolutionOutcome::Incompatible,
-                Vec::new(),
-                Some(reason.clone()),
-                catalog_schema_version,
-                observed_schema_version,
+                PostgresSchemaEvolutionObservationParts {
+                    table_id: table_id.clone(),
+                    upstream_table: upstream_table.clone(),
+                    policy: self.schema_policy,
+                    outcome: PostgresSchemaEvolutionOutcome::Incompatible,
+                    added_columns: Vec::new(),
+                    reason: Some(reason.clone()),
+                    catalog_schema_version,
+                    observed_schema_version,
+                },
             ));
             bail!(
                 "Postgres CDC schema for table '{}' is incompatible with catalog schema: {reason}",
@@ -216,17 +220,19 @@ impl PostgresTransactionAssembler {
                 PostgresSchemaEvolutionPolicy::FailFast => {
                     self.record_schema_evolution_observation(
                         PostgresSchemaEvolutionObservation::new(
-                            table_id.clone(),
-                            upstream_table.clone(),
-                            self.schema_policy,
-                            PostgresSchemaEvolutionOutcome::RejectedCompatibleAddition,
-                            added_columns.clone(),
-                            Some(
-                                "compatible column additions rejected by fail-fast policy"
-                                    .to_string(),
-                            ),
-                            catalog_schema_version,
-                            observed_schema_version,
+                            PostgresSchemaEvolutionObservationParts {
+                                table_id: table_id.clone(),
+                                upstream_table: upstream_table.clone(),
+                                policy: self.schema_policy,
+                                outcome: PostgresSchemaEvolutionOutcome::RejectedCompatibleAddition,
+                                added_columns: added_columns.clone(),
+                                reason: Some(
+                                    "compatible column additions rejected by fail-fast policy"
+                                        .to_string(),
+                                ),
+                                catalog_schema_version,
+                                observed_schema_version,
+                            },
                         ),
                     );
                     tracing::warn!(
@@ -249,14 +255,16 @@ impl PostgresTransactionAssembler {
                 | PostgresSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
                     self.record_schema_evolution_observation(
                         PostgresSchemaEvolutionObservation::new(
-                            table_id.clone(),
-                            upstream_table.clone(),
-                            self.schema_policy,
-                            PostgresSchemaEvolutionOutcome::CompatibleAddition,
-                            added_columns.clone(),
-                            None,
-                            catalog_schema_version,
-                            observed_schema_version,
+                            PostgresSchemaEvolutionObservationParts {
+                                table_id: table_id.clone(),
+                                upstream_table: upstream_table.clone(),
+                                policy: self.schema_policy,
+                                outcome: PostgresSchemaEvolutionOutcome::CompatibleAddition,
+                                added_columns: added_columns.clone(),
+                                reason: None,
+                                catalog_schema_version,
+                                observed_schema_version,
+                            },
                         ),
                     );
                     tracing::info!(
@@ -278,14 +286,16 @@ impl PostgresTransactionAssembler {
             },
             SchemaEvolution::Incompatible(reason) => {
                 self.record_schema_evolution_observation(PostgresSchemaEvolutionObservation::new(
-                    table_id.clone(),
-                    upstream_table.clone(),
-                    self.schema_policy,
-                    PostgresSchemaEvolutionOutcome::Incompatible,
-                    Vec::new(),
-                    Some(reason.clone()),
-                    catalog_schema_version,
-                    observed_schema_version,
+                    PostgresSchemaEvolutionObservationParts {
+                        table_id: table_id.clone(),
+                        upstream_table: upstream_table.clone(),
+                        policy: self.schema_policy,
+                        outcome: PostgresSchemaEvolutionOutcome::Incompatible,
+                        added_columns: Vec::new(),
+                        reason: Some(reason.clone()),
+                        catalog_schema_version,
+                        observed_schema_version,
+                    },
                 ));
                 tracing::warn!(
                     source = %self.source_id.as_str(),

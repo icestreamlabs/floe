@@ -24,17 +24,17 @@ async fn join_operator_can_drop_matched_append_only_left_rows() {
         .await
         .expect("output zset");
 
-    let mut op = JoinOp::new_batch(
-        IndexedBatchZSet::new(table.clone(), "join_drop_left_index"),
-        IndexedBatchZSet::new(table.clone(), "join_drop_right_index"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        output,
-        None,
-    )
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_drop_left_index"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_drop_right_index"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    })
     .with_input_retention(
         JoinInputRetention::DropMatchedAppendOnly,
         JoinInputRetention::RetainAll,
@@ -125,17 +125,17 @@ async fn join_operator_can_drop_closed_append_only_left_keys() {
         .await
         .expect("output zset");
 
-    let mut op = JoinOp::new_batch(
-        IndexedBatchZSet::new(table.clone(), "join_closed_left_index"),
-        IndexedBatchZSet::new(table.clone(), "join_closed_right_index"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        output,
-        None,
-    )
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_closed_left_index"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_closed_right_index"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    })
     .with_input_retention(
         JoinInputRetention::DropMatchedAppendOnly,
         JoinInputRetention::RetainAll,
@@ -238,17 +238,17 @@ async fn join_operator_inmemory_indexes_preserve_cross_tick_matches() {
     .await
     .expect("output zset");
 
-    let mut op = JoinOp::new_batch(
-        IndexedBatchZSet::new(table.clone(), "join_inmemory_left_index"),
-        IndexedBatchZSet::new(table.clone(), "join_inmemory_right_index"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        output,
-        None,
-    )
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_inmemory_left_index"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_inmemory_right_index"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    })
     .with_persist_indexes(false);
 
     let empty_left = empty_handle("join_inmemory_left_stream");

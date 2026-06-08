@@ -55,18 +55,18 @@ pub(super) fn source_backed_table_definition_from_sql(
 pub(super) fn replication_pipeline_definition_from_sql(
     definition: &SqlReplicationPipelineDefinition,
 ) -> anyhow::Result<CatalogReplicationPipelineDefinition> {
-    CatalogReplicationPipelineDefinition::new(
-        definition.name(),
-        definition.source_name(),
-        definition.upstream_table(),
-        definition.target().clone(),
-        definition.format(),
-        definition.buffer_mode(),
-        definition.buffer_policy(),
-        definition.emit_tombstones(),
-        definition.include_transaction_metadata(),
-        definition.error_policy(),
-    )
+    CatalogReplicationPipelineDefinition::new(CatalogReplicationPipelineDefinitionParts {
+        name: definition.name().to_string(),
+        source_name: definition.source_name().to_string(),
+        upstream_table: definition.upstream_table().to_string(),
+        target: definition.target().clone(),
+        format: definition.format(),
+        buffer_mode: definition.buffer_mode(),
+        buffer_policy: definition.buffer_policy(),
+        emit_tombstones: definition.emit_tombstones(),
+        include_transaction_metadata: definition.include_transaction_metadata(),
+        error_policy: definition.error_policy(),
+    })
 }
 
 pub(super) fn source_definition_from_table(

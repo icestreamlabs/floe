@@ -1,4 +1,5 @@
 use super::*;
+use crate::definitions::ReplicationPipelineDefinitionParts;
 
 pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {
     let normalized = normalize_sql(sql)?;
@@ -496,10 +497,10 @@ pub(super) fn parse_replication_pipeline_statement(
         other => return Err(anyhow!("unsupported replication pipeline target '{other}'")),
     };
 
-    ReplicationPipelineDefinition::new(
-        pipeline_name,
-        source_name,
-        upstream_table,
+    ReplicationPipelineDefinition::new(ReplicationPipelineDefinitionParts {
+        name: pipeline_name.to_string(),
+        source_name: source_name.to_string(),
+        upstream_table: upstream_table.to_string(),
         target,
         format,
         buffer_mode,
@@ -507,7 +508,7 @@ pub(super) fn parse_replication_pipeline_statement(
         emit_tombstones,
         include_transaction_metadata,
         error_policy,
-    )
+    })
 }
 
 pub(super) fn postgres_connection_string_from_options(

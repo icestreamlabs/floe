@@ -1,7 +1,8 @@
 use anyhow::Context;
 use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
 use floe_storage::{
-    CdcBufferRecord, ReplicationPipelineDlqEntry, SlateCatalog, encode_cdc_buffer_records_payload,
+    CdcBufferRecord, ReplicationPipelineDlqEntry, ReplicationPipelineDlqEntryParts, SlateCatalog,
+    encode_cdc_buffer_records_payload,
 };
 
 use super::super::ReplicationPipelineRuntimePlan;
@@ -31,21 +32,21 @@ pub(super) async fn persist_dead_letter_records(
                 plan.name
             )
         })?;
-    let entry = ReplicationPipelineDlqEntry::new(
-        &plan.name,
+    let entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+        pipeline_name: plan.name.clone(),
         dlq_id,
-        &plan.source_name,
-        source_position.clone(),
-        transaction_id.cloned(),
-        format!("{}_delivery", target_kind(plan)),
-        truncate_target_error(&format!("{err:#}")),
-        1,
-        Some(payload_object_key),
-        Some("kafka_records".to_string()),
+        source_name: plan.source_name.clone(),
+        source_position: source_position.clone(),
+        transaction_id: transaction_id.cloned(),
+        error_class: format!("{}_delivery", target_kind(plan)),
+        error_message: truncate_target_error(&format!("{err:#}")),
+        attempt_count: 1,
+        payload_object_key: Some(payload_object_key),
+        payload_format: Some("kafka_records".to_string()),
         payload_bytes,
-        dead_letter_target_state(plan, err),
-        current_unix_time_ms(),
-    )?;
+        target_state: dead_letter_target_state(plan, err),
+        created_at_unix_ms: current_unix_time_ms(),
+    })?;
     storage
         .put_replication_pipeline_dlq_entry(entry.clone())
         .await

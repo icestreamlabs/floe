@@ -20,6 +20,7 @@ use floe_cdc_core::{
 use floe_config::ReplicationArrowIpcCompressionConfig;
 use floe_core::RowValue;
 use floe_core::catalog::ColumnType;
+use floe_storage::ReplicationPipelineDlqEntryParts;
 use std::collections::BTreeMap;
 
 mod buffer_limits;
@@ -124,21 +125,21 @@ async fn persist_test_dlq_entry(
     let payload_object_key = storage
         .put_replication_pipeline_dlq_payload(&plan.name, dlq_id, payload)
         .await?;
-    let entry = ReplicationPipelineDlqEntry::new(
-        &plan.name,
-        dlq_id,
-        &plan.source_name,
-        floe_cdc_core::CdcSourcePosition::postgres(lsn, None)?,
-        Some(CdcTransactionId::new(transaction_id)?),
-        "kafka_delivery",
-        "broker unavailable",
-        1,
-        Some(payload_object_key),
-        Some("kafka_records".to_string()),
+    let entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+        pipeline_name: plan.name.clone(),
+        dlq_id: dlq_id.to_string(),
+        source_name: plan.source_name.clone(),
+        source_position: floe_cdc_core::CdcSourcePosition::postgres(lsn, None)?,
+        transaction_id: Some(CdcTransactionId::new(transaction_id)?),
+        error_class: "kafka_delivery".to_string(),
+        error_message: "broker unavailable".to_string(),
+        attempt_count: 1,
+        payload_object_key: Some(payload_object_key),
+        payload_format: Some("kafka_records".to_string()),
         payload_bytes,
-        BTreeMap::new(),
+        target_state: BTreeMap::new(),
         created_at_unix_ms,
-    )?;
+    })?;
     storage
         .put_replication_pipeline_dlq_entry(entry.clone())
         .await?;

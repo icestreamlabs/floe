@@ -25,10 +25,11 @@ use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch}
 mod interval_index;
 use interval_index::LeftIntervalIndex;
 
-type BatchLeftRangeExtractor<L, K> = Arc<dyn Fn(&[(L, i64)]) -> Vec<(K, K, L, i64)> + Send + Sync>;
-type BatchRightKeyExtractor<R, K> = Arc<dyn Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync>;
-type RangeJoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
-type RangeJoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
+pub type BatchLeftRangeExtractor<L, K> =
+    Arc<dyn Fn(&[(L, i64)]) -> Vec<(K, K, L, i64)> + Send + Sync>;
+pub type BatchRightKeyExtractor<R, K> = Arc<dyn Fn(&[(R, i64)]) -> Vec<(K, R, i64)> + Send + Sync>;
+pub type RangeJoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
+pub type RangeJoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
 type RowDeltas<T> = HashMap<T, i64>;
 type LeftRangeDeltas<L, K> = HashMap<L, (K, K, i64)>;
 type RightKeyedDeltas<R, K> = HashMap<K, HashMap<R, i64>>;
@@ -39,6 +40,59 @@ const RANGE_JOIN_DELTA_DELTA_INDEX_THRESHOLD: usize = 64;
 pub enum RangeLookupMode {
     All,
     First,
+}
+
+pub struct RangeJoinBatchConfig<L, R, O, K>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Ord
+        + RangeKey
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub left_state: RelationState<L>,
+    pub right_state: RelationState<R>,
+    pub right_index: IndexedBatchZSet<K, R>,
+    pub left_range: BatchLeftRangeExtractor<L, K>,
+    pub right_key: BatchRightKeyExtractor<R, K>,
+    pub predicate: RangeJoinPredicate<L, R>,
+    pub projector: RangeJoinProjector<L, R, O>,
+    pub table: Arc<dyn KeyValueTable>,
+    pub output: VersionedZSet<O>,
+    pub integrated: Option<RelationState<O>>,
 }
 
 /// Incremental half-open range join.
@@ -147,20 +201,15 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_batch(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_range: BatchLeftRangeExtractor<L, K>,
-        right_key: BatchRightKeyExtractor<R, K>,
-        predicate: RangeJoinPredicate<L, R>,
-        projector: RangeJoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<O>,
-        integrated: Option<RelationState<O>>,
+    pub fn new_batch(config: RangeJoinBatchConfig<L, R, O, K>) -> Self {
+        Self::new_batch_with_lookup_mode(config, RangeLookupMode::All)
+    }
+
+    pub fn new_batch_with_lookup_mode(
+        config: RangeJoinBatchConfig<L, R, O, K>,
+        range_lookup_mode: RangeLookupMode,
     ) -> Self {
-        Self::new_batch_with_lookup_mode(
+        let RangeJoinBatchConfig {
             left_state,
             right_state,
             right_index,
@@ -171,24 +220,7 @@ where
             table,
             output,
             integrated,
-            RangeLookupMode::All,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_batch_with_lookup_mode(
-        left_state: RelationState<L>,
-        right_state: RelationState<R>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_range: BatchLeftRangeExtractor<L, K>,
-        right_key: BatchRightKeyExtractor<R, K>,
-        predicate: RangeJoinPredicate<L, R>,
-        projector: RangeJoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<O>,
-        integrated: Option<RelationState<O>>,
-        range_lookup_mode: RangeLookupMode,
-    ) -> Self {
+        } = config;
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
             left_state,

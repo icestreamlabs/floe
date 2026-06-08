@@ -15,15 +15,17 @@ async fn postgres_cdc_runtime_plan_builds_cdc_schema_from_source_primary_key() {
     registry.register(source);
     let include_tables = vec!["public.orders".to_string()];
 
-    let plan = postgres_cdc_runtime_plan(
-        "pg_main",
-        "postgres://postgres:postgres@localhost/postgres",
-        PostgresSchemaEvolutionPolicy::IgnoreCompatible,
-        Some(&include_tables),
-        &registry,
-        &HashMap::new(),
-        &HashMap::new(),
-    )
+    let source_tables = HashMap::new();
+    let replication_pipelines = HashMap::new();
+    let plan = postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
+        connector_name: "pg_main",
+        connection_string: "postgres://postgres:postgres@localhost/postgres",
+        schema_evolution_policy: PostgresSchemaEvolutionPolicy::IgnoreCompatible,
+        include_tables: Some(&include_tables),
+        registry: &registry,
+        source_tables: &source_tables,
+        replication_pipelines: &replication_pipelines,
+    })
     .await
     .expect("runtime plan")
     .expect("native runtime plan");
@@ -58,32 +60,35 @@ async fn postgres_cdc_runtime_plan_accepts_postgres_replication_target() {
     let mut registry = SourceRegistry::new();
     registry.register(source);
     let include_tables = vec!["public.orders".to_string()];
-    let pipeline = CatalogReplicationPipelineDefinition::new(
-        "pg_orders_to_postgres",
-        "pg_main",
-        "public.orders",
-        CatalogReplicationPipelineTarget::Postgres {
-            connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
-            table: "public.orders_copy".to_string(),
-        },
-        CatalogReplicationPipelineFormat::FloeJson,
-        CatalogReplicationBufferMode::Durable,
-        CatalogReplicationBufferPolicy::default(),
-        false,
-        false,
-        CatalogReplicationErrorPolicy::default(),
-    )
-    .expect("pipeline");
+    let pipeline =
+        CatalogReplicationPipelineDefinition::new(CatalogReplicationPipelineDefinitionParts {
+            name: "pg_orders_to_postgres".to_string(),
+            source_name: "pg_main".to_string(),
+            upstream_table: "public.orders".to_string(),
+            target: CatalogReplicationPipelineTarget::Postgres {
+                connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
+                table: "public.orders_copy".to_string(),
+            },
+            format: CatalogReplicationPipelineFormat::FloeJson,
+            buffer_mode: CatalogReplicationBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
+            emit_tombstones: false,
+            include_transaction_metadata: false,
+            error_policy: CatalogReplicationErrorPolicy::default(),
+        })
+        .expect("pipeline");
 
-    let plan = postgres_cdc_runtime_plan(
-        "pg_main",
-        "postgres://postgres:postgres@localhost/postgres",
-        PostgresSchemaEvolutionPolicy::FailFast,
-        Some(&include_tables),
-        &registry,
-        &HashMap::new(),
-        &HashMap::from([(pipeline.name().to_string(), pipeline)]),
-    )
+    let source_tables = HashMap::new();
+    let replication_pipelines = HashMap::from([(pipeline.name().to_string(), pipeline)]);
+    let plan = postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
+        connector_name: "pg_main",
+        connection_string: "postgres://postgres:postgres@localhost/postgres",
+        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
+        include_tables: Some(&include_tables),
+        registry: &registry,
+        source_tables: &source_tables,
+        replication_pipelines: &replication_pipelines,
+    })
     .await
     .expect("runtime plan")
     .expect("native runtime plan");
@@ -112,32 +117,35 @@ async fn postgres_cdc_runtime_plan_keeps_pipeline_only_table_unmaterialized() {
     let mut registry = SourceRegistry::new();
     registry.register(source);
     let include_tables = vec!["public.orders".to_string()];
-    let pipeline = CatalogReplicationPipelineDefinition::new(
-        "pg_orders_to_kafka",
-        "pg_main",
-        "public.orders",
-        CatalogReplicationPipelineTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders_cdc".to_string(),
-        },
-        CatalogReplicationPipelineFormat::DebeziumJson,
-        CatalogReplicationBufferMode::Durable,
-        CatalogReplicationBufferPolicy::default(),
-        false,
-        false,
-        CatalogReplicationErrorPolicy::default(),
-    )
-    .expect("pipeline");
+    let pipeline =
+        CatalogReplicationPipelineDefinition::new(CatalogReplicationPipelineDefinitionParts {
+            name: "pg_orders_to_kafka".to_string(),
+            source_name: "pg_main".to_string(),
+            upstream_table: "public.orders".to_string(),
+            target: CatalogReplicationPipelineTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders_cdc".to_string(),
+            },
+            format: CatalogReplicationPipelineFormat::DebeziumJson,
+            buffer_mode: CatalogReplicationBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
+            emit_tombstones: false,
+            include_transaction_metadata: false,
+            error_policy: CatalogReplicationErrorPolicy::default(),
+        })
+        .expect("pipeline");
 
-    let plan = postgres_cdc_runtime_plan(
-        "pg_main",
-        "postgres://postgres:postgres@localhost/postgres",
-        PostgresSchemaEvolutionPolicy::FailFast,
-        Some(&include_tables),
-        &registry,
-        &HashMap::new(),
-        &HashMap::from([(pipeline.name().to_string(), pipeline)]),
-    )
+    let source_tables = HashMap::new();
+    let replication_pipelines = HashMap::from([(pipeline.name().to_string(), pipeline)]);
+    let plan = postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
+        connector_name: "pg_main",
+        connection_string: "postgres://postgres:postgres@localhost/postgres",
+        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
+        include_tables: Some(&include_tables),
+        registry: &registry,
+        source_tables: &source_tables,
+        replication_pipelines: &replication_pipelines,
+    })
     .await
     .expect("runtime plan")
     .expect("native runtime plan");
@@ -167,15 +175,17 @@ async fn postgres_cdc_runtime_plan_rejects_include_table_without_primary_key() {
     registry.register(source);
     let include_tables = vec!["orders".to_string()];
 
-    let err = match postgres_cdc_runtime_plan(
-        "pg_main",
-        "postgres://postgres:postgres@localhost/postgres",
-        PostgresSchemaEvolutionPolicy::FailFast,
-        Some(&include_tables),
-        &registry,
-        &HashMap::new(),
-        &HashMap::new(),
-    )
+    let source_tables = HashMap::new();
+    let replication_pipelines = HashMap::new();
+    let err = match postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
+        connector_name: "pg_main",
+        connection_string: "postgres://postgres:postgres@localhost/postgres",
+        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
+        include_tables: Some(&include_tables),
+        registry: &registry,
+        source_tables: &source_tables,
+        replication_pipelines: &replication_pipelines,
+    })
     .await
     {
         Ok(_) => panic!("include-table CDC source without a primary key should fail"),
@@ -193,15 +203,17 @@ async fn postgres_cdc_runtime_plan_rejects_unbound_include_table() {
     let registry = SourceRegistry::new();
     let include_tables = vec!["public.orders".to_string()];
 
-    let err = match postgres_cdc_runtime_plan(
-        "pg_main",
-        "postgres://postgres:postgres@localhost/postgres",
-        PostgresSchemaEvolutionPolicy::FailFast,
-        Some(&include_tables),
-        &registry,
-        &HashMap::new(),
-        &HashMap::new(),
-    )
+    let source_tables = HashMap::new();
+    let replication_pipelines = HashMap::new();
+    let err = match postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
+        connector_name: "pg_main",
+        connection_string: "postgres://postgres:postgres@localhost/postgres",
+        schema_evolution_policy: PostgresSchemaEvolutionPolicy::FailFast,
+        include_tables: Some(&include_tables),
+        registry: &registry,
+        source_tables: &source_tables,
+        replication_pipelines: &replication_pipelines,
+    })
     .await
     {
         Ok(_) => panic!("unbound include-table CDC source should fail"),

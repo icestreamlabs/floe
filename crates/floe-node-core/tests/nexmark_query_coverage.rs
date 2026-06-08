@@ -100,7 +100,7 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     .map(str::to_string)
     .collect::<BTreeSet<_>>();
 
-    let planner = DbspPlanBuilder::new(nexmark_config());
+    let planner = DbspPlanBuilder::new(nexmark_config()?);
 
     let mut out = BTreeMap::new();
     for query in canonical_nexmark_queries() {

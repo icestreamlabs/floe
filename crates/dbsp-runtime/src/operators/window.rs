@@ -24,8 +24,9 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::delta_zset_handle;
 
-type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
-type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
+pub type BatchWindowExtractor<V, K> =
+    Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
+pub type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
 trait OptionalIntCounter {
     fn inc(&self);
@@ -127,6 +128,48 @@ pub struct WindowKey<K> {
     pub key: K,
 }
 
+pub struct WindowAggregateBatchConfig<K, V, A>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    V: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    V::Archived: RkyvDeserialize<V, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    A: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub state: RelationState<(WindowKey<K>, A)>,
+    pub index: IndexedBatchZSet<WindowKey<K>, V>,
+    pub table: Arc<dyn KeyValueTable>,
+    pub window_extractor: BatchWindowExtractor<V, K>,
+    pub aggregator: Aggregator<K, V, A>,
+    pub output: VersionedZSet<(WindowKey<K>, A)>,
+    pub window_size: i64,
+    pub window_slide: i64,
+    pub allowed_lateness_ms: i64,
+    pub watermark: Arc<AtomicI64>,
+}
+
 pub struct WindowAggregateOp<K, V, A>
 where
     K: Archive
@@ -202,19 +245,19 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     A::Archived: RkyvDeserialize<A, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_batch_extractor(
-        state: RelationState<(WindowKey<K>, A)>,
-        index: IndexedBatchZSet<WindowKey<K>, V>,
-        table: Arc<dyn KeyValueTable>,
-        window_extractor: BatchWindowExtractor<V, K>,
-        aggregator: Aggregator<K, V, A>,
-        output: VersionedZSet<(WindowKey<K>, A)>,
-        window_size: i64,
-        window_slide: i64,
-        allowed_lateness_ms: i64,
-        watermark: Arc<AtomicI64>,
-    ) -> Result<Self> {
+    pub fn new_with_batch_extractor(config: WindowAggregateBatchConfig<K, V, A>) -> Result<Self> {
+        let WindowAggregateBatchConfig {
+            state,
+            index,
+            table,
+            window_extractor,
+            aggregator,
+            output,
+            window_size,
+            window_slide,
+            allowed_lateness_ms,
+            watermark,
+        } = config;
         ensure!(window_size > 0, "window size must be positive");
         ensure!(window_slide > 0, "window slide must be positive");
         ensure!(

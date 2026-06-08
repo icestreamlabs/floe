@@ -387,17 +387,28 @@ pub(super) fn drain_ready(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_batch(
-    queues: &mut [ConnectorQueue],
-    source_id_by_name: &HashMap<String, usize>,
-    source_count: usize,
-    start_index: usize,
-    max_batch: usize,
-    max_per_source: usize,
-    max_per_connector: usize,
-    pending_events: &core_source::PendingAppendIngestEventCounter,
-) -> BatchSelection {
+pub(super) struct BuildBatchRequest<'a> {
+    pub(super) queues: &'a mut [ConnectorQueue],
+    pub(super) source_id_by_name: &'a HashMap<String, usize>,
+    pub(super) source_count: usize,
+    pub(super) start_index: usize,
+    pub(super) max_batch: usize,
+    pub(super) max_per_source: usize,
+    pub(super) max_per_connector: usize,
+    pub(super) pending_events: &'a core_source::PendingAppendIngestEventCounter,
+}
+
+pub(super) fn build_batch(request: BuildBatchRequest<'_>) -> BatchSelection {
+    let BuildBatchRequest {
+        queues,
+        source_id_by_name,
+        source_count,
+        start_index,
+        max_batch,
+        max_per_source,
+        max_per_connector,
+        pending_events,
+    } = request;
     let mut batch = Vec::with_capacity(max_batch);
     let mut per_source_counts = vec![0usize; source_count];
     let mut unknown_source_counts: HashMap<String, usize> = HashMap::new();

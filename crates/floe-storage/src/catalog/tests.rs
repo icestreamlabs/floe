@@ -4,8 +4,8 @@ use floe_cdc_core::{CdcSourcePosition, CdcTransactionId};
 use floe_core::catalog::{
     CatalogSourceConnector, CatalogSourceDefinition, ColumnDefinition, ColumnType,
     PostgresCdcSourceDefinition, ReplicationBufferMode, ReplicationPipelineDefinition,
-    ReplicationPipelineFormat, ReplicationPipelineTarget, SourceBackedTableDefinition,
-    TableDefinition,
+    ReplicationPipelineDefinitionParts, ReplicationPipelineFormat, ReplicationPipelineTarget,
+    SourceBackedTableDefinition, TableDefinition,
 };
 
 #[tokio::test]
@@ -116,21 +116,21 @@ async fn roundtrip_catalog_sources_and_source_backed_tables() {
 #[tokio::test]
 async fn roundtrip_replication_pipeline_and_checkpoint() {
     let catalog = SlateCatalog::in_memory().await.expect("open catalog");
-    let pipeline = ReplicationPipelineDefinition::new(
-        "pg_orders_to_kafka",
-        "pg_main",
-        "public.orders",
-        ReplicationPipelineTarget::Kafka {
+    let pipeline = ReplicationPipelineDefinition::new(ReplicationPipelineDefinitionParts {
+        name: "pg_orders_to_kafka".to_string(),
+        source_name: "pg_main".to_string(),
+        upstream_table: "public.orders".to_string(),
+        target: ReplicationPipelineTarget::Kafka {
             brokers: "localhost:9092".to_string(),
             topic: "orders_cdc".to_string(),
         },
-        ReplicationPipelineFormat::DebeziumJson,
-        ReplicationBufferMode::Durable,
-        floe_core::catalog::ReplicationBufferPolicy::default(),
-        true,
-        true,
-        floe_core::catalog::ReplicationErrorPolicy::default(),
-    )
+        format: ReplicationPipelineFormat::DebeziumJson,
+        buffer_mode: ReplicationBufferMode::Durable,
+        buffer_policy: floe_core::catalog::ReplicationBufferPolicy::default(),
+        emit_tombstones: true,
+        include_transaction_metadata: true,
+        error_policy: floe_core::catalog::ReplicationErrorPolicy::default(),
+    })
     .expect("pipeline");
     catalog
         .upsert_replication_pipeline(pipeline.clone())
@@ -187,21 +187,21 @@ async fn roundtrip_replication_pipeline_and_checkpoint() {
             .expect("load dlq payload"),
         dlq_payload
     );
-    let dlq_entry = ReplicationPipelineDlqEntry::new(
-        "pg_orders_to_kafka",
-        "0_16B6C50_tx_7",
-        "pg_main",
-        CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
-        Some(CdcTransactionId::new("tx-7").expect("transaction")),
-        "kafka_delivery",
-        "broker unavailable",
-        2,
-        Some(dlq_payload_object_key),
-        Some("kafka_records".to_string()),
-        4096,
-        BTreeMap::from([("kafka.topic".to_string(), "orders_cdc".to_string())]),
-        1_700_000_000_001,
-    )
+    let dlq_entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+        pipeline_name: "pg_orders_to_kafka".to_string(),
+        dlq_id: "0_16B6C50_tx_7".to_string(),
+        source_name: "pg_main".to_string(),
+        source_position: CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
+        transaction_id: Some(CdcTransactionId::new("tx-7").expect("transaction")),
+        error_class: "kafka_delivery".to_string(),
+        error_message: "broker unavailable".to_string(),
+        attempt_count: 2,
+        payload_object_key: Some(dlq_payload_object_key),
+        payload_format: Some("kafka_records".to_string()),
+        payload_bytes: 4096,
+        target_state: BTreeMap::from([("kafka.topic".to_string(), "orders_cdc".to_string())]),
+        created_at_unix_ms: 1_700_000_000_001,
+    })
     .expect("dlq entry");
     catalog
         .put_replication_pipeline_dlq_entry(dlq_entry.clone())
@@ -282,22 +282,22 @@ async fn roundtrip_replication_pipeline_and_checkpoint() {
 async fn replication_pipeline_dlq_stats_count_statuses_without_loading_entries() {
     let catalog = SlateCatalog::in_memory().await.expect("open catalog");
     for (idx, created_at) in [(1, 1_000_u64), (2, 1_200_u64), (3, 1_500_u64)] {
-        let entry = ReplicationPipelineDlqEntry::new(
-            "pg_orders_to_kafka",
-            format!("entry-{idx}"),
-            "pg_main",
-            CdcSourcePosition::postgres(&format!("0/{:X}", 0x16B6C50 + idx), None)
+        let entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+            pipeline_name: "pg_orders_to_kafka".to_string(),
+            dlq_id: format!("entry-{idx}"),
+            source_name: "pg_main".to_string(),
+            source_position: CdcSourcePosition::postgres(&format!("0/{:X}", 0x16B6C50 + idx), None)
                 .expect("position"),
-            Some(CdcTransactionId::new(format!("tx-{idx}")).expect("transaction")),
-            "target_delivery",
-            "target unavailable",
-            1,
-            None,
-            Some("kafka_records".to_string()),
-            1024,
-            BTreeMap::new(),
-            created_at,
-        )
+            transaction_id: Some(CdcTransactionId::new(format!("tx-{idx}")).expect("transaction")),
+            error_class: "target_delivery".to_string(),
+            error_message: "target unavailable".to_string(),
+            attempt_count: 1,
+            payload_object_key: None,
+            payload_format: Some("kafka_records".to_string()),
+            payload_bytes: 1024,
+            target_state: BTreeMap::new(),
+            created_at_unix_ms: created_at,
+        })
         .expect("dlq entry");
         catalog
             .put_replication_pipeline_dlq_entry(entry)
@@ -344,21 +344,23 @@ async fn replication_pipeline_dlq_page_filters_orders_and_paginates() {
         ("entry-b", 1_200_u64),
         ("entry-d", 1_400_u64),
     ] {
-        let entry = ReplicationPipelineDlqEntry::new(
-            "pg_orders_to_kafka",
-            dlq_id,
-            "pg_main",
-            CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
-            Some(CdcTransactionId::new(format!("tx-{dlq_id}")).expect("transaction")),
-            "target_delivery",
-            "target unavailable",
-            1,
-            None,
-            Some("kafka_records".to_string()),
-            1024,
-            BTreeMap::new(),
-            created_at,
-        )
+        let entry = ReplicationPipelineDlqEntry::new(ReplicationPipelineDlqEntryParts {
+            pipeline_name: "pg_orders_to_kafka".to_string(),
+            dlq_id: dlq_id.to_string(),
+            source_name: "pg_main".to_string(),
+            source_position: CdcSourcePosition::postgres("0/16B6C50", None).expect("position"),
+            transaction_id: Some(
+                CdcTransactionId::new(format!("tx-{dlq_id}")).expect("transaction"),
+            ),
+            error_class: "target_delivery".to_string(),
+            error_message: "target unavailable".to_string(),
+            attempt_count: 1,
+            payload_object_key: None,
+            payload_format: Some("kafka_records".to_string()),
+            payload_bytes: 1024,
+            target_state: BTreeMap::new(),
+            created_at_unix_ms: created_at,
+        })
         .expect("dlq entry");
         catalog
             .put_replication_pipeline_dlq_entry(entry)
@@ -414,21 +416,21 @@ async fn replication_pipeline_dlq_page_filters_orders_and_paginates() {
 #[tokio::test]
 async fn roundtrip_postgres_replication_pipeline_target() {
     let catalog = SlateCatalog::in_memory().await.expect("open catalog");
-    let pipeline = ReplicationPipelineDefinition::new(
-        "pg_orders_to_postgres",
-        "pg_main",
-        "public.orders",
-        ReplicationPipelineTarget::Postgres {
+    let pipeline = ReplicationPipelineDefinition::new(ReplicationPipelineDefinitionParts {
+        name: "pg_orders_to_postgres".to_string(),
+        source_name: "pg_main".to_string(),
+        upstream_table: "public.orders".to_string(),
+        target: ReplicationPipelineTarget::Postgres {
             connection: "postgres://postgres:postgres@localhost/postgres".to_string(),
             table: "public.orders_copy".to_string(),
         },
-        ReplicationPipelineFormat::FloeJson,
-        ReplicationBufferMode::Durable,
-        floe_core::catalog::ReplicationBufferPolicy::default(),
-        false,
-        false,
-        floe_core::catalog::ReplicationErrorPolicy::default(),
-    )
+        format: ReplicationPipelineFormat::FloeJson,
+        buffer_mode: ReplicationBufferMode::Durable,
+        buffer_policy: floe_core::catalog::ReplicationBufferPolicy::default(),
+        emit_tombstones: false,
+        include_transaction_metadata: false,
+        error_policy: floe_core::catalog::ReplicationErrorPolicy::default(),
+    })
     .expect("pipeline");
 
     catalog

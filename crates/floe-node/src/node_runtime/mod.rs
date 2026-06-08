@@ -35,6 +35,7 @@ use floe_core::catalog::{
     ReplicationBufferPolicy as CatalogReplicationBufferPolicy,
     ReplicationErrorPolicy as CatalogReplicationErrorPolicy,
     ReplicationPipelineDefinition as CatalogReplicationPipelineDefinition,
+    ReplicationPipelineDefinitionParts as CatalogReplicationPipelineDefinitionParts,
     ReplicationPipelineFormat as CatalogReplicationPipelineFormat,
     ReplicationPipelineTarget as CatalogReplicationPipelineTarget, SourceBackedTableDefinition,
     TableDefinition,

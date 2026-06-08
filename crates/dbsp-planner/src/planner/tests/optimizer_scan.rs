@@ -21,7 +21,7 @@ fn count_star_maps_to_untyped_count() {
 
 #[test]
 fn plans_projection_over_scan() {
-    let table = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let table = nexmark_person_table();
     let plan = LogicalPlanBuilder::scan(table.name(), table_source(table), None)
         .unwrap()
         .project(vec![
@@ -45,7 +45,7 @@ fn plans_projection_over_scan() {
 
 #[test]
 fn plans_scan_pushdown_filter_and_projection() {
-    let table = dbsp_circuit::circuit::tables::nexmark_person_table();
+    let table = nexmark_person_table();
     let plan = LogicalPlanBuilder::scan_with_filters(
         table.name(),
         table_source(table),
@@ -98,7 +98,7 @@ async fn pushes_filter_through_subquery_projection_alias() {
 
 #[test]
 fn merges_consecutive_projection_nodes() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
@@ -132,7 +132,7 @@ fn merges_consecutive_projection_nodes() {
 
 #[test]
 fn optimizer_diagnostics_report_named_stages_and_rules() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
@@ -163,7 +163,7 @@ fn optimizer_diagnostics_report_named_stages_and_rules() {
 
 #[test]
 fn can_disable_optimizer_rule_by_name() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
@@ -194,7 +194,7 @@ fn can_disable_optimizer_rule_by_name() {
 
 #[test]
 fn optimizer_diagnostics_include_disabled_rules_and_stage_counts() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
@@ -226,7 +226,7 @@ fn optimizer_diagnostics_include_disabled_rules_and_stage_counts() {
 
 #[test]
 fn pushes_filter_and_projection_into_union_inputs() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let left = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .build()
@@ -270,7 +270,7 @@ fn pushes_filter_and_projection_into_union_inputs() {
 
 #[test]
 fn skips_union_filter_pushdown_when_duplication_input_gate_exceeded() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let left = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .build()
@@ -310,7 +310,7 @@ fn skips_union_filter_pushdown_when_duplication_input_gate_exceeded() {
 
 #[test]
 fn skips_union_projection_pushdown_when_expression_duplication_gate_exceeded() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let left = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .build()
@@ -350,7 +350,7 @@ fn skips_union_projection_pushdown_when_expression_duplication_gate_exceeded() {
 
 #[test]
 fn flattens_nested_union_nodes() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let first = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .build()

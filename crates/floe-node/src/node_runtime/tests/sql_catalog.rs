@@ -282,22 +282,23 @@ fn catalog_postgres_source_connector_merges_pipeline_tables() {
     )
     .expect("source");
     catalog_sources.insert(source.name().to_string(), source);
-    let pipeline = CatalogReplicationPipelineDefinition::new(
-        "pg_orders_to_kafka",
-        "pg_main",
-        "public.orders",
-        CatalogReplicationPipelineTarget::Kafka {
-            brokers: "localhost:9092".to_string(),
-            topic: "orders_cdc".to_string(),
-        },
-        CatalogReplicationPipelineFormat::DebeziumJson,
-        CatalogReplicationBufferMode::Durable,
-        CatalogReplicationBufferPolicy::default(),
-        false,
-        false,
-        CatalogReplicationErrorPolicy::default(),
-    )
-    .expect("pipeline");
+    let pipeline =
+        CatalogReplicationPipelineDefinition::new(CatalogReplicationPipelineDefinitionParts {
+            name: "pg_orders_to_kafka".to_string(),
+            source_name: "pg_main".to_string(),
+            upstream_table: "public.orders".to_string(),
+            target: CatalogReplicationPipelineTarget::Kafka {
+                brokers: "localhost:9092".to_string(),
+                topic: "orders_cdc".to_string(),
+            },
+            format: CatalogReplicationPipelineFormat::DebeziumJson,
+            buffer_mode: CatalogReplicationBufferMode::Durable,
+            buffer_policy: CatalogReplicationBufferPolicy::default(),
+            emit_tombstones: false,
+            include_transaction_metadata: false,
+            error_policy: CatalogReplicationErrorPolicy::default(),
+        })
+        .expect("pipeline");
     let mut pipelines = HashMap::new();
     pipelines.insert(pipeline.name().to_string(), pipeline);
 

@@ -23,6 +23,8 @@ use executor_task::{
     ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
     ExecutorRuntimeContext, ExecutorSourceContext, ExecutorTaskContext, spawn_executor_task,
 };
+#[cfg(test)]
+pub(super) use postgres_runtime::PostgresCdcRuntimePlanRequest;
 use postgres_runtime::{
     insert_catalog_source_definition, insert_replication_pipeline_definition,
     insert_source_backed_table_definition, postgres_schema_evolution_policy_from_catalog,

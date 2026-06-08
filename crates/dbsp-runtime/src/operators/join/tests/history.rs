@@ -6,22 +6,23 @@ async fn run_join_history_invariance_probe(
     let db = build_db().await;
     let table: Arc<dyn KeyValueTable> = Arc::new(crate::storage::SlateTable::new(db.clone()));
 
-    let mut op = JoinOp::new_without_output_batch(
-        IndexedBatchZSet::new(
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(
             table.clone(),
             format!("history_probe_left_index_{unrelated_history_rows}"),
         ),
-        IndexedBatchZSet::new(
+        right_index: IndexedBatchZSet::new(
             table.clone(),
             format!("history_probe_right_index_{unrelated_history_rows}"),
         ),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
         table,
-        None,
-    );
+        output: None,
+        integrated: None,
+    });
 
     let left_history = (0..unrelated_history_rows)
         .map(|idx| (1_000_000 + idx, 1))
@@ -143,17 +144,17 @@ async fn join_operator_uses_arranged_state_as_canonical_persisted_input() {
     .await
     .expect("output zset");
 
-    let mut op = JoinOp::new_batch(
-        IndexedBatchZSet::new(table.clone(), "join_canonical_left_index"),
-        IndexedBatchZSet::new(table.clone(), "join_canonical_right_index"),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        output,
-        None,
-    );
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), "join_canonical_left_index"),
+        right_index: IndexedBatchZSet::new(table.clone(), "join_canonical_right_index"),
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    });
 
     let left_delta = stage_version(
         left_dict.clone(),

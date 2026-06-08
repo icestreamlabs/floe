@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn plans_aggregate_and_topn() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
 
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
@@ -35,7 +35,7 @@ fn plans_aggregate_and_topn() {
 
 #[test]
 fn normalizes_limit_sort_to_sort_fetch_for_topn() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
 
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
@@ -63,7 +63,7 @@ fn normalizes_limit_sort_to_sort_fetch_for_topn() {
 
 #[test]
 fn lowers_sort_fetch_to_topn() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let input = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .build()

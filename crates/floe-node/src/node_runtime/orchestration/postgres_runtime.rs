@@ -1,15 +1,28 @@
 use super::super::*;
 
-#[allow(clippy::too_many_arguments)]
+pub(in crate::node_runtime) struct PostgresCdcRuntimePlanRequest<'a> {
+    pub(in crate::node_runtime) connector_name: &'a str,
+    pub(in crate::node_runtime) connection_string: &'a str,
+    pub(in crate::node_runtime) schema_evolution_policy: PostgresSchemaEvolutionPolicy,
+    pub(in crate::node_runtime) include_tables: Option<&'a [String]>,
+    pub(in crate::node_runtime) registry: &'a SourceRegistry,
+    pub(in crate::node_runtime) source_tables: &'a HashMap<String, SourceBackedTableDefinition>,
+    pub(in crate::node_runtime) replication_pipelines:
+        &'a HashMap<String, CatalogReplicationPipelineDefinition>,
+}
+
 pub(in crate::node_runtime) async fn postgres_cdc_runtime_plan(
-    connector_name: &str,
-    connection_string: &str,
-    schema_evolution_policy: PostgresSchemaEvolutionPolicy,
-    include_tables: Option<&[String]>,
-    registry: &SourceRegistry,
-    source_tables: &HashMap<String, SourceBackedTableDefinition>,
-    replication_pipelines: &HashMap<String, CatalogReplicationPipelineDefinition>,
+    request: PostgresCdcRuntimePlanRequest<'_>,
 ) -> anyhow::Result<Option<PostgresCdcRuntimePlan>> {
+    let PostgresCdcRuntimePlanRequest {
+        connector_name,
+        connection_string,
+        schema_evolution_policy,
+        include_tables,
+        registry,
+        source_tables,
+        replication_pipelines,
+    } = request;
     let has_source_tables = source_tables
         .values()
         .any(|table| table.source_name() == connector_name);

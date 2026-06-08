@@ -21,7 +21,8 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
-type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
+pub type SemiJoinBatchKeyExtractor<T, K> =
+    Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemiJoinMode {
@@ -36,6 +37,47 @@ impl SemiJoinMode {
             SemiJoinMode::Anti => !right_present,
         }
     }
+}
+
+pub struct SemiJoinBatchConfig<L, R, K>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub left_state: RelationState<L>,
+    pub left_index: IndexedBatchZSet<K, L>,
+    pub right_index: IndexedBatchZSet<K, ()>,
+    pub left_key: SemiJoinBatchKeyExtractor<L, K>,
+    pub right_key: SemiJoinBatchKeyExtractor<R, K>,
+    pub mode: SemiJoinMode,
+    pub table: Arc<dyn KeyValueTable>,
+    pub output: VersionedZSet<L>,
+    pub integrated: Option<RelationState<L>>,
 }
 
 pub struct SemiJoinOp<L, R, K>
@@ -71,8 +113,8 @@ where
     pub(crate) left_state: RelationState<L>,
     pub(crate) left_index: IndexedBatchZSet<K, L>,
     pub(crate) right_index: IndexedBatchZSet<K, ()>,
-    pub(crate) left_key: BatchJoinKeyExtractor<L, K>,
-    pub(crate) right_key: BatchJoinKeyExtractor<R, K>,
+    pub(crate) left_key: SemiJoinBatchKeyExtractor<L, K>,
+    pub(crate) right_key: SemiJoinBatchKeyExtractor<R, K>,
     pub(crate) mode: SemiJoinMode,
     pub(crate) table: Arc<dyn KeyValueTable>,
     pub(crate) integrated: Option<RelationState<L>>,
@@ -112,19 +154,18 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_batch(
-        left_state: RelationState<L>,
-        _right_state: RelationState<R>,
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, ()>,
-        left_key: BatchJoinKeyExtractor<L, K>,
-        right_key: BatchJoinKeyExtractor<R, K>,
-        mode: SemiJoinMode,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<L>,
-        integrated: Option<RelationState<L>>,
-    ) -> Self {
+    pub fn new_batch(config: SemiJoinBatchConfig<L, R, K>) -> Self {
+        let SemiJoinBatchConfig {
+            left_state,
+            left_index,
+            right_index,
+            left_key,
+            right_key,
+            mode,
+            table,
+            output,
+            integrated,
+        } = config;
         Self {
             left_state,
             left_index,
@@ -149,7 +190,7 @@ where
     fn keyed_deltas<T>(
         &self,
         deltas: &HashMap<T, i64>,
-        extractor: &BatchJoinKeyExtractor<T, K>,
+        extractor: &SemiJoinBatchKeyExtractor<T, K>,
     ) -> HashMap<K, Vec<(T, i64)>>
     where
         T: Clone + Eq + Hash,
@@ -546,7 +587,9 @@ mod tests {
 
     static TEST_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-    fn batch_row_key_extractor(key_extractor: RowKeyExtractor) -> BatchJoinKeyExtractor<Row, i64> {
+    fn batch_row_key_extractor(
+        key_extractor: RowKeyExtractor,
+    ) -> SemiJoinBatchKeyExtractor<Row, i64> {
         Arc::new(move |deltas: &[(Row, i64)]| {
             deltas
                 .iter()
@@ -668,7 +711,6 @@ mod tests {
         let right_stream_ns = format!("{prefix}_right_stream");
         let output_ns = format!("{prefix}_output");
         let left_state_ns = format!("{prefix}_left_state");
-        let right_state_ns = format!("{prefix}_right_state");
         let left_index_ns = format!("{prefix}_left_index");
         let right_index_ns = format!("{prefix}_right_index");
 
@@ -691,9 +733,6 @@ mod tests {
         let left_state = RelationState::empty(table.clone(), left_state_ns)
             .await
             .expect("left state");
-        let right_state = RelationState::empty(table.clone(), right_state_ns)
-            .await
-            .expect("right state");
         let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
             .await
             .expect("output zset");
@@ -703,18 +742,17 @@ mod tests {
         let left_key: RowKeyExtractor = Arc::new(|row: &Row| Some(row.0));
         let right_key: RowKeyExtractor = Arc::new(|row: &Row| Some(row.0));
 
-        let mut op = SemiJoinOp::new_batch(
+        let mut op = SemiJoinOp::new_batch(SemiJoinBatchConfig {
             left_state,
-            right_state,
             left_index,
             right_index,
-            batch_row_key_extractor(left_key),
-            batch_row_key_extractor(right_key),
+            left_key: batch_row_key_extractor(left_key),
+            right_key: batch_row_key_extractor(right_key),
             mode,
-            table.clone(),
+            table: table.clone(),
             output,
-            None,
-        );
+            integrated: None,
+        });
 
         let left_deltas: Vec<Vec<(Row, i64)>> = vec![
             vec![((1, 10), 1), ((2, 20), 1)],
@@ -844,25 +882,21 @@ mod tests {
         let left_state = RelationState::empty(table.clone(), format!("{prefix}_left_state"))
             .await
             .expect("left state");
-        let right_state = RelationState::empty(table.clone(), format!("{prefix}_right_state"))
-            .await
-            .expect("right state");
         let output = VersionedZSet::new(output_dict.clone(), table.clone(), output_ns.clone())
             .await
             .expect("output zset");
 
-        let mut op = SemiJoinOp::new_batch(
+        let mut op = SemiJoinOp::new_batch(SemiJoinBatchConfig {
             left_state,
-            right_state,
-            IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
-            IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
-            batch_row_key_extractor(Arc::new(|row: &Row| Some(row.0))),
-            batch_row_key_extractor(Arc::new(|row: &Row| Some(row.0))),
+            left_index: IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
+            right_index: IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
+            left_key: batch_row_key_extractor(Arc::new(|row: &Row| Some(row.0))),
+            right_key: batch_row_key_extractor(Arc::new(|row: &Row| Some(row.0))),
             mode,
-            table.clone(),
+            table: table.clone(),
             output,
-            None,
-        );
+            integrated: None,
+        });
 
         let left_history = (0..history_rows)
             .map(|idx| ((1_000_000 + idx, idx), 1))

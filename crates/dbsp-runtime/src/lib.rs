@@ -35,12 +35,12 @@ pub use operators::incremental_aggregate::{
     IncrementalAggregateSlotKind, IncrementalAggregateSlotState, IncrementalAggregateSlotUpdate,
 };
 pub use operators::join::JoinOp;
-pub use operators::range_join::{RangeJoinOp, RangeLookupMode};
-pub use operators::semijoin::{SemiJoinMode, SemiJoinOp};
+pub use operators::range_join::{RangeJoinBatchConfig, RangeJoinOp, RangeLookupMode};
+pub use operators::semijoin::{SemiJoinBatchConfig, SemiJoinMode, SemiJoinOp};
 pub use operators::top1::PartitionedTop1Op;
 pub use operators::topn::TopNOp;
 pub use operators::union::UnionOp;
-pub use operators::window::{WindowAggregateOp, WindowKey};
+pub use operators::window::{WindowAggregateBatchConfig, WindowAggregateOp, WindowKey};
 pub use relation_state::RelationState;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,

@@ -66,18 +66,18 @@ pub(super) async fn start_runtime_frontend_services(
     );
     let signal_handle =
         spawn_signal_handler(runtime_cancel.clone(), ingest_cancel, shutdown_signal);
-    let server_handle = spawn_pgwire_server(
-        query.clone(),
-        Arc::clone(mv_registry),
-        service_cancel,
-        runtime_cancel,
-        runtime_failure,
-        pgwire_enabled,
-        pgwire_addr.unwrap_or_else(|| DEFAULT_PGWIRE_ADDR.to_string()),
-        server::ServerRuntimeConfig {
+    let server_handle = spawn_pgwire_server(PgwireServerSpawn {
+        query: query.clone(),
+        mv_registry: Arc::clone(mv_registry),
+        server_cancel: service_cancel,
+        runtime_cancel_for_server: runtime_cancel,
+        failure_for_server: runtime_failure,
+        enabled: pgwire_enabled,
+        address: pgwire_addr.unwrap_or_else(|| DEFAULT_PGWIRE_ADDR.to_string()),
+        runtime_config: server::ServerRuntimeConfig {
             subscribe: subscribe_execution_config,
         },
-    );
+    });
     Ok(RuntimeFrontendServices {
         query,
         sink_handles,

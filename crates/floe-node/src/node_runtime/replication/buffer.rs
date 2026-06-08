@@ -269,17 +269,28 @@ pub(super) fn effective_u64_limit(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn log_replication_buffer_backpressure(
-    plan: &ReplicationPipelineRuntimePlan,
-    phase: &str,
-    stats: Option<&CdcBufferStats>,
-    incoming_bytes: usize,
-    incoming_records: usize,
-    limits: ReplicationBufferLimits,
-    violation: ReplicationBufferLimitViolation,
-    delivered_records: Option<usize>,
-) {
+pub(super) struct ReplicationBufferBackpressureEvent<'a> {
+    pub(super) plan: &'a ReplicationPipelineRuntimePlan,
+    pub(super) phase: &'a str,
+    pub(super) stats: Option<&'a CdcBufferStats>,
+    pub(super) incoming_bytes: usize,
+    pub(super) incoming_records: usize,
+    pub(super) limits: ReplicationBufferLimits,
+    pub(super) violation: ReplicationBufferLimitViolation,
+    pub(super) delivered_records: Option<usize>,
+}
+
+pub(super) fn log_replication_buffer_backpressure(event: ReplicationBufferBackpressureEvent<'_>) {
+    let ReplicationBufferBackpressureEvent {
+        plan,
+        phase,
+        stats,
+        incoming_bytes,
+        incoming_records,
+        limits,
+        violation,
+        delivered_records,
+    } = event;
     tracing::warn!(
         pipeline = %plan.name,
         source = %plan.source_name,

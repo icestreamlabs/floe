@@ -10,7 +10,7 @@ use dbsp::LogicalWorkSnapshot;
 use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
-use dbsp::operators::join::JoinOp;
+use dbsp::operators::join::{JoinBatchConfig, JoinOp};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::stream::runtime::DeltaOperator;
@@ -136,17 +136,17 @@ async fn build_join_state(unrelated_history: usize, affected_fanout: usize) -> J
         .await
         .expect("output zset");
 
-    let mut op = JoinOp::new_batch(
-        IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
-        IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
-        batch_join_key(Arc::new(join_key)),
-        batch_join_key(Arc::new(join_key)),
-        Arc::new(|left: &i64, right: &i64| join_key(left) == join_key(right)),
-        Arc::new(|left: &i64, right: &i64| left + right),
-        table.clone(),
-        output,
-        None,
-    );
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
+        left_index: IndexedBatchZSet::new(table.clone(), format!("{prefix}_left_index")),
+        right_index: IndexedBatchZSet::new(table.clone(), format!("{prefix}_right_index")),
+        left_key: batch_join_key(Arc::new(join_key)),
+        right_key: batch_join_key(Arc::new(join_key)),
+        predicate: Arc::new(|left: &i64, right: &i64| join_key(left) == join_key(right)),
+        projector: Arc::new(|left: &i64, right: &i64| left + right),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    });
 
     let mut right_seed = (0..unrelated_history)
         .map(|idx| (1_000_000_000 + (idx as i64 * 1_000), 1))

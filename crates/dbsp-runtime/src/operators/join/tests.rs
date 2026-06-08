@@ -9,7 +9,7 @@ use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 use slatedb::Db;
 
-use super::{JoinInputRetention, JoinOp, JoinTransientInputs};
+use super::{JoinBatchConfig, JoinInputRetention, JoinOp, JoinTransientInputs};
 use crate::collections::IndexedBatchZSet;
 use crate::collections::zset::{SegmentRecord, VersionedZSet};
 use crate::handles::ZSetHandle;

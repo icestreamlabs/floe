@@ -23,9 +23,9 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::stream::runtime::DeltaOperator;
 use crate::stream::util::{delta_zset_handle_batch, publish_transient_zset_batch};
 
-type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
-type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
-type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
+pub type JoinPredicate<L, R> = Arc<dyn Fn(&L, &R) -> bool + Send + Sync>;
+pub type JoinProjector<L, R, O> = Arc<dyn Fn(&L, &R) -> O + Send + Sync>;
+pub type BatchJoinKeyExtractor<T, K> = Arc<dyn Fn(&[(T, i64)]) -> Vec<(K, T, i64)> + Send + Sync>;
 type FastHashMap<K, V> = AHashMap<K, V>;
 type KeyedRowDeltas<K, T> = FastHashMap<K, FastHashMap<T, i64>>;
 static NEXT_JOIN_CLOSED_INDEX_ID: AtomicUsize = AtomicUsize::new(0);
@@ -50,6 +50,99 @@ pub struct JoinTransientInputs<L, R, K> {
     pub(crate) right: Option<Arc<Vec<(R, i64)>>>,
     pub(crate) left_closed_keys: Option<Arc<Vec<(K, i64)>>>,
     pub(crate) right_closed_keys: Option<Arc<Vec<(K, i64)>>>,
+}
+
+pub struct JoinBatchConfig<L, R, O, K>
+where
+    L: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    L::Archived: RkyvDeserialize<L, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    R: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    R::Archived: RkyvDeserialize<R, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    O: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    O::Archived: RkyvDeserialize<O, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub left_index: IndexedBatchZSet<K, L>,
+    pub right_index: IndexedBatchZSet<K, R>,
+    pub left_key: BatchJoinKeyExtractor<L, K>,
+    pub right_key: BatchJoinKeyExtractor<R, K>,
+    pub predicate: JoinPredicate<L, R>,
+    pub projector: JoinProjector<L, R, O>,
+    pub table: Arc<dyn KeyValueTable>,
+    pub output: Option<VersionedZSet<O>>,
+    pub integrated: Option<RelationState<O>>,
+}
+
+pub struct JoinClosedIndexConfig<K, L, R>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub left_closed_index: IndexedBatchZSet<K, ()>,
+    pub right_closed_index: IndexedBatchZSet<K, ()>,
+    _left: std::marker::PhantomData<L>,
+    _right: std::marker::PhantomData<R>,
+}
+
+impl<K, L, R> JoinClosedIndexConfig<K, L, R>
+where
+    K: Archive
+        + Clone
+        + Eq
+        + Hash
+        + Send
+        + Sync
+        + 'static
+        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
+    K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
+{
+    pub fn new(
+        left_closed_index: IndexedBatchZSet<K, ()>,
+        right_closed_index: IndexedBatchZSet<K, ()>,
+    ) -> Self {
+        Self {
+            left_closed_index,
+            right_closed_index,
+            _left: std::marker::PhantomData,
+            _right: std::marker::PhantomData,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,27 +252,25 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     K::Archived: RkyvDeserialize<K, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_batch(
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_key: BatchJoinKeyExtractor<L, K>,
-        right_key: BatchJoinKeyExtractor<R, K>,
-        predicate: JoinPredicate<L, R>,
-        projector: JoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<O>,
-        integrated: Option<RelationState<O>>,
-    ) -> Self {
+    pub fn new_batch(config: JoinBatchConfig<L, R, O, K>) -> Self {
         let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
+        let table = config.table.clone();
         Self::new_batch_with_closed_indexes(
+            config,
+            JoinClosedIndexConfig::new(
+                IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
+                IndexedBatchZSet::new(table, format!("join_right_closed_index_{closed_id}")),
+            ),
+        )
+    }
+
+    pub fn new_batch_with_closed_indexes(
+        config: JoinBatchConfig<L, R, O, K>,
+        closed_indexes: JoinClosedIndexConfig<K, L, R>,
+    ) -> Self {
+        let JoinBatchConfig {
             left_index,
             right_index,
-            IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
-            IndexedBatchZSet::new(
-                table.clone(),
-                format!("join_right_closed_index_{closed_id}"),
-            ),
             left_key,
             right_key,
             predicate,
@@ -187,23 +278,12 @@ where
             table,
             output,
             integrated,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_batch_with_closed_indexes(
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_closed_index: IndexedBatchZSet<K, ()>,
-        right_closed_index: IndexedBatchZSet<K, ()>,
-        left_key: BatchJoinKeyExtractor<L, K>,
-        right_key: BatchJoinKeyExtractor<R, K>,
-        predicate: JoinPredicate<L, R>,
-        projector: JoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        output: VersionedZSet<O>,
-        integrated: Option<RelationState<O>>,
-    ) -> Self {
+        } = config;
+        let JoinClosedIndexConfig {
+            left_closed_index,
+            right_closed_index,
+            ..
+        } = closed_indexes;
         debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
         debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
         Self {
@@ -217,78 +297,7 @@ where
             projector,
             table,
             integrated,
-            output: Some(output),
-            dict_cache_left: HashMap::new(),
-            dict_cache_right: HashMap::new(),
-            left_memory_index: FastHashMap::new(),
-            right_memory_index: FastHashMap::new(),
-            left_closed_memory_index: FastHashMap::new(),
-            right_closed_memory_index: FastHashMap::new(),
-            persist_indexes: true,
-            left_retention: JoinInputRetention::RetainAll,
-            right_retention: JoinInputRetention::RetainAll,
-            logical_work: metrics::LogicalWorkCollector::default(),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(crate) fn new_without_output_batch(
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_key: BatchJoinKeyExtractor<L, K>,
-        right_key: BatchJoinKeyExtractor<R, K>,
-        predicate: JoinPredicate<L, R>,
-        projector: JoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        integrated: Option<RelationState<O>>,
-    ) -> Self {
-        let closed_id = NEXT_JOIN_CLOSED_INDEX_ID.fetch_add(1, Ordering::Relaxed);
-        Self::new_without_output_batch_with_closed_indexes(
-            left_index,
-            right_index,
-            IndexedBatchZSet::new(table.clone(), format!("join_left_closed_index_{closed_id}")),
-            IndexedBatchZSet::new(
-                table.clone(),
-                format!("join_right_closed_index_{closed_id}"),
-            ),
-            left_key,
-            right_key,
-            predicate,
-            projector,
-            table,
-            integrated,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(crate) fn new_without_output_batch_with_closed_indexes(
-        left_index: IndexedBatchZSet<K, L>,
-        right_index: IndexedBatchZSet<K, R>,
-        left_closed_index: IndexedBatchZSet<K, ()>,
-        right_closed_index: IndexedBatchZSet<K, ()>,
-        left_key: BatchJoinKeyExtractor<L, K>,
-        right_key: BatchJoinKeyExtractor<R, K>,
-        predicate: JoinPredicate<L, R>,
-        projector: JoinProjector<L, R, O>,
-        table: Arc<dyn KeyValueTable>,
-        integrated: Option<RelationState<O>>,
-    ) -> Self {
-        debug_assert_eq!(left_index.engine_kind(), "indexed_batch");
-        debug_assert_eq!(right_index.engine_kind(), "indexed_batch");
-        Self {
-            left_index,
-            right_index,
-            left_closed_index,
-            right_closed_index,
-            left_key,
-            right_key,
-            predicate,
-            projector,
-            table,
-            integrated,
-            output: None,
+            output,
             dict_cache_left: HashMap::new(),
             dict_cache_right: HashMap::new(),
             left_memory_index: FastHashMap::new(),

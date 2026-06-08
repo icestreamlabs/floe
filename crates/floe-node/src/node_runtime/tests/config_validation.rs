@@ -18,16 +18,16 @@ fn build_batch_limits_per_connector() {
     ];
 
     let source_id_by_name = HashMap::from([("s1".to_string(), 0usize), ("s2".to_string(), 1usize)]);
-    let selection = build_batch(
-        &mut queues,
-        &source_id_by_name,
-        2,
-        0,
-        10,
-        10,
-        1,
-        &pending_events,
-    );
+    let selection = build_batch(BuildBatchRequest {
+        queues: &mut queues,
+        source_id_by_name: &source_id_by_name,
+        source_count: 2,
+        start_index: 0,
+        max_batch: 10,
+        max_per_source: 10,
+        max_per_connector: 1,
+        pending_events: &pending_events,
+    });
     assert_eq!(selection.batch.len(), 2);
     assert_eq!(selection.batch[0].source_id, Some(0));
     assert_eq!(selection.batch[1].source_id, Some(1));
@@ -52,16 +52,16 @@ fn build_batch_limits_per_source() {
     }];
 
     let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);
-    let selection = build_batch(
-        &mut queues,
-        &source_id_by_name,
-        1,
-        0,
-        10,
-        1,
-        10,
-        &pending_events,
-    );
+    let selection = build_batch(BuildBatchRequest {
+        queues: &mut queues,
+        source_id_by_name: &source_id_by_name,
+        source_count: 1,
+        start_index: 0,
+        max_batch: 10,
+        max_per_source: 1,
+        max_per_connector: 10,
+        pending_events: &pending_events,
+    });
     assert_eq!(selection.batch.len(), 1);
     assert_eq!(selection.batch[0].source_id, Some(0));
     assert_eq!(queues[0].pending.len(), 2);

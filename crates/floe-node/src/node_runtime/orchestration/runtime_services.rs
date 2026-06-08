@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_runtime::orchestration::postgres_runtime::PostgresCdcRuntimePlanRequest;
 
 pub(super) struct RuntimeServices {
     pub(super) postgres_cdc_runtime_plans_by_connector: HashMap<String, PostgresCdcRuntimePlan>,
@@ -45,15 +46,17 @@ pub(super) async fn start_runtime_services(
             .as_ref()
             .copied()
             .unwrap_or(CatalogPostgresCdcSchemaEvolutionPolicy::FailFast);
-        if let Some(plan) = postgres_cdc_runtime_plan(
-            &connector.name,
-            connection,
-            postgres_schema_evolution_policy_from_catalog(schema_evolution_policy),
-            include_tables.as_deref(),
-            config.source_registry,
-            config.source_backed_tables,
-            config.replication_pipelines,
-        )
+        if let Some(plan) = postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
+            connector_name: &connector.name,
+            connection_string: connection,
+            schema_evolution_policy: postgres_schema_evolution_policy_from_catalog(
+                schema_evolution_policy,
+            ),
+            include_tables: include_tables.as_deref(),
+            registry: config.source_registry,
+            source_tables: config.source_backed_tables,
+            replication_pipelines: config.replication_pipelines,
+        })
         .await
         .with_context(|| {
             format!(

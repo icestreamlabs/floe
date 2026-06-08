@@ -8,7 +8,7 @@ use slatedb::Db;
 use dbsp::collections::IndexedBatchZSet;
 use dbsp::collections::zset::{SegmentRecord, VersionedZSet};
 use dbsp::handles::ZSetHandle;
-use dbsp::operators::join::JoinOp;
+use dbsp::operators::join::{JoinBatchConfig, JoinOp};
 use dbsp::storage::dictionary::Dictionary;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use dbsp::stream::runtime::DeltaOperator;
@@ -127,17 +127,17 @@ async fn build_state(base_size: usize, delta_size: usize) -> JoinBenchState {
     let left_index = IndexedBatchZSet::new(table.clone(), "bench_left_index");
     let right_index = IndexedBatchZSet::new(table.clone(), "bench_right_index");
 
-    let mut op = JoinOp::new_batch(
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
         left_index,
         right_index,
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        batch_join_key(Arc::new(|value: &i64| Some(*value))),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(|l: &i64, r: &i64| l + r),
-        table.clone(),
-        output,
-        None,
-    );
+        left_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        right_key: batch_join_key(Arc::new(|value: &i64| Some(*value))),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(|l: &i64, r: &i64| l + r),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    });
 
     let base_left: Vec<(i64, i64)> = (0..base_size as i64).map(|idx| (idx, 1)).collect();
     let base_right: Vec<(i64, i64)> = (0..base_size as i64).map(|idx| (idx, 1)).collect();

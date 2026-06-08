@@ -549,15 +549,15 @@ fn prune_unreachable_nodes(plan: &mut CircuitPlan) {
 }
 
 /// Returns a [`PlannerConfig`] pre-populated with Nexmark table descriptors.
-pub fn nexmark_config() -> PlannerConfig {
+pub fn nexmark_config() -> anyhow::Result<PlannerConfig> {
     let mut cfg = PlannerConfig::new();
-    cfg.register_table(nexmark_person_table());
-    cfg.register_table(nexmark_person_alias_table());
-    cfg.register_table(nexmark_auction_table());
-    cfg.register_table(nexmark_auction_alias_table());
-    cfg.register_table(nexmark_bid_table());
-    cfg.register_table(nexmark_bid_alias_table());
-    cfg
+    cfg.register_table(nexmark_person_table()?);
+    cfg.register_table(nexmark_person_alias_table()?);
+    cfg.register_table(nexmark_auction_table()?);
+    cfg.register_table(nexmark_auction_alias_table()?);
+    cfg.register_table(nexmark_bid_table()?);
+    cfg.register_table(nexmark_bid_alias_table()?);
+    Ok(cfg)
 }
 
 #[derive(Clone, Debug)]

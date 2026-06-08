@@ -48,17 +48,17 @@ async fn join_operator_matches_batch_join_over_time() {
         },
     };
 
-    let mut op = JoinOp::new_batch(
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
         left_index,
         right_index,
-        batch_join_key(left_key),
-        batch_join_key(right_key),
-        match_sum,
+        left_key: batch_join_key(left_key),
+        right_key: batch_join_key(right_key),
+        predicate: match_sum,
         projector,
-        table.clone(),
-        output,
-        Some(integrated_join),
-    );
+        table: table.clone(),
+        output: Some(output),
+        integrated: Some(integrated_join),
+    });
 
     let mut full_left: HashMap<i64, i64> = HashMap::new();
     let mut full_right: HashMap<i64, i64> = HashMap::new();
@@ -197,17 +197,17 @@ async fn join_operator_handles_negative_deltas() {
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
 
-    let mut op = JoinOp::new_batch(
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
         left_index,
         right_index,
-        batch_join_key(left_key),
-        batch_join_key(right_key),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        output,
-        Some(integrated_join),
-    );
+        left_key: batch_join_key(left_key),
+        right_key: batch_join_key(right_key),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(output),
+        integrated: Some(integrated_join),
+    });
 
     let left_delta1 = stage_version(
         left_dict.clone(),
@@ -296,17 +296,19 @@ async fn join_operator_skips_null_keys() {
     let left_key = Arc::new(|value: &Option<i64>| *value);
     let right_key = Arc::new(|value: &Option<i64>| *value);
 
-    let mut op = JoinOp::new_batch(
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
         left_index,
         right_index,
-        batch_join_key(left_key),
-        batch_join_key(right_key),
-        Arc::new(|l: &Option<i64>, r: &Option<i64>| matches!((l, r), (Some(a), Some(b)) if a == b)),
-        Arc::new(|l: &Option<i64>, r: &Option<i64>| l.unwrap_or(0) + r.unwrap_or(0)),
-        table.clone(),
-        output,
-        None,
-    );
+        left_key: batch_join_key(left_key),
+        right_key: batch_join_key(right_key),
+        predicate: Arc::new(
+            |l: &Option<i64>, r: &Option<i64>| matches!((l, r), (Some(a), Some(b)) if a == b),
+        ),
+        projector: Arc::new(|l: &Option<i64>, r: &Option<i64>| l.unwrap_or(0) + r.unwrap_or(0)),
+        table: table.clone(),
+        output: Some(output),
+        integrated: None,
+    });
 
     let left_delta = stage_version(
         left_dict.clone(),
@@ -386,17 +388,17 @@ async fn join_operator_matches_full_recompute() {
     let left_key = Arc::new(|value: &i64| Some(*value));
     let right_key = Arc::new(|value: &i64| Some(*value));
 
-    let mut op = JoinOp::new_batch(
+    let mut op = JoinOp::new_batch(JoinBatchConfig {
         left_index,
         right_index,
-        batch_join_key(left_key),
-        batch_join_key(right_key),
-        Arc::new(|l: &i64, r: &i64| l == r),
-        Arc::new(project_sum),
-        table.clone(),
-        output,
-        Some(integrated_join),
-    );
+        left_key: batch_join_key(left_key),
+        right_key: batch_join_key(right_key),
+        predicate: Arc::new(|l: &i64, r: &i64| l == r),
+        projector: Arc::new(project_sum),
+        table: table.clone(),
+        output: Some(output),
+        integrated: Some(integrated_join),
+    });
 
     let steps = vec![
         (vec![(1, 1), (2, 1)], vec![(1, 2)]),

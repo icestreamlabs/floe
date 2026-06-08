@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     .map(str::to_string)
     .collect::<BTreeSet<_>>();
 
-    let planner = DbspPlanBuilder::new(nexmark_config());
+    let planner = DbspPlanBuilder::new(nexmark_config()?);
 
     println!("query,latency_ms,throughput_qps,memory_delta_kb");
     for query in canonical_nexmark_queries() {

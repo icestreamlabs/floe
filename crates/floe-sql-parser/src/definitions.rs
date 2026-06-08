@@ -318,6 +318,20 @@ pub struct ReplicationPipelineDefinition {
     error_policy: ReplicationErrorPolicy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationPipelineDefinitionParts {
+    pub name: String,
+    pub source_name: String,
+    pub upstream_table: String,
+    pub target: ReplicationPipelineTarget,
+    pub format: ReplicationPipelineFormat,
+    pub buffer_mode: ReplicationBufferMode,
+    pub buffer_policy: ReplicationBufferPolicy,
+    pub emit_tombstones: bool,
+    pub include_transaction_metadata: bool,
+    pub error_policy: ReplicationErrorPolicy,
+}
+
 impl SinkDefinition {
     pub fn new(
         name: impl Into<String>,
@@ -357,22 +371,19 @@ impl SinkDefinition {
 }
 
 impl ReplicationPipelineDefinition {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: impl Into<String>,
-        source_name: impl Into<String>,
-        upstream_table: impl Into<String>,
-        target: ReplicationPipelineTarget,
-        format: ReplicationPipelineFormat,
-        buffer_mode: ReplicationBufferMode,
-        buffer_policy: ReplicationBufferPolicy,
-        emit_tombstones: bool,
-        include_transaction_metadata: bool,
-        error_policy: ReplicationErrorPolicy,
-    ) -> Result<Self> {
-        let name = name.into();
-        let source_name = source_name.into();
-        let upstream_table = upstream_table.into();
+    pub fn new(parts: ReplicationPipelineDefinitionParts) -> Result<Self> {
+        let ReplicationPipelineDefinitionParts {
+            name,
+            source_name,
+            upstream_table,
+            target,
+            format,
+            buffer_mode,
+            buffer_policy,
+            emit_tombstones,
+            include_transaction_metadata,
+            error_policy,
+        } = parts;
         if name.trim().is_empty() {
             return Err(anyhow!("replication pipeline name cannot be empty"));
         }

@@ -134,18 +134,18 @@ async fn window_aggregate_groups_by_window() {
     });
     let watermark = Arc::new(AtomicI64::new(-1));
 
-    let mut op = WindowAggregateOp::new_with_batch_extractor(
+    let mut op = WindowAggregateOp::new_with_batch_extractor(WindowAggregateBatchConfig {
         state,
         index,
-        table.clone(),
-        batch_window_extractor(key_extractor, time_extractor),
+        table: table.clone(),
+        window_extractor: batch_window_extractor(key_extractor, time_extractor),
         aggregator,
         output,
-        2,
-        2,
-        0,
+        window_size: 2,
+        window_slide: 2,
+        allowed_lateness_ms: 0,
         watermark,
-    )
+    })
     .expect("window aggregate op");
 
     let deltas: Vec<Vec<(Row, i64)>> = vec![
@@ -253,18 +253,18 @@ async fn window_aggregate_respects_watermark_allowed_lateness_cutoff() {
     });
     let watermark = Arc::new(AtomicI64::new(5_000));
 
-    let mut op = WindowAggregateOp::new_with_batch_extractor(
+    let mut op = WindowAggregateOp::new_with_batch_extractor(WindowAggregateBatchConfig {
         state,
         index,
-        table.clone(),
-        batch_window_extractor(key_extractor, time_extractor),
+        table: table.clone(),
+        window_extractor: batch_window_extractor(key_extractor, time_extractor),
         aggregator,
         output,
-        1_000,
-        1_000,
-        500,
+        window_size: 1_000,
+        window_slide: 1_000,
+        allowed_lateness_ms: 500,
         watermark,
-    )
+    })
     .expect("window aggregate op");
 
     let handle = stage_version(
@@ -352,18 +352,18 @@ async fn window_aggregate_accepts_out_of_order_events_within_lateness() {
     });
     let watermark = Arc::new(AtomicI64::new(5_000));
 
-    let mut op = WindowAggregateOp::new_with_batch_extractor(
+    let mut op = WindowAggregateOp::new_with_batch_extractor(WindowAggregateBatchConfig {
         state,
         index,
-        table.clone(),
-        batch_window_extractor(key_extractor, time_extractor),
+        table: table.clone(),
+        window_extractor: batch_window_extractor(key_extractor, time_extractor),
         aggregator,
         output,
-        1_000,
-        1_000,
-        500,
+        window_size: 1_000,
+        window_slide: 1_000,
+        allowed_lateness_ms: 500,
         watermark,
-    )
+    })
     .expect("window aggregate op");
 
     // 5_200 arrives before 4_600; both are >= watermark - allowed_lateness (4_500).
@@ -455,18 +455,18 @@ async fn window_aggregate_ignores_too_late_retractions_after_window_close() {
     });
     let watermark = Arc::new(AtomicI64::new(-1));
 
-    let mut op = WindowAggregateOp::new_with_batch_extractor(
+    let mut op = WindowAggregateOp::new_with_batch_extractor(WindowAggregateBatchConfig {
         state,
         index,
-        table.clone(),
-        batch_window_extractor(key_extractor, time_extractor),
+        table: table.clone(),
+        window_extractor: batch_window_extractor(key_extractor, time_extractor),
         aggregator,
         output,
-        1_000,
-        1_000,
-        0,
-        Arc::clone(&watermark),
-    )
+        window_size: 1_000,
+        window_slide: 1_000,
+        allowed_lateness_ms: 0,
+        watermark: Arc::clone(&watermark),
+    })
     .expect("window aggregate op");
 
     let first = stage_version(
@@ -558,18 +558,18 @@ async fn window_aggregate_evicts_expired_windows_on_watermark_advance() {
     });
     let watermark = Arc::new(AtomicI64::new(-1));
 
-    let mut op = WindowAggregateOp::new_with_batch_extractor(
+    let mut op = WindowAggregateOp::new_with_batch_extractor(WindowAggregateBatchConfig {
         state,
         index,
-        table.clone(),
-        batch_window_extractor(key_extractor, time_extractor),
+        table: table.clone(),
+        window_extractor: batch_window_extractor(key_extractor, time_extractor),
         aggregator,
         output,
-        1_000,
-        1_000,
-        0,
-        Arc::clone(&watermark),
-    )
+        window_size: 1_000,
+        window_slide: 1_000,
+        allowed_lateness_ms: 0,
+        watermark: Arc::clone(&watermark),
+    })
     .expect("window aggregate op");
 
     let first = stage_version(
@@ -652,18 +652,18 @@ async fn run_window_history_probe(history_rows: i64) -> metrics::LogicalWorkSnap
     });
     let watermark = Arc::new(AtomicI64::new(-1));
 
-    let mut op = WindowAggregateOp::new_with_batch_extractor(
+    let mut op = WindowAggregateOp::new_with_batch_extractor(WindowAggregateBatchConfig {
         state,
         index,
-        table.clone(),
-        batch_window_extractor(key_extractor, time_extractor),
+        table: table.clone(),
+        window_extractor: batch_window_extractor(key_extractor, time_extractor),
         aggregator,
         output,
-        10,
-        10,
-        0,
+        window_size: 10,
+        window_slide: 10,
+        allowed_lateness_ms: 0,
         watermark,
-    )
+    })
     .expect("window aggregate op");
 
     let mut history = (0..history_rows)

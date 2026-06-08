@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn plans_distinct() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![col(qualified(bid, "auction"))])
@@ -20,7 +20,7 @@ fn plans_distinct() {
 
 #[test]
 fn plans_multi_column_distinct() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
@@ -41,7 +41,7 @@ fn plans_multi_column_distinct() {
 
 #[test]
 fn plans_aggregate_over_distinct_subquery() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let distinct = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![
@@ -70,7 +70,7 @@ fn plans_aggregate_over_distinct_subquery() {
 
 #[test]
 fn prunes_unused_aggregate_calls_under_projection() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .aggregate(
@@ -111,7 +111,7 @@ fn prunes_unused_aggregate_calls_under_projection() {
 
 #[test]
 fn prunes_unused_aggregate_calls_through_aggregate_filter() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .aggregate(
@@ -154,7 +154,7 @@ fn prunes_unused_aggregate_calls_through_aggregate_filter() {
 
 #[test]
 fn pushes_only_group_key_filters_below_aggregate() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .aggregate(
@@ -208,7 +208,7 @@ fn pushes_only_group_key_filters_below_aggregate() {
 
 #[test]
 fn plans_union_distinct_as_union_plus_distinct() {
-    let bid = dbsp_circuit::circuit::tables::nexmark_bid_table();
+    let bid = nexmark_bid_table();
     let left = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
         .unwrap()
         .project(vec![col(qualified(bid, "auction"))])

@@ -88,6 +88,23 @@ pub struct ReplicationPipelineDlqEntry {
     last_updated_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationPipelineDlqEntryParts {
+    pub pipeline_name: String,
+    pub dlq_id: String,
+    pub source_name: String,
+    pub source_position: CdcSourcePosition,
+    pub transaction_id: Option<CdcTransactionId>,
+    pub error_class: String,
+    pub error_message: String,
+    pub attempt_count: u32,
+    pub payload_object_key: Option<String>,
+    pub payload_format: Option<String>,
+    pub payload_bytes: usize,
+    pub target_state: BTreeMap<String, String>,
+    pub created_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplicationPipelineDlqStats {
     pending_entries: usize,

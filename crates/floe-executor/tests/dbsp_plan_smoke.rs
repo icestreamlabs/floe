@@ -4,11 +4,43 @@ use datafusion::common::Column;
 use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, col, lit, table_scan};
 
 use floe_executor::dbsp_plan::{
-    CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerError, RowSchema,
-    TableDescriptor, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
-    nexmark_config, nexmark_person_table,
+    CircuitNode, CircuitPlan, DbspNodeKind, DbspPlanBuilder, PlannerConfig, PlannerError,
+    RowSchema, TableDescriptor, nexmark_auction_table as raw_nexmark_auction_table,
+    nexmark_bid_alias_table as raw_nexmark_bid_alias_table,
+    nexmark_bid_table as raw_nexmark_bid_table, nexmark_config as raw_nexmark_config,
+    nexmark_person_table as raw_nexmark_person_table,
 };
 use floe_executor::plan_source_requirements;
+
+fn static_table(table: Result<&'static TableDescriptor>, label: &str) -> &'static TableDescriptor {
+    match table {
+        Ok(table) => table,
+        Err(error) => panic!("invalid {label} table descriptor: {error}"),
+    }
+}
+
+fn nexmark_person_table() -> &'static TableDescriptor {
+    static_table(raw_nexmark_person_table(), "nexmark_person")
+}
+
+fn nexmark_auction_table() -> &'static TableDescriptor {
+    static_table(raw_nexmark_auction_table(), "nexmark_auction")
+}
+
+fn nexmark_bid_table() -> &'static TableDescriptor {
+    static_table(raw_nexmark_bid_table(), "nexmark_bid")
+}
+
+fn nexmark_bid_alias_table() -> &'static TableDescriptor {
+    static_table(raw_nexmark_bid_alias_table(), "bid")
+}
+
+fn nexmark_config() -> PlannerConfig {
+    match raw_nexmark_config() {
+        Ok(config) => config,
+        Err(error) => panic!("invalid NEXMARK planner config: {error}"),
+    }
+}
 
 #[test]
 fn plans_scan_then_project() -> Result<()> {

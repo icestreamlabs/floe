@@ -125,14 +125,16 @@ impl SnapshotAdaptiveConcurrencyRuntime {
         let task_slot = slot.clone();
         let task = tokio::spawn(async move {
             run_snapshot_adaptive_concurrency_controller(
-                source,
-                task_slot,
-                config,
-                task_scan_limiter,
-                cdc_replication_debug,
-                wal_pressure_rx,
-                scan_observation_rx,
-                task_cancel,
+                SnapshotAdaptiveConcurrencyControllerRequest {
+                    source,
+                    slot: task_slot,
+                    config,
+                    scan_limiter: task_scan_limiter,
+                    cdc_replication_debug,
+                    wal_pressure_rx,
+                    scan_observation_rx,
+                    cancel: task_cancel,
+                },
             )
             .await;
         });
@@ -210,17 +212,31 @@ pub(super) fn snapshot_adaptive_concurrency_config(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct SnapshotAdaptiveConcurrencyControllerRequest {
+    pub(super) source: String,
+    pub(super) slot: String,
+    pub(super) config: SnapshotAdaptiveConcurrencyConfig,
+    pub(super) scan_limiter: Arc<SnapshotScanLimiter>,
+    pub(super) cdc_replication_debug:
+        Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
+    pub(super) wal_pressure_rx: watch::Receiver<SnapshotWalBufferPressure>,
+    pub(super) scan_observation_rx: watch::Receiver<Option<SnapshotScanObservation>>,
+    pub(super) cancel: CancellationToken,
+}
+
 pub(super) async fn run_snapshot_adaptive_concurrency_controller(
-    source: String,
-    slot: String,
-    config: SnapshotAdaptiveConcurrencyConfig,
-    scan_limiter: Arc<SnapshotScanLimiter>,
-    cdc_replication_debug: Arc<tokio::sync::RwLock<http_ingest::CdcReplicationDebugState>>,
-    mut wal_pressure_rx: watch::Receiver<SnapshotWalBufferPressure>,
-    mut scan_observation_rx: watch::Receiver<Option<SnapshotScanObservation>>,
-    cancel: CancellationToken,
+    request: SnapshotAdaptiveConcurrencyControllerRequest,
 ) {
+    let SnapshotAdaptiveConcurrencyControllerRequest {
+        source,
+        slot,
+        config,
+        scan_limiter,
+        cdc_replication_debug,
+        mut wal_pressure_rx,
+        mut scan_observation_rx,
+        cancel,
+    } = request;
     let mut latest_scan_observation = None;
     let mut interval = tokio::time::interval(config.controller_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

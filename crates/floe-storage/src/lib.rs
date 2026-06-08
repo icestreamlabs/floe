@@ -4,7 +4,8 @@ mod object_payload;
 
 pub use catalog::{
     MaterializedViewMetadata, ReplicationPipelineCheckpoint, ReplicationPipelineDlqEntry,
-    ReplicationPipelineDlqStats, ReplicationPipelineDlqStatus, SlateCatalog,
+    ReplicationPipelineDlqEntryParts, ReplicationPipelineDlqStats, ReplicationPipelineDlqStatus,
+    SlateCatalog,
 };
 pub use cdc_buffer::{
     CdcBufferAppend, CdcBufferCleanupPolicy, CdcBufferCleanupSummary, CdcBufferFrontier,

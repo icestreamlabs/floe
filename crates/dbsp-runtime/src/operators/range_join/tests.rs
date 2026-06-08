@@ -143,7 +143,7 @@ async fn build_op(
     let projector: RangeJoinProjector<LeftRow, RightRow, OutRow> =
         Arc::new(|left, right| (left.0, right.1));
 
-    let op = RangeJoinOp::new_batch(
+    let op = RangeJoinOp::new_batch(RangeJoinBatchConfig {
         left_state,
         right_state,
         right_index,
@@ -151,10 +151,10 @@ async fn build_op(
         right_key,
         predicate,
         projector,
-        table.clone(),
+        table: table.clone(),
         output,
-        None,
-    );
+        integrated: None,
+    });
 
     (op, left_dict, right_dict, table)
 }

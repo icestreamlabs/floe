@@ -432,16 +432,16 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     cdc_staged_writes = Some(staged_writes);
                 }
             } else {
-                let selection = build_batch(
-                    &mut connector_queues,
-                    &source_id_by_name_for_task,
+                let selection = build_batch(BuildBatchRequest {
+                    queues: &mut connector_queues,
+                    source_id_by_name: &source_id_by_name_for_task,
                     source_count,
-                    next_connector,
+                    start_index: next_connector,
                     max_batch,
-                    max_batch_per_source,
-                    max_batch_per_connector,
-                    &pending_event_counter,
-                );
+                    max_per_source: max_batch_per_source,
+                    max_per_connector: max_batch_per_connector,
+                    pending_events: &pending_event_counter,
+                });
                 let BatchSelection {
                     batch,
                     per_connector_counts: selected_per_connector_counts,

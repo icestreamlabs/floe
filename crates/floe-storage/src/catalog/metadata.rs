@@ -77,30 +77,30 @@ impl ReplicationPipelineCheckpoint {
 }
 
 impl ReplicationPipelineDlqEntry {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        pipeline_name: impl Into<String>,
-        dlq_id: impl Into<String>,
-        source_name: impl Into<String>,
-        source_position: CdcSourcePosition,
-        transaction_id: Option<CdcTransactionId>,
-        error_class: impl Into<String>,
-        error_message: impl Into<String>,
-        attempt_count: u32,
-        payload_object_key: Option<String>,
-        payload_format: Option<String>,
-        payload_bytes: usize,
-        target_state: BTreeMap<String, String>,
-        created_at_unix_ms: u64,
-    ) -> Result<Self> {
-        let entry = Self {
-            pipeline_name: pipeline_name.into(),
-            dlq_id: dlq_id.into(),
-            source_name: source_name.into(),
+    pub fn new(parts: ReplicationPipelineDlqEntryParts) -> Result<Self> {
+        let ReplicationPipelineDlqEntryParts {
+            pipeline_name,
+            dlq_id,
+            source_name,
             source_position,
             transaction_id,
-            error_class: error_class.into(),
-            error_message: error_message.into(),
+            error_class,
+            error_message,
+            attempt_count,
+            payload_object_key,
+            payload_format,
+            payload_bytes,
+            target_state,
+            created_at_unix_ms,
+        } = parts;
+        let entry = Self {
+            pipeline_name,
+            dlq_id,
+            source_name,
+            source_position,
+            transaction_id,
+            error_class,
+            error_message,
             attempt_count,
             payload_object_key,
             payload_format,

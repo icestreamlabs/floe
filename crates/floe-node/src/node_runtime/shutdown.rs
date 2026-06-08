@@ -53,17 +53,28 @@ pub(super) fn spawn_signal_handler(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_pgwire_server(
-    query: FloeQueryContext,
-    mv_registry: Arc<MaterializedViewRegistry>,
-    server_cancel: CancellationToken,
-    runtime_cancel_for_server: CancellationToken,
-    failure_for_server: Arc<StdMutex<Option<String>>>,
-    enabled: bool,
-    address: String,
-    runtime_config: server::ServerRuntimeConfig,
-) -> JoinHandle<anyhow::Result<()>> {
+pub(super) struct PgwireServerSpawn {
+    pub(super) query: FloeQueryContext,
+    pub(super) mv_registry: Arc<MaterializedViewRegistry>,
+    pub(super) server_cancel: CancellationToken,
+    pub(super) runtime_cancel_for_server: CancellationToken,
+    pub(super) failure_for_server: Arc<StdMutex<Option<String>>>,
+    pub(super) enabled: bool,
+    pub(super) address: String,
+    pub(super) runtime_config: server::ServerRuntimeConfig,
+}
+
+pub(super) fn spawn_pgwire_server(request: PgwireServerSpawn) -> JoinHandle<anyhow::Result<()>> {
+    let PgwireServerSpawn {
+        query,
+        mv_registry,
+        server_cancel,
+        runtime_cancel_for_server,
+        failure_for_server,
+        enabled,
+        address,
+        runtime_config,
+    } = request;
     if !enabled {
         tracing::warn!("pgwire server disabled by configuration");
         tokio::spawn(async move {

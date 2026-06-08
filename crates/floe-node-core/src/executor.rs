@@ -84,7 +84,7 @@ pub fn build_dataflows(
 pub fn planner_config_from_sources(
     registry: &crate::source::SourceRegistry,
 ) -> Result<PlannerConfig> {
-    let mut config = nexmark_config();
+    let mut config = nexmark_config()?;
     for definition in registry.definitions() {
         if definition.property(SOURCE_PRIMARY_KEY_PROPERTY).is_none() {
             continue;
