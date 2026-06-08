@@ -296,11 +296,10 @@ impl TableDefinition {
         &self.columns
     }
 
-    pub fn primary_key_index(&self) -> usize {
+    pub fn primary_key_index(&self) -> Option<usize> {
         self.columns
             .iter()
             .position(|column| column.is_primary_key())
-            .expect("table definition validated to contain a primary key")
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {

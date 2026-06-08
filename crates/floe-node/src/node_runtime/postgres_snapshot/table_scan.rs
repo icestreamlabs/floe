@@ -92,11 +92,20 @@ pub(super) fn int64_snapshot_range_chunks(
             break;
         }
         let next = lower + width;
-        let upper_exclusive = (next <= i128::from(max_key))
-            .then(|| i64::try_from(next).expect("chunk upper bound remains in i64 range"));
+        let Ok(lower_inclusive) = i64::try_from(lower) else {
+            break;
+        };
+        let upper_exclusive = if next <= i128::from(max_key) {
+            match i64::try_from(next) {
+                Ok(next) => Some(next),
+                Err(_) => break,
+            }
+        } else {
+            None
+        };
         chunks.push(SnapshotTableChunk::Int64Range {
             column: column.to_string(),
-            lower_inclusive: i64::try_from(lower).expect("chunk lower bound remains in i64 range"),
+            lower_inclusive,
             upper_exclusive,
         });
     }

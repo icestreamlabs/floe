@@ -526,7 +526,7 @@ fn postgres_param_from_json(
             let text = if let Some(value) = value.as_str() {
                 value.to_string()
             } else {
-                format_decimal128(i128::from(json_i64(column.name(), value)?), *scale)
+                format_decimal128(i128::from(json_i64(column.name(), value)?), *scale)?
             };
             Ok(PostgresParamValue::Text(Some(text)))
         }

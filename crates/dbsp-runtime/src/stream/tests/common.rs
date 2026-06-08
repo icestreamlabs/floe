@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 use object_store::memory::InMemory;
 use slatedb::Db;
@@ -10,16 +11,16 @@ pub struct IntegerGroup;
 
 #[async_trait]
 impl AbelianGroup<i64> for IntegerGroup {
-    async fn add(&self, a: &i64, b: &i64) -> i64 {
-        a + b
+    async fn add(&self, a: &i64, b: &i64) -> Result<i64> {
+        Ok(a + b)
     }
 
-    async fn neg(&self, a: &i64) -> i64 {
-        -a
+    async fn neg(&self, a: &i64) -> Result<i64> {
+        Ok(-a)
     }
 
-    async fn identity(&self) -> i64 {
-        0
+    async fn identity(&self) -> Result<i64> {
+        Ok(0)
     }
 }
 

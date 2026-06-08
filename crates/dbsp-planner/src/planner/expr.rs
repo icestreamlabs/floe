@@ -145,12 +145,12 @@ pub(super) fn extract_range_join_and_residual(
         }
     }
 
-    let lower = lower_bounds
-        .get(lower_idx)
-        .expect("selected lower bound should exist");
-    let upper = upper_bounds
-        .get(upper_idx)
-        .expect("selected upper bound should exist");
+    let lower = lower_bounds.get(lower_idx).ok_or_else(|| {
+        PlannerError::UnsupportedJoin("selected lower range bound index was invalid".to_string())
+    })?;
+    let upper = upper_bounds.get(upper_idx).ok_or_else(|| {
+        PlannerError::UnsupportedJoin("selected upper range bound index was invalid".to_string())
+    })?;
 
     Ok((
         Some(RangeJoinExpressions {

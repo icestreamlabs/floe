@@ -266,7 +266,7 @@ impl CdcRowKey {
     }
 
     pub fn validate_against_schema(&self, schema: &CdcTableSchema) -> Result<()> {
-        let indices = schema.primary_key_indices();
+        let indices = schema.primary_key_indices()?;
         ensure!(
             self.values.len() == indices.len(),
             "CDC row key length {} does not match primary-key column count {}",

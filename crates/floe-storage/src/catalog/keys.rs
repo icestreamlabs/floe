@@ -76,7 +76,12 @@ pub(super) fn table_row_prefix(name: &str) -> Vec<u8> {
 }
 
 pub(super) fn table_row_key(table: &TableDefinition, row: &RowValues) -> Result<Vec<u8>> {
-    let pk_index = table.primary_key_index();
+    let pk_index = table.primary_key_index().ok_or_else(|| {
+        anyhow!(
+            "table '{}' does not define a primary key column",
+            table.name()
+        )
+    })?;
     let pk_value = row
         .get(pk_index)
         .cloned()

@@ -70,7 +70,7 @@ where
         + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
     T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
 {
-    async fn add(&self, a: &Stream<T>, b: &Stream<T>) -> Stream<T> {
+    async fn add(&self, a: &Stream<T>, b: &Stream<T>) -> Result<Stream<T>> {
         let frontier = a.current_time().max(b.current_time());
         let horizon = a.semantic_horizon().max(b.semantic_horizon());
         build_builtin_addition_stream(
@@ -90,10 +90,9 @@ where
             horizon,
         )
         .await
-        .expect("failed to construct stream for addition")
     }
 
-    async fn neg(&self, a: &Stream<T>) -> Stream<T> {
+    async fn neg(&self, a: &Stream<T>) -> Result<Stream<T>> {
         let frontier = a.current_time();
         let horizon = a.semantic_horizon();
         build_builtin_addition_stream(
@@ -109,17 +108,15 @@ where
             horizon,
         )
         .await
-        .expect("failed to construct stream for negation")
     }
 
-    async fn identity(&self) -> Stream<T> {
+    async fn identity(&self) -> Result<Stream<T>> {
         build_derived_stream(
             self.table.clone(),
             self.group.clone(),
             &self.namespace_prefix,
         )
         .await
-        .expect("failed to construct stream for identity")
     }
 }
 
@@ -186,7 +183,7 @@ where
         let value = result
             .derived_value_at(t)
             .await?
-            .expect("built-in addition stream missing evaluator");
+            .ok_or_else(|| anyhow::anyhow!("built-in addition stream missing evaluator"))?;
         if t == 0 {
             super::util::set_default_in_place(&mut result, value);
         } else if t <= frontier {
@@ -231,7 +228,7 @@ where
         let mut right = self.right.clone();
         let left_value = left.get(timestamp).await?;
         let right_value = right.get(timestamp).await?;
-        Ok(group.add(&left_value, &right_value).await)
+        group.add(&left_value, &right_value).await
     }
 }
 
@@ -264,6 +261,6 @@ where
     async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T> {
         let mut input = self.input.clone();
         let value = input.get(timestamp).await?;
-        Ok(group.neg(&value).await)
+        group.neg(&value).await
     }
 }

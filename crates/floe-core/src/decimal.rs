@@ -62,10 +62,10 @@ pub fn parse_decimal_text_to_i128(value: &str, scale: i8) -> Result<i128> {
     }
 }
 
-pub fn format_decimal128(value: i128, scale: i8) -> String {
+pub fn format_decimal128(value: i128, scale: i8) -> Result<String> {
     let mut out = Vec::new();
-    append_decimal128_text(&mut out, value, scale).expect("valid Decimal128 scale formats");
-    String::from_utf8(out).expect("Decimal128 text is ASCII")
+    append_decimal128_text(&mut out, value, scale)?;
+    String::from_utf8(out).context("Decimal128 text should be ASCII")
 }
 
 pub fn append_decimal128_text(out: &mut Vec<u8>, value: i128, scale: i8) -> Result<()> {
@@ -112,10 +112,11 @@ mod tests {
     }
 
     #[test]
-    fn formats_decimal128_with_scale() {
-        assert_eq!(format_decimal128(12_345, 2), "123.45");
-        assert_eq!(format_decimal128(-7, 2), "-0.07");
-        assert_eq!(format_decimal128(42_100, 3), "42.100");
-        assert_eq!(format_decimal128(42, 0), "42");
+    fn formats_decimal128_with_scale() -> Result<()> {
+        assert_eq!(format_decimal128(12_345, 2)?, "123.45");
+        assert_eq!(format_decimal128(-7, 2)?, "-0.07");
+        assert_eq!(format_decimal128(42_100, 3)?, "42.100");
+        assert_eq!(format_decimal128(42, 0)?, "42");
+        Ok(())
     }
 }

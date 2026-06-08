@@ -85,7 +85,7 @@ fn array_value_to_json(array: &ArrayRef, row_idx: usize) -> Result<serde_json::V
         return Ok(serde_json::Value::String(format_decimal128(
             values.value(row_idx),
             scale,
-        )));
+        )?));
     }
 
     match array.data_type() {

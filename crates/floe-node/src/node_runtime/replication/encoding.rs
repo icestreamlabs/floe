@@ -474,7 +474,7 @@ fn floe_json_value_fields(schema: &CdcTableSchema) -> anyhow::Result<Vec<FloeJso
 }
 
 fn floe_json_key_fields(schema: &CdcTableSchema) -> anyhow::Result<Vec<FloeJsonColumnarField>> {
-    let primary_key_indices = schema.primary_key_indices();
+    let primary_key_indices = schema.primary_key_indices()?;
     schema
         .primary_key()
         .columns()

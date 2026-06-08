@@ -177,7 +177,9 @@ where
                 suffix.len()
             ));
         }
-        Ok(u64::from_be_bytes(suffix.try_into().unwrap()))
+        let mut id_bytes = [0_u8; 8];
+        id_bytes.copy_from_slice(suffix);
+        Ok(u64::from_be_bytes(id_bytes))
     }
 
     fn id2k_range_end_exclusive(&self, end_id_inclusive: u64) -> Vec<u8> {

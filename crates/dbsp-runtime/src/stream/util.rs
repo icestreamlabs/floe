@@ -72,9 +72,9 @@ where
 
     let key = transient_zset_batch_key::<K>(handle);
     let payload: Arc<dyn Any + Send + Sync> = Arc::new(batch) as Arc<dyn Any + Send + Sync>;
-    let mut registry = TRANSIENT_ZSET_BATCH_REGISTRY
-        .lock()
-        .expect("transient zset batch registry lock poisoned");
+    let Ok(mut registry) = TRANSIENT_ZSET_BATCH_REGISTRY.lock() else {
+        return;
+    };
     registry.entries.insert(key.clone(), payload);
     registry.order.push_back(key);
     evict_excess_transient_zset_batches(&mut registry);
@@ -90,9 +90,9 @@ where
 
     let key = transient_zset_batch_key::<K>(handle);
     let payload = {
-        let registry = TRANSIENT_ZSET_BATCH_REGISTRY
-            .lock()
-            .expect("transient zset batch registry lock poisoned");
+        let Ok(registry) = TRANSIENT_ZSET_BATCH_REGISTRY.lock() else {
+            return None;
+        };
         registry.entries.get(&key).cloned()
     }?;
     let batch = Arc::downcast::<Arc<Vec<(K, i64)>>>(payload).ok()?;

@@ -356,7 +356,7 @@ fn arrow_ipc_schema(schema: &CdcTableSchema) -> Arc<ArrowSchema> {
 fn key_only_row(schema: &CdcTableSchema, key: &CdcRowKey) -> anyhow::Result<Vec<Option<RowValue>>> {
     key.validate_against_schema(schema)?;
     let mut values = vec![None; schema.columns().len()];
-    for (value, column_idx) in key.values().iter().zip(schema.primary_key_indices()) {
+    for (value, column_idx) in key.values().iter().zip(schema.primary_key_indices()?) {
         values[column_idx] = Some(value.clone());
     }
     Ok(values)

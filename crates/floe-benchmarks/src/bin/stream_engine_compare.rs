@@ -793,7 +793,10 @@ impl Harness {
                 status.as_deref(),
                 Some("SqlError" | "RustError" | "SystemError")
             ) {
-                bail!("Feldera program failed with status {}", status.unwrap());
+                bail!(
+                    "Feldera program failed with status {}",
+                    status.unwrap_or_else(|| "unknown".to_string())
+                );
             }
             Ok(status.as_deref() == Some("Success"))
         })?;

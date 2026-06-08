@@ -56,7 +56,11 @@ where
                     range_scan_spans += 1;
                     range_scan_ids += span_ids.len();
                     let start_key = self.id2k_key(span_ids[0]);
-                    let end_key = self.id2k_range_end_exclusive(*span_ids.last().unwrap());
+                    let Some(end_id) = span_ids.last().copied() else {
+                        span_start = span_end;
+                        continue;
+                    };
+                    let end_key = self.id2k_range_end_exclusive(end_id);
                     let scanned = self
                         .table
                         .scan_range_bytes(start_key..end_key, &ScanOptions::default())

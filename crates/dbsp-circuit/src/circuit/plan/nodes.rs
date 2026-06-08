@@ -483,7 +483,7 @@ impl DbspJoinNode {
                 DbspJoinType::LeftSemi
                 | DbspJoinType::RightSemi
                 | DbspJoinType::LeftAnti
-                | DbspJoinType::RightAnti => unreachable!("semi/anti joins returned above"),
+                | DbspJoinType::RightAnti => field.nullable,
             };
             fields.push(Field::new(
                 field.name.clone(),
@@ -507,7 +507,7 @@ impl DbspJoinNode {
                 DbspJoinType::LeftSemi
                 | DbspJoinType::RightSemi
                 | DbspJoinType::LeftAnti
-                | DbspJoinType::RightAnti => unreachable!("semi/anti joins returned above"),
+                | DbspJoinType::RightAnti => field.nullable,
             };
             fields.push(Field::new(name, field.data_type.clone(), nullable));
         }

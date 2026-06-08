@@ -30,7 +30,7 @@ impl CdcMetadataStore {
             )
         })?;
         self.table
-            .put(&source_metadata_key(source.source_id()), &encoded)
+            .put(&source_metadata_key(source.source_id())?, &encoded)
             .await
             .with_context(|| {
                 format!(
@@ -46,7 +46,7 @@ impl CdcMetadataStore {
     ) -> Result<Option<CdcSourceDefinition>> {
         let Some(bytes) = self
             .table
-            .get(&source_metadata_key(source_id))
+            .get(&source_metadata_key(source_id)?)
             .await
             .with_context(|| format!("load CDC source metadata for '{}'", source_id.as_str()))?
         else {
@@ -87,11 +87,11 @@ impl CdcMetadataStore {
 
         let mut batch = WriteBatch::new();
         batch.put(
-            table_metadata_key(table_definition.table_id()),
+            table_metadata_key(table_definition.table_id())?,
             encoded.clone(),
         );
         batch.put(
-            source_table_index_key(table_definition.source_id(), table_definition.table_id()),
+            source_table_index_key(table_definition.source_id(), table_definition.table_id())?,
             encoded,
         );
         if let Some(previous) = previous
@@ -100,7 +100,7 @@ impl CdcMetadataStore {
             batch.delete(source_table_index_key(
                 previous.source_id(),
                 previous.table_id(),
-            ));
+            )?);
         }
 
         self.table.write_batch(batch).await.with_context(|| {
@@ -114,7 +114,7 @@ impl CdcMetadataStore {
     pub async fn load_table(&self, table_id: &CdcTableId) -> Result<Option<CdcTableDefinition>> {
         let Some(bytes) = self
             .table
-            .get(&table_metadata_key(table_id))
+            .get(&table_metadata_key(table_id)?)
             .await
             .with_context(|| format!("load CDC table metadata for '{}'", table_id.as_str()))?
         else {
@@ -129,7 +129,7 @@ impl CdcMetadataStore {
     ) -> Result<Vec<CdcTableDefinition>> {
         self.table
             .scan_prefix(
-                source_table_index_prefix(source_id).as_slice(),
+                source_table_index_prefix(source_id)?.as_slice(),
                 &ScanOptions::default(),
             )
             .await

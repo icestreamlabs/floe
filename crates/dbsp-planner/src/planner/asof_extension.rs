@@ -132,12 +132,19 @@ impl UserDefinedLogicalNodeCore for FloeAsofJoinNode {
         let mut iter = exprs.into_iter();
         let mut on = Vec::with_capacity(self.on.len());
         for _ in 0..self.on.len() {
-            let left = iter.next().expect("validated expression count");
-            let right = iter.next().expect("validated expression count");
+            let Some(left) = iter.next() else {
+                return plan_err!("Floe ASOF logical node missing left ON expression");
+            };
+            let Some(right) = iter.next() else {
+                return plan_err!("Floe ASOF logical node missing right ON expression");
+            };
             on.push((left, right));
         }
         let filter = if self.filter.is_some() {
-            Some(iter.next().expect("validated expression count"))
+            let Some(filter) = iter.next() else {
+                return plan_err!("Floe ASOF logical node missing filter expression");
+            };
+            Some(filter)
         } else {
             None
         };

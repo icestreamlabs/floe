@@ -12,7 +12,7 @@ fn table_definition_from_sql_preserves_primary_key_and_nullability() {
     let table = table_definition_from_sql(&definition).expect("table definition");
     assert_eq!(table.name(), "orders");
     assert_eq!(table.columns().len(), 4);
-    assert_eq!(table.primary_key_index(), 0);
+    assert_eq!(table.primary_key_index(), Some(0));
     assert!(!table.columns()[0].nullable());
     assert!(table.columns()[1].nullable());
     assert!(!table.columns()[2].nullable());

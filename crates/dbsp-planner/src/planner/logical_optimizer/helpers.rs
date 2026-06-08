@@ -209,7 +209,7 @@ pub(super) fn is_safe_projection_replacement(expr: &Expr, input_schema: &DFSchem
                         | Expr::ScalarSubquery(_)
                 ))
             })
-            .expect("expression safety check is infallible")
+            .unwrap_or(true)
 }
 
 pub(super) fn projection_expr_value(expr: &Expr) -> Expr {
@@ -337,10 +337,14 @@ pub(super) fn can_duplicate_expressions(
 
 pub(super) fn expr_node_count(expr: &Expr) -> usize {
     let mut count = 0;
-    expr.apply(|_| {
-        count += 1;
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .expect("expression node counting is infallible");
+    if expr
+        .apply(|_| {
+            count += 1;
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .is_err()
+    {
+        return usize::MAX;
+    }
     count
 }

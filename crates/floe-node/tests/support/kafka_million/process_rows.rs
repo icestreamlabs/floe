@@ -90,7 +90,7 @@ pub(super) async fn wait_for_pgwire(
             Err(err) => bail!("pgwire listener at {addr} never became ready: {err}"),
         }
     }
-    unreachable!("loop returns or bails")
+    bail!("pgwire listener at {addr} never became ready")
 }
 
 pub(super) fn row_from_json(value: &Value, output_fields: &[FieldSpec]) -> Result<ExpectedRow> {

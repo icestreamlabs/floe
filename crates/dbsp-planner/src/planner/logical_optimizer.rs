@@ -8,7 +8,7 @@ use datafusion::logical_expr::logical_plan::{
 };
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion_common::{Column, DFSchema, Result as DataFusionResult};
+use datafusion_common::{Column, DFSchema, Result as DataFusionResult, plan_err};
 
 use super::config::PlannerConfig;
 use super::error::PlannerError;
@@ -83,9 +83,8 @@ impl OptimizerDiagnostics {
             rules: Vec::new(),
             disabled_rules: Vec::new(),
         });
-        self.stages
-            .last_mut()
-            .expect("stage was just inserted into diagnostics")
+        let index = self.stages.len() - 1;
+        &mut self.stages[index]
     }
 }
 
@@ -567,8 +566,9 @@ impl LogicalOptimizerRule for FilterAggregateTransposeRule {
         }
 
         let Some(pushed_predicate) = combine_filters(pushdown) else {
-            let predicate = combine_filters(remaining)
-                .expect("remaining filter conjuncts cannot be empty when nothing was pushed");
+            let Some(predicate) = combine_filters(remaining) else {
+                return plan_err!("aggregate filter pushdown found no predicate to keep or push");
+            };
             return Ok(Transformed::no(LogicalPlan::Filter(Filter::try_new(
                 predicate,
                 Arc::clone(&filter.input),

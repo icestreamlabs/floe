@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 
 /// Basic operations required for an Abelian group.
@@ -10,9 +11,9 @@ pub trait AbelianGroup<T>: Send + Sync
 where
     T: Send + Sync,
 {
-    async fn add(&self, a: &T, b: &T) -> T;
-    async fn neg(&self, a: &T) -> T;
-    async fn identity(&self) -> T;
+    async fn add(&self, a: &T, b: &T) -> Result<T>;
+    async fn neg(&self, a: &T) -> Result<T>;
+    async fn identity(&self) -> Result<T>;
 }
 
 #[async_trait]
@@ -21,15 +22,15 @@ where
     T: Send + Sync,
     G: AbelianGroup<T> + ?Sized + Send + Sync,
 {
-    async fn add(&self, a: &T, b: &T) -> T {
+    async fn add(&self, a: &T, b: &T) -> Result<T> {
         (**self).add(a, b).await
     }
 
-    async fn neg(&self, a: &T) -> T {
+    async fn neg(&self, a: &T) -> Result<T> {
         (**self).neg(a).await
     }
 
-    async fn identity(&self) -> T {
+    async fn identity(&self) -> Result<T> {
         (**self).identity().await
     }
 }
@@ -38,6 +39,7 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use anyhow::Result;
     use async_trait::async_trait;
     use object_store::memory::InMemory;
     use slatedb::Db;
@@ -51,16 +53,16 @@ mod tests {
 
     #[async_trait]
     impl AbelianGroup<i64> for IntegerGroup {
-        async fn add(&self, a: &i64, b: &i64) -> i64 {
-            a + b
+        async fn add(&self, a: &i64, b: &i64) -> Result<i64> {
+            Ok(a + b)
         }
 
-        async fn neg(&self, a: &i64) -> i64 {
-            -a
+        async fn neg(&self, a: &i64) -> Result<i64> {
+            Ok(-a)
         }
 
-        async fn identity(&self) -> i64 {
-            0
+        async fn identity(&self) -> Result<i64> {
+            Ok(0)
         }
     }
 
@@ -73,27 +75,28 @@ mod tests {
         )
     }
 
-    async fn assert_group_laws<T, G>(group: &G, a: &T, b: &T, c: &T)
+    async fn assert_group_laws<T, G>(group: &G, a: &T, b: &T, c: &T) -> Result<()>
     where
         T: Clone + PartialEq + std::fmt::Debug + Send + Sync,
         G: AbelianGroup<T> + ?Sized,
     {
-        let ab = group.add(a, b).await;
-        let bc = group.add(b, c).await;
-        let ab_c = group.add(&ab, c).await;
-        let a_bc = group.add(a, &bc).await;
+        let ab = group.add(a, b).await?;
+        let bc = group.add(b, c).await?;
+        let ab_c = group.add(&ab, c).await?;
+        let a_bc = group.add(a, &bc).await?;
         assert_eq!(ab_c, a_bc, "associativity failed");
 
-        let ba = group.add(b, a).await;
+        let ba = group.add(b, a).await?;
         assert_eq!(ab, ba, "commutativity failed");
 
-        let identity = group.identity().await;
-        let a_id = group.add(a, &identity).await;
+        let identity = group.identity().await?;
+        let a_id = group.add(a, &identity).await?;
         assert_eq!(a_id, a.clone(), "identity failed");
 
-        let neg_a = group.neg(a).await;
-        let a_neg = group.add(a, &neg_a).await;
+        let neg_a = group.neg(a).await?;
+        let a_neg = group.add(a, &neg_a).await?;
         assert_eq!(a_neg, identity, "inverse failed");
+        Ok(())
     }
 
     async fn build_stream(
@@ -131,13 +134,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integer_group_obeys_abelian_laws() {
+    async fn integer_group_obeys_abelian_laws() -> Result<()> {
         let group = IntegerGroup;
-        assert_group_laws(&group, &3, &-2, &7).await;
+        assert_group_laws(&group, &3, &-2, &7).await
     }
 
     #[tokio::test]
-    async fn stream_addition_obeys_abelian_laws() {
+    async fn stream_addition_obeys_abelian_laws() -> Result<()> {
         let db = build_db().await;
         let value_group: Arc<dyn AbelianGroup<i64>> = Arc::new(IntegerGroup);
 
@@ -149,22 +152,23 @@ mod tests {
 
         let group = StreamAddition::from_stream(&stream_a);
 
-        let ab = group.add(&stream_a, &stream_b).await;
-        let ba = group.add(&stream_b, &stream_a).await;
+        let ab = group.add(&stream_a, &stream_b).await?;
+        let ba = group.add(&stream_b, &stream_a).await?;
         assert_stream_eq(&ab, &ba).await;
 
-        let bc = group.add(&stream_b, &stream_c).await;
-        let ab_c = group.add(&ab, &stream_c).await;
-        let a_bc = group.add(&stream_a, &bc).await;
+        let bc = group.add(&stream_b, &stream_c).await?;
+        let ab_c = group.add(&ab, &stream_c).await?;
+        let a_bc = group.add(&stream_a, &bc).await?;
         assert_stream_eq(&ab_c, &a_bc).await;
 
-        let identity = group.identity().await;
-        let a_id = group.add(&stream_a, &identity).await;
+        let identity = group.identity().await?;
+        let a_id = group.add(&stream_a, &identity).await?;
         assert_stream_eq(&stream_a, &a_id).await;
 
-        let neg_a = group.neg(&stream_a).await;
-        let a_neg = group.add(&stream_a, &neg_a).await;
-        let identity = group.identity().await;
+        let neg_a = group.neg(&stream_a).await?;
+        let a_neg = group.add(&stream_a, &neg_a).await?;
+        let identity = group.identity().await?;
         assert_stream_eq(&a_neg, &identity).await;
+        Ok(())
     }
 }

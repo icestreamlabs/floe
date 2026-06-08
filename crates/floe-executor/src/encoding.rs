@@ -263,7 +263,7 @@ pub(crate) fn encoded_row_column_count(bytes: &[u8]) -> Result<usize> {
     if bytes.len() < 4 {
         return Err(anyhow!("encoded key too short"));
     }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(read_fixed::<4>(bytes, 0, "encoded column count")?) as usize;
     let mut cursor = 4usize;
     for _ in 0..count {
         let tag = *bytes
@@ -279,20 +279,24 @@ fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
     match tag {
         0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C => Ok(cursor),
         0x01 | 0x03 => {
-            let end = cursor + 8;
+            let end = cursor
+                .checked_add(8)
+                .ok_or_else(|| anyhow!("fixed-width value offset overflow"))?;
             bytes
                 .get(cursor..end)
                 .ok_or_else(|| anyhow!("truncated fixed-width value"))?;
             Ok(end)
         }
         0x02 => {
-            let len_bytes = bytes
-                .get(cursor..cursor + 4)
-                .ok_or_else(|| anyhow!("truncated string length"))?;
-            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-            let end = cursor + 4 + len;
+            let len = u32::from_le_bytes(read_fixed::<4>(bytes, cursor, "string length")?) as usize;
+            let start = cursor
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("string payload offset overflow"))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("string payload length overflow"))?;
             bytes
-                .get(cursor + 4..end)
+                .get(start..end)
                 .ok_or_else(|| anyhow!("truncated string payload"))?;
             Ok(end)
         }
@@ -300,17 +304,23 @@ fn encoded_field_end(bytes: &[u8], cursor: usize, tag: u8) -> Result<usize> {
             bytes
                 .get(cursor)
                 .ok_or_else(|| anyhow!("missing boolean payload"))?;
-            Ok(cursor + 1)
+            cursor
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("boolean payload offset overflow"))
         }
         0x09 => {
-            let end = cursor + 4;
+            let end = cursor
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("date32 value offset overflow"))?;
             bytes
                 .get(cursor..end)
                 .ok_or_else(|| anyhow!("truncated date32 value"))?;
             Ok(end)
         }
         0x0B => {
-            let end = cursor + 16;
+            let end = cursor
+                .checked_add(16)
+                .ok_or_else(|| anyhow!("decimal128 value offset overflow"))?;
             bytes
                 .get(cursor..end)
                 .ok_or_else(|| anyhow!("truncated decimal128 value"))?;
@@ -324,20 +334,18 @@ fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<
     match tag {
         0x00 | 0x05 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C => Ok(None),
         0x01 => {
-            let end = cursor + 8;
-            let chunk = bytes
-                .get(cursor..end)
-                .ok_or_else(|| anyhow!("truncated int64"))?;
-            let value = i64::from_le_bytes(chunk.try_into().unwrap());
+            let chunk = read_fixed::<8>(bytes, cursor, "int64")?;
+            let value = i64::from_le_bytes(chunk);
             Ok(Some(EncodedRowScalar::Int64(value)))
         }
         0x02 => {
-            let len_bytes = bytes
-                .get(cursor..cursor + 4)
-                .ok_or_else(|| anyhow!("truncated string length"))?;
-            let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-            let start = cursor + 4;
-            let end = start + len;
+            let len = u32::from_le_bytes(read_fixed::<4>(bytes, cursor, "string length")?) as usize;
+            let start = cursor
+                .checked_add(4)
+                .ok_or_else(|| anyhow!("string payload offset overflow"))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("string payload length overflow"))?;
             let chunk = bytes
                 .get(start..end)
                 .ok_or_else(|| anyhow!("truncated string payload"))?;
@@ -346,11 +354,8 @@ fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<
             Ok(Some(EncodedRowScalar::Utf8(text.to_string())))
         }
         0x03 => {
-            let end = cursor + 8;
-            let chunk = bytes
-                .get(cursor..end)
-                .ok_or_else(|| anyhow!("truncated timestamp"))?;
-            let value = i64::from_le_bytes(chunk.try_into().unwrap());
+            let chunk = read_fixed::<8>(bytes, cursor, "timestamp")?;
+            let value = i64::from_le_bytes(chunk);
             Ok(Some(EncodedRowScalar::TimestampMillis(value)))
         }
         0x04 => {
@@ -360,23 +365,29 @@ fn decode_encoded_scalar(bytes: &[u8], cursor: usize, tag: u8) -> Result<Option<
             Ok(Some(EncodedRowScalar::Bool(flag != 0)))
         }
         0x09 => {
-            let end = cursor + 4;
-            let chunk = bytes
-                .get(cursor..end)
-                .ok_or_else(|| anyhow!("truncated date32 value"))?;
-            let value = i32::from_le_bytes(chunk.try_into().unwrap());
+            let chunk = read_fixed::<4>(bytes, cursor, "date32 value")?;
+            let value = i32::from_le_bytes(chunk);
             Ok(Some(EncodedRowScalar::DateDays(value)))
         }
         0x0B => {
-            let end = cursor + 16;
-            let chunk = bytes
-                .get(cursor..end)
-                .ok_or_else(|| anyhow!("truncated decimal128 value"))?;
-            let value = i128::from_le_bytes(chunk.try_into().unwrap());
+            let chunk = read_fixed::<16>(bytes, cursor, "decimal128 value")?;
+            let value = i128::from_le_bytes(chunk);
             Ok(Some(EncodedRowScalar::Decimal128(value)))
         }
         _ => Err(anyhow!("unknown column tag {tag:#x} in MV key")),
     }
+}
+
+fn read_fixed<const N: usize>(bytes: &[u8], cursor: usize, label: &str) -> Result<[u8; N]> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or_else(|| anyhow!("{label} offset overflow"))?;
+    let chunk = bytes
+        .get(cursor..end)
+        .ok_or_else(|| anyhow!("truncated {label}"))?;
+    let mut out = [0_u8; N];
+    out.copy_from_slice(chunk);
+    Ok(out)
 }
 
 fn is_null_field_tag(tag: u8) -> bool {

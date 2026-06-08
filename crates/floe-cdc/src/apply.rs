@@ -30,7 +30,7 @@ impl CdcTableStore {
     pub async fn load_checkpoint(&self, source_id: &CdcSourceId) -> Result<Option<CdcCheckpoint>> {
         let Some(bytes) = self
             .table
-            .get(&checkpoint_key(source_id))
+            .get(&checkpoint_key(source_id)?)
             .await
             .with_context(|| format!("load CDC checkpoint for source '{}'", source_id.as_str()))?
         else {
@@ -512,7 +512,7 @@ fn ensure_no_unresolved_toast(operation: &str, table_id: &CdcTableId, row: &CdcR
 
 fn stage_checkpoint(checkpoint: &CdcCheckpoint, batch: &mut WriteBatch) -> Result<()> {
     batch.put(
-        checkpoint_key(checkpoint.source_id()),
+        checkpoint_key(checkpoint.source_id())?,
         serde_json::to_vec(checkpoint).context("encode CDC checkpoint")?,
     );
     Ok(())

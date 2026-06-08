@@ -221,31 +221,26 @@ impl<'a> CdcRowStateCursor<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_le_bytes(
-            bytes.try_into().expect("slice length checked"),
-        ))
+        Ok(u32::from_le_bytes(self.read_fixed::<4>()?))
     }
 
     fn read_i64(&mut self) -> Result<i64> {
-        let bytes = self.take(8)?;
-        Ok(i64::from_le_bytes(
-            bytes.try_into().expect("slice length checked"),
-        ))
+        Ok(i64::from_le_bytes(self.read_fixed::<8>()?))
     }
 
     fn read_i32(&mut self) -> Result<i32> {
-        let bytes = self.take(4)?;
-        Ok(i32::from_le_bytes(
-            bytes.try_into().expect("slice length checked"),
-        ))
+        Ok(i32::from_le_bytes(self.read_fixed::<4>()?))
     }
 
     fn read_i128(&mut self) -> Result<i128> {
-        let bytes = self.take(16)?;
-        Ok(i128::from_le_bytes(
-            bytes.try_into().expect("slice length checked"),
-        ))
+        Ok(i128::from_le_bytes(self.read_fixed::<16>()?))
+    }
+
+    fn read_fixed<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let bytes = self.take(N)?;
+        let mut out = [0_u8; N];
+        out.copy_from_slice(bytes);
+        Ok(out)
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {

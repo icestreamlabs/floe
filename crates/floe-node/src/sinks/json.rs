@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use datafusion::arrow::datatypes::SchemaRef;
 use floe_executor::mv_changelog::MvChangelogBatch;
 
@@ -11,7 +11,11 @@ pub(super) fn changelog_row_to_json(
 ) -> Result<serde_json::Value> {
     let mut object = match record_batch_row_to_json(&batch.batch, row_idx, schema)? {
         serde_json::Value::Object(object) => object,
-        _ => unreachable!("record batch rows encode as JSON objects"),
+        other => {
+            return Err(anyhow!(
+                "record batch row encoded as non-object JSON: {other:?}"
+            ));
+        }
     };
     object.insert(
         "__mv_version".to_string(),

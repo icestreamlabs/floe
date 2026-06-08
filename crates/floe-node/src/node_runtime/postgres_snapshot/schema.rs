@@ -413,8 +413,5 @@ pub(super) fn decimal128_type_from_precision_scale(
     if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
         return None;
     }
-    Some(ColumnType::decimal128(
-        precision as u8,
-        i8::try_from(scale).expect("scale <= 38 fits i8"),
-    ))
+    Some(ColumnType::decimal128(precision as u8, scale as i8))
 }

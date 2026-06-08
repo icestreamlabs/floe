@@ -519,7 +519,7 @@ fn postgres_param_from_row_value(
             Ok(PostgresParamValue::Int32(Some(value)))
         }
         (ColumnType::Decimal128 { scale, .. }, RowValue::Decimal128(value)) => Ok(
-            PostgresParamValue::Text(Some(format_decimal128(value, *scale))),
+            PostgresParamValue::Text(Some(format_decimal128(value, *scale)?)),
         ),
         (ColumnType::Numeric, RowValue::Numeric(value)) => {
             Ok(PostgresParamValue::Text(Some(value)))

@@ -235,11 +235,9 @@ impl DbspBridge {
                 bytes.len()
             );
         }
-        Ok(Some(u64::from_le_bytes(
-            bytes[..std::mem::size_of::<u64>()]
-                .try_into()
-                .expect("slice width already checked"),
-        )))
+        let mut version_bytes = [0_u8; std::mem::size_of::<u64>()];
+        version_bytes.copy_from_slice(&bytes);
+        Ok(Some(u64::from_le_bytes(version_bytes)))
     }
 
     fn mv_schema_key(view_name: &str) -> Result<Vec<u8>> {

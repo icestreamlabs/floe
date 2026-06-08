@@ -280,13 +280,18 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                     pending.push_back(input_idx);
                 }
             }
-            DbspNodeKind::Passthrough | DbspNodeKind::Sink(_) => {
-                let operator = match &node.kind {
-                    DbspNodeKind::Passthrough => "passthrough",
-                    DbspNodeKind::Sink(_) => "sink",
-                    _ => unreachable!(),
-                };
-                let input_idx = first_input(node, operator)?;
+            DbspNodeKind::Passthrough => {
+                let input_idx = first_input(node, "passthrough")?;
+                if extend_required_columns(
+                    &mut required_columns_by_node,
+                    input_idx,
+                    required_columns,
+                ) {
+                    pending.push_back(input_idx);
+                }
+            }
+            DbspNodeKind::Sink(_) => {
+                let input_idx = first_input(node, "sink")?;
                 if extend_required_columns(
                     &mut required_columns_by_node,
                     input_idx,

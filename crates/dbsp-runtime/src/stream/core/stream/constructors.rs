@@ -59,7 +59,7 @@ where
         let mut evaluator_key = base.clone();
         evaluator_key.extend_from_slice(b"meta/evaluator");
 
-        let initial_default = group.identity().await;
+        let initial_default = group.identity().await?;
         let state = StreamState::new(initial_default.clone());
         let (frontier_tx, frontier_rx) = watch::channel(state.logical_timestamp);
         let core = Arc::new(StreamCore {
@@ -93,9 +93,10 @@ where
                     "cannot reopen evaluator-derived stream `{namespace}` without its in-memory DBSP evaluator graph"
                 );
             };
-            Arc::get_mut(&mut stream.core)
-                .expect("new stream should have unique core")
-                .evaluator = Some(evaluator);
+            let Some(core) = Arc::get_mut(&mut stream.core) else {
+                bail!("new stream unexpectedly shared its core before evaluator install");
+            };
+            core.evaluator = Some(evaluator);
         }
 
         if let Some(bytes) = stream.table().get_bytes(&stream.core.state_key).await? {
@@ -158,9 +159,10 @@ where
         let namespace = namespace.into();
         register_stream_evaluator(&namespace, evaluator.clone());
         let mut stream = Self::with_table(table, namespace, group).await?;
-        Arc::get_mut(&mut stream.core)
-            .expect("new evaluated stream should have unique core")
-            .evaluator = Some(evaluator);
+        let Some(core) = Arc::get_mut(&mut stream.core) else {
+            bail!("new evaluated stream unexpectedly shared its core before evaluator install");
+        };
+        core.evaluator = Some(evaluator);
         stream
             .table()
             .put(&stream.core.evaluator_key, b"ephemeral")

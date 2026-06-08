@@ -712,10 +712,7 @@ fn numeric_type_from_typmod(type_modifier: i32) -> Option<Result<ColumnType>> {
     if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
         return None;
     }
-    Some(ColumnType::decimal128(
-        precision as u8,
-        i8::try_from(scale).expect("scale <= 38 fits i8"),
-    ))
+    Some(ColumnType::decimal128(precision as u8, scale as i8))
 }
 
 fn parse_pg_date_days(value: &str) -> Result<i32> {

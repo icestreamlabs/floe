@@ -637,7 +637,7 @@ fn row_key_to_json(schema: &CdcTableSchema, key: &CdcRowKey) -> Result<Value> {
             })?;
         object.insert(
             column.clone(),
-            row_value_to_json(value, column_definition.data_type()),
+            row_value_to_json(value, column_definition.data_type())?,
         );
     }
     Ok(Value::Object(object))
@@ -647,31 +647,32 @@ fn row_to_json(schema: &CdcTableSchema, row: &CdcRow) -> Result<Value> {
     schema.validate_row(row)?;
     let mut object = Map::new();
     for (column, value) in schema.columns().iter().zip(row.values()) {
-        object.insert(
-            column.name().to_string(),
-            value
-                .as_ref()
-                .map(|value| row_value_to_json(value, column.data_type()))
-                .unwrap_or(Value::Null),
-        );
+        let value = match value {
+            Some(value) => row_value_to_json(value, column.data_type())?,
+            None => Value::Null,
+        };
+        object.insert(column.name().to_string(), value);
     }
     Ok(Value::Object(object))
 }
 
-fn row_value_to_json(value: &RowValue, data_type: &floe_core::catalog::ColumnType) -> Value {
+fn row_value_to_json(
+    value: &RowValue,
+    data_type: &floe_core::catalog::ColumnType,
+) -> Result<Value> {
     match value {
-        RowValue::Int64(value) => json!(*value),
-        RowValue::Bool(value) => json!(*value),
-        RowValue::Utf8(value) => Value::String(value.clone()),
-        RowValue::TimestampMillis(value) => json!(*value),
-        RowValue::DateDays(value) => json!(*value),
+        RowValue::Int64(value) => Ok(json!(*value)),
+        RowValue::Bool(value) => Ok(json!(*value)),
+        RowValue::Utf8(value) => Ok(Value::String(value.clone())),
+        RowValue::TimestampMillis(value) => Ok(json!(*value)),
+        RowValue::DateDays(value) => Ok(json!(*value)),
         RowValue::Decimal128(value) => match data_type {
             floe_core::catalog::ColumnType::Decimal128 { scale, .. } => {
-                Value::String(format_decimal128(*value, *scale))
+                Ok(Value::String(format_decimal128(*value, *scale)?))
             }
-            _ => Value::String(value.to_string()),
+            _ => Ok(Value::String(value.to_string())),
         },
-        RowValue::Numeric(value) => Value::String(value.clone()),
+        RowValue::Numeric(value) => Ok(Value::String(value.clone())),
     }
 }
 

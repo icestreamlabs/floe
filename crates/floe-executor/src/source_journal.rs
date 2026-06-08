@@ -346,15 +346,11 @@ fn decode_vectorized_entry(value: &[u8]) -> Result<(Option<i64>, Vec<RecordBatch
         bail!("vectorized source batch journal entry missing Arrow header");
     }
     let mut cursor = VECTORIZED_SOURCE_BATCH_JOURNAL_ARROW_MAGIC.len();
-    if value.len() < cursor + 8 {
-        bail!("vectorized source batch journal Arrow entry missing metadata header");
-    }
-    let max_event_time_ms = i64::from_le_bytes(
-        value[cursor..cursor + 8]
-            .try_into()
-            .expect("slice width already checked"),
-    );
-    cursor += 8;
+    let max_event_time_ms = i64::from_le_bytes(read_fixed::<8>(
+        value,
+        &mut cursor,
+        "vectorized source batch journal Arrow metadata header",
+    )?);
 
     let reader = StreamReader::try_new(Cursor::new(&value[cursor..]), None)
         .context("create vectorized source batch journal Arrow reader")?;
@@ -366,6 +362,19 @@ fn decode_vectorized_entry(value: &[u8]) -> Result<(Option<i64>, Vec<RecordBatch
         (max_event_time_ms >= 0).then_some(max_event_time_ms),
         batches,
     ))
+}
+
+fn read_fixed<const N: usize>(value: &[u8], cursor: &mut usize, label: &str) -> Result<[u8; N]> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or_else(|| anyhow!("{label} cursor overflow"))?;
+    if end > value.len() {
+        bail!("{label} truncated");
+    }
+    let mut bytes = [0_u8; N];
+    bytes.copy_from_slice(&value[*cursor..end]);
+    *cursor = end;
+    Ok(bytes)
 }
 
 fn encode_kafka_entry(
@@ -410,67 +419,59 @@ fn decode_kafka_entry(value: &[u8]) -> Result<(Option<i64>, Vec<KafkaSourceJourn
         bail!("kafka source journal entry missing header");
     }
     let mut cursor = 0usize;
-    let max_event_time_ms = i64::from_le_bytes(
-        value[cursor..cursor + 8]
-            .try_into()
-            .expect("slice width already checked"),
-    );
-    cursor += 8;
-    let count = u32::from_le_bytes(
-        value[cursor..cursor + 4]
-            .try_into()
-            .expect("slice width already checked"),
-    ) as usize;
-    cursor += 4;
+    let max_event_time_ms = i64::from_le_bytes(read_fixed::<8>(
+        value,
+        &mut cursor,
+        "kafka source journal timestamp",
+    )?);
+    let count = u32::from_le_bytes(read_fixed::<4>(
+        value,
+        &mut cursor,
+        "kafka source journal count",
+    )?) as usize;
 
     let mut ranges = Vec::with_capacity(count);
     for _ in 0..count {
-        if cursor + 4 > value.len() {
-            bail!("kafka source journal entry truncated before topic length");
+        let topic_len = u32::from_le_bytes(read_fixed::<4>(
+            value,
+            &mut cursor,
+            "kafka source journal topic length",
+        )?) as usize;
+        let topic_end = cursor
+            .checked_add(topic_len)
+            .ok_or_else(|| anyhow!("kafka source journal topic length overflow"))?;
+        if topic_end > value.len() {
+            bail!("kafka source journal entry truncated while decoding topic");
         }
-        let topic_len = u32::from_le_bytes(
-            value[cursor..cursor + 4]
-                .try_into()
-                .expect("slice width already checked"),
-        ) as usize;
-        cursor += 4;
-        if cursor + topic_len + 36 > value.len() {
-            bail!("kafka source journal entry truncated while decoding range");
-        }
-        let topic = std::str::from_utf8(&value[cursor..cursor + topic_len])
+        let topic = std::str::from_utf8(&value[cursor..topic_end])
             .context("kafka source journal topic must be utf8")?
             .to_string();
-        cursor += topic_len;
-        let partition = i32::from_le_bytes(
-            value[cursor..cursor + 4]
-                .try_into()
-                .expect("slice width already checked"),
-        );
-        cursor += 4;
-        let start_offset = i64::from_le_bytes(
-            value[cursor..cursor + 8]
-                .try_into()
-                .expect("slice width already checked"),
-        );
-        cursor += 8;
-        let end_offset = i64::from_le_bytes(
-            value[cursor..cursor + 8]
-                .try_into()
-                .expect("slice width already checked"),
-        );
-        cursor += 8;
-        let row_count = u64::from_le_bytes(
-            value[cursor..cursor + 8]
-                .try_into()
-                .expect("slice width already checked"),
-        );
-        cursor += 8;
-        let checksum = u64::from_le_bytes(
-            value[cursor..cursor + 8]
-                .try_into()
-                .expect("slice width already checked"),
-        );
-        cursor += 8;
+        cursor = topic_end;
+        let partition = i32::from_le_bytes(read_fixed::<4>(
+            value,
+            &mut cursor,
+            "kafka source journal partition",
+        )?);
+        let start_offset = i64::from_le_bytes(read_fixed::<8>(
+            value,
+            &mut cursor,
+            "kafka source journal start offset",
+        )?);
+        let end_offset = i64::from_le_bytes(read_fixed::<8>(
+            value,
+            &mut cursor,
+            "kafka source journal end offset",
+        )?);
+        let row_count = u64::from_le_bytes(read_fixed::<8>(
+            value,
+            &mut cursor,
+            "kafka source journal row count",
+        )?);
+        let checksum = u64::from_le_bytes(read_fixed::<8>(
+            value,
+            &mut cursor,
+            "kafka source journal checksum",
+        )?);
         if start_offset > end_offset {
             bail!(
                 "kafka source journal entry has invalid range {topic}[{partition}] {start_offset}..{end_offset}"

@@ -115,19 +115,18 @@ pub(super) fn deterministic_nexmark_q15_fingerprint(bid_rows: u64) -> ContentFin
         stats.total_bids += 1;
         stats.total_auctions.insert(row.auction);
         match price_rank(row.price) {
-            1 => {
+            PriceRank::Rank1 => {
                 stats.rank1_bids += 1;
                 stats.rank1_auctions.insert(row.auction);
             }
-            2 => {
+            PriceRank::Rank2 => {
                 stats.rank2_bids += 1;
                 stats.rank2_auctions.insert(row.auction);
             }
-            3 => {
+            PriceRank::Rank3 => {
                 stats.rank3_bids += 1;
                 stats.rank3_auctions.insert(row.auction);
             }
-            _ => unreachable!("validated price rank"),
         }
     }
 
@@ -182,19 +181,18 @@ pub(super) fn deterministic_nexmark_q16_fingerprint(bid_rows: u64) -> ContentFin
         stats.total_bids += 1;
         stats.total_auctions.insert(row.auction);
         match price_rank(row.price) {
-            1 => {
+            PriceRank::Rank1 => {
                 stats.rank1_bids += 1;
                 stats.rank1_auctions.insert(row.auction);
             }
-            2 => {
+            PriceRank::Rank2 => {
                 stats.rank2_bids += 1;
                 stats.rank2_auctions.insert(row.auction);
             }
-            3 => {
+            PriceRank::Rank3 => {
                 stats.rank3_bids += 1;
                 stats.rank3_auctions.insert(row.auction);
             }
-            _ => unreachable!("validated price rank"),
         }
     }
 
@@ -241,10 +239,9 @@ pub(super) fn deterministic_nexmark_q17_fingerprint(bid_rows: u64) -> ContentFin
         let stats = stats_by_group.entry((row.auction, row.day)).or_default();
         stats.total_bids += 1;
         match price_rank(row.price) {
-            1 => stats.rank1_bids += 1,
-            2 => stats.rank2_bids += 1,
-            3 => stats.rank3_bids += 1,
-            _ => unreachable!("validated price rank"),
+            PriceRank::Rank1 => stats.rank1_bids += 1,
+            PriceRank::Rank2 => stats.rank2_bids += 1,
+            PriceRank::Rank3 => stats.rank3_bids += 1,
         }
         stats.min_price = Some(
             stats
@@ -304,7 +301,7 @@ fn deterministic_bid_row(bid_idx: u64) -> DeterministicBidRow {
         _ => "baidu",
     };
     let timestamp = DateTime::<Utc>::from_timestamp_millis(NEXMARK_BASE_TS_MS + bid_idx_i64)
-        .expect("deterministic Nexmark timestamp is in range");
+        .unwrap_or(DateTime::UNIX_EPOCH);
     DeterministicBidRow {
         auction,
         price,
@@ -314,13 +311,19 @@ fn deterministic_bid_row(bid_idx: u64) -> DeterministicBidRow {
     }
 }
 
-pub(super) fn price_rank(price: i64) -> u8 {
+enum PriceRank {
+    Rank1,
+    Rank2,
+    Rank3,
+}
+
+fn price_rank(price: i64) -> PriceRank {
     if price < 10_000 {
-        1
+        PriceRank::Rank1
     } else if price < 1_000_000 {
-        2
+        PriceRank::Rank2
     } else {
-        3
+        PriceRank::Rank3
     }
 }
 

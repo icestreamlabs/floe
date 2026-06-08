@@ -118,7 +118,11 @@ where
             handles.push(handle);
         }
 
-        let ts = target_ts.expect("at least one input stream");
+        let Some(ts) = target_ts else {
+            return Err(anyhow!(
+                "handle operator runtime requires at least one input stream"
+            ));
+        };
         Ok((ts, handles))
     }
 }

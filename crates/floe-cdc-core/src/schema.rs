@@ -177,13 +177,14 @@ impl CdcTableSchema {
             .position(|column| column.name() == column_name)
     }
 
-    pub fn primary_key_indices(&self) -> Vec<usize> {
+    pub fn primary_key_indices(&self) -> Result<Vec<usize>> {
         self.primary_key
             .columns()
             .iter()
             .map(|column| {
-                self.column_index(column)
-                    .expect("CDC table schema validated primary-key columns")
+                self.column_index(column).ok_or_else(|| {
+                    anyhow::anyhow!("CDC primary key column '{column}' is not in table schema")
+                })
             })
             .collect()
     }
@@ -261,9 +262,9 @@ impl CdcTableSchema {
             }
         }
         for key_column in self.primary_key.columns() {
-            let column_idx = self
-                .column_index(key_column)
-                .expect("CDC table schema validated primary-key columns");
+            let column_idx = self.column_index(key_column).ok_or_else(|| {
+                anyhow::anyhow!("CDC primary key column '{key_column}' is not in table schema")
+            })?;
             let values = &rows.columns()[column_idx];
             ensure!(
                 !values.has_nulls(),
@@ -285,7 +286,7 @@ impl CdcTableSchema {
 
     fn primary_key_from_validated_row(&self, row: &CdcRow) -> Result<CdcRowKey> {
         let mut values = Vec::with_capacity(self.primary_key.columns().len());
-        for idx in self.primary_key_indices() {
+        for idx in self.primary_key_indices()? {
             let column = &self.columns[idx];
             let Some(value) = row.values()[idx].clone() else {
                 bail!("CDC primary key column '{}' cannot be NULL", column.name());
@@ -306,7 +307,7 @@ impl CdcTableSchema {
             rows.row_count()
         );
         let mut values = Vec::with_capacity(self.primary_key.columns().len());
-        for idx in self.primary_key_indices() {
+        for idx in self.primary_key_indices()? {
             let column = &self.columns[idx];
             let column_values = rows
                 .columns()

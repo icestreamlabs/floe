@@ -45,8 +45,9 @@ impl DerefMut for SnapshotHandleStream {
 ///
 /// fn needs_delta(_stream: &DeltaHandleStream) {}
 ///
-/// let snapshot: SnapshotHandleStream = todo!();
-/// needs_delta(&snapshot);
+/// fn rejected(snapshot: SnapshotHandleStream) {
+///     needs_delta(&snapshot);
+/// }
 /// ```
 #[derive(Clone)]
 pub struct DeltaHandleStream {
