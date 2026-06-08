@@ -231,7 +231,7 @@ impl CdcBufferStore {
             buffered_at_unix_ms: append.buffered_at_unix_ms,
             delivered_at_unix_ms: None,
         };
-        let pending_key = pending_manifest_key(&append.pipeline_name, &transaction_key);
+        let pending_key = pending_manifest_key(&append.pipeline_name, &transaction_key)?;
         let mut pending_stats = self
             .load_or_rebuild_pending_stats(&append.pipeline_name)
             .await?;
@@ -246,13 +246,13 @@ impl CdcBufferStore {
 
         let mut batch = WriteBatch::new();
         if let Some(existing) = existing_pending_manifest.as_ref() {
-            batch.delete(pending_time_index_key_for_manifest(existing));
+            batch.delete(pending_time_index_key_for_manifest(existing)?);
         }
         batch.put(
             pending_key,
             serde_json::to_vec(&manifest).context("encode CDC buffer transaction manifest")?,
         );
-        stage_pending_time_index(&mut batch, &manifest);
+        stage_pending_time_index(&mut batch, &manifest)?;
         stage_pending_stats(&mut batch, &append.pipeline_name, &pending_stats)?;
         let frontier = CdcBufferFrontier {
             pipeline_name: append.pipeline_name.clone(),
@@ -261,7 +261,7 @@ impl CdcBufferStore {
             updated_at_unix_ms: append.buffered_at_unix_ms,
         };
         batch.put(
-            source_frontier_key(&frontier.pipeline_name),
+            source_frontier_key(&frontier.pipeline_name)?,
             serde_json::to_vec(&frontier).context("encode CDC buffer source frontier")?,
         );
         write_batch(self.db.as_ref(), batch, await_durable)
@@ -280,7 +280,8 @@ impl CdcBufferStore {
         limit: usize,
     ) -> Result<Vec<CdcBufferedTransactionManifest>> {
         let limit = limit.max(1);
-        scan_prefix_limit(&self.db, &pending_manifest_prefix(pipeline_name), limit)
+        let prefix = pending_manifest_prefix(pipeline_name)?;
+        scan_prefix_limit(&self.db, &prefix, limit)
             .await?
             .into_iter()
             .map(|(_, value)| {
@@ -371,7 +372,7 @@ impl CdcBufferStore {
     ) -> Result<CdcBufferedTransactionManifest> {
         let delivered = manifest.clone().with_delivered_at(delivered_at_unix_ms);
         let pending_key =
-            pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key());
+            pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key())?;
         let mut pending_stats = self
             .load_or_rebuild_pending_stats(manifest.pipeline_name())
             .await?;
@@ -386,14 +387,14 @@ impl CdcBufferStore {
         let mut batch = WriteBatch::new();
         batch.delete(pending_key);
         if let Some(existing) = existing_pending_manifest.as_ref() {
-            batch.delete(pending_time_index_key_for_manifest(existing));
+            batch.delete(pending_time_index_key_for_manifest(existing)?);
         }
         batch.put(
             delivered_manifest_key(
                 manifest.pipeline_name(),
                 delivered_at_unix_ms,
                 manifest.transaction_key(),
-            ),
+            )?,
             serde_json::to_vec(&delivered).context("encode delivered CDC buffer manifest")?,
         );
         let frontier = CdcBufferFrontier {
@@ -403,7 +404,7 @@ impl CdcBufferStore {
             updated_at_unix_ms: delivered_at_unix_ms,
         };
         batch.put(
-            delivery_frontier_key(manifest.pipeline_name()),
+            delivery_frontier_key(manifest.pipeline_name())?,
             serde_json::to_vec(&frontier).context("encode CDC buffer delivery frontier")?,
         );
         stage_pending_stats(&mut batch, manifest.pipeline_name(), &pending_stats)?;
@@ -416,7 +417,7 @@ impl CdcBufferStore {
     pub async fn source_frontier(&self, pipeline_name: &str) -> Result<Option<CdcBufferFrontier>> {
         load_json(
             &self.db,
-            source_frontier_key(pipeline_name),
+            source_frontier_key(pipeline_name)?,
             "CDC buffer source frontier",
         )
         .await
@@ -428,7 +429,7 @@ impl CdcBufferStore {
     ) -> Result<Option<CdcBufferFrontier>> {
         load_json(
             &self.db,
-            delivery_frontier_key(pipeline_name),
+            delivery_frontier_key(pipeline_name)?,
             "CDC buffer delivery frontier",
         )
         .await
@@ -458,7 +459,7 @@ impl CdcBufferStore {
     ) -> Result<CdcBufferPendingStats> {
         let loaded_stats = load_json::<CdcBufferPendingStats>(
             &self.db,
-            pending_stats_key(pipeline_name),
+            pending_stats_key(pipeline_name)?,
             "CDC buffer pending stats",
         )
         .await?;
@@ -483,7 +484,7 @@ impl CdcBufferStore {
         let mut batch = WriteBatch::new();
         for manifest in manifests {
             stats.add_manifest(&manifest);
-            stage_pending_time_index(&mut batch, &manifest);
+            stage_pending_time_index(&mut batch, &manifest)?;
         }
         stage_pending_stats(&mut batch, pipeline_name, &stats)?;
         write_batch(self.db.as_ref(), batch, false)
@@ -493,7 +494,8 @@ impl CdcBufferStore {
     }
 
     async fn oldest_pending_buffered_at_unix_ms(&self, pipeline_name: &str) -> Result<Option<u64>> {
-        let entries = scan_prefix_limit(&self.db, &pending_time_index_prefix(pipeline_name), 1)
+        let prefix = pending_time_index_prefix(pipeline_name)?;
+        let entries = scan_prefix_limit(&self.db, &prefix, 1)
             .await
             .context("scan CDC buffer pending time index")?;
         let Some((_, value)) = entries.into_iter().next() else {
@@ -524,7 +526,8 @@ impl CdcBufferStore {
         policy: CdcBufferCleanupPolicy,
         now_unix_ms: u64,
     ) -> Result<CdcBufferCleanupSummary> {
-        let delivered = scan_prefix(&self.db, &delivered_manifest_prefix(pipeline_name)).await?;
+        let delivered_prefix = delivered_manifest_prefix(pipeline_name)?;
+        let delivered = scan_prefix(&self.db, &delivered_prefix).await?;
         if !delivered.is_empty() {
             self.db
                 .flush()
@@ -549,7 +552,7 @@ impl CdcBufferStore {
                 continue;
             }
             let pending_key =
-                pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key());
+                pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key())?;
             if self
                 .db
                 .get(pending_key)
@@ -601,9 +604,9 @@ impl CdcBufferStore {
             manifest.pipeline_name(),
             delivered_at,
             manifest.transaction_key(),
-        );
+        )?;
         let pending_key =
-            pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key());
+            pending_manifest_key(manifest.pipeline_name(), manifest.transaction_key())?;
         let mut batch = WriteBatch::new();
         let mut summary = CdcBufferCleanupSummary {
             deleted_transactions: 0,
@@ -727,7 +730,8 @@ impl CdcBufferStore {
         &self,
         pipeline_name: &str,
     ) -> Result<Vec<CdcBufferedTransactionManifest>> {
-        scan_prefix(&self.db, &delivered_manifest_prefix(pipeline_name))
+        let prefix = delivered_manifest_prefix(pipeline_name)?;
+        scan_prefix(&self.db, &prefix)
             .await?
             .into_iter()
             .map(|(_, value)| {

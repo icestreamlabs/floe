@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, ObjectStore};
 
@@ -14,10 +14,12 @@ pub(crate) fn hex_component(bytes: &[u8]) -> String {
     out
 }
 
-pub(crate) fn push_length_prefixed_component(out: &mut Vec<u8>, component: &[u8]) {
-    let len = u32::try_from(component.len()).expect("storage key component length exceeds u32");
+pub(crate) fn push_length_prefixed_component(out: &mut Vec<u8>, component: &[u8]) -> Result<()> {
+    let len = u32::try_from(component.len())
+        .map_err(|_| anyhow!("storage key component length exceeds u32"))?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(component);
+    Ok(())
 }
 
 pub(crate) async fn put_payload_object(

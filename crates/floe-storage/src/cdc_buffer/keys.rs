@@ -5,68 +5,68 @@ use crate::object_payload::{hex_component, push_length_prefixed_component};
 
 const CDC_BUFFER_PREFIX: &[u8] = b"floe_cdc_buffer/v1/";
 
-pub(super) fn source_frontier_key(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
+pub(super) fn source_frontier_key(pipeline_name: &str) -> Result<Vec<u8>> {
+    let mut key = pipeline_prefix(pipeline_name)?;
     key.extend_from_slice(b"frontier/source");
-    key
+    Ok(key)
 }
 
-pub(super) fn delivery_frontier_key(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
+pub(super) fn delivery_frontier_key(pipeline_name: &str) -> Result<Vec<u8>> {
+    let mut key = pipeline_prefix(pipeline_name)?;
     key.extend_from_slice(b"frontier/delivery");
-    key
+    Ok(key)
 }
 
-pub(super) fn pending_manifest_prefix(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
+pub(super) fn pending_manifest_prefix(pipeline_name: &str) -> Result<Vec<u8>> {
+    let mut key = pipeline_prefix(pipeline_name)?;
     key.extend_from_slice(b"pending/");
-    key
+    Ok(key)
 }
 
-pub(super) fn pending_stats_key(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
+pub(super) fn pending_stats_key(pipeline_name: &str) -> Result<Vec<u8>> {
+    let mut key = pipeline_prefix(pipeline_name)?;
     key.extend_from_slice(b"stats/pending");
-    key
+    Ok(key)
 }
 
-pub(super) fn pending_time_index_prefix(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
+pub(super) fn pending_time_index_prefix(pipeline_name: &str) -> Result<Vec<u8>> {
+    let mut key = pipeline_prefix(pipeline_name)?;
     key.extend_from_slice(b"pending_by_time/");
-    key
+    Ok(key)
 }
 
 pub(super) fn pending_time_index_key(
     pipeline_name: &str,
     buffered_at_unix_ms: u64,
     transaction_key: &str,
-) -> Vec<u8> {
-    let mut key = pending_time_index_prefix(pipeline_name);
+) -> Result<Vec<u8>> {
+    let mut key = pending_time_index_prefix(pipeline_name)?;
     key.extend_from_slice(format!("{buffered_at_unix_ms:020}/").as_bytes());
     key.extend_from_slice(transaction_key.as_bytes());
-    key
+    Ok(key)
 }
 
-pub(super) fn pending_manifest_key(pipeline_name: &str, transaction_key: &str) -> Vec<u8> {
-    let mut key = pending_manifest_prefix(pipeline_name);
+pub(super) fn pending_manifest_key(pipeline_name: &str, transaction_key: &str) -> Result<Vec<u8>> {
+    let mut key = pending_manifest_prefix(pipeline_name)?;
     key.extend_from_slice(transaction_key.as_bytes());
-    key
+    Ok(key)
 }
 
-pub(super) fn delivered_manifest_prefix(pipeline_name: &str) -> Vec<u8> {
-    let mut key = pipeline_prefix(pipeline_name);
+pub(super) fn delivered_manifest_prefix(pipeline_name: &str) -> Result<Vec<u8>> {
+    let mut key = pipeline_prefix(pipeline_name)?;
     key.extend_from_slice(b"delivered/");
-    key
+    Ok(key)
 }
 
 pub(super) fn delivered_manifest_key(
     pipeline_name: &str,
     delivered_at_unix_ms: u64,
     transaction_key: &str,
-) -> Vec<u8> {
-    let mut key = delivered_manifest_prefix(pipeline_name);
+) -> Result<Vec<u8>> {
+    let mut key = delivered_manifest_prefix(pipeline_name)?;
     key.extend_from_slice(format!("{delivered_at_unix_ms:020}/").as_bytes());
     key.extend_from_slice(transaction_key.as_bytes());
-    key
+    Ok(key)
 }
 
 pub(super) fn payload_object_key(pipeline_name: &str, transaction_key: &str) -> String {
@@ -84,12 +84,12 @@ pub(super) fn payload_object_prefix(pipeline_name: &str) -> String {
     )
 }
 
-fn pipeline_prefix(pipeline_name: &str) -> Vec<u8> {
+fn pipeline_prefix(pipeline_name: &str) -> Result<Vec<u8>> {
     let mut key = CDC_BUFFER_PREFIX.to_vec();
     key.extend_from_slice(b"pipeline/");
-    push_length_prefixed_component(&mut key, pipeline_name.as_bytes());
+    push_length_prefixed_component(&mut key, pipeline_name.as_bytes())?;
     key.extend_from_slice(b"/");
-    key
+    Ok(key)
 }
 
 pub(super) fn transaction_key(

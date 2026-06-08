@@ -375,7 +375,7 @@ pub(super) fn stage_pending_stats(
     stats: &CdcBufferPendingStats,
 ) -> Result<()> {
     batch.put(
-        pending_stats_key(pipeline_name),
+        pending_stats_key(pipeline_name)?,
         serde_json::to_vec(stats).context("encode CDC buffer pending stats")?,
     );
     Ok(())
@@ -384,16 +384,17 @@ pub(super) fn stage_pending_stats(
 pub(super) fn stage_pending_time_index(
     batch: &mut WriteBatch,
     manifest: &CdcBufferedTransactionManifest,
-) {
+) -> Result<()> {
     batch.put(
-        pending_time_index_key_for_manifest(manifest),
+        pending_time_index_key_for_manifest(manifest)?,
         manifest.buffered_at_unix_ms().to_be_bytes(),
     );
+    Ok(())
 }
 
 pub(super) fn pending_time_index_key_for_manifest(
     manifest: &CdcBufferedTransactionManifest,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     pending_time_index_key(
         manifest.pipeline_name(),
         manifest.buffered_at_unix_ms(),
