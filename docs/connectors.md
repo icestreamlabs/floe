@@ -7,80 +7,168 @@ permalink: /connectors/
 
 # Connectors and Sinks
 
-This page describes the connector and sink behavior Floe exposes today.
+Floe can run with CLI-created connectors or a config file. CLI startup is useful
+for quick local runs. Config files are the preferred path for multiple
+connectors, sinks, Postgres CDC, and production-style settings.
 
-## Lifecycle
+Supported input connectors:
 
-Connectors follow a simple lifecycle:
+- `generator`: built-in Nexmark `nexmark_person`, `nexmark_auction`, and `nexmark_bid` data.
+- `file`: newline-delimited JSON from a local file or stdin.
+- `http`: `POST /ingest` JSON ingestion.
+- `kafka`: JSON or Debezium JSON messages from Kafka topics.
+- `object_store`: newline-delimited JSON from an object-store prefix.
+- `postgres_cdc`: native logical replication with the `pgoutput` plugin.
 
-- init: allocate resources and validate configuration.
-- tick: emit zero or more source events for one logical cycle.
-- shutdown: release resources and finish gracefully.
+Supported sinks:
 
-The runtime drives `tick` at the connector's declared interval and stops when the
-connector reports `Finished` or the runtime is cancelled.
+- `kafka`: MV changelog rows to a Kafka topic.
+- `file`: MV changelog rows to JSONL.
+- `http`: MV changelog batches to an HTTP endpoint.
+- `postgres`: MV changelog rows into a Postgres target table.
 
-Connector lifecycle behavior:
+Postgres CDC replication pipelines can also forward source table changes
+directly to Kafka or Postgres without materializing an MV changelog first.
 
-- pre-tick commit notification: connectors can receive commit decisions
-  before polling (for example, Kafka offsets and Postgres CDC LSN advancement).
-- post-checkpoint barrier: commit notifications are sent only after tick state
-  and checkpoint writes are durable.
+## Configuration Files
 
-## Event Emission
+`--config` accepts TOML, YAML, and JSON. Unknown fields are rejected.
 
-- Connectors send events through the shared source-event channel.
-- Events are expected to be self-contained JSON objects with fields matching the
-  corresponding `SourceDefinition`.
-- A connector should skip emitting events with missing required fields rather
-  than sending partial records.
-- Connectors should attach resume metadata whenever
-  available (partition/offset/LSN/cursor) and may attach `event_time_ms` when
-  source-native event time is known.
+```toml
+[[connectors]]
+type = "kafka"
+name = "bids"
+brokers = "localhost:9092"
+topics = ["nexmark_bid"]
+group_id = "floe"
+default_source = "nexmark_bid"
+poll_ms = 100
+max_messages_per_tick = 256
+format = "floe_json"
 
-## Batching Expectations
+[[materialized_views]]
+name = "mv_bid"
+query = "SELECT auction, bidder, price FROM nexmark_bid WHERE price >= 100"
 
-- The runtime batches events per source before writing to DBSP outer streams.
-- Connectors do not need to implement batching themselves; emitting one event
-  per `tick` is acceptable.
-- If a connector naturally produces batches (e.g., polling a file or stream),
-  it can emit multiple events per `tick` as long as they share the same source
-  schema.
+[[sinks]]
+type = "file"
+name = "mv_bid_file"
+mv = "mv_bid"
+path = "/tmp/mv_bid.jsonl"
+with_snapshot = true
 
-## File Connector Format
+[runtime]
+pgwire_addr = "127.0.0.1:6432"
+admin_port = 8081
+ingest_batch_size = 256
+mv_retain_last = 1
 
-The file connector reads newline-delimited JSON. Each line must be either:
+[storage]
+data_dir = "/tmp/floe-data"
+source_journal = "auto"
+```
 
-- An object containing `source` and `data` fields, where `data` is the row payload.
-- A row payload object, when a default source name is configured.
+Precedence rules:
 
-Examples:
+- If `--config` is present, connector creation flags such as `--http-port`,
+  `--kafka-brokers`, `--kafka-topics`, and `--input-file` are ignored.
+- Runtime and storage flags still apply after config defaults.
+- Existing persisted catalog definitions load first.
+- Config connectors, materialized views, and sinks load next.
+- SQL definitions from `--mv-query` are applied after config parsing.
+
+## Append JSON Payloads
+
+File and HTTP ingest use Floe JSON objects. A payload can be wrapped:
 
 ```json
 {"source":"nexmark_bid","data":{"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}}
 ```
 
+Or it can be an unwrapped row when a default source is configured:
+
 ```json
 {"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}
 ```
 
-## HTTP Ingest Endpoint
+Kafka `floe_json` values can be a wrapped object, an unwrapped row, or an array
+of either form. If an unwrapped Kafka row has no configured `default_source`,
+Floe uses the Kafka topic name as the source.
 
-When enabled, Floe exposes `POST /ingest` to accept JSON payloads. The body can be:
+The Kafka connector applies low-latency fetch settings:
 
-- An object with `source` and `data` fields.
-- A row payload object when a default source is configured.
-- An array of either of the above.
+- `fetch.wait.max.ms = 1`
+- `fetch.queue.backoff.ms = 1`
+- `fetch.min.bytes = 1`
+- `enable.auto.offset.store = false`
 
-Optional query parameter `source` overrides the configured default source.
+## Connector Reference
 
-Examples:
+### Generator
+
+CLI:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/ingest \
-  -H 'content-type: application/json' \
-  -d '{"source":"nexmark_bid","data":{"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}}'
+cargo run -p floe-node -- run \
+  --events-per-second 100 \
+  --max-events 10000 \
+  --mv-query "CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid"
 ```
+
+Config:
+
+```toml
+[[connectors]]
+type = "generator"
+events_per_second = 100.0
+max_events = 10000
+```
+
+### File
+
+CLI:
+
+```bash
+cargo run -p floe-node -- run \
+  --input-file /path/to/events.jsonl \
+  --input-source nexmark_bid \
+  --mv-query "CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid"
+```
+
+Config:
+
+```toml
+[[connectors]]
+type = "file"
+path = "/path/to/events.jsonl"
+default_source = "nexmark_bid"
+```
+
+Use `-` as the path to read from stdin.
+
+### HTTP
+
+CLI:
+
+```bash
+cargo run -p floe-node -- run \
+  --http-port 8080 \
+  --http-source nexmark_bid \
+  --mv-query "CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid"
+```
+
+Config:
+
+```toml
+[[connectors]]
+type = "http"
+host = "127.0.0.1"
+port = 8080
+default_source = "nexmark_bid"
+```
+
+Requests go to `POST /ingest`. Optional query parameter `source` overrides the
+configured default source:
 
 ```bash
 curl -X POST 'http://127.0.0.1:8080/ingest?source=nexmark_bid' \
@@ -88,99 +176,43 @@ curl -X POST 'http://127.0.0.1:8080/ingest?source=nexmark_bid' \
   -d '{"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}'
 ```
 
-## Kafka Connector
+### Kafka
 
-When enabled, Floe consumes JSON payloads from Kafka topics. Each message value can be:
+CLI:
 
-- An object with `source` and `data` fields.
-- A row payload object, which uses the configured default source if provided.
-- A row payload object with no default source, which falls back to the Kafka topic name.
-- An array of either of the above.
-
-Examples (message value):
-
-```json
-{"source":"nexmark_bid","data":{"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}}
+```bash
+cargo run -p floe-node -- run \
+  --kafka-brokers localhost:9092 \
+  --kafka-topics nexmark_bid \
+  --kafka-default-source nexmark_bid \
+  --kafka-poll-ms 100 \
+  --kafka-max-messages 256 \
+  --mv-query "CREATE MATERIALIZED VIEW mv AS SELECT * FROM nexmark_bid"
 ```
 
-```json
-{"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}
-```
-
-Enable it with `--kafka-brokers` and `--kafka-topics`. Optional flags:
-`--kafka-group-id`, `--kafka-default-source`, `--kafka-poll-ms`, and
-`--kafka-max-messages`.
-
-## Connector Configuration Files
-
-Floe can load connector and sink definitions from a config file:
-
-- `--config path/to/connectors.toml`
-- Supported formats: TOML, YAML, JSON
-- Configuration can also include `materialized_views`, `runtime`, `storage`,
-  and `maintenance` sections.
-
-Example (TOML):
+Config:
 
 ```toml
-[[connectors]]
-type = "generator"
-events_per_second = 50.0
-max_events = 10000
-
 [[connectors]]
 type = "kafka"
 brokers = "localhost:9092"
 topics = ["nexmark_bid"]
 group_id = "floe"
 default_source = "nexmark_bid"
-
-[[connectors]]
-type = "http"
-host = "127.0.0.1"
-port = 8080
-default_source = "nexmark_bid"
-
-[[sinks]]
-type = "file"
-mv = "mv_bid_passthrough"
-path = "/tmp/mv_bid.jsonl"
-with_snapshot = true
+poll_ms = 100
+max_messages_per_tick = 256
+format = "floe_json"
 ```
 
-### Merge and Precedence Rules
+Kafka input formats:
 
-When multiple inputs are provided, Floe applies deterministic precedence:
+- `floe_json`: Floe wrapped/unwrapped JSON. This is the default.
+- `debezium_json`: Debezium-style change envelopes.
 
-1. Connector and sink definitions in `--config` are the base runtime input.
-2. `CREATE MATERIALIZED VIEW` and `CREATE SINK` statements from `--mv-query`
-   are applied after config parsing.
-3. Existing persisted materialized views are loaded first, then config/SQL
-   updates are applied in process startup order.
+### Object Store
 
-Operational notes:
-
-- If `--config` is present, connector creation flags (`--http-port`,
-  `--kafka-brokers`, `--kafka-topics`, `--input-file`) are ignored.
-- Runtime/storage knobs (for example `--slatedb-*`, `--zset-*`,
-  `--mv-retain-last`) still apply when `--config` is used.
-
-Connector config fields are exposed for introspection (for example,
-`connector.kafka.brokers` and `connector.generator.events_per_second`).
-
-Validation rules:
-
-- Required string fields must be non-empty (for example `brokers`, `slot`, `url`).
-- Numeric rate/limit fields must be positive when provided.
-- Connector-specific required collections (for example Kafka `topics`) must be
-  non-empty.
-
-## Object Store Connector
-
-The object store connector reads newline-delimited JSON from an object store
-prefix (S3-compatible via `s3://` URLs).
-
-Example (TOML):
+The object-store connector reads newline-delimited JSON under a URL prefix such
+as `s3://bucket/prefix/`.
 
 ```toml
 [[connectors]]
@@ -189,75 +221,191 @@ url = "s3://my-bucket/events/nexmark/"
 default_source = "nexmark_bid"
 ```
 
-The connector lists all objects under the prefix and ingests each line as an
-event payload.
+### Postgres CDC
 
-## Postgres CDC Connector
-
-The Postgres CDC connector uses native logical replication with the built-in
-`pgoutput` plugin. It reads from an existing logical replication slot and
-publication, and reports the applied LSN only after Floe's durable tick-commit
-barrier. CDC-backed tables use the native CDC table runtime so inserts, updates,
-and deletes can be reflected in materialized views and replication pipelines.
-
-Example (TOML):
+The Postgres CDC connector uses native logical replication with `pgoutput`.
+It can auto-create the publication and slot when the configured user has enough
+privileges.
 
 ```toml
 [[connectors]]
 type = "postgres_cdc"
+name = "pg_main"
 connection = "postgres://user:password@localhost:5432/db"
 slot = "floe_slot"
 publication = "floe_publication"
-include_tables = ["nexmark_bid", "nexmark_auction"]
+include_tables = ["public.orders", "public.customers"]
+include_schema_in_source = true
+schema_evolution_policy = "ignore_compatible"
+auto_create_slot = true
+auto_create_publication = true
 ```
 
-## Sink Connectors
+CDC-backed tables are declared in SQL:
 
-Sinks stream materialized view changelog output to external systems. Each sink
-specifies the materialized view name (`mv`) and optional stream parameters
-(`with_snapshot`, `as_of`).
+```sql
+CREATE TABLE orders (
+  id BIGINT PRIMARY KEY,
+  amount BIGINT NOT NULL,
+  status TEXT
+) FROM pg_main TABLE 'public.orders';
+```
 
-Supported sinks:
+Postgres CDC settings:
 
-- Kafka (`type = "kafka"`) writes JSON rows to a topic.
-- File (`type = "file"`) appends JSONL rows to a file.
-- HTTP (`type = "http"`) POSTs JSON batches to a URL.
-- Postgres (`type = "postgres"`) writes MV changes into a target table.
+```toml
+[postgres_cdc.snapshot]
+rows_per_batch = 16384
+max_workers = 1
+intra_table_chunks = 1
+adaptive_concurrency = true
+min_workers = 1
+wal_buffer_high_watermark_percent = 75
+wal_buffer_low_watermark_percent = 25
+slow_scan_ms = 30000
+controller_interval_ms = 500
 
-Postgres sinks support two modes:
+[postgres_cdc.reconnect]
+max_reconnects = 10
+retry_base_ms = 1000
+retry_max_backoff_ms = 30000
+```
 
-- `mode = "upsert"` requires `primary_key = [...]`. Negative diffs delete by
-  key, then positive diffs upsert rows in the same transaction.
-- `mode = "append_only"` inserts positive diffs and fails if the MV emits a
-  negative diff.
+Postgres CDC limits:
+
+- CDC tables need primary-key metadata for updates, deletes, and upsert targets.
+- Common scalar types are covered; arrays, enums/domains, intervals, and range
+  types are not currently supported.
+- Compatible appended nullable non-key columns can be ignored or applied
+  according to `schema_evolution_policy`; incompatible changes fail closed.
+- Automatic failover discovery is not available. Use stable DNS/proxy endpoints
+  and compatible logical slots/publications after promotion.
+
+## Sink Reference
+
+Sinks consume MV changelog output. Common changelog options are `with_snapshot`
+and `as_of`.
 
 Reliability and throughput options:
 
-- `batch_rows` (Kafka/File/HTTP): flush when buffered row count reaches threshold.
-- `batch_bytes` (Kafka/File/HTTP): flush when buffered serialized bytes reach
-  threshold.
-- `queue_capacity` (Kafka/File/HTTP): bounded in-memory queue size between the
-  changelog producer and sink worker.
-- `retry_max_attempts` (Kafka/HTTP/Postgres): max delivery attempts before
-  permanent failure.
-- `retry_base_ms` (Kafka/HTTP/Postgres): base delay for exponential backoff.
-- `retry_max_backoff_ms` (Kafka/HTTP/Postgres): max delay cap for backoff.
+- `batch_rows`
+- `batch_bytes`
+- `queue_capacity`
+- `retry_max_attempts`
+- `retry_base_ms`
+- `retry_max_backoff_ms`
+
+Kafka sinks:
+
+```toml
+[[sinks]]
+type = "kafka"
+name = "mv_bid_kafka"
+brokers = "localhost:9092"
+topic = "mv_bid"
+mv = "mv_bid"
+format = "json"
+with_snapshot = true
+batch_rows = 1000
+```
+
+Kafka sink formats are `json` and `debezium_json`. Debezium sinks require
+`key_columns`. Config-file Kafka sinks also support `transactional_id`,
+`checkpoint_topic`, and `checkpoint_partition`.
+
+File sinks:
+
+```toml
+[[sinks]]
+type = "file"
+name = "mv_bid_file"
+path = "/tmp/mv_bid.jsonl"
+mv = "mv_bid"
+append = true
+with_snapshot = true
+```
+
+HTTP sinks:
+
+```toml
+[[sinks]]
+type = "http"
+name = "mv_bid_http"
+url = "http://127.0.0.1:9000/mv_bid"
+mv = "mv_bid"
+batch_size = 100
+with_snapshot = true
+```
+
+Postgres sinks:
+
+```toml
+[[sinks]]
+type = "postgres"
+name = "mv_bid_pg"
+connection = "postgres://postgres:postgres@localhost/postgres"
+table = "public.mv_bid"
+mv = "mv_bid"
+mode = "upsert"
+primary_key = ["auction"]
+with_snapshot = true
+```
+
+Postgres sink modes:
+
+- `upsert`: negative diffs delete by key and positive diffs upsert in one transaction.
+- `append_only`: inserts positive diffs and fails if the MV emits a negative diff.
 
 Execution semantics:
 
-- Kafka/File/HTTP rows are flushed on threshold, MV version boundary, and shutdown.
-- Postgres applies each MV version in one transaction and checkpoints after
-  commit. The sink uses temporary text staging tables loaded by
-  `COPY FROM STDIN`, then applies a bulk delete/upsert or append statement.
+- Kafka, file, and HTTP sinks flush on thresholds, MV version boundaries, and shutdown.
+- Postgres applies each MV version in one transaction.
 - Kafka and HTTP sinks retry transient failures with bounded exponential backoff.
 - Permanent failures are recorded and stop the sink task.
-- Backpressure is applied via bounded queues for queued sinks and directly by
-  the Postgres commit path for Postgres sinks.
-- Metrics exported per sink:
-  - `floe_sink_queue_depth{sink=...}`
-  - `floe_sink_version_lag{sink=...}`
-  - `floe_sink_failures_total{sink=...,transport=...}`
-  - `floe_sink_retries_total{sink=...,transport=...}`
+- Bounded queues apply backpressure when consumers fall behind.
 
-See the [operations page]({{ site.baseurl }}/operations/) for health checks,
-metrics, and CDC operator endpoints.
+## CDC Replication Pipelines
+
+Replication pipelines forward Postgres CDC source-table changes directly to
+Kafka or Postgres targets:
+
+```sql
+CREATE REPLICATION PIPELINE pg_orders_to_kafka
+FROM pg_main TABLE 'public.orders'
+INTO KAFKA WITH (
+  brokers = 'localhost:9092',
+  topic = 'orders_cdc',
+  format = 'debezium-json',
+  durable_buffer = true,
+  buffer.max_pending_bytes = 1048576,
+  error.policy = 'dead-letter-and-continue'
+);
+```
+
+Durable buffers are enabled by default and are bounded by the global
+`[replication.buffer_limits]` settings plus any per-pipeline caps.
+
+```toml
+[replication.buffer_limits]
+max_pending_bytes = 10737418240
+max_pending_records = 0
+max_pending_transactions = 0
+max_pending_age_ms = 0
+
+[replication.buffer_cleanup]
+delivered_retention_ms = 5000
+orphan_retention_ms = 60000
+cleanup_interval_ms = 5000
+
+[replication.kafka]
+message_max_bytes = 10485760
+acks = "1"
+enable_idempotence = false
+linger_ms = 1
+
+[replication.encoding]
+arrow_ipc_rows_per_record = 16384
+snapshot_batches_per_chunk = 1
+arrow_ipc_compression = "lz4_frame"
+kafka_metadata_headers = false
+```
