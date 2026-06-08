@@ -38,6 +38,45 @@ semantics for materialized views and SUBSCRIBE.
   not the full `CREATE MATERIALIZED VIEW` statement.
 - The runtime currently accepts at most one materialized view per process.
 
+## Startup SQL vs pgwire SQL
+
+`CREATE SOURCE`, source-backed `CREATE TABLE`, `CREATE MATERIALIZED VIEW`,
+`CREATE SINK`, and `CREATE REPLICATION PIPELINE` are supported as startup SQL
+through `--mv-query`. Despite the flag name, `--mv-query` accepts a full Floe
+SQL program, not only one materialized-view statement.
+
+Runtime DDL over pgwire is not supported yet. After the node is running, pgwire
+clients can query materialized views and run `SUBSCRIBE`, but cannot issue
+`CREATE SOURCE`, `CREATE TABLE`, `CREATE MATERIALIZED VIEW`, `CREATE SINK`, or
+`CREATE REPLICATION PIPELINE`.
+
+Example startup SQL:
+
+```bash
+cargo run -p floe-node -- run --mv-query "
+CREATE SOURCE pg_main WITH (
+  connector = 'postgres-cdc',
+  connection = 'postgres://postgres:postgres@localhost/postgres',
+  slot.name = 'floe_slot',
+  publication.name = 'floe_pub'
+);
+
+CREATE TABLE orders (
+  id BIGINT PRIMARY KEY,
+  amount BIGINT NOT NULL
+) FROM pg_main TABLE 'public.orders';
+
+CREATE MATERIALIZED VIEW mv_orders AS
+SELECT * FROM orders;
+
+CREATE SINK out_orders FROM mv_orders WITH (
+  connector = 'file',
+  path = '/tmp/orders.jsonl',
+  with_snapshot = true
+);
+"
+```
+
 ## CREATE SOURCE
 
 `CREATE SOURCE` currently supports the native Postgres CDC connector:

@@ -77,6 +77,10 @@ Precedence rules:
 - Config connectors, materialized views, and sinks load next.
 - SQL definitions from `--mv-query` are applied after config parsing.
 
+`--mv-query` can also define Postgres CDC sources, source-backed tables, sinks,
+and replication pipelines with SQL at startup. See the [SQL reference]({{ site.baseurl }}/sql/)
+for the full startup-SQL boundary. Runtime DDL over pgwire is not supported yet.
+
 ## Append JSON Payloads
 
 File and HTTP ingest use Floe JSON objects. A payload can be wrapped:
