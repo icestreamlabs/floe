@@ -7,111 +7,13 @@ use prometheus::{
     register_int_gauge_vec,
 };
 
-struct OptionalMetricValue<T> {
-    metric: Option<T>,
-}
+#[path = "metrics/optional.rs"]
+mod optional;
 
-trait OptionalIntGauge {
-    fn set(&self, value: i64);
-}
-
-trait OptionalIntGaugeVec {
-    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<IntGauge>;
-}
-
-trait OptionalIntCounterVec {
-    fn with_label_values(
-        &self,
-        label_values: &[&str],
-    ) -> OptionalMetricValue<prometheus::IntCounter>;
-}
-
-trait OptionalHistogram {
-    fn observe(&self, value: f64);
-}
-
-trait OptionalHistogramVec {
-    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram>;
-}
-
-impl OptionalIntGauge for LazyLock<Option<IntGauge>> {
-    fn set(&self, value: i64) {
-        if let Some(metric) = self.as_ref() {
-            metric.set(value);
-        }
-    }
-}
-
-impl OptionalIntGauge for OptionalMetricValue<IntGauge> {
-    fn set(&self, value: i64) {
-        if let Some(metric) = &self.metric {
-            metric.set(value);
-        }
-    }
-}
-
-impl OptionalIntGaugeVec for LazyLock<Option<IntGaugeVec>> {
-    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<IntGauge> {
-        OptionalMetricValue {
-            metric: self
-                .as_ref()
-                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
-        }
-    }
-}
-
-impl OptionalIntCounterVec for LazyLock<Option<IntCounterVec>> {
-    fn with_label_values(
-        &self,
-        label_values: &[&str],
-    ) -> OptionalMetricValue<prometheus::IntCounter> {
-        OptionalMetricValue {
-            metric: self
-                .as_ref()
-                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
-        }
-    }
-}
-
-impl OptionalMetricValue<prometheus::IntCounter> {
-    fn inc(&self) {
-        if let Some(metric) = &self.metric {
-            metric.inc();
-        }
-    }
-
-    fn inc_by(&self, value: u64) {
-        if let Some(metric) = &self.metric {
-            metric.inc_by(value);
-        }
-    }
-}
-
-impl OptionalHistogram for LazyLock<Option<Histogram>> {
-    fn observe(&self, value: f64) {
-        if let Some(metric) = self.as_ref() {
-            metric.observe(value);
-        }
-    }
-}
-
-impl OptionalHistogram for OptionalMetricValue<Histogram> {
-    fn observe(&self, value: f64) {
-        if let Some(metric) = &self.metric {
-            metric.observe(value);
-        }
-    }
-}
-
-impl OptionalHistogramVec for LazyLock<Option<HistogramVec>> {
-    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram> {
-        OptionalMetricValue {
-            metric: self
-                .as_ref()
-                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
-        }
-    }
-}
+use self::optional::{
+    OptionalHistogram, OptionalHistogramVec, OptionalIntCounterVec, OptionalIntGauge,
+    OptionalIntGaugeVec,
+};
 
 static INGEST_QUEUE_DEPTH: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     register_int_gauge!(
