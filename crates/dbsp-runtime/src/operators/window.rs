@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
-use prometheus::{IntCounter, IntGauge, register_int_counter, register_int_gauge};
+use prometheus::{IntCounter, IntGauge, core::Collector};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -27,29 +27,91 @@ use crate::stream::util::delta_zset_handle;
 type BatchWindowExtractor<V, K> = Arc<dyn Fn(&[(V, i64)]) -> Vec<(V, i64, K, i64)> + Send + Sync>;
 type Aggregator<K, V, A> = Arc<dyn Fn(&K, &[(V, i64)]) -> Option<A> + Send + Sync>;
 
-pub(crate) static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter!(
-        "floe_window_events_dropped_too_late_total",
-        "Number of input rows dropped by window operators because they arrived beyond allowed lateness",
-    )
-    .expect("register floe_window_events_dropped_too_late_total")
-});
+trait OptionalIntCounter {
+    fn inc(&self);
+    fn inc_by(&self, value: u64);
+}
 
-pub(crate) static WINDOW_STATE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
-    register_int_gauge!(
+trait OptionalIntGauge {
+    fn set(&self, value: i64);
+}
+
+impl OptionalIntCounter for LazyLock<Option<IntCounter>> {
+    fn inc(&self) {
+        if let Some(metric) = self.as_ref() {
+            metric.inc();
+        }
+    }
+
+    fn inc_by(&self, value: u64) {
+        if let Some(metric) = self.as_ref() {
+            metric.inc_by(value);
+        }
+    }
+}
+
+impl OptionalIntGauge for LazyLock<Option<IntGauge>> {
+    fn set(&self, value: i64) {
+        if let Some(metric) = self.as_ref() {
+            metric.set(value);
+        }
+    }
+}
+
+fn register_metric<T>(name: &str, metric: T) -> T
+where
+    T: Collector + Clone + 'static,
+{
+    if let Err(error) = prometheus::register(Box::new(metric.clone())) {
+        tracing::warn!(metric = name, %error, "failed to register Prometheus metric");
+    }
+    metric
+}
+
+fn int_counter(name: &str, help: &str) -> Option<IntCounter> {
+    IntCounter::new(name, help)
+        .map(|metric| register_metric(name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+fn int_gauge(name: &str, help: &str) -> Option<IntGauge> {
+    IntGauge::new(name, help)
+        .map(|metric| register_metric(name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+pub(crate) static WINDOW_DROPPED_TOO_LATE_TOTAL: LazyLock<Option<IntCounter>> = LazyLock::new(
+    || {
+        int_counter(
+            "floe_window_events_dropped_too_late_total",
+            "Number of input rows dropped by window operators because they arrived beyond allowed lateness",
+        )
+    },
+);
+
+pub(crate) static WINDOW_STATE_ENTRIES: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
+    int_gauge(
         "floe_window_state_entries",
         "Approximate number of active window aggregate entries currently retained",
     )
-    .expect("register floe_window_state_entries")
 });
 
-pub(crate) static WINDOW_STATE_LIMIT_EXCEEDED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter!(
-        "floe_window_state_limit_exceeded_total",
-        "Number of times window aggregate state exceeded configured FLOE_WINDOW_STATE_MAX_ENTRIES limit",
-    )
-    .expect("register floe_window_state_limit_exceeded_total")
-});
+pub(crate) static WINDOW_STATE_LIMIT_EXCEEDED_TOTAL: LazyLock<Option<IntCounter>> = LazyLock::new(
+    || {
+        int_counter(
+            "floe_window_state_limit_exceeded_total",
+            "Number of times window aggregate state exceeded configured FLOE_WINDOW_STATE_MAX_ENTRIES limit",
+        )
+    },
+);
 
 pub(crate) static WINDOW_STATE_LIMIT: LazyLock<Option<usize>> = LazyLock::new(|| {
     std::env::var("FLOE_WINDOW_STATE_MAX_ENTRIES")

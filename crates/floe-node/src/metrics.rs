@@ -7,568 +7,684 @@ use prometheus::{
     register_int_gauge_vec,
 };
 
-static INGEST_QUEUE_DEPTH: LazyLock<IntGauge> = LazyLock::new(|| {
+struct OptionalMetricValue<T> {
+    metric: Option<T>,
+}
+
+trait OptionalIntGauge {
+    fn set(&self, value: i64);
+}
+
+trait OptionalIntGaugeVec {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<IntGauge>;
+}
+
+trait OptionalIntCounterVec {
+    fn with_label_values(
+        &self,
+        label_values: &[&str],
+    ) -> OptionalMetricValue<prometheus::IntCounter>;
+}
+
+trait OptionalHistogram {
+    fn observe(&self, value: f64);
+}
+
+trait OptionalHistogramVec {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram>;
+}
+
+impl OptionalIntGauge for LazyLock<Option<IntGauge>> {
+    fn set(&self, value: i64) {
+        if let Some(metric) = self.as_ref() {
+            metric.set(value);
+        }
+    }
+}
+
+impl OptionalIntGauge for OptionalMetricValue<IntGauge> {
+    fn set(&self, value: i64) {
+        if let Some(metric) = &self.metric {
+            metric.set(value);
+        }
+    }
+}
+
+impl OptionalIntGaugeVec for LazyLock<Option<IntGaugeVec>> {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<IntGauge> {
+        OptionalMetricValue {
+            metric: self
+                .as_ref()
+                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
+        }
+    }
+}
+
+impl OptionalIntCounterVec for LazyLock<Option<IntCounterVec>> {
+    fn with_label_values(
+        &self,
+        label_values: &[&str],
+    ) -> OptionalMetricValue<prometheus::IntCounter> {
+        OptionalMetricValue {
+            metric: self
+                .as_ref()
+                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
+        }
+    }
+}
+
+impl OptionalMetricValue<prometheus::IntCounter> {
+    fn inc(&self) {
+        if let Some(metric) = &self.metric {
+            metric.inc();
+        }
+    }
+
+    fn inc_by(&self, value: u64) {
+        if let Some(metric) = &self.metric {
+            metric.inc_by(value);
+        }
+    }
+}
+
+impl OptionalHistogram for LazyLock<Option<Histogram>> {
+    fn observe(&self, value: f64) {
+        if let Some(metric) = self.as_ref() {
+            metric.observe(value);
+        }
+    }
+}
+
+impl OptionalHistogram for OptionalMetricValue<Histogram> {
+    fn observe(&self, value: f64) {
+        if let Some(metric) = &self.metric {
+            metric.observe(value);
+        }
+    }
+}
+
+impl OptionalHistogramVec for LazyLock<Option<HistogramVec>> {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram> {
+        OptionalMetricValue {
+            metric: self
+                .as_ref()
+                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
+        }
+    }
+}
+
+static INGEST_QUEUE_DEPTH: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     register_int_gauge!(
         "floe_ingest_queue_depth",
         "Number of events buffered between connectors and the executor"
     )
-    .expect("register floe_ingest_queue_depth")
+    .ok()
 });
 
-static INGEST_DECODE_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
+static INGEST_DECODE_LATENCY_MS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
     register_histogram!(HistogramOpts::new(
         "floe_ingest_decode_latency_ms",
         "Time spent decoding a batch of append ingest events in milliseconds",
     ))
-    .expect("register floe_ingest_decode_latency_ms")
+    .ok()
 });
 
-static INGEST_TICK_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
+static INGEST_TICK_LATENCY_MS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
     register_histogram!(HistogramOpts::new(
         "floe_ingest_tick_latency_ms",
         "Time spent advancing source frontiers per ingestion tick in milliseconds",
     ))
-    .expect("register floe_ingest_tick_latency_ms")
+    .ok()
 });
 
-static INGEST_TICK_PHASE_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+static INGEST_TICK_PHASE_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
     register_histogram_vec!(
         "floe_ingest_tick_phase_latency_ms",
         "Time spent in ingest tick phases in milliseconds",
         &["phase"]
     )
-    .expect("register floe_ingest_tick_phase_latency_ms")
+    .ok()
 });
 
-static INGEST_TICKS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static INGEST_TICKS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_ingest_ticks_total",
         "Total number of successful ingest ticks",
         &["result"]
     )
-    .expect("register floe_ingest_ticks_total")
+    .ok()
 });
 
-static LAST_COMMITTED_TICK: LazyLock<IntGauge> = LazyLock::new(|| {
+static LAST_COMMITTED_TICK: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     register_int_gauge!(
         "floe_last_committed_tick",
         "Most recently committed ingestion tick id"
     )
-    .expect("register floe_last_committed_tick")
+    .ok()
 });
 
-static CHECKPOINT_AGE_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
+static CHECKPOINT_AGE_SECONDS: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     register_int_gauge!(
         "floe_checkpoint_age_seconds",
         "Seconds elapsed since the latest committed tick checkpoint"
     )
-    .expect("register floe_checkpoint_age_seconds")
+    .ok()
 });
 
-static SOURCE_OFFSET_LAG: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static SOURCE_OFFSET_LAG: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_source_offset_lag",
         "Difference between latest observed source offset and last committed offset",
         &["source", "partition"]
     )
-    .expect("register floe_source_offset_lag")
+    .ok()
 });
 
-static WATERMARK_LAG_MS: LazyLock<IntGauge> = LazyLock::new(|| {
+static WATERMARK_LAG_MS: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     register_int_gauge!(
         "floe_watermark_lag_ms",
         "Difference between wall-clock time and current global watermark in milliseconds",
     )
-    .expect("register floe_watermark_lag_ms")
+    .ok()
 });
 
-static SOURCE_WATERMARK_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static SOURCE_WATERMARK_MS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_source_watermark_ms",
         "Latest observed watermark timestamp (ms) per source",
         &["source"]
     )
-    .expect("register floe_source_watermark_ms")
+    .ok()
 });
 
-static GLOBAL_WATERMARK_MS: LazyLock<IntGauge> = LazyLock::new(|| {
+static GLOBAL_WATERMARK_MS: LazyLock<Option<IntGauge>> = LazyLock::new(|| {
     register_int_gauge!(
         "floe_global_watermark_ms",
         "Latest propagated global watermark timestamp (ms)",
     )
-    .expect("register floe_global_watermark_ms")
+    .ok()
 });
 
-static MV_FRESHNESS_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static MV_FRESHNESS_SECONDS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_mv_freshness_seconds",
         "Seconds since each materialized view last advanced to a new committed version",
         &["view"]
     )
-    .expect("register floe_mv_freshness_seconds")
+    .ok()
 });
 
-static SINK_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static SINK_QUEUE_DEPTH: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_sink_queue_depth",
         "Number of records currently buffered in a sink queue",
         &["sink"]
     )
-    .expect("register floe_sink_queue_depth")
+    .ok()
 });
 
-static SINK_VERSION_LAG: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static SINK_VERSION_LAG: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_sink_version_lag",
         "Difference between latest enqueued and latest flushed MV version per sink",
         &["sink"]
     )
-    .expect("register floe_sink_version_lag")
+    .ok()
 });
 
-static SINK_FAILURES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static SINK_FAILURES: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_sink_failures_total",
         "Total sink emission failures by sink and transport",
         &["sink", "transport"]
     )
-    .expect("register floe_sink_failures_total")
+    .ok()
 });
 
-static SINK_RETRIES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static SINK_RETRIES: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_sink_retries_total",
         "Total sink retry attempts by sink and transport",
         &["sink", "transport"]
     )
-    .expect("register floe_sink_retries_total")
+    .ok()
 });
 
-static RUNTIME_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static RUNTIME_ERRORS: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_runtime_errors_total",
         "Total runtime errors by component",
         &["component"]
     )
-    .expect("register floe_runtime_errors_total")
+    .ok()
 });
 
-static POSTGRES_CDC_UPSTREAM_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_UPSTREAM_LSN: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_upstream_lsn",
         "Latest observed upstream Postgres WAL LSN per CDC source and slot",
         &["source", "slot"]
     )
-    .expect("register floe_postgres_cdc_upstream_lsn")
+    .ok()
 });
 
-static POSTGRES_CDC_DURABLE_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_DURABLE_LSN: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_durable_lsn",
         "Latest SlateDB-durable Postgres CDC LSN per source and slot",
         &["source", "slot"]
     )
-    .expect("register floe_postgres_cdc_durable_lsn")
+    .ok()
 });
 
-static POSTGRES_CDC_SOURCE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_SOURCE_LAG_BYTES: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_source_lag_bytes",
         "Byte lag between latest observed upstream Postgres WAL LSN and durable Floe CDC LSN",
         &["source", "slot"]
     )
-    .expect("register floe_postgres_cdc_source_lag_bytes")
+    .ok()
 });
 
-static POSTGRES_CDC_SOURCE_CONNECTED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_SOURCE_CONNECTED: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_source_connected",
         "Whether the Postgres CDC replication stream is currently connected",
         &["source", "slot"]
     )
-    .expect("register floe_postgres_cdc_source_connected")
+    .ok()
 });
 
-static POSTGRES_CDC_RECONNECTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static POSTGRES_CDC_RECONNECTS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_postgres_cdc_reconnects_total",
         "Postgres CDC source reconnect attempts by source, slot, and result",
         &["source", "slot", "result"]
     )
-    .expect("register floe_postgres_cdc_reconnects_total")
+    .ok()
 });
 
-static POSTGRES_CDC_TABLE_LAST_APPLIED_LSN: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_TABLE_LAST_APPLIED_LSN: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_table_last_applied_lsn",
         "Latest SlateDB-durable Postgres CDC LSN applied to each CDC table",
         &["source", "slot", "table"]
     )
-    .expect("register floe_postgres_cdc_table_last_applied_lsn")
+    .ok()
 });
 
-static POSTGRES_CDC_TABLE_LAG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_TABLE_LAG_BYTES: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_table_lag_bytes",
         "Byte lag between latest observed upstream Postgres WAL LSN and each CDC table's durable applied LSN",
         &["source", "slot", "table"]
     )
-    .expect("register floe_postgres_cdc_table_lag_bytes")
+    .ok()
 });
 
-static POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_SCHEMA_EVOLUTION_POLICY: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_schema_evolution_policy",
         "Configured Postgres CDC schema evolution policy per source; the active policy label is set to 1",
         &["source", "policy"]
     )
-    .expect("register floe_postgres_cdc_schema_evolution_policy")
+    .ok()
 });
 
-static POSTGRES_CDC_SCHEMA_EVOLUTION_EVENTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        "floe_postgres_cdc_schema_evolution_events_total",
-        "Observed Postgres CDC schema evolution events by source, table, outcome, and policy",
-        &["source", "table", "outcome", "policy"]
-    )
-    .expect("register floe_postgres_cdc_schema_evolution_events_total")
-});
+static POSTGRES_CDC_SCHEMA_EVOLUTION_EVENTS_TOTAL: LazyLock<Option<IntCounterVec>> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
+            "floe_postgres_cdc_schema_evolution_events_total",
+            "Observed Postgres CDC schema evolution events by source, table, outcome, and policy",
+            &["source", "table", "outcome", "policy"]
+        )
+        .ok()
+    });
 
-static POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS: LazyLock<IntGaugeVec> = LazyLock::new(
-    || {
+static POSTGRES_CDC_SCHEMA_EVOLUTION_LAST_OBSERVED_UNIX_MS: LazyLock<Option<IntGaugeVec>> =
+    LazyLock::new(|| {
         register_int_gauge_vec!(
             "floe_postgres_cdc_schema_evolution_last_observed_unix_ms",
             "Unix timestamp in milliseconds for the latest observed Postgres CDC schema evolution event",
             &["source", "table", "outcome", "policy"]
         )
-        .expect("register floe_postgres_cdc_schema_evolution_last_observed_unix_ms")
-    },
-);
+        .ok()
+    });
 
-static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_TARGET: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec!(
-        "floe_postgres_cdc_snapshot_concurrency_target",
-        "Current adaptive Postgres CDC initial snapshot scan concurrency target",
-        &["source", "slot"]
-    )
-    .expect("register floe_postgres_cdc_snapshot_concurrency_target")
-});
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_TARGET: LazyLock<Option<IntGaugeVec>> =
+    LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "floe_postgres_cdc_snapshot_concurrency_target",
+            "Current adaptive Postgres CDC initial snapshot scan concurrency target",
+            &["source", "slot"]
+        )
+        .ok()
+    });
 
-static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec!(
-        "floe_postgres_cdc_snapshot_concurrency_active",
-        "Current active Postgres CDC initial snapshot scan workers",
-        &["source", "slot"]
-    )
-    .expect("register floe_postgres_cdc_snapshot_concurrency_active")
-});
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ACTIVE: LazyLock<Option<IntGaugeVec>> =
+    LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "floe_postgres_cdc_snapshot_concurrency_active",
+            "Current active Postgres CDC initial snapshot scan workers",
+            &["source", "slot"]
+        )
+        .ok()
+    });
 
-static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_MAX: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_MAX: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_postgres_cdc_snapshot_concurrency_max",
         "Maximum configured Postgres CDC initial snapshot scan workers",
         &["source", "slot"]
     )
-    .expect("register floe_postgres_cdc_snapshot_concurrency_max")
+    .ok()
 });
 
-static POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_FILL_PERCENT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec!(
+static POSTGRES_CDC_SNAPSHOT_WAL_BUFFER_FILL_PERCENT: LazyLock<Option<IntGaugeVec>> = LazyLock::new(
+    || {
+        register_int_gauge_vec!(
             "floe_postgres_cdc_snapshot_wal_buffer_fill_percent",
             "Percent fill of the in-memory WAL buffer used while Postgres CDC initial snapshot scans are running",
             &["source", "slot"]
         )
-        .expect("register floe_postgres_cdc_snapshot_wal_buffer_fill_percent")
-});
+        .ok()
+    },
+);
 
-static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ADJUSTMENTS_TOTAL: LazyLock<IntCounterVec> =
+static POSTGRES_CDC_SNAPSHOT_CONCURRENCY_ADJUSTMENTS_TOTAL: LazyLock<Option<IntCounterVec>> =
     LazyLock::new(|| {
         register_int_counter_vec!(
             "floe_postgres_cdc_snapshot_concurrency_adjustments_total",
             "Adaptive Postgres CDC initial snapshot concurrency target changes",
             &["source", "slot", "direction", "reason"]
         )
-        .expect("register floe_postgres_cdc_snapshot_concurrency_adjustments_total")
+        .ok()
     });
 
-static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_PENDING_TRANSACTIONS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_transactions",
         "Number of pending transactions in each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_pending_transactions")
+    .ok()
 });
 
-static CDC_BUFFER_PENDING_OBJECTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_PENDING_OBJECTS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_objects",
         "Number of pending payload objects in each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_pending_objects")
+    .ok()
 });
 
-static CDC_BUFFER_PENDING_RECORDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_PENDING_RECORDS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_records",
         "Number of pending records in each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_pending_records")
+    .ok()
 });
 
-static CDC_BUFFER_PENDING_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_PENDING_BYTES: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_pending_bytes",
         "Approximate pending payload bytes in each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_pending_bytes")
+    .ok()
 });
 
-static CDC_BUFFER_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_OLDEST_PENDING_AGE_MS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_oldest_pending_age_ms",
         "Age in milliseconds of the oldest pending transaction in each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_oldest_pending_age_ms")
+    .ok()
 });
 
-static CDC_BUFFER_CAP_UTILIZATION_PERCENT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_CAP_UTILIZATION_PERCENT: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_cap_utilization_percent",
         "Percent utilization of configured CDC replication buffer caps",
         &["pipeline", "limit"]
     )
-    .expect("register floe_cdc_buffer_cap_utilization_percent")
+    .ok()
 });
 
-static CDC_BUFFER_INTEGRITY_OBJECTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_INTEGRITY_OBJECTS: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_integrity_objects",
         "CDC replication buffer payload object integrity counts by state",
         &["pipeline", "state"]
     )
-    .expect("register floe_cdc_buffer_integrity_objects")
+    .ok()
 });
 
-static CDC_BUFFER_ORPHAN_PAYLOAD_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_ORPHAN_PAYLOAD_BYTES: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_orphan_payload_bytes",
         "Total bytes in orphaned CDC replication buffer payload objects",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_orphan_payload_bytes")
+    .ok()
 });
 
-static CDC_BUFFER_OBJECT_OPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_OBJECT_OPS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_object_ops_total",
         "CDC replication buffer object-store operations",
         &["pipeline", "operation"]
     )
-    .expect("register floe_cdc_buffer_object_ops_total")
+    .ok()
 });
 
-static CDC_BUFFER_APPENDED_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_APPENDED_RECORDS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_appended_records_total",
         "Number of records appended to each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_appended_records_total")
+    .ok()
 });
 
-static CDC_BUFFER_APPENDED_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_APPENDED_BYTES_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_appended_bytes_total",
         "Approximate payload bytes appended to each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_appended_bytes_total")
+    .ok()
 });
 
-static CDC_BUFFER_APPEND_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+static CDC_BUFFER_APPEND_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
     register_histogram_vec!(
         "floe_cdc_buffer_append_latency_ms",
         "Time spent appending a transaction to each CDC replication buffer in milliseconds",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_append_latency_ms")
+    .ok()
 });
 
-static CDC_BUFFER_CLEANUP_TRANSACTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        "floe_cdc_buffer_cleanup_transactions_total",
-        "Number of delivered CDC replication buffer transactions removed by cleanup",
-        &["pipeline"]
-    )
-    .expect("register floe_cdc_buffer_cleanup_transactions_total")
-});
+static CDC_BUFFER_CLEANUP_TRANSACTIONS_TOTAL: LazyLock<Option<IntCounterVec>> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
+            "floe_cdc_buffer_cleanup_transactions_total",
+            "Number of delivered CDC replication buffer transactions removed by cleanup",
+            &["pipeline"]
+        )
+        .ok()
+    });
 
-static CDC_BUFFER_CLEANUP_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_CLEANUP_RECORDS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_cleanup_records_total",
         "Number of delivered CDC replication buffer records removed by cleanup",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_cleanup_records_total")
+    .ok()
 });
 
-static CDC_BUFFER_CLEANUP_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_CLEANUP_BYTES_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_cleanup_bytes_total",
         "Number of delivered CDC replication buffer payload bytes removed by cleanup",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_cleanup_bytes_total")
+    .ok()
 });
 
-static CDC_BUFFER_CLEANUP_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+static CDC_BUFFER_CLEANUP_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
     register_histogram_vec!(
         "floe_cdc_buffer_cleanup_latency_ms",
         "Time spent cleaning delivered CDC replication buffer payloads in milliseconds",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_cleanup_latency_ms")
+    .ok()
 });
 
-static CDC_BUFFER_FORCED_FLUSHES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_FORCED_FLUSHES_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_forced_flushes_total",
         "Number of explicit CDC replication buffer flushes",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_forced_flushes_total")
+    .ok()
 });
 
-static CDC_BUFFER_FLUSH_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+static CDC_BUFFER_FLUSH_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
     register_histogram_vec!(
         "floe_cdc_buffer_flush_latency_ms",
         "Time spent flushing each CDC replication buffer in milliseconds",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_flush_latency_ms")
+    .ok()
 });
 
-static CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_DRAIN_ATTEMPTS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_drain_attempts_total",
         "Number of CDC replication buffer drain attempts before accepting more source data",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_drain_attempts_total")
+    .ok()
 });
 
-static CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_BUFFER_SOURCE_BACKPRESSURE_ACTIVE: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_buffer_source_backpressure_active",
         "Whether a CDC replication buffer is applying source backpressure because pending limits remain exceeded",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_source_backpressure_active")
+    .ok()
 });
 
-static CDC_BUFFER_REPLAYED_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_BUFFER_REPLAYED_RECORDS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_buffer_replayed_records_total",
         "Number of records replayed from each CDC replication buffer",
         &["pipeline"]
     )
-    .expect("register floe_cdc_buffer_replayed_records_total")
+    .ok()
 });
 
-static CDC_BUFFER_REPLAY_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
+static CDC_BUFFER_REPLAY_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
     register_histogram_vec!(
         "floe_cdc_buffer_replay_latency_ms",
         "Time spent replaying records from each CDC replication buffer in milliseconds",
         &["pipeline", "phase"]
     )
-    .expect("register floe_cdc_buffer_replay_latency_ms")
+    .ok()
 });
 
-static CDC_REPLICATION_REPLAYING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_REPLICATION_REPLAYING: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_replication_replaying",
         "Whether a CDC replication pipeline is actively replaying buffered records",
         &["pipeline"]
     )
-    .expect("register floe_cdc_replication_replaying")
+    .ok()
 });
 
-static CDC_REPLICATION_TARGET_ERROR: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_REPLICATION_TARGET_ERROR: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_replication_target_error",
         "Whether the last CDC replication target delivery attempt failed",
         &["pipeline"]
     )
-    .expect("register floe_cdc_replication_target_error")
+    .ok()
 });
 
-static CDC_REPLICATION_TARGET_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        "floe_cdc_replication_target_failures_total",
-        "CDC replication target delivery failures by pipeline, target kind, and failure class",
-        &["pipeline", "target_kind", "class"]
-    )
-    .expect("register floe_cdc_replication_target_failures_total")
-});
+static CDC_REPLICATION_TARGET_FAILURES_TOTAL: LazyLock<Option<IntCounterVec>> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
+            "floe_cdc_replication_target_failures_total",
+            "CDC replication target delivery failures by pipeline, target kind, and failure class",
+            &["pipeline", "target_kind", "class"]
+        )
+        .ok()
+    });
 
-static CDC_REPLICATION_TARGET_WRITE_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
-        "floe_cdc_replication_target_write_latency_ms",
-        "Time spent delivering CDC replication records to a target in milliseconds",
-        &["pipeline", "target_kind", "result"]
-    )
-    .expect("register floe_cdc_replication_target_write_latency_ms")
-});
+static CDC_REPLICATION_TARGET_WRITE_LATENCY_MS: LazyLock<Option<HistogramVec>> =
+    LazyLock::new(|| {
+        register_histogram_vec!(
+            "floe_cdc_replication_target_write_latency_ms",
+            "Time spent delivering CDC replication records to a target in milliseconds",
+            &["pipeline", "target_kind", "result"]
+        )
+        .ok()
+    });
 
-static CDC_REPLICATION_TARGET_WRITE_BATCH_RECORDS: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
-        "floe_cdc_replication_target_write_batch_records",
-        "CDC replication target write batch size in records",
-        &["pipeline", "target_kind", "result"]
-    )
-    .expect("register floe_cdc_replication_target_write_batch_records")
-});
+static CDC_REPLICATION_TARGET_WRITE_BATCH_RECORDS: LazyLock<Option<HistogramVec>> =
+    LazyLock::new(|| {
+        register_histogram_vec!(
+            "floe_cdc_replication_target_write_batch_records",
+            "CDC replication target write batch size in records",
+            &["pipeline", "target_kind", "result"]
+        )
+        .ok()
+    });
 
-static CDC_REPLICATION_TARGET_WRITE_RECORDS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
+static CDC_REPLICATION_TARGET_WRITE_RECORDS_TOTAL: LazyLock<Option<IntCounterVec>> =
+    LazyLock::new(|| {
+        register_int_counter_vec!(
         "floe_cdc_replication_target_write_records_total",
         "Total CDC replication records delivered or attempted by pipeline, target kind, and result",
         &["pipeline", "target_kind", "result"]
     )
-    .expect("register floe_cdc_replication_target_write_records_total")
-});
+    .ok()
+    });
 
-static CDC_REPLICATION_DLQ_REPLAYS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+static CDC_REPLICATION_DLQ_REPLAYS_TOTAL: LazyLock<Option<IntCounterVec>> = LazyLock::new(|| {
     register_int_counter_vec!(
         "floe_cdc_replication_dlq_replays_total",
         "Manual CDC replication DLQ replay attempts by pipeline and result",
         &["pipeline", "result"]
     )
-    .expect("register floe_cdc_replication_dlq_replays_total")
+    .ok()
 });
 
-static CDC_REPLICATION_DLQ_ENTRIES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+static CDC_REPLICATION_DLQ_ENTRIES: LazyLock<Option<IntGaugeVec>> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "floe_cdc_replication_dlq_entries",
         "CDC replication DLQ entries by pipeline and status",
         &["pipeline", "status"]
     )
-    .expect("register floe_cdc_replication_dlq_entries")
+    .ok()
 });
 
-static CDC_REPLICATION_DLQ_OLDEST_PENDING_AGE_MS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec!(
-        "floe_cdc_replication_dlq_oldest_pending_age_ms",
-        "Oldest pending CDC replication DLQ entry age in milliseconds",
-        &["pipeline"]
-    )
-    .expect("register floe_cdc_replication_dlq_oldest_pending_age_ms")
-});
+static CDC_REPLICATION_DLQ_OLDEST_PENDING_AGE_MS: LazyLock<Option<IntGaugeVec>> =
+    LazyLock::new(|| {
+        register_int_gauge_vec!(
+            "floe_cdc_replication_dlq_oldest_pending_age_ms",
+            "Oldest pending CDC replication DLQ entry age in milliseconds",
+            &["pipeline"]
+        )
+        .ok()
+    });
 
 #[path = "metrics/postgres_cdc.rs"]
 mod postgres_cdc;

@@ -1,82 +1,168 @@
 use std::sync::LazyLock;
 
 use crate::delta_consolidation::ConsolidationStats;
-use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, register_histogram, register_histogram_vec,
-    register_int_counter,
-};
+use prometheus::{Histogram, HistogramOpts, HistogramVec, IntCounter, core::Collector};
 
-static SUBSCRIBE_THROUGHPUT_ROWS: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter!(
+struct OptionalMetricValue<T> {
+    metric: Option<T>,
+}
+
+trait OptionalIntCounter {
+    fn inc(&self);
+    fn inc_by(&self, value: u64);
+}
+
+trait OptionalHistogram {
+    fn observe(&self, value: f64);
+}
+
+trait OptionalHistogramVec {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram>;
+}
+
+impl OptionalIntCounter for LazyLock<Option<IntCounter>> {
+    fn inc(&self) {
+        if let Some(metric) = self.as_ref() {
+            metric.inc();
+        }
+    }
+
+    fn inc_by(&self, value: u64) {
+        if let Some(metric) = self.as_ref() {
+            metric.inc_by(value);
+        }
+    }
+}
+
+impl OptionalHistogram for LazyLock<Option<Histogram>> {
+    fn observe(&self, value: f64) {
+        if let Some(metric) = self.as_ref() {
+            metric.observe(value);
+        }
+    }
+}
+
+impl OptionalHistogram for OptionalMetricValue<Histogram> {
+    fn observe(&self, value: f64) {
+        if let Some(metric) = &self.metric {
+            metric.observe(value);
+        }
+    }
+}
+
+impl OptionalHistogramVec for LazyLock<Option<HistogramVec>> {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram> {
+        OptionalMetricValue {
+            metric: self
+                .as_ref()
+                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
+        }
+    }
+}
+
+fn register_metric<T>(name: &str, metric: T) -> T
+where
+    T: Collector + Clone + 'static,
+{
+    if let Err(error) = prometheus::register(Box::new(metric.clone())) {
+        tracing::warn!(metric = name, %error, "failed to register Prometheus metric");
+    }
+    metric
+}
+
+fn int_counter(name: &str, help: &str) -> Option<IntCounter> {
+    IntCounter::new(name, help)
+        .map(|metric| register_metric(name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+fn histogram(opts: HistogramOpts) -> Option<Histogram> {
+    let name = opts.common_opts.name.clone();
+    Histogram::with_opts(opts)
+        .map(|metric| register_metric(&name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+fn histogram_vec(name: &str, help: &str, labels: &[&str]) -> Option<HistogramVec> {
+    HistogramVec::new(HistogramOpts::new(name, help), labels)
+        .map(|metric| register_metric(name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+static SUBSCRIBE_THROUGHPUT_ROWS: LazyLock<Option<IntCounter>> = LazyLock::new(|| {
+    int_counter(
         "floe_subscribe_rows_total",
-        "Total number of rows emitted by SUBSCRIBE streams"
+        "Total number of rows emitted by SUBSCRIBE streams",
     )
-    .expect("register floe_subscribe_rows_total")
 });
 
-static DELTA_BATCH_ROWS: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static DELTA_BATCH_ROWS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_delta_batch_rows",
         "Number of rows emitted per delta batch",
     ))
-    .expect("register floe_delta_batch_rows")
 });
 
-static DELTA_BATCH_BYTES: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static DELTA_BATCH_BYTES: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_delta_batch_bytes",
         "Estimated byte size of emitted delta batches",
     ))
-    .expect("register floe_delta_batch_bytes")
 });
 
-static DELTA_BATCH_FLUSHES: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter!(
+static DELTA_BATCH_FLUSHES: LazyLock<Option<IntCounter>> = LazyLock::new(|| {
+    int_counter(
         "floe_delta_batch_flush_total",
-        "Number of delta batch flushes emitted"
+        "Number of delta batch flushes emitted",
     )
-    .expect("register floe_delta_batch_flush_total")
 });
 
-static DELTA_CONSOLIDATION_ROWS: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
+static DELTA_CONSOLIDATION_ROWS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
+    histogram_vec(
         "floe_delta_consolidation_rows",
         "Rows observed during vectorized delta consolidation",
-        &["phase"]
+        &["phase"],
     )
-    .expect("register floe_delta_consolidation_rows")
 });
 
-static DELTA_CONSOLIDATION_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static DELTA_CONSOLIDATION_LATENCY_MS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_delta_consolidation_latency_ms",
         "Time spent consolidating vectorized delta batches in milliseconds",
     ))
-    .expect("register floe_delta_consolidation_latency_ms")
 });
 
-static FULL_MV_REFRESH_TICKS: LazyLock<IntCounter> = LazyLock::new(|| {
-    register_int_counter!(
+static FULL_MV_REFRESH_TICKS: LazyLock<Option<IntCounter>> = LazyLock::new(|| {
+    int_counter(
         "floe_full_mv_refresh_ticks_total",
-        "Number of materialized view ticks executed with full-refresh execution"
+        "Number of materialized view ticks executed with full-refresh execution",
     )
-    .expect("register floe_full_mv_refresh_ticks_total")
 });
 
-static FULL_MV_REFRESH_ROWS: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static FULL_MV_REFRESH_ROWS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_full_mv_refresh_rows",
         "Rows scanned by full-refresh materialized view ticks",
     ))
-    .expect("register floe_full_mv_refresh_rows")
 });
 
-static FULL_MV_REFRESH_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static FULL_MV_REFRESH_LATENCY_MS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_full_mv_refresh_latency_ms",
         "Time spent executing full-refresh materialized view ticks in milliseconds",
     ))
-    .expect("register floe_full_mv_refresh_latency_ms")
 });
 
 pub(crate) fn observe_delta_batch(rows: usize, bytes: usize) {

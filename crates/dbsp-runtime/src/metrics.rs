@@ -1,9 +1,7 @@
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, register_histogram, register_histogram_vec,
-};
+use prometheus::{Histogram, HistogramOpts, HistogramVec, core::Collector};
 
 use crate::collections::LookupMetrics;
 
@@ -205,46 +203,110 @@ impl FlushWriteMetrics {
     }
 }
 
-static DBSP_FLUSH_WRITE_BATCH_CALLS: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+struct OptionalMetricValue<T> {
+    metric: Option<T>,
+}
+
+trait OptionalHistogram {
+    fn observe(&self, value: f64);
+}
+
+trait OptionalHistogramVec {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram>;
+}
+
+impl OptionalHistogram for LazyLock<Option<Histogram>> {
+    fn observe(&self, value: f64) {
+        if let Some(metric) = self.as_ref() {
+            metric.observe(value);
+        }
+    }
+}
+
+impl OptionalHistogram for OptionalMetricValue<Histogram> {
+    fn observe(&self, value: f64) {
+        if let Some(metric) = &self.metric {
+            metric.observe(value);
+        }
+    }
+}
+
+impl OptionalHistogramVec for LazyLock<Option<HistogramVec>> {
+    fn with_label_values(&self, label_values: &[&str]) -> OptionalMetricValue<Histogram> {
+        OptionalMetricValue {
+            metric: self
+                .as_ref()
+                .and_then(|metric| metric.get_metric_with_label_values(label_values).ok()),
+        }
+    }
+}
+
+fn register_metric<T>(name: &str, metric: T) -> T
+where
+    T: Collector + Clone + 'static,
+{
+    if let Err(error) = prometheus::register(Box::new(metric.clone())) {
+        tracing::warn!(metric = name, %error, "failed to register Prometheus metric");
+    }
+    metric
+}
+
+fn histogram(opts: HistogramOpts) -> Option<Histogram> {
+    let name = opts.common_opts.name.clone();
+    Histogram::with_opts(opts)
+        .map(|metric| register_metric(&name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+fn histogram_vec(name: &str, help: &str, labels: &[&str]) -> Option<HistogramVec> {
+    HistogramVec::new(HistogramOpts::new(name, help), labels)
+        .map(|metric| register_metric(name, metric))
+        .map_err(|error| {
+            tracing::warn!(metric = name, %error, "failed to create Prometheus metric");
+            error
+        })
+        .ok()
+}
+
+static DBSP_FLUSH_WRITE_BATCH_CALLS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_dbsp_flush_write_batch_calls",
         "Number of write_batch calls issued per DBSP flush tick",
     ))
-    .expect("register floe_dbsp_flush_write_batch_calls")
 });
 
-static DBSP_FLUSH_KEYS_WRITTEN: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static DBSP_FLUSH_KEYS_WRITTEN: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_dbsp_flush_keys_written",
         "Number of keys written per DBSP flush tick",
     ))
-    .expect("register floe_dbsp_flush_keys_written")
 });
 
-static DBSP_FOREGROUND_COMPACTION_LATENCY_MS: LazyLock<Histogram> = LazyLock::new(|| {
-    register_histogram!(HistogramOpts::new(
+static DBSP_FOREGROUND_COMPACTION_LATENCY_MS: LazyLock<Option<Histogram>> = LazyLock::new(|| {
+    histogram(HistogramOpts::new(
         "floe_dbsp_foreground_compaction_latency_ms",
         "Time spent in foreground DBSP compaction work during a flush tick in milliseconds",
     ))
-    .expect("register floe_dbsp_foreground_compaction_latency_ms")
 });
 
-static DBSP_OPERATOR_PERSISTENCE_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
+static DBSP_OPERATOR_PERSISTENCE_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
+    histogram_vec(
         "floe_dbsp_operator_persistence_latency_ms",
         "Time spent persisting DBSP operator state in milliseconds",
-        &["operator", "state"]
+        &["operator", "state"],
     )
-    .expect("register floe_dbsp_operator_persistence_latency_ms")
 });
 
-static DBSP_OPERATOR_PHASE_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
+static DBSP_OPERATOR_PHASE_LATENCY_MS: LazyLock<Option<HistogramVec>> = LazyLock::new(|| {
+    histogram_vec(
         "floe_dbsp_operator_phase_latency_ms",
         "Time spent in DBSP operator phases in milliseconds",
-        &["operator", "state", "phase"]
+        &["operator", "state", "phase"],
     )
-    .expect("register floe_dbsp_operator_phase_latency_ms")
 });
 
 static DBSP_OPERATOR_PERSISTENCE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
