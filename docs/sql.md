@@ -294,20 +294,25 @@ default error policy is retry-with-backoff.
   timestamp keys. `FOR SYSTEM_TIME AS OF` compatibility syntax is not currently
   supported.
 
-## Nexmark Support Matrix
+## Nexmark Query Coverage
 
-The canonical Sprint 0005 Nexmark suite (`q0-q9`, `q12-q22`) is guarded by
-`crates/floe-node-core/tests/nexmark_query_coverage.rs`.
+Nexmark is a standard streaming benchmark built around auction, bid, and person
+event streams. Floe uses it to exercise common streaming SQL patterns such as
+filters, projections, joins, aggregations, windows, top-N queries, distinct, and
+unions.
 
-Current status:
-- All canonical queries pass logical planning, circuit planning, and runtime
-  graph validation in the coverage harness.
-- SQL `ASOF JOIN` is available in Floe. RisingWave-compatible
-  `FOR SYSTEM_TIME AS OF` syntax is listed below.
+Current coverage:
 
-## Nexmark-Specific Limits
+- Floe supports the main Nexmark query set used by the project (`q0` through
+  `q9`, plus `q12` through `q22`) through logical planning, DBSP circuit
+  planning, and runtime graph validation.
+- Floe supports SQL `ASOF JOIN` for latest-prior lookup joins.
+- RisingWave-style `FOR SYSTEM_TIME AS OF` syntax is not supported yet; use
+  Floe's `ASOF JOIN` syntax instead.
 
-Current limits with concrete errors:
+## Nexmark Compatibility Limits
+
+Known compatibility limits:
 
 - Temporal joins using `FOR SYSTEM_TIME AS OF` syntax
   - Example parser error:
