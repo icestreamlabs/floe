@@ -178,6 +178,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction ORDER BY p.name",
     },
     ValidPlanRuntimeCase {
+        id: "topn_over_three_way_join",
+        sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction ORDER BY b.price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_over_three_way_join",
         sql: "SELECT p_name, COUNT(price) AS bid_count FROM (SELECT p.name AS p_name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction) j GROUP BY p_name",
     },
@@ -1047,6 +1051,7 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("topn_over_left_join", "columnar_join_topn"),
         ("join_over_topn", "columnar_join"),
         ("topn_over_self_join", "columnar_join_topn"),
+        ("topn_over_three_way_join", "columnar_multijoin"),
     ];
     for (case_id, expected_mode) in expected_modes {
         if execution_modes.get(case_id).map(String::as_str) != Some(expected_mode) {
