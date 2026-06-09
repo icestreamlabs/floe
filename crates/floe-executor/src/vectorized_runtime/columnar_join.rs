@@ -60,6 +60,14 @@ impl ColumnarJoinMaterializedViewState {
     pub(super) fn initial_snapshot(&self) -> Vec<RecordBatch> {
         self.initial_snapshot.clone()
     }
+
+    #[cfg(test)]
+    pub(super) fn execution_strategy_name(&self) -> &'static str {
+        match self.execution_strategy {
+            ColumnarJoinExecutionStrategy::IncrementalInner => "incremental_inner",
+            ColumnarJoinExecutionStrategy::SnapshotDiff => "snapshot_diff",
+        }
+    }
 }
 
 struct ColumnarJoinSourceState {
@@ -71,7 +79,9 @@ struct ColumnarJoinSourceState {
 
 struct JoinDeltaEvaluator {
     ctx: SessionContext,
-    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    logical_plan: LogicalPlan,
+    plan: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    rebuild_each_evaluate: bool,
     left_input: JoinEvaluatorInput,
     right_input: JoinEvaluatorInput,
     output_schema: SchemaRef,
@@ -198,6 +208,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
     let logical_plan = plan.logical_plan;
     let left_name = plan.left_source;
     let right_name = plan.right_source;
+    let rebuild_each_evaluate = execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff;
     let left_delta_right_state = JoinDeltaEvaluator::build(
         logical_plan.clone(),
         sources,
@@ -205,6 +216,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         output_schema,
         &left_name,
         &right_name,
+        rebuild_each_evaluate,
     )
     .await
     .context("build left-delta/right-state join evaluator")?;
@@ -215,6 +227,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         output_schema,
         &left_name,
         &right_name,
+        rebuild_each_evaluate,
     )
     .await
     .context("build left-state/right-delta join evaluator")?;
@@ -225,6 +238,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         output_schema,
         &left_name,
         &right_name,
+        rebuild_each_evaluate,
     )
     .await
     .context("build left-delta/right-delta join evaluator")?;
@@ -688,13 +702,15 @@ impl JoinDeltaEvaluator {
         output_schema: &SchemaRef,
         left_source_name: &str,
         right_source_name: &str,
+        rebuild_each_evaluate: bool,
     ) -> Result<Self> {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         for udf in udfs.iter().cloned() {
             ctx.register_udf(udf);
         }
-        let left_input = JoinEvaluatorInput::new(left_source_name, sources)?;
-        let right_input = JoinEvaluatorInput::new(right_source_name, sources)?;
+        let left_input = JoinEvaluatorInput::new(left_source_name, sources, rebuild_each_evaluate)?;
+        let right_input =
+            JoinEvaluatorInput::new(right_source_name, sources, rebuild_each_evaluate)?;
         let logical_plan = rebind_join_logical_plan(
             logical_plan,
             left_source_name,
@@ -702,10 +718,16 @@ impl JoinDeltaEvaluator {
             right_source_name,
             &right_input,
         )?;
-        let plan = ctx.state().create_physical_plan(&logical_plan).await?;
+        let plan = if rebuild_each_evaluate {
+            None
+        } else {
+            Some(ctx.state().create_physical_plan(&logical_plan).await?)
+        };
         Ok(Self {
             ctx,
+            logical_plan,
             plan,
+            rebuild_each_evaluate,
             left_input,
             right_input,
             output_schema: Arc::clone(output_schema),
@@ -725,7 +747,20 @@ impl JoinDeltaEvaluator {
         self.right_input
             .set_batches(right_source, right_batches)
             .with_context(|| format!("set right join evaluator input for '{right_source}'"))?;
-        let collected = collect(Arc::clone(&self.plan), self.ctx.task_ctx()).await;
+        let plan = if self.rebuild_each_evaluate {
+            self.ctx
+                .state()
+                .create_physical_plan(&self.logical_plan)
+                .await
+                .context("rebuild vectorized join delta physical plan")?
+        } else {
+            Arc::clone(
+                self.plan
+                    .as_ref()
+                    .context("cached vectorized join delta physical plan missing")?,
+            )
+        };
+        let collected = collect(plan, self.ctx.task_ctx()).await;
         self.clear_inputs()?;
         normalize_batches(
             collected.context("execute vectorized join delta evaluator")?,
@@ -741,16 +776,30 @@ impl JoinDeltaEvaluator {
 }
 
 impl JoinEvaluatorInput {
-    fn new(source_name: &str, sources: &HashMap<String, VectorizedSourceState>) -> Result<Self> {
+    fn new(
+        source_name: &str,
+        sources: &HashMap<String, VectorizedSourceState>,
+        single_partition_scan: bool,
+    ) -> Result<Self> {
         let source = sources
             .get(source_name)
             .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
-        let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&source.schema)));
+        let provider = if single_partition_scan {
+            DynamicStateTableProvider::new_with_scan_partitions(Arc::clone(&source.schema), 1)
+        } else {
+            DynamicStateTableProvider::new(Arc::clone(&source.schema))
+        };
+        let provider = Arc::new(provider);
         let (alias_schema, alias_provider) = if let (Some(_alias), Some(alias_schema)) = (
             source_name.strip_prefix("nexmark_"),
             source.alias_schema.as_ref(),
         ) {
-            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
+            let provider = if single_partition_scan {
+                DynamicStateTableProvider::new_with_scan_partitions(Arc::clone(alias_schema), 1)
+            } else {
+                DynamicStateTableProvider::new(Arc::clone(alias_schema))
+            };
+            let provider = Arc::new(provider);
             (Some(Arc::clone(alias_schema)), Some(provider))
         } else {
             (None, None)

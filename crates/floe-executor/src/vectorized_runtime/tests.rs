@@ -266,6 +266,26 @@ fn outer_join_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<String>, i64)> {
     rows
 }
 
+fn full_outer_join_rows(
+    batches: &[RecordBatch],
+) -> Vec<(Option<i64>, Option<String>, Option<i64>)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let order_ids = nullable_int64_values(batch, 0);
+        let regions = nullable_string_values(batch, 1);
+        let amounts = nullable_int64_values(batch, 2);
+        rows.extend(
+            order_ids
+                .into_iter()
+                .zip(regions)
+                .zip(amounts)
+                .map(|((order_id, region), amount)| (order_id, region, amount)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn asof_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<i64>)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -308,6 +328,32 @@ fn weighted_outer_join_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<String>
         let order_ids = int64_values(batch, 0);
         let regions = nullable_string_values(batch, 1);
         let amounts = int64_values(batch, 2);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            order_ids
+                .into_iter()
+                .zip(regions)
+                .zip(amounts)
+                .zip(weights)
+                .map(|(((order_id, region), amount), weight)| (order_id, region, amount, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_full_outer_join_rows(
+    batches: &[RecordBatch],
+) -> Vec<(Option<i64>, Option<String>, Option<i64>, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let order_ids = nullable_int64_values(batch, 0);
+        let regions = nullable_string_values(batch, 1);
+        let amounts = nullable_int64_values(batch, 2);
         let weights = int64_values(batch, weight_idx);
         rows.extend(
             order_ids
@@ -500,6 +546,14 @@ async fn build_operator_state_table(name: &str) -> Arc<dyn KeyValueTable> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
     Arc::new(SlateTable::new(db))
+}
+
+fn assert_columnar_join_strategy(runtime: &VectorizedExecutionRuntime, expected: &str) {
+    let actual = runtime.materialized_views[0]
+        .columnar_join
+        .as_ref()
+        .map(|state| state.execution_strategy_name());
+    assert_eq!(actual, Some(expected));
 }
 
 #[tokio::test]
@@ -2921,6 +2975,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
         runtime.materialized_views[0].execution_mode,
         MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&runtime, "incremental_inner");
 
     runtime
         .append_source_batches_for_execution_and_query(
@@ -3146,6 +3201,7 @@ async fn left_outer_join_uses_slate_backed_columnar_operator_semantics() {
         runtime.materialized_views[0].execution_mode,
         MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
 
     runtime
         .append_source_batches_for_execution_and_query(
@@ -3353,6 +3409,7 @@ async fn left_anti_join_uses_slate_backed_columnar_operator_semantics() {
         runtime.materialized_views[0].execution_mode,
         MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
 
     runtime
         .append_source_batches_for_execution_and_query(
@@ -3458,6 +3515,781 @@ async fn left_anti_join_uses_slate_backed_columnar_operator_semantics() {
         .arrow_delta_for(4)
         .expect("post-retract delta");
     assert_eq!(weighted_id_count_rows(&delta), vec![(1, 50, 1)]);
+}
+
+#[tokio::test]
+async fn right_semi_join_uses_slate_backed_columnar_operator_semantics() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("customer_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("orders source definition");
+    let customers = SourceDefinition::new(
+        "customers",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("region", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("customers source definition");
+    let orders_schema = orders.to_arrow_schema();
+    let customers_schema = customers.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 11])),
+            Arc::new(Int64Array::from(vec![50, 60])),
+        ],
+    )
+    .expect("initial orders batch");
+    let initial_customers = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 11, 12])),
+            Arc::new(StringArray::from(vec!["west", "east", "north"])),
+        ],
+    )
+    .expect("initial customers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(customers);
+    let table = build_operator_state_table("vectorized-columnar-right-semi-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let query = "SELECT c.id, c.region \
+        FROM orders o RIGHT SEMI JOIN customers c ON o.customer_id = c.id";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_matched_customers",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![initial_customers.clone()],
+            vec![initial_customers],
+        )
+        .await
+        .expect("append initial customers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_matched_customers")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(10, "west".to_string()), (11, "east".to_string())]
+    );
+
+    let order_insert = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(Int64Array::from(vec![12])),
+            Arc::new(Int64Array::from(vec![70])),
+        ],
+    )
+    .expect("order insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![order_insert.clone()],
+            vec![order_insert],
+        )
+        .await
+        .expect("append order insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![
+            (10, "west".to_string()),
+            (11, "east".to_string()),
+            (12, "north".to_string()),
+        ]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(12, "north".to_string(), 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_matched_customers",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_matched_customers")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        id_note_rows(&recovered_snapshot),
+        vec![
+            (10, "west".to_string()),
+            (11, "east".to_string()),
+            (12, "north".to_string()),
+        ]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let order_retract = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("order retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&orders_schema)
+        .expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&order_retract, &weighted_schema, &[-1])
+        .expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply order retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(11, "east".to_string()), (12, "north".to_string())]
+    );
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(10, "west".to_string(), -1)]
+    );
+}
+
+#[tokio::test]
+async fn right_anti_join_uses_slate_backed_columnar_operator_semantics() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("customer_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("orders source definition");
+    let customers = SourceDefinition::new(
+        "customers",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("region", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("customers source definition");
+    let orders_schema = orders.to_arrow_schema();
+    let customers_schema = customers.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 11])),
+            Arc::new(Int64Array::from(vec![50, 60])),
+        ],
+    )
+    .expect("initial orders batch");
+    let initial_customers = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 11, 12])),
+            Arc::new(StringArray::from(vec!["west", "east", "north"])),
+        ],
+    )
+    .expect("initial customers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(customers);
+    let table = build_operator_state_table("vectorized-columnar-right-anti-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let query = "SELECT c.id, c.region \
+        FROM orders o RIGHT ANTI JOIN customers c ON o.customer_id = c.id";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_unmatched_customers",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![initial_customers.clone()],
+            vec![initial_customers],
+        )
+        .await
+        .expect("append initial customers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_unmatched_customers")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(id_note_rows(&snapshot), vec![(12, "north".to_string())]);
+
+    let order_insert = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(Int64Array::from(vec![12])),
+            Arc::new(Int64Array::from(vec![70])),
+        ],
+    )
+    .expect("order insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![order_insert.clone()],
+            vec![order_insert],
+        )
+        .await
+        .expect("append order insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert!(snapshot.iter().all(|batch| batch.num_rows() == 0));
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(12, "north".to_string(), -1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_unmatched_customers",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_unmatched_customers")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert!(recovered_snapshot.iter().all(|batch| batch.num_rows() == 0));
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let order_retract = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("order retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&orders_schema)
+        .expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&order_retract, &weighted_schema, &[-1])
+        .expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply order retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(id_note_rows(&snapshot), vec![(10, "west".to_string())]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(10, "west".to_string(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn full_outer_join_uses_slate_backed_columnar_operator_semantics() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("customer_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("orders source definition");
+    let customers = SourceDefinition::new(
+        "customers",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("region", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("customers source definition");
+    let orders_schema = orders.to_arrow_schema();
+    let customers_schema = customers.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 11, 99])),
+            Arc::new(Int64Array::from(vec![50, 60, 70])),
+        ],
+    )
+    .expect("initial orders batch");
+    let initial_customers = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 12])),
+            Arc::new(StringArray::from(vec!["west", "north"])),
+        ],
+    )
+    .expect("initial customers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(customers);
+    let table = build_operator_state_table("vectorized-columnar-full-outer-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("order_id", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("amount", DataType::Int64, true),
+    ]));
+    let query = "SELECT o.id AS order_id, c.region, o.amount \
+        FROM orders o FULL OUTER JOIN customers c ON o.customer_id = c.id";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_all_customer_orders",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![initial_customers.clone()],
+            vec![initial_customers],
+        )
+        .await
+        .expect("append initial customers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_all_customer_orders")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        full_outer_join_rows(&snapshot),
+        vec![
+            (None, Some("north".to_string()), None),
+            (Some(1), Some("west".to_string()), Some(50)),
+            (Some(2), None, Some(60)),
+            (Some(3), None, Some(70)),
+        ]
+    );
+
+    let customer_insert = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![11])),
+            Arc::new(StringArray::from(vec!["east"])),
+        ],
+    )
+    .expect("customer insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![customer_insert.clone()],
+            vec![customer_insert],
+        )
+        .await
+        .expect("append customer insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        full_outer_join_rows(&snapshot),
+        vec![
+            (None, Some("north".to_string()), None),
+            (Some(1), Some("west".to_string()), Some(50)),
+            (Some(2), Some("east".to_string()), Some(60)),
+            (Some(3), None, Some(70)),
+        ]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_full_outer_join_rows(&delta),
+        vec![
+            (Some(2), None, Some(60), -1),
+            (Some(2), Some("east".to_string()), Some(60), 1),
+        ]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_all_customer_orders",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_all_customer_orders")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        full_outer_join_rows(&recovered_snapshot),
+        vec![
+            (None, Some("north".to_string()), None),
+            (Some(1), Some("west".to_string()), Some(50)),
+            (Some(2), Some("east".to_string()), Some(60)),
+            (Some(3), None, Some(70)),
+        ]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let customer_retract = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(StringArray::from(vec!["west"])),
+        ],
+    )
+    .expect("customer retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&customers_schema)
+        .expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&customer_retract, &weighted_schema, &[-1])
+        .expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("customers", weighted)
+        .await
+        .expect("apply customer retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(
+        full_outer_join_rows(&snapshot),
+        vec![
+            (None, Some("north".to_string()), None),
+            (Some(1), None, Some(50)),
+            (Some(2), Some("east".to_string()), Some(60)),
+            (Some(3), None, Some(70)),
+        ]
+    );
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_full_outer_join_rows(&delta),
+        vec![
+            (Some(1), None, Some(50), 1),
+            (Some(1), Some("west".to_string()), Some(50), -1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("customer_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("orders source definition");
+    let customers = SourceDefinition::new(
+        "customers",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("region", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("customers source definition");
+    let orders_schema = orders.to_arrow_schema();
+    let customers_schema = customers.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 10, 11])),
+            Arc::new(Int64Array::from(vec![50, 60, 70])),
+        ],
+    )
+    .expect("initial orders batch");
+    let initial_customers = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 10, 11])),
+            Arc::new(Int64Array::from(vec![50, 60, 80])),
+            Arc::new(StringArray::from(vec!["west", "east", "north"])),
+        ],
+    )
+    .expect("initial customers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(customers);
+    let table = build_operator_state_table("vectorized-columnar-multi-column-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("order_id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+    let query = "SELECT o.id AS order_id, c.region, o.amount \
+        FROM orders o JOIN customers c \
+        ON o.customer_id = c.id AND o.amount = c.amount";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_customer_amount_orders",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&runtime, "incremental_inner");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![initial_customers.clone()],
+            vec![initial_customers],
+        )
+        .await
+        .expect("append initial customers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_customer_amount_orders")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        join_rows(&snapshot),
+        vec![(1, "west".to_string(), 50), (2, "east".to_string(), 60)]
+    );
+
+    let customer_insert = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![11])),
+            Arc::new(Int64Array::from(vec![70])),
+            Arc::new(StringArray::from(vec!["south"])),
+        ],
+    )
+    .expect("customer insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![customer_insert.clone()],
+            vec![customer_insert],
+        )
+        .await
+        .expect("append customer insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        join_rows(&snapshot),
+        vec![
+            (1, "west".to_string(), 50),
+            (2, "east".to_string(), 60),
+            (3, "south".to_string(), 70),
+        ]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_join_rows(&delta),
+        vec![(3, "south".to_string(), 70, 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_customer_amount_orders",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_customer_amount_orders")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        join_rows(&recovered_snapshot),
+        vec![
+            (1, "west".to_string(), 50),
+            (2, "east".to_string(), 60),
+            (3, "south".to_string(), 70),
+        ]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
 }
 
 #[tokio::test]
