@@ -8,8 +8,9 @@ use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
-use datafusion::common::ScalarValue;
-use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
+use datafusion::common::{Column, ScalarValue};
+use datafusion::functions_aggregate::count::count_all;
+use datafusion::logical_expr::logical_plan::{Aggregate, Distinct, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
@@ -74,7 +75,7 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
     sources: &HashMap<String, VectorizedSourceState>,
     output_schema: &SchemaRef,
 ) -> Result<Option<ColumnarGroupedCountPlan>> {
-    let Some((aggregate, projection)) = grouped_count_aggregate_for_plan(plan) else {
+    let Some((aggregate, projection)) = grouped_count_aggregate_for_plan(plan)? else {
         return Ok(None);
     };
     if aggregate.group_expr.is_empty() || aggregate.aggr_expr.len() != 1 {
@@ -98,10 +99,11 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
     {
         return Ok(None);
     }
-    let output_mapping = match output_mapping_for_projection(projection, aggregate, output_schema) {
-        Some(mapping) => mapping,
-        None => return Ok(None),
-    };
+    let output_mapping =
+        match output_mapping_for_projection(projection.as_ref(), &aggregate, output_schema) {
+            Some(mapping) => mapping,
+            None => return Ok(None),
+        };
     if output_mapping
         .iter()
         .any(|idx| *idx >= aggregate_schema.fields().len())
@@ -402,6 +404,7 @@ async fn apply_grouped_count_delta(
 
     let mut writes = WriteBatch::new();
     let mut wrote_state = false;
+    let output_includes_count = columnar.output_mapping.contains(&columnar.count_idx);
     for (group_key, delta) in pending {
         let old_count = columnar.count_state.load_count(&group_key).await?;
         let new_count = old_count
@@ -410,7 +413,7 @@ async fn apply_grouped_count_delta(
         if new_count < 0 {
             bail!("grouped-count state removed more rows than were present");
         }
-        if old_count > 0 {
+        if output_includes_count && old_count > 0 {
             builder.append(
                 &delta.batch,
                 delta.row_idx,
@@ -419,7 +422,25 @@ async fn apply_grouped_count_delta(
                 -1,
             )?;
         }
-        if new_count > 0 {
+        if output_includes_count && new_count > 0 {
+            builder.append(
+                &delta.batch,
+                delta.row_idx,
+                columnar.count_idx,
+                new_count,
+                1,
+            )?;
+        }
+        if !output_includes_count && old_count > 0 && new_count == 0 {
+            builder.append(
+                &delta.batch,
+                delta.row_idx,
+                columnar.count_idx,
+                old_count,
+                -1,
+            )?;
+        }
+        if !output_includes_count && old_count == 0 && new_count > 0 {
             builder.append(
                 &delta.batch,
                 delta.row_idx,
@@ -542,16 +563,55 @@ impl WeightedOutputBuilder {
 
 fn grouped_count_aggregate_for_plan(
     plan: &LogicalPlan,
-) -> Option<(&Aggregate, Option<&Projection>)> {
+) -> Result<Option<(Aggregate, Option<Projection>)>> {
     match plan {
-        LogicalPlan::Aggregate(aggregate) => Some((aggregate, None)),
+        LogicalPlan::Aggregate(aggregate) => grouped_count_aggregate_for_aggregate(aggregate)
+            .map(|aggregate| aggregate.map(|aggregate| (aggregate, None))),
         LogicalPlan::Projection(projection) => match projection.input.as_ref() {
-            LogicalPlan::Aggregate(aggregate) => Some((aggregate, Some(projection))),
-            _ => None,
+            LogicalPlan::Aggregate(aggregate) => grouped_count_aggregate_for_aggregate(aggregate)
+                .map(|aggregate| aggregate.map(|aggregate| (aggregate, Some(projection.clone())))),
+            _ => Ok(None),
         },
         LogicalPlan::SubqueryAlias(alias) => grouped_count_aggregate_for_plan(alias.input.as_ref()),
-        _ => None,
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            distinct_count_aggregate_for_input(input.as_ref())
+                .map(|aggregate| aggregate.map(|aggregate| (aggregate, None)))
+        }
+        _ => Ok(None),
     }
+}
+
+fn grouped_count_aggregate_for_aggregate(aggregate: &Aggregate) -> Result<Option<Aggregate>> {
+    match aggregate.aggr_expr.len() {
+        0 => distinct_count_aggregate_for_input_with_groups(
+            aggregate.input.as_ref(),
+            aggregate.group_expr.clone(),
+        )
+        .map(Some),
+        1 if is_count_star_expr(&aggregate.aggr_expr[0]) => Ok(Some(aggregate.clone())),
+        _ => Ok(None),
+    }
+}
+
+fn distinct_count_aggregate_for_input(input: &LogicalPlan) -> Result<Option<Aggregate>> {
+    let group_expr = (0..input.schema().fields().len())
+        .map(|idx| {
+            let (qualifier, field) = input.schema().qualified_field(idx);
+            Expr::Column(Column::new(qualifier.cloned(), field.name()))
+        })
+        .collect::<Vec<_>>();
+    if group_expr.is_empty() {
+        return Ok(None);
+    }
+    distinct_count_aggregate_for_input_with_groups(input, group_expr).map(Some)
+}
+
+fn distinct_count_aggregate_for_input_with_groups(
+    input: &LogicalPlan,
+    group_expr: Vec<Expr>,
+) -> Result<Aggregate> {
+    Aggregate::try_new(Arc::new(input.clone()), group_expr, vec![count_all()])
+        .context("build hidden grouped-count aggregate for distinct rows")
 }
 
 fn output_mapping_for_projection(
@@ -573,6 +633,20 @@ fn output_mapping_for_projection(
                 .collect()
         }
         None => {
+            if aggregate_schema.fields().len() == output_schema.fields().len() {
+                return Some((0..aggregate_schema.fields().len()).collect());
+            }
+            if count_idx == output_schema.fields().len()
+                && output_schema
+                    .fields()
+                    .iter()
+                    .zip(aggregate_schema.fields().iter().take(count_idx))
+                    .all(|(output_field, aggregate_field)| {
+                        output_field.data_type() == aggregate_field.data_type()
+                    })
+            {
+                return Some((0..count_idx).collect());
+            }
             if aggregate_schema.fields().len() != output_schema.fields().len() {
                 return None;
             }
