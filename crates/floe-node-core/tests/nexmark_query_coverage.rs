@@ -566,6 +566,10 @@ fn generated_dbsp_runtime_plan_cases() -> Vec<GeneratedPlanRuntimeCase> {
             sql: format!("SELECT key, value FROM ({input_sql}) s WHERE value > 100"),
         });
         cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_ordered_over_{input_id}"),
+            sql: format!("SELECT key, value FROM ({input_sql}) s ORDER BY key"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
             id: format!("generated_distinct_over_{input_id}"),
             sql: format!("SELECT DISTINCT key FROM ({input_sql}) s"),
         });
@@ -586,9 +590,61 @@ fn generated_dbsp_runtime_plan_cases() -> Vec<GeneratedPlanRuntimeCase> {
             sql: format!("SELECT s.key, p.name FROM ({input_sql}) s JOIN person p ON s.key = p.id"),
         });
         cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_join_as_right_over_{input_id}"),
+            sql: format!("SELECT s.key, p.name FROM person p JOIN ({input_sql}) s ON p.id = s.key"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_left_join_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key, a.seller FROM ({input_sql}) s LEFT JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_right_join_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key, a.seller FROM ({input_sql}) s RIGHT JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_full_join_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key, a.seller FROM ({input_sql}) s FULL OUTER JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_left_semi_join_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key FROM ({input_sql}) s LEFT SEMI JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_left_anti_join_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key FROM ({input_sql}) s LEFT ANTI JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_right_semi_join_over_{input_id}"),
+            sql: format!(
+                "SELECT a.id FROM ({input_sql}) s RIGHT SEMI JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_right_anti_join_over_{input_id}"),
+            sql: format!(
+                "SELECT a.id FROM ({input_sql}) s RIGHT ANTI JOIN auction a ON s.key = a.id"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
             id: format!("generated_union_over_{input_id}"),
             sql: format!(
                 "SELECT key FROM (SELECT key FROM ({input_sql}) s UNION ALL SELECT id AS key FROM auction) u"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_union_distinct_over_{input_id}"),
+            sql: format!(
+                "SELECT key FROM (SELECT key FROM ({input_sql}) s UNION SELECT id AS key FROM auction) u"
             ),
         });
     }
@@ -785,7 +841,7 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         skipped.len()
     );
     assert!(
-        execution_modes.len() >= 90,
+        execution_modes.len() >= 200,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
         execution_modes.len(),
         skipped.len()
