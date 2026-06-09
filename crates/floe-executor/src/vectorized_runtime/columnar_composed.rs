@@ -178,6 +178,16 @@ pub(super) fn columnar_distinct_aggregate_plan_for_plan(
     columnar_composed_plan_for_plan(plan, sources)
 }
 
+pub(super) fn columnar_union_aggregate_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_union_aggregate(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Extension(extension) => extension
@@ -317,6 +327,38 @@ fn contains_distinct(plan: &LogicalPlan) -> bool {
     }
 }
 
+fn contains_union_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => contains_union(aggregate.input.as_ref()),
+        LogicalPlan::Projection(projection) => contains_union_aggregate(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_union_aggregate(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_union_aggregate(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_union_aggregate(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_union_aggregate(limit.input.as_ref()),
+        _ => false,
+    }
+}
+
+fn contains_union(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Union(_) => true,
+        LogicalPlan::Projection(projection) => contains_union(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_union(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_union(alias.input.as_ref()),
+        LogicalPlan::Subquery(subquery) => contains_union(subquery.subquery.as_ref()),
+        LogicalPlan::Aggregate(aggregate) => contains_union(aggregate.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_union(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_union(limit.input.as_ref()),
+        LogicalPlan::Window(window) => contains_union(window.input.as_ref()),
+        LogicalPlan::Repartition(repartition) => contains_union(repartition.input.as_ref()),
+        LogicalPlan::Distinct(distinct) => contains_union(distinct.input()),
+        LogicalPlan::Join(join) => {
+            contains_union(join.left.as_ref()) || contains_union(join.right.as_ref())
+        }
+        _ => false,
+    }
+}
+
 pub(super) async fn build_columnar_composed_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
@@ -401,6 +443,28 @@ pub(super) async fn build_columnar_join_aggregate_materialized_view_state(
         "join_aggregate",
         "join aggregate",
         "columnar_join_aggregate_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_union_aggregate_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "union_aggregate",
+        "union aggregate",
+        "columnar_union_aggregate_snapshot_diff",
     )
     .await
 }
@@ -576,6 +640,24 @@ pub(super) async fn run_columnar_join_aggregate_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_union_aggregate_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::UnionAggregate,
+    )
+    .await
+}
+
 pub(super) async fn run_columnar_distinct_aggregate_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -600,6 +682,7 @@ enum ColumnarSnapshotDiffSlot {
     AsofJoin,
     SelfJoinAggregate,
     JoinAggregate,
+    UnionAggregate,
     DistinctAggregate,
 }
 
@@ -616,6 +699,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         ColumnarSnapshotDiffSlot::AsofJoin => mv.columnar_asof_join.as_mut(),
         ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::JoinAggregate => mv.columnar_join_aggregate.as_mut(),
+        ColumnarSnapshotDiffSlot::UnionAggregate => mv.columnar_union_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctAggregate => mv.columnar_distinct_aggregate.as_mut(),
     }) else {
         return Ok(false);

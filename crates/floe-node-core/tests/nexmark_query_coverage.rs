@@ -210,6 +210,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT DISTINCT auction FROM (SELECT auction FROM bid WHERE price > 100 UNION ALL SELECT auction FROM bid WHERE price <= 100) u",
     },
     ValidPlanRuntimeCase {
+        id: "union_aggregate",
+        sql: "SELECT key, COUNT(*) AS row_count FROM (SELECT auction AS key FROM bid UNION ALL SELECT id AS key FROM auction) u GROUP BY key",
+    },
+    ValidPlanRuntimeCase {
         id: "having_aggregate",
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction HAVING SUM(price) > 1000",
     },
