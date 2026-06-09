@@ -57,6 +57,7 @@ pub(super) fn incremental_source_for_plan(
             incremental_source_for_plan(projection.input.as_ref(), sources)
         }
         LogicalPlan::Filter(filter) => incremental_source_for_plan(filter.input.as_ref(), sources),
+        LogicalPlan::Sort(sort) => incremental_source_for_plan(sort.input.as_ref(), sources),
         LogicalPlan::SubqueryAlias(alias) => {
             incremental_source_for_plan(alias.input.as_ref(), sources)
         }

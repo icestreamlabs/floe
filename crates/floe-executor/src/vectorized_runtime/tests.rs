@@ -674,6 +674,112 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
 }
 
 #[tokio::test]
+async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incrementally() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![3, 1, 2]))],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-sort-stateless").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::clone(&schema);
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders",
+            "SELECT id FROM orders ORDER BY id DESC",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarStateless
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_orders").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 2, 3]);
+
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let source_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 4]))],
+    )
+    .expect("source delta rows");
+    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, 1])
+        .expect("weighted source rows");
+    runtime
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply weighted delta");
+    runtime.run_tick(2).await.expect("weighted tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 3, 4]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(2, -1), (4, 1)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders",
+            "SELECT id FROM orders ORDER BY id DESC",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarStateless
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_orders")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(single_int_rows(&recovered_snapshot), vec![1, 3, 4]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+}
+
+#[tokio::test]
 async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
     let orders = SourceDefinition::new(
         "orders",
