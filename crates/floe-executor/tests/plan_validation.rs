@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use datafusion::common::Column;
+use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, col, lit, table_scan};
 
 use floe_executor::dbsp_plan::{
@@ -162,6 +163,31 @@ fn accepts_window_aggregate_operator() -> Result<()> {
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_window")?;
     assert_eq!(validated.root_node, plan.root);
+    Ok(())
+}
+
+#[test]
+fn accepts_boolean_group_key_and_ordering_plans() -> Result<()> {
+    let table = bool_events_table()?;
+    let schema = table.schema().to_arrow_schema();
+    let mut config = PlannerConfig::new();
+    config.register_owned_table(table.clone());
+    let planner = DbspPlanBuilder::new(config);
+
+    let grouped_plan = table_scan(Some(table.name()), &schema, None)?
+        .aggregate(vec![col("active")], vec![count(lit(1_i64)).alias("count")])?
+        .build()?;
+    let grouped_circuit = planner.build(&grouped_plan)?;
+    let mut sources = BTreeSet::new();
+    sources.insert(table.source_name().to_string());
+    validate_dbsp_plan(&grouped_circuit, &sources, "mv_bool_group")?;
+
+    let ordered_plan = table_scan(Some(table.name()), &schema, None)?
+        .sort(vec![col("active").sort(false, true)])?
+        .limit(0, Some(5))?
+        .build()?;
+    let ordered_circuit = planner.build(&ordered_plan)?;
+    validate_dbsp_plan(&ordered_circuit, &sources, "mv_bool_topn")?;
     Ok(())
 }
 
@@ -363,6 +389,17 @@ fn window_aggregate_plan() -> Result<CircuitPlan> {
         root: 1,
         nodes: vec![source, window_node],
     })
+}
+
+fn bool_events_table() -> Result<TableDescriptor> {
+    Ok(TableDescriptor::try_new(
+        "events",
+        vec![
+            Field::new("id", DbspScalarType::Int64, false),
+            Field::new("active", DbspScalarType::Bool, false),
+        ],
+        &["id"],
+    )?)
 }
 
 fn planner() -> DbspPlanBuilder {

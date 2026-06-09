@@ -216,9 +216,6 @@ impl DbspJoinKey {
                 right.data_type().name()
             );
         }
-        if left.data_type() == &DbspScalarType::Bool {
-            bail!("boolean join keys are not supported");
-        }
         Ok(Self { left, right })
     }
 
@@ -771,9 +768,6 @@ impl GroupKeyExpr {
     fn try_new(expr: Expr, input_schema: Arc<RowSchema>, alias: Option<String>) -> Result<Self> {
         let expression = DbspExpression::analyze(expr, input_schema)?;
         let alias = alias.unwrap_or_else(|| expression.expr().schema_name().to_string());
-        if expression.data_type() == &DbspScalarType::Bool {
-            bail!("boolean values are not supported as group keys");
-        }
         Ok(Self { expression, alias })
     }
 
@@ -948,9 +942,6 @@ impl OrderExpr {
         nulls_first: bool,
     ) -> Result<Self> {
         let expression = DbspExpression::analyze(expr, input_schema)?;
-        if expression.data_type() == &DbspScalarType::Bool {
-            bail!("boolean ordering is not supported");
-        }
         Ok(Self {
             expression,
             ascending,
@@ -997,9 +988,6 @@ impl DbspTopNNode {
         let mut partition_exprs = Vec::with_capacity(partition_by.len());
         for expr in partition_by {
             let analyzed = DbspExpression::analyze(expr, input_schema.clone())?;
-            if analyzed.data_type() == &DbspScalarType::Bool {
-                bail!("boolean partition keys are not supported");
-            }
             partition_exprs.push(analyzed);
         }
         Ok(Self {

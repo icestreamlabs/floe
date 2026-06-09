@@ -126,6 +126,21 @@ fn id_count_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     rows
 }
 
+fn bool_count_rows(batches: &[RecordBatch]) -> Vec<(bool, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let flags = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("boolean column");
+        let counts = int64_values(batch, 1);
+        rows.extend((0..flags.len()).map(|idx| (flags.value(idx), counts[idx])));
+    }
+    rows.sort();
+    rows
+}
+
 fn single_int_rows(batches: &[RecordBatch]) -> Vec<i64> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -540,6 +555,26 @@ fn weighted_id_count_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
                 .zip(weights)
                 .map(|((id, count), weight)| (id, count, weight)),
         );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_bool_count_rows(batches: &[RecordBatch]) -> Vec<(bool, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let flags = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("boolean column");
+        let counts = int64_values(batch, 1);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend((0..flags.len()).map(|idx| (flags.value(idx), counts[idx], weights[idx])));
     }
     rows.sort();
     rows
@@ -2106,6 +2141,88 @@ async fn grouped_count_with_hidden_key_uses_slate_backed_columnar_operator_incre
         .arrow_delta_for(4)
         .expect("post-recovery delta");
     assert_eq!(weighted_id_count_rows(&delta), vec![(1, 1, -1), (1, 2, 1)]);
+}
+
+#[tokio::test]
+async fn grouped_count_supports_boolean_group_key_incrementally() {
+    let definition = SourceDefinition::new(
+        "events",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("active", SourceDataType::Bool, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(BooleanArray::from(vec![true, false, true])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-count-bool-key").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("active", DataType::Boolean, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_active_counts",
+            "SELECT active, COUNT(*) AS count FROM events GROUP BY active",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedCount
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "events",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_active_counts").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(bool_count_rows(&snapshot), vec![(false, 1), (true, 2)]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4])),
+            Arc::new(BooleanArray::from(vec![false])),
+        ],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("events", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(bool_count_rows(&snapshot), vec![(false, 2), (true, 2)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_bool_count_rows(&delta),
+        vec![(false, 1, -1), (false, 2, 1)]
+    );
 }
 
 #[tokio::test]
