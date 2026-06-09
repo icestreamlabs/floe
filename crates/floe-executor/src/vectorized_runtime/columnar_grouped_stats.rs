@@ -11,27 +11,32 @@ use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
-use datafusion::common::ScalarValue;
+use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, ScalarValue};
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
-use crate::delta_consolidation::weighted_snapshot_schema;
+use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
 use crate::encoding::EncodedRowScalar;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
+use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::incremental_source_for_plan;
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
-    collect_incremental_output,
+    collect_incremental_output, normalize_batches,
 };
 
 const GROUP_TAG: u8 = b'g';
@@ -43,10 +48,12 @@ pub(super) struct ColumnarGroupedStatsPlan {
     source_name: String,
     projection: Projection,
     projection_schema: SchemaRef,
+    aggregate_schema: SchemaRef,
     group_schema: SchemaRef,
     specs: Vec<AggregateSpec>,
     output_mapping: Vec<usize>,
     group_count: usize,
+    post_aggregate_plan: Option<LogicalPlan>,
 }
 
 pub(super) struct ColumnarGroupedStatsMaterializedViewState {
@@ -57,6 +64,8 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     stats_state: SlateGroupedStatsState,
     projection_delta: IncrementalMaterializedViewState,
     projection_schema: SchemaRef,
+    aggregate_schema: SchemaRef,
+    post_aggregate: Option<PostAggregateTransformState>,
     group_schema: SchemaRef,
     specs: Vec<AggregateSpec>,
     output_mapping: Vec<usize>,
@@ -107,6 +116,18 @@ struct SlateGroupedStatsState {
     string_value_counts: Mutex<HashMap<(Vec<u8>, usize, String), i64>>,
 }
 
+struct GroupedStatsPlanMatch<'a> {
+    aggregate: &'a Aggregate,
+    projection: Option<&'a Projection>,
+    post_aggregate_plan: Option<LogicalPlan>,
+}
+
+struct PostAggregateTransformState {
+    ctx: SessionContext,
+    provider: Arc<DynamicStateTableProvider>,
+    plan: Arc<dyn ExecutionPlan>,
+}
+
 struct PendingStatsGroupDelta {
     row_count_delta: i64,
     agg_deltas: Vec<AggregateDelta>,
@@ -132,14 +153,17 @@ enum AggregateValue {
     Null,
 }
 
+const POST_AGGREGATE_SOURCE_NAME: &str = "__floe_grouped_stats_aggregate";
+
 pub(super) fn columnar_grouped_stats_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     output_schema: &SchemaRef,
 ) -> Result<Option<ColumnarGroupedStatsPlan>> {
-    let Some((aggregate, projection)) = grouped_stats_aggregate_for_plan(plan) else {
+    let Some(plan_match) = grouped_stats_aggregate_for_plan(plan) else {
         return Ok(None);
     };
+    let aggregate = plan_match.aggregate;
     if aggregate.aggr_expr.is_empty() {
         return Ok(None);
     }
@@ -170,7 +194,12 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         specs.push(spec);
     }
 
-    let output_mapping = match output_mapping_for_projection(projection, aggregate, output_schema) {
+    let output_mapping = match output_mapping_for_projection(
+        plan_match.projection,
+        aggregate,
+        output_schema,
+        plan_match.post_aggregate_plan.is_some(),
+    ) {
         Some(mapping) => mapping,
         None => return Ok(None),
     };
@@ -183,6 +212,17 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     for (output_field, source_idx) in output_schema.fields().iter().zip(output_mapping.iter()) {
         if output_field.data_type() != aggregate_schema.field(*source_idx).data_type() {
             return Ok(None);
+        }
+    }
+    if let Some(post_plan) = plan_match.post_aggregate_plan.as_ref() {
+        let post_schema = df_schema_to_arrow(post_plan.schema())?;
+        if post_schema.fields().len() != output_schema.fields().len() {
+            return Ok(None);
+        }
+        for (output_field, post_field) in output_schema.fields().iter().zip(post_schema.fields()) {
+            if output_field.data_type() != post_field.data_type() {
+                return Ok(None);
+            }
         }
     }
     if projection_expr.is_empty() {
@@ -222,10 +262,12 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         source_name,
         projection: projection_plan,
         projection_schema,
+        aggregate_schema,
         group_schema,
         specs,
         output_mapping,
         group_count,
+        post_aggregate_plan: plan_match.post_aggregate_plan,
     }))
 }
 
@@ -265,6 +307,18 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state(
     )
     .await
     .context("build grouped-stats vectorized projection delta plan")?;
+    let post_aggregate = match plan.post_aggregate_plan {
+        Some(post_plan) => Some(
+            build_post_aggregate_transform_state(
+                Arc::clone(&plan.aggregate_schema),
+                &post_plan,
+                udfs,
+            )
+            .await
+            .context("build grouped-stats post-aggregate transform")?,
+        ),
+        None => None,
+    };
 
     Ok(ColumnarGroupedStatsMaterializedViewState {
         source_name: plan.source_name,
@@ -284,6 +338,8 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state(
         output_zset,
         projection_delta,
         projection_schema: plan.projection_schema,
+        aggregate_schema: plan.aggregate_schema,
+        post_aggregate,
         group_schema: plan.group_schema,
         specs: plan.specs,
         output_mapping: plan.output_mapping,
@@ -593,12 +649,20 @@ async fn apply_grouped_stats_delta(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     pending: HashMap<Vec<u8>, PendingStatsGroupDelta>,
 ) -> Result<Vec<RecordBatch>> {
-    let mut builder = WeightedStatsOutputBuilder::new(
+    let mut direct_builder = WeightedStatsOutputBuilder::new(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
     )?;
+    let mut old_aggregate_builder = AggregateStatsOutputBuilder::new(
+        Arc::clone(&columnar.aggregate_schema),
+        columnar.group_count,
+    )?;
+    let mut new_aggregate_builder = AggregateStatsOutputBuilder::new(
+        Arc::clone(&columnar.aggregate_schema),
+        columnar.group_count,
+    )?;
     if pending.is_empty() {
-        return builder.finish();
+        return direct_builder.finish();
     }
 
     let mut writes = WriteBatch::new();
@@ -618,31 +682,50 @@ async fn apply_grouped_stats_delta(
             .write_group_count(&mut writes, &group_key, new_row_count)?;
 
         if old_row_count > 0 && (new_row_count == 0 || old_values != new_values) {
-            builder.append(
-                &delta.batch,
-                delta.row_idx,
-                columnar.group_count,
-                &old_values,
-                -1,
-            )?;
+            if columnar.post_aggregate.is_some() {
+                old_aggregate_builder.append(&delta.batch, delta.row_idx, &old_values)?;
+            } else {
+                direct_builder.append(
+                    &delta.batch,
+                    delta.row_idx,
+                    columnar.group_count,
+                    &old_values,
+                    -1,
+                )?;
+            }
         }
         if new_row_count > 0 && (old_row_count == 0 || old_values != new_values) {
-            builder.append(
-                &delta.batch,
-                delta.row_idx,
-                columnar.group_count,
-                &new_values,
-                1,
-            )?;
+            if columnar.post_aggregate.is_some() {
+                new_aggregate_builder.append(&delta.batch, delta.row_idx, &new_values)?;
+            } else {
+                direct_builder.append(
+                    &delta.batch,
+                    delta.row_idx,
+                    columnar.group_count,
+                    &new_values,
+                    1,
+                )?;
+            }
         }
     }
+    let output_delta_batches = if let Some(post_aggregate) = columnar.post_aggregate.as_ref() {
+        post_aggregate_delta_batches(
+            post_aggregate,
+            columnar.output_zset.value_schema(),
+            old_aggregate_builder.finish()?,
+            new_aggregate_builder.finish()?,
+        )
+        .await?
+    } else {
+        direct_builder.finish()?
+    };
     columnar
         .stats_state
         .table
         .write_batch(writes)
         .await
         .context("persist grouped-stats state updates")?;
-    builder.finish()
+    Ok(output_delta_batches)
 }
 
 async fn load_aggregate_values(
@@ -1566,6 +1649,65 @@ impl SlateGroupedStatsState {
     }
 }
 
+struct AggregateStatsOutputBuilder {
+    schema: SchemaRef,
+    group_count: usize,
+    builders: Vec<ScalarColumnBuilder>,
+    rows: usize,
+}
+
+impl AggregateStatsOutputBuilder {
+    fn new(schema: SchemaRef, group_count: usize) -> Result<Self> {
+        let builders = schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            schema,
+            group_count,
+            builders,
+            rows: 0,
+        })
+    }
+
+    fn append(
+        &mut self,
+        projection_batch: &RecordBatch,
+        row_idx: usize,
+        aggregate_values: &[AggregateValue],
+    ) -> Result<()> {
+        for source_idx in 0..self.schema.fields().len() {
+            if source_idx < self.group_count {
+                self.builders[source_idx]
+                    .append_array_value(projection_batch.column(source_idx).as_ref(), row_idx)?;
+            } else {
+                let aggregate_idx = source_idx - self.group_count;
+                append_aggregate_value(
+                    &mut self.builders[source_idx],
+                    aggregate_values.get(aggregate_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats aggregate row mapping out of bounds")
+                    })?,
+                )?;
+            }
+        }
+        self.rows = self.rows.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        if self.rows == 0 {
+            return Ok(Vec::new());
+        }
+        let columns = self
+            .builders
+            .iter_mut()
+            .map(ScalarColumnBuilder::finish_array)
+            .collect::<Vec<_>>();
+        Ok(vec![RecordBatch::try_new(self.schema, columns)?])
+    }
+}
+
 struct WeightedStatsOutputBuilder {
     weighted_schema: SchemaRef,
     output_mapping: Vec<usize>,
@@ -1609,19 +1751,7 @@ impl WeightedStatsOutputBuilder {
                     .get(aggregate_idx)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats output mapping out of bounds"))?
                 {
-                    AggregateValue::Int64(value) => {
-                        self.builders[output_idx].append_i64_value(*value)?;
-                    }
-                    AggregateValue::Float64(value) => {
-                        self.builders[output_idx].append_f64_value(*value)?;
-                    }
-                    AggregateValue::Utf8(value) => {
-                        self.builders[output_idx]
-                            .append_encoded_scalar(Some(&EncodedRowScalar::Utf8(value.clone())))?;
-                    }
-                    AggregateValue::Null => {
-                        self.builders[output_idx].append_encoded_scalar(None)?;
-                    }
+                    value => append_aggregate_value(&mut self.builders[output_idx], value)?,
                 }
             }
         }
@@ -1641,6 +1771,64 @@ impl WeightedStatsOutputBuilder {
             .collect::<Vec<_>>();
         columns.push(Arc::new(self.weights.finish()) as ArrayRef);
         Ok(vec![RecordBatch::try_new(self.weighted_schema, columns)?])
+    }
+}
+
+fn append_aggregate_value(builder: &mut ScalarColumnBuilder, value: &AggregateValue) -> Result<()> {
+    match value {
+        AggregateValue::Int64(value) => builder.append_i64_value(*value),
+        AggregateValue::Float64(value) => builder.append_f64_value(*value),
+        AggregateValue::Utf8(value) => {
+            builder.append_encoded_scalar(Some(&EncodedRowScalar::Utf8(value.clone())))
+        }
+        AggregateValue::Null => builder.append_encoded_scalar(None),
+    }
+}
+
+async fn post_aggregate_delta_batches(
+    post_aggregate: &PostAggregateTransformState,
+    output_schema: SchemaRef,
+    old_aggregate_rows: Vec<RecordBatch>,
+    new_aggregate_rows: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let weighted_schema = weighted_snapshot_schema(&output_schema)?;
+    let old_output = post_aggregate
+        .collect(old_aggregate_rows, &output_schema)
+        .await
+        .context("evaluate grouped-stats old post-aggregate rows")?;
+    let mut output_delta = add_weight_column_to_batches(&old_output, &weighted_schema, -1)?;
+    let new_output = post_aggregate
+        .collect(new_aggregate_rows, &output_schema)
+        .await
+        .context("evaluate grouped-stats new post-aggregate rows")?;
+    output_delta.extend(add_weight_column_to_batches(
+        &new_output,
+        &weighted_schema,
+        1,
+    )?);
+    Ok(output_delta)
+}
+
+impl PostAggregateTransformState {
+    async fn collect(
+        &self,
+        aggregate_rows: Vec<RecordBatch>,
+        output_schema: &SchemaRef,
+    ) -> Result<Vec<RecordBatch>> {
+        if aggregate_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.provider
+            .set_batches(aggregate_rows)
+            .context("set grouped-stats post-aggregate input rows")?;
+        let collected = collect(Arc::clone(&self.plan), self.ctx.task_ctx()).await;
+        self.provider
+            .set_batches(Vec::new())
+            .context("clear grouped-stats post-aggregate input rows")?;
+        normalize_batches(
+            collected.context("execute grouped-stats post-aggregate transform")?,
+            output_schema,
+        )
     }
 }
 
@@ -1748,13 +1936,131 @@ fn aggregate_value_type_for_data_type(data_type: &DataType) -> Option<AggregateV
     }
 }
 
-fn grouped_stats_aggregate_for_plan(
-    plan: &LogicalPlan,
-) -> Option<(&Aggregate, Option<&Projection>)> {
+async fn build_post_aggregate_transform_state(
+    aggregate_schema: SchemaRef,
+    post_aggregate_plan: &LogicalPlan,
+    udfs: &[ScalarUDF],
+) -> Result<PostAggregateTransformState> {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    for udf in udfs.iter().cloned() {
+        ctx.register_udf(udf);
+    }
+    let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(
+        &aggregate_schema,
+    )));
+    ctx.register_table(
+        POST_AGGREGATE_SOURCE_NAME,
+        Arc::clone(&provider) as Arc<dyn TableProvider>,
+    )
+    .context("register grouped-stats post-aggregate input")?;
+    let table_scan = ctx
+        .table(POST_AGGREGATE_SOURCE_NAME)
+        .await
+        .context("build grouped-stats post-aggregate table scan")?
+        .logical_plan()
+        .clone();
+    let logical_plan = rebind_post_aggregate_plan(post_aggregate_plan.clone(), table_scan)?;
+    let plan = ctx
+        .state()
+        .create_physical_plan(&logical_plan)
+        .await
+        .context("create grouped-stats post-aggregate physical plan")?;
+    Ok(PostAggregateTransformState {
+        ctx,
+        provider,
+        plan,
+    })
+}
+
+fn rebind_post_aggregate_plan(
+    logical_plan: LogicalPlan,
+    aggregate_scan: LogicalPlan,
+) -> Result<LogicalPlan> {
+    let mut replaced = false;
+    let logical_plan = unqualify_post_aggregate_columns(logical_plan)?;
+    let transformed = logical_plan.transform_up(|plan| match plan {
+        LogicalPlan::Aggregate(_) if !replaced => {
+            replaced = true;
+            Ok(Transformed::yes(aggregate_scan.clone()))
+        }
+        other => Ok(Transformed::no(other)),
+    })?;
+    if !replaced {
+        bail!("grouped-stats post-aggregate plan did not contain an aggregate");
+    }
+    Ok(transformed.data)
+}
+
+fn unqualify_post_aggregate_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
+    Ok(match plan {
+        LogicalPlan::Projection(mut projection) => {
+            projection.expr = projection
+                .expr
+                .into_iter()
+                .map(unqualify_post_aggregate_expr)
+                .collect::<Result<Vec<_>>>()?;
+            projection.input = Arc::new(unqualify_post_aggregate_columns(
+                projection.input.as_ref().clone(),
+            )?);
+            LogicalPlan::Projection(projection)
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.predicate = unqualify_post_aggregate_expr(filter.predicate)?;
+            filter.input = Arc::new(unqualify_post_aggregate_columns(
+                filter.input.as_ref().clone(),
+            )?);
+            LogicalPlan::Filter(filter)
+        }
+        LogicalPlan::SubqueryAlias(mut alias) => {
+            alias.input = Arc::new(unqualify_post_aggregate_columns(
+                alias.input.as_ref().clone(),
+            )?);
+            LogicalPlan::SubqueryAlias(alias)
+        }
+        other => other,
+    })
+}
+
+fn unqualify_post_aggregate_expr(expr: Expr) -> Result<Expr> {
+    expr.transform_up(|expr| match expr {
+        Expr::Column(column) => Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+            column.name,
+        )))),
+        other => Ok(Transformed::no(other)),
+    })
+    .map(|result| result.data)
+    .map_err(anyhow::Error::new)
+}
+
+fn grouped_stats_aggregate_for_plan(plan: &LogicalPlan) -> Option<GroupedStatsPlanMatch<'_>> {
     match plan {
-        LogicalPlan::Aggregate(aggregate) => Some((aggregate, None)),
+        LogicalPlan::Aggregate(aggregate) => Some(GroupedStatsPlanMatch {
+            aggregate,
+            projection: None,
+            post_aggregate_plan: None,
+        }),
         LogicalPlan::Projection(projection) => match projection.input.as_ref() {
-            LogicalPlan::Aggregate(aggregate) => Some((aggregate, Some(projection))),
+            LogicalPlan::Aggregate(aggregate) => Some(GroupedStatsPlanMatch {
+                aggregate,
+                projection: Some(projection),
+                post_aggregate_plan: None,
+            }),
+            LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+                LogicalPlan::Aggregate(aggregate) => Some(GroupedStatsPlanMatch {
+                    aggregate,
+                    projection: None,
+                    post_aggregate_plan: Some(plan.clone()),
+                }),
+                _ => None,
+            },
+            _ => None,
+        },
+        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => Some(GroupedStatsPlanMatch {
+                aggregate,
+                projection: None,
+                post_aggregate_plan: Some(plan.clone()),
+            }),
             _ => None,
         },
         LogicalPlan::SubqueryAlias(alias) => grouped_stats_aggregate_for_plan(alias.input.as_ref()),
@@ -1766,7 +2072,11 @@ fn output_mapping_for_projection(
     projection: Option<&Projection>,
     aggregate: &Aggregate,
     output_schema: &SchemaRef,
+    has_post_aggregate_plan: bool,
 ) -> Option<Vec<usize>> {
+    if has_post_aggregate_plan {
+        return Some(Vec::new());
+    }
     let aggregate_schema = &aggregate.schema;
     match projection {
         Some(projection) => {
