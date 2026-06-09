@@ -226,6 +226,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT a.auction, a.max_price, au.seller FROM (SELECT auction, MAX(price) AS max_price FROM bid GROUP BY auction) a JOIN auction au ON a.auction = au.id",
     },
     ValidPlanRuntimeCase {
+        id: "topn_over_aggregate_join",
+        sql: "SELECT j.auction, j.max_price FROM (SELECT a.auction, a.max_price, au.seller FROM (SELECT auction, MAX(price) AS max_price FROM bid GROUP BY auction) a JOIN auction au ON a.auction = au.id) j ORDER BY j.max_price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "distinct_join",
         sql: "SELECT d.auction, a.seller FROM (SELECT DISTINCT auction FROM bid) d JOIN auction a ON d.auction = a.id",
     },
@@ -1103,6 +1107,7 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("join_over_three_way_join", "columnar_join"),
         ("union_join", "columnar_join"),
         ("aggregate_join", "columnar_join"),
+        ("topn_over_aggregate_join", "columnar_topn"),
         ("join_over_join_aggregate", "columnar_join"),
         ("join_over_global_aggregate", "columnar_join"),
         ("join_over_window_aggregate", "columnar_join"),

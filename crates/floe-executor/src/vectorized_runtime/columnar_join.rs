@@ -2478,14 +2478,16 @@ fn join_input_plan_for_side(
         }));
     }
 
-    if let Some(topn) = columnar_topn_plan_for_plan(plan, sources)? {
+    if let Some(topn) = columnar_topn_plan_for_plan(plan, sources)?
+        && let Some(source_name) = topn.source_name()
+    {
         let input_name =
             constant_relation_name(plan).unwrap_or_else(|| format!("__floe_join_{side}_topn"));
         return Ok(Some(ColumnarJoinInputPlan {
             input_name,
             schema: df_schema_to_arrow(plan.schema()),
             kind: ColumnarJoinInputPlanKind::TopN {
-                source_name: topn.source_name,
+                source_name,
                 logical_plan: topn.logical_plan,
             },
         }));

@@ -298,6 +298,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: join_aggregate_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "topn_over_aggregate_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_topn_over_aggregate_join",
+            query: r#"SELECT j.auction, j.max_price FROM (SELECT m.auction, m.max_price, a.seller FROM (SELECT auction, MAX(price) AS max_price FROM bid GROUP BY auction) m JOIN auction a ON m.auction = a.id) j ORDER BY j.max_price DESC LIMIT 256"#,
+            output_schema: topn_over_aggregate_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "filtered_join_topn",
             sources: &[
                 NexmarkRuntimeSource {
@@ -954,6 +970,13 @@ fn join_aggregate_join_output_schema() -> SchemaRef {
         Field::new("auction", DataType::Int64, false),
         Field::new("total_price", DataType::Int64, true),
         Field::new("person_id", DataType::Int64, false),
+    ]))
+}
+
+fn topn_over_aggregate_join_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("max_price", DataType::Int64, false),
     ]))
 }
 

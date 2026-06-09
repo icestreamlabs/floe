@@ -922,6 +922,28 @@ pub(super) async fn build_columnar_aggregate_join_materialized_view_state(
     .await
 }
 
+pub(super) async fn build_columnar_aggregate_join_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "aggregate_join",
+        "aggregate join",
+        "columnar_aggregate_join_snapshot_diff",
+    )
+    .await
+}
+
 pub(super) async fn build_columnar_distinct_join_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
