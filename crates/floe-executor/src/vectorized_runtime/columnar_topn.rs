@@ -534,7 +534,7 @@ fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::SubqueryAlias(alias) => global_sort_limit_for_plan(alias.input.as_ref()),
         LogicalPlan::Limit(limit) => {
-            limit_has_zero_skip_and_positive_fetch(limit)
+            limit_has_nonnegative_skip_and_positive_fetch(limit)
                 && sort_input_for_limit(limit.input.as_ref())
         }
         LogicalPlan::Sort(sort) => sort_has_positive_fetch(sort),
@@ -542,14 +542,14 @@ fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
     }
 }
 
-fn limit_has_zero_skip_and_positive_fetch(limit: &Limit) -> bool {
+fn limit_has_nonnegative_skip_and_positive_fetch(limit: &Limit) -> bool {
     let skip = limit
         .skip
         .as_deref()
         .map(literal_to_nonnegative_usize)
         .unwrap_or(Some(0));
     let fetch = limit.fetch.as_deref().and_then(literal_to_positive_usize);
-    skip == Some(0) && fetch.is_some()
+    skip.is_some() && fetch.is_some()
 }
 
 fn sort_input_for_limit(plan: &LogicalPlan) -> bool {
