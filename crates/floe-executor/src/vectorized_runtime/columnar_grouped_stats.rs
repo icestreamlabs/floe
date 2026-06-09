@@ -139,7 +139,8 @@ struct PendingStatsGroupDelta {
 #[derive(Clone)]
 enum AggregateDelta {
     Count { count_delta: i64 },
-    DistinctCount { value_deltas: HashMap<i64, i64> },
+    DistinctCountI64 { value_deltas: HashMap<i64, i64> },
+    DistinctCountUtf8 { value_deltas: HashMap<String, i64> },
     Sum { sum_delta: i64 },
     Avg { sum_delta: i64, count_delta: i64 },
     MinMaxI64 { value_deltas: HashMap<i64, i64> },
@@ -239,9 +240,22 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let projection_plan = Projection::try_new(projection_expr, Arc::clone(&aggregate.input))
         .context("build grouped-stats value projection")?;
     let projection_schema = df_schema_to_arrow(&projection_plan.schema)?;
-    for spec in &specs {
+    for spec in &mut specs {
         if let (Some(value_idx), Some(value_type)) = (spec.value_idx, spec.value_type) {
             let expected = match value_type {
+                AggregateValueType::Any if spec.kind == AggregateKind::DistinctCount => {
+                    match projection_schema.field(value_idx).data_type() {
+                        DataType::Int64 => {
+                            spec.value_type = Some(AggregateValueType::Int64);
+                            Some(&DataType::Int64)
+                        }
+                        DataType::Utf8 => {
+                            spec.value_type = Some(AggregateValueType::Utf8);
+                            Some(&DataType::Utf8)
+                        }
+                        _ => return Ok(None),
+                    }
+                }
                 AggregateValueType::Any => None,
                 AggregateValueType::Int64 => Some(&DataType::Int64),
                 AggregateValueType::Utf8 => Some(&DataType::Utf8),
@@ -597,11 +611,17 @@ fn add_projected_stats_row_to_pending(
                     .checked_add(sign)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats count delta overflow"))?;
             }
-            (AggregateDelta::DistinctCount { value_deltas }, AggregateKind::DistinctCount) => {
+            (AggregateDelta::DistinctCountI64 { value_deltas }, AggregateKind::DistinctCount) => {
                 let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
                     continue;
                 };
                 update_i64_value_delta(value_deltas, value, sign)?;
+            }
+            (AggregateDelta::DistinctCountUtf8 { value_deltas }, AggregateKind::DistinctCount) => {
+                let Some(value) = projected_utf8_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                update_string_value_delta(value_deltas, value.to_string(), sign)?;
             }
             (AggregateDelta::Sum { sum_delta }, AggregateKind::Sum) => {
                 let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
@@ -807,7 +827,7 @@ async fn apply_aggregate_deltas(
                     .write_i64(writes, group_key, idx, new)?;
                 AggregateValue::Int64(new)
             }
-            (AggregateKind::DistinctCount, AggregateDelta::DistinctCount { value_deltas }) => {
+            (AggregateKind::DistinctCount, AggregateDelta::DistinctCountI64 { value_deltas }) => {
                 let old = columnar.stats_state.load_i64(group_key, idx).await?;
                 let mut new = old;
                 for (value, value_delta) in value_deltas {
@@ -836,6 +856,43 @@ async fn apply_aggregate_deltas(
                 }
                 if new < 0 {
                     bail!("grouped-stats distinct count became negative");
+                }
+                columnar
+                    .stats_state
+                    .write_i64(writes, group_key, idx, new)?;
+                AggregateValue::Int64(new)
+            }
+            (AggregateKind::DistinctCount, AggregateDelta::DistinctCountUtf8 { value_deltas }) => {
+                let old = columnar.stats_state.load_i64(group_key, idx).await?;
+                let mut new = old;
+                for (value, value_delta) in value_deltas {
+                    let old_count = columnar
+                        .stats_state
+                        .load_string_value_count(group_key, idx, value)
+                        .await?;
+                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats string distinct value count overflow")
+                    })?;
+                    if new_count < 0 {
+                        bail!(
+                            "grouped-stats string distinct removed more values than were present"
+                        );
+                    }
+                    if old_count == 0 && new_count > 0 {
+                        new = new.checked_add(1).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats string distinct overflow")
+                        })?;
+                    } else if old_count > 0 && new_count == 0 {
+                        new = new.checked_sub(1).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats string distinct underflow")
+                        })?;
+                    }
+                    columnar
+                        .stats_state
+                        .write_string_value_count(writes, group_key, idx, value, new_count)?;
+                }
+                if new < 0 {
+                    bail!("grouped-stats string distinct count became negative");
                 }
                 columnar
                     .stats_state
@@ -955,7 +1012,12 @@ impl AggregateDelta {
     fn for_spec(spec: &AggregateSpec) -> Self {
         match (spec.kind, spec.value_type) {
             (AggregateKind::Count, _) => Self::Count { count_delta: 0 },
-            (AggregateKind::DistinctCount, _) => Self::DistinctCount {
+            (AggregateKind::DistinctCount, Some(AggregateValueType::Utf8)) => {
+                Self::DistinctCountUtf8 {
+                    value_deltas: HashMap::new(),
+                }
+            }
+            (AggregateKind::DistinctCount, _) => Self::DistinctCountI64 {
                 value_deltas: HashMap::new(),
             },
             (AggregateKind::Sum, _) => Self::Sum { sum_delta: 0 },
@@ -978,7 +1040,8 @@ impl AggregateDelta {
 fn aggregate_deltas_empty(deltas: &[AggregateDelta]) -> bool {
     deltas.iter().all(|delta| match delta {
         AggregateDelta::Count { count_delta } => *count_delta == 0,
-        AggregateDelta::DistinctCount { value_deltas } => value_deltas.is_empty(),
+        AggregateDelta::DistinctCountI64 { value_deltas } => value_deltas.is_empty(),
+        AggregateDelta::DistinctCountUtf8 { value_deltas } => value_deltas.is_empty(),
         AggregateDelta::Sum { sum_delta } => *sum_delta == 0,
         AggregateDelta::Avg {
             sum_delta,
@@ -1899,7 +1962,7 @@ fn aggregate_spec_for_expr(
                 kind: AggregateKind::DistinctCount,
                 value_idx: Some(value_idx),
                 filter_idx,
-                value_type: Some(AggregateValueType::Int64),
+                value_type: Some(AggregateValueType::Any),
             });
         }
         if !is_count_star_args(&params.args) {

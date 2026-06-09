@@ -250,6 +250,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT COUNT(*) FILTER (WHERE price > 100) AS filtered_rows, COUNT(DISTINCT bidder) FILTER (WHERE price > 100) AS filtered_distinct_bidders FROM bid",
     },
     ValidPlanRuntimeCase {
+        id: "string_distinct_count_aggregate",
+        sql: "SELECT COUNT(DISTINCT channel) AS distinct_channels FROM bid",
+    },
+    ValidPlanRuntimeCase {
         id: "hop_window_aggregate",
         sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)",
     },
