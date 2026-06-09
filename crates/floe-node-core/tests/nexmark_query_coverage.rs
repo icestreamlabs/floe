@@ -57,6 +57,30 @@ struct ValidPlanRuntimeCase {
 
 const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
+        id: "projection_over_scan",
+        sql: "SELECT id, name FROM person",
+    },
+    ValidPlanRuntimeCase {
+        id: "scan_pushdown_filter_projection",
+        sql: "SELECT id, name FROM person WHERE id > 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "filter_through_subquery_projection_alias",
+        sql: "SELECT p FROM (SELECT price AS p, auction FROM bid) q WHERE p > 10",
+    },
+    ValidPlanRuntimeCase {
+        id: "merged_projection_alias",
+        sql: "SELECT p AS price_alias FROM (SELECT price AS p, auction AS a FROM bid) q",
+    },
+    ValidPlanRuntimeCase {
+        id: "plain_distinct",
+        sql: "SELECT DISTINCT auction FROM bid",
+    },
+    ValidPlanRuntimeCase {
+        id: "multi_column_distinct",
+        sql: "SELECT DISTINCT auction, bidder FROM bid",
+    },
+    ValidPlanRuntimeCase {
         id: "left_outer_join",
         sql: "SELECT b.auction, a.seller FROM bid b LEFT JOIN auction a ON b.auction = a.id",
     },
@@ -89,6 +113,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve",
     },
     ValidPlanRuntimeCase {
+        id: "multi_column_join",
+        sql: "SELECT p.id, a.id AS auction_id FROM person p JOIN auction a ON p.id = a.seller AND p.\"dateTime\" = a.expires",
+    },
+    ValidPlanRuntimeCase {
+        id: "join_key_filter_inference",
+        sql: "SELECT p.name, a.\"itemName\" FROM person p JOIN auction a ON p.id = a.seller WHERE p.id > 10",
+    },
+    ValidPlanRuntimeCase {
+        id: "join_expression_key_pruning",
+        sql: "SELECT b.auction, a.seller FROM bid b JOIN auction a ON b.auction = a.id AND b.auction % 10000 = a.id % 10000",
+    },
+    ValidPlanRuntimeCase {
         id: "three_way_join",
         sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction",
     },
@@ -101,6 +137,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
     },
     ValidPlanRuntimeCase {
+        id: "global_sort_limit_topn",
+        sql: "SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "partitioned_row_number_topn",
+        sql: "SELECT auction, bidder, price, channel, url, \"dateTime\", extra FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY bidder, auction ORDER BY \"dateTime\" DESC) AS rank_number FROM bid) ranked WHERE rank_number <= 1",
+    },
+    ValidPlanRuntimeCase {
+        id: "row_number_alias_projection",
+        sql: "SELECT auction, bidder, price, \"bidTime\" FROM (SELECT b.auction, b.bidder, b.price, b.\"dateTime\" AS \"bidTime\", ROW_NUMBER() OVER (PARTITION BY b.auction ORDER BY b.price DESC, b.\"dateTime\" ASC) AS rownum FROM bid b) ranked WHERE rownum <= 1",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_over_distinct_subquery",
         sql: "SELECT COUNT(auction) AS c FROM (SELECT DISTINCT auction, bidder FROM bid) d",
     },
@@ -111,6 +159,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "union_duplicate_source",
         sql: "SELECT auction FROM (SELECT auction, price FROM bid WHERE price > 100 UNION ALL SELECT auction, price FROM bid WHERE price <= 100) u",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_filter_projection_pushdown",
+        sql: "SELECT auction FROM (SELECT auction, price FROM bid UNION ALL SELECT auction, price FROM bid) u WHERE price > 100",
+    },
+    ValidPlanRuntimeCase {
+        id: "three_input_union",
+        sql: "SELECT auction FROM bid UNION ALL SELECT auction FROM bid UNION ALL SELECT auction FROM bid",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_distinct",
+        sql: "SELECT auction FROM bid UNION SELECT auction FROM bid",
     },
     ValidPlanRuntimeCase {
         id: "distinct_over_union",
