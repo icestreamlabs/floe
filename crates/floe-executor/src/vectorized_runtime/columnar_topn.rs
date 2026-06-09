@@ -82,9 +82,6 @@ pub(super) fn columnar_topn_plan_for_plan(
         else {
             return Ok(None);
         };
-        if window_function.params.partition_by.is_empty() {
-            return Ok(None);
-        }
         let partition_columns = window_function
             .params
             .partition_by
