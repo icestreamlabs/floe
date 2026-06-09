@@ -34,11 +34,16 @@ const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
 const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
 
 mod columnar_count;
+mod columnar_stateless;
 mod source_state;
 
 use columnar_count::{
     ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
     columnar_count_plan_for_plan, run_columnar_count_materialized_view_tick,
+};
+use columnar_stateless::{
+    ColumnarStatelessMaterializedViewState, build_columnar_stateless_materialized_view_state,
+    columnar_stateless_plan_for_plan, run_columnar_stateless_materialized_view_tick,
 };
 
 #[derive(Debug, Clone)]
@@ -126,6 +131,7 @@ struct VectorizedMaterializedViewState {
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     previous_snapshot: Vec<RecordBatch>,
     incremental: Option<IncrementalMaterializedViewState>,
+    columnar_stateless: Option<ColumnarStatelessMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
     execution_mode: MaterializedViewExecutionMode,
 }
@@ -142,6 +148,7 @@ struct IncrementalMaterializedViewState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializedViewExecutionMode {
+    ColumnarStateless,
     ColumnarCountByKey,
     IncrementalFilterProject,
     FullRefresh,
@@ -331,7 +338,36 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
-            let incremental_source = if columnar_count.is_none() {
+            let columnar_stateless_plan = if columnar_count.is_none() {
+                columnar_stateless_plan_for_plan(df.logical_plan(), &source_states)
+            } else {
+                None
+            };
+            let columnar_stateless = match (
+                columnar_stateless_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_stateless_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.query,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar stateless operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                _ => None,
+            };
+            let incremental_source = if columnar_count.is_none() && columnar_stateless.is_none() {
                 incremental_source_for_plan(df.logical_plan(), &source_states)
             } else {
                 None
@@ -355,6 +391,7 @@ impl VectorizedExecutionRuntime {
                 None => None,
             };
             if columnar_count.is_none()
+                && columnar_stateless.is_none()
                 && incremental.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
             {
@@ -363,7 +400,9 @@ impl VectorizedExecutionRuntime {
                     mv.view_name
                 );
             }
-            let execution_mode = if columnar_count.is_some() {
+            let execution_mode = if columnar_stateless.is_some() {
+                MaterializedViewExecutionMode::ColumnarStateless
+            } else if columnar_count.is_some() {
                 MaterializedViewExecutionMode::ColumnarCountByKey
             } else if incremental.is_some() {
                 MaterializedViewExecutionMode::IncrementalFilterProject
@@ -379,8 +418,12 @@ impl VectorizedExecutionRuntime {
                 view_name: mv.view_name,
                 output_schema: mv.output_schema,
                 plan,
-                previous_snapshot: Vec::new(),
+                previous_snapshot: columnar_stateless
+                    .as_ref()
+                    .map(ColumnarStatelessMaterializedViewState::initial_snapshot)
+                    .unwrap_or_default(),
                 incremental,
+                columnar_stateless,
                 columnar_count,
                 execution_mode,
             });
@@ -557,6 +600,17 @@ impl VectorizedExecutionRuntime {
         let insert_batches = &self.current_insert_batches;
         let weighted_delta_batches = &self.current_weighted_delta_batches;
         for mv in &mut self.materialized_views {
+            if run_columnar_stateless_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
             if run_columnar_count_materialized_view_tick(
                 registry,
                 insert_batches,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
-use datafusion::arrow::array::{Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::storage::{KeyValueTable, SlateTable};
@@ -18,6 +18,49 @@ fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
         .downcast_ref::<Int64Array>()
         .expect("int64 column");
     (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
+fn string_values(batch: &RecordBatch, column_idx: usize) -> Vec<String> {
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("string column");
+    (0..values.len())
+        .map(|idx| values.value(idx).to_string())
+        .collect()
+}
+
+fn id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let ids = int64_values(batch, 0);
+        let notes = string_values(batch, 1);
+        rows.extend(ids.into_iter().zip(notes));
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let ids = int64_values(batch, 0);
+        let notes = string_values(batch, 1);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            ids.into_iter()
+                .zip(notes)
+                .zip(weights)
+                .map(|((id, note), weight)| (id, note, weight)),
+        );
+    }
+    rows.sort();
+    rows
 }
 
 async fn build_operator_state_table(name: &str) -> Arc<dyn KeyValueTable> {
@@ -222,6 +265,129 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     assert_eq!(source_rows.len(), 1);
     assert_eq!(int64_values(&source_rows[0], 0), vec![1]);
     assert_eq!(int64_values(&source_rows[0], 1), vec![40]);
+}
+
+#[tokio::test]
+async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementally() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new("id", SourceDataType::Int64),
+            SourceColumn::new("note", SourceDataType::Utf8),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 4])),
+            Arc::new(StringArray::from(vec!["a", "b", "d"])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-stateless").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::clone(&schema);
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders",
+            "SELECT id, note FROM orders WHERE id >= 2",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarStateless
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_orders").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(2, "b".to_string()), (4, "d".to_string())]
+    );
+
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let source_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 3])),
+            Arc::new(StringArray::from(vec!["b", "c"])),
+        ],
+    )
+    .expect("source delta rows");
+    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, 1])
+        .expect("weighted source rows");
+    runtime
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply weighted delta");
+    runtime.run_tick(2).await.expect("weighted tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(3, "c".to_string()), (4, "d".to_string())]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(2, "b".to_string(), -1), (3, "c".to_string(), 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders",
+            "SELECT id, note FROM orders WHERE id >= 2",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarStateless
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_orders")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        id_note_rows(&recovered_snapshot),
+        vec![(3, "c".to_string()), (4, "d".to_string())]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
 }
 
 #[tokio::test]
