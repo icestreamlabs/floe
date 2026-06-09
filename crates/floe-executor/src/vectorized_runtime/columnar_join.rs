@@ -85,6 +85,7 @@ struct ColumnarJoinSourceState {
     constant: Option<ColumnarJoinConstantState>,
     topn: Option<ColumnarJoinTopNInputState>,
     join_topn: Option<ColumnarJoinJoinTopNInputState>,
+    join: Option<ColumnarJoinJoinInputState>,
 }
 
 struct ColumnarJoinConstantState {
@@ -104,6 +105,10 @@ struct ColumnarJoinTopNInputState {
 
 struct ColumnarJoinJoinTopNInputState {
     state: ColumnarJoinTopNMaterializedViewState,
+}
+
+struct ColumnarJoinJoinInputState {
+    state: Box<ColumnarJoinMaterializedViewState>,
 }
 
 struct ColumnarJoinInputPlan {
@@ -126,12 +131,21 @@ enum ColumnarJoinInputPlanKind {
     JoinTopN {
         plan: ColumnarJoinTopNPlan,
     },
+    Join {
+        plan: Box<ColumnarJoinPlan>,
+    },
 }
 
 struct JoinInputTick {
     delta: ColumnarZSet,
     changed: bool,
     next_snapshot: Option<Vec<RecordBatch>>,
+}
+
+pub(super) struct ColumnarJoinTick {
+    delta: ColumnarZSet,
+    next_snapshot: Vec<RecordBatch>,
+    input_changed: bool,
 }
 
 struct JoinDeltaEvaluator {
@@ -159,8 +173,16 @@ pub(super) fn columnar_join_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarJoinPlan>> {
+    columnar_join_plan_for_plan_with_options(plan, sources, true)
+}
+
+fn columnar_join_plan_for_plan_with_options(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    skip_derived_join_inputs: bool,
+) -> Result<Option<ColumnarJoinPlan>> {
     let mut joins = Vec::new();
-    collect_joins(plan, sources, &mut joins)?;
+    collect_joins(plan, sources, &mut joins, false, skip_derived_join_inputs)?;
     let [join] = joins.as_slice() else {
         return Ok(None);
     };
@@ -211,13 +233,32 @@ pub(super) async fn build_columnar_join_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinMaterializedViewState> {
+    let mv_namespace = namespaces::materialized_view(view_name)?;
+    build_columnar_join_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+    )
+    .await
+}
+
+async fn build_columnar_join_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarJoinPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarJoinMaterializedViewState> {
     let ColumnarJoinPlan {
         logical_plan,
         left,
         right,
         execution_strategy,
     } = plan;
-    let mv_namespace = namespaces::materialized_view(view_name)?;
     let shared_source_input =
         left.is_source() && right.is_source() && left.source_name() == right.source_name();
     let (left_namespace, right_namespace) = if shared_source_input {
@@ -339,6 +380,9 @@ fn join_input_namespace(mv_namespace: &str, side: &str, input: &ColumnarJoinInpu
         ColumnarJoinInputPlanKind::JoinTopN { .. } => {
             format!("{mv_namespace}/columnar/join/{side}/join_topn")
         }
+        ColumnarJoinInputPlanKind::Join { .. } => {
+            format!("{mv_namespace}/columnar/join/{side}/join")
+        }
     }
 }
 
@@ -393,6 +437,7 @@ async fn build_join_input_state(
                 constant: None,
                 topn: None,
                 join_topn: None,
+                join: None,
             })
         }
         ColumnarJoinInputPlanKind::Constant { logical_plan } => {
@@ -452,6 +497,7 @@ async fn build_join_input_state(
                 }),
                 topn: None,
                 join_topn: None,
+                join: None,
             })
         }
         ColumnarJoinInputPlanKind::TopN {
@@ -519,6 +565,7 @@ async fn build_join_input_state(
                     evaluator,
                 }),
                 join_topn: None,
+                join: None,
             })
         }
         ColumnarJoinInputPlanKind::JoinTopN { plan } => {
@@ -552,6 +599,39 @@ async fn build_join_input_state(
                 constant: None,
                 topn: None,
                 join_topn: Some(ColumnarJoinJoinTopNInputState { state }),
+                join: None,
+            })
+        }
+        ColumnarJoinInputPlanKind::Join { plan } => {
+            let join_namespace = format!("{namespace}/state");
+            let state = Box::pin(build_columnar_join_materialized_view_state_in_namespace(
+                table,
+                join_namespace,
+                &input.schema,
+                *plan,
+                sources,
+                udfs,
+            ))
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed {side} nested join input for '{}'",
+                    input.input_name
+                )
+            })?;
+            let snapshot = state.initial_snapshot();
+            Ok(ColumnarJoinSourceState {
+                input_name: input.input_name,
+                source_name: None,
+                schema: input.schema,
+                input_zset: None,
+                snapshot,
+                constant: None,
+                topn: None,
+                join_topn: None,
+                join: Some(ColumnarJoinJoinInputState {
+                    state: Box::new(state),
+                }),
             })
         }
     }
@@ -588,27 +668,54 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
 ) -> Result<bool> {
-    let Some(execution_strategy) = mv
-        .columnar_join
-        .as_ref()
-        .map(|columnar| columnar.execution_strategy)
-    else {
-        return Ok(false);
-    };
-    if execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff {
-        return run_columnar_snapshot_diff_join_materialized_view_tick(
-            registry,
-            insert_batches,
-            weighted_delta_batches,
-            mv,
-            version,
-        )
-        .await;
-    }
     let Some(columnar) = mv.columnar_join.as_mut() else {
         return Ok(false);
     };
     let plan_start = Instant::now();
+    let tick = run_columnar_join_state_tick(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        &mv.output_schema,
+        &mv.previous_snapshot,
+    )
+    .await?;
+
+    let delta_batches = tick.delta.batches().to_vec();
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = tick.next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = if columnar.execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff {
+            "columnar_join_snapshot_diff"
+        } else {
+            "columnar_join"
+        },
+        "SlateDB-backed join columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+async fn run_columnar_join_state_tick(
+    columnar: &mut ColumnarJoinMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarJoinTick> {
+    if columnar.execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff {
+        return run_columnar_snapshot_diff_join_state_tick(
+            columnar,
+            insert_batches,
+            weighted_delta_batches,
+            output_schema,
+            previous_snapshot,
+        )
+        .await;
+    }
 
     let left_input_delta =
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
@@ -698,18 +805,10 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed join columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+            .await
+            .context("apply Slate-backed join columnar snapshot delta")?;
     columnar.left.snapshot =
         apply_source_snapshot_delta(&columnar.left.schema, &columnar.left.snapshot, &left_delta)
             .await?;
@@ -720,31 +819,20 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     )
     .await?;
 
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_join",
-        "SlateDB-backed join columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarJoinTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed: !left_delta.batches().is_empty() || !right_delta.batches().is_empty(),
+    })
 }
 
-async fn run_columnar_snapshot_diff_join_materialized_view_tick(
-    registry: &MaterializedViewRegistry,
+async fn run_columnar_snapshot_diff_join_state_tick(
+    columnar: &mut ColumnarJoinMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    mv: &mut VectorizedMaterializedViewState,
-    version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_join.as_mut() else {
-        return Ok(false);
-    };
-    let plan_start = Instant::now();
-
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarJoinTick> {
     let left_tick =
         prepare_join_input_tick(&mut columnar.left, insert_batches, weighted_delta_batches).await?;
     let right_tick =
@@ -787,14 +875,10 @@ async fn run_columnar_snapshot_diff_join_materialized_view_tick(
             )
             .await
             .context("evaluate next snapshot-diff join output")?;
-        diff_snapshot_batches(
-            Arc::clone(&mv.output_schema),
-            &mv.previous_snapshot,
-            &next_output,
-        )
-        .await
-        .context("diff snapshot-diff join output")?
-        .batches
+        diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
+            .await
+            .context("diff snapshot-diff join output")?
+            .batches
     } else {
         Vec::new()
     };
@@ -819,34 +903,20 @@ async fn run_columnar_snapshot_diff_join_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed snapshot-diff join columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+            .await
+            .context("apply Slate-backed snapshot-diff join columnar snapshot delta")?;
 
     columnar.left.snapshot = next_left_snapshot;
     columnar.right.snapshot = next_right_snapshot;
     mark_join_constant_initialized(&mut columnar.left).await?;
     mark_join_constant_initialized(&mut columnar.right).await?;
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_join_snapshot_diff",
-        "SlateDB-backed snapshot-diff join columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarJoinTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed: has_input_change,
+    })
 }
 
 enum JoinEvaluatorKind {
@@ -939,6 +1009,10 @@ async fn prepare_join_input_tick(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<JoinInputTick> {
+    if source.join.is_some() {
+        return prepare_nested_join_input_tick(source, insert_batches, weighted_delta_batches)
+            .await;
+    }
     if source.join_topn.is_some() {
         return prepare_join_topn_join_input_tick(source, insert_batches, weighted_delta_batches)
             .await;
@@ -961,6 +1035,50 @@ async fn prepare_join_input_tick(
         delta,
         changed,
         next_snapshot: None,
+    })
+}
+
+async fn prepare_nested_join_input_tick(
+    source: &mut ColumnarJoinSourceState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<JoinInputTick> {
+    let Some(join) = source.join.as_mut() else {
+        return Ok(JoinInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&source.schema))?,
+            changed: false,
+            next_snapshot: None,
+        });
+    };
+    let tick = Box::pin(run_columnar_join_state_tick(
+        &mut join.state,
+        insert_batches,
+        weighted_delta_batches,
+        &source.schema,
+        &source.snapshot,
+    ))
+    .await
+    .with_context(|| format!("evaluate nested join input '{}'", source.input_name))?;
+    let changed = !tick.delta.batches().is_empty();
+    if !tick.input_changed {
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    if !changed {
+        source.snapshot = tick.next_snapshot;
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    Ok(JoinInputTick {
+        delta: tick.delta,
+        changed: true,
+        next_snapshot: Some(tick.next_snapshot),
     })
 }
 
@@ -1371,7 +1489,8 @@ impl JoinEvaluatorInput {
             }
             ColumnarJoinInputPlanKind::Constant { .. }
             | ColumnarJoinInputPlanKind::TopN { .. }
-            | ColumnarJoinInputPlanKind::JoinTopN { .. } => (None, None),
+            | ColumnarJoinInputPlanKind::JoinTopN { .. }
+            | ColumnarJoinInputPlanKind::Join { .. } => (None, None),
         };
         Ok(Self {
             provider,
@@ -1501,6 +1620,7 @@ fn rebind_join_side_logical_plan(
         ColumnarJoinInputPlanKind::Constant { .. }
             | ColumnarJoinInputPlanKind::TopN { .. }
             | ColumnarJoinInputPlanKind::JoinTopN { .. }
+            | ColumnarJoinInputPlanKind::Join { .. }
     ) {
         return input.scan_plan(&input_plan.input_name);
     }
@@ -1528,6 +1648,7 @@ impl ColumnarJoinInputPlan {
             ColumnarJoinInputPlanKind::Constant { .. } => None,
             ColumnarJoinInputPlanKind::TopN { source_name, .. } => Some(source_name.clone()),
             ColumnarJoinInputPlanKind::JoinTopN { .. } => None,
+            ColumnarJoinInputPlanKind::Join { .. } => None,
         }
     }
 
@@ -1540,6 +1661,12 @@ impl ColumnarJoinInputPlan {
             ColumnarJoinInputPlanKind::JoinTopN { plan } => {
                 plan.source_names().into_iter().collect()
             }
+            ColumnarJoinInputPlanKind::Join { plan } => plan
+                .left
+                .source_names()
+                .into_iter()
+                .chain(plan.right.source_names())
+                .collect(),
             ColumnarJoinInputPlanKind::Constant { .. } => BTreeSet::new(),
         }
     }
@@ -1595,6 +1722,18 @@ fn join_input_plan_for_side(
         }));
     }
 
+    if let Some(input_name) = constant_relation_name(plan)
+        && let Some(join) = columnar_join_plan_for_plan_with_options(plan, sources, false)?
+    {
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarJoinInputPlanKind::Join {
+                plan: Box::new(join),
+            },
+        }));
+    }
+
     let Some(source_name) = single_source_for_plan(plan, sources) else {
         return Ok(None);
     };
@@ -1614,28 +1753,80 @@ fn constant_relation_name(plan: &LogicalPlan) -> Option<String> {
         .find_map(|(relation, _)| relation.map(ToString::to_string))
 }
 
+fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Projection(projection) => derived_relation_name(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => derived_relation_name(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(_) => constant_relation_name(plan),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            derived_relation_name(sort.input.as_ref())
+        }
+        _ => None,
+    }
+}
+
 fn collect_joins<'a>(
     plan: &'a LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     joins: &mut Vec<&'a Join>,
+    skip_this_derived_join: bool,
+    skip_derived_join_inputs: bool,
 ) -> Result<()> {
     if columnar_join_topn_plan_for_plan(plan, sources)?.is_some() {
+        return Ok(());
+    }
+    if skip_this_derived_join
+        && derived_relation_name(plan).is_some()
+        && columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+    {
         return Ok(());
     }
     match plan {
         LogicalPlan::Join(join) => {
             joins.push(join);
-            collect_joins(join.left.as_ref(), sources, joins)?;
-            collect_joins(join.right.as_ref(), sources, joins)?;
+            collect_joins(
+                join.left.as_ref(),
+                sources,
+                joins,
+                skip_derived_join_inputs,
+                skip_derived_join_inputs,
+            )?;
+            collect_joins(
+                join.right.as_ref(),
+                sources,
+                joins,
+                skip_derived_join_inputs,
+                skip_derived_join_inputs,
+            )?;
         }
-        LogicalPlan::Projection(projection) => {
-            collect_joins(projection.input.as_ref(), sources, joins)?
-        }
-        LogicalPlan::Filter(filter) => collect_joins(filter.input.as_ref(), sources, joins)?,
-        LogicalPlan::SubqueryAlias(alias) => collect_joins(alias.input.as_ref(), sources, joins)?,
-        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            collect_joins(sort.input.as_ref(), sources, joins)?
-        }
+        LogicalPlan::Projection(projection) => collect_joins(
+            projection.input.as_ref(),
+            sources,
+            joins,
+            skip_this_derived_join,
+            skip_derived_join_inputs,
+        )?,
+        LogicalPlan::Filter(filter) => collect_joins(
+            filter.input.as_ref(),
+            sources,
+            joins,
+            skip_this_derived_join,
+            skip_derived_join_inputs,
+        )?,
+        LogicalPlan::SubqueryAlias(alias) => collect_joins(
+            alias.input.as_ref(),
+            sources,
+            joins,
+            skip_this_derived_join,
+            skip_derived_join_inputs,
+        )?,
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => collect_joins(
+            sort.input.as_ref(),
+            sources,
+            joins,
+            skip_this_derived_join,
+            skip_derived_join_inputs,
+        )?,
         _ => {}
     }
     Ok(())
@@ -1749,6 +1940,11 @@ fn contains_unsupported_join_side_wrapper(
         return Ok(false);
     }
     if columnar_join_topn_plan_for_plan(plan, sources)?.is_some() {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+    {
         return Ok(false);
     }
     match plan {

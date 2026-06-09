@@ -226,6 +226,26 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: join_over_join_topn_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "join_over_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_person",
+                    batch: person_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_join_over_join",
+            query: r#"SELECT joined.auction, p.id AS person_id FROM (SELECT b.auction, a.seller FROM bid b JOIN auction a ON b.auction = a.id) joined JOIN person p ON joined.seller = p.id"#,
+            output_schema: join_over_join_topn_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "join_row_number_topn",
             sources: &[
                 NexmarkRuntimeSource {

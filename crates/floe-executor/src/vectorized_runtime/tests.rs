@@ -12247,6 +12247,188 @@ async fn join_over_global_join_topn_uses_slate_backed_columnar_join_operator_sem
 }
 
 #[tokio::test]
+async fn join_over_join_uses_slate_backed_columnar_join_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let auctions = SourceDefinition::new(
+        "auctions",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("auctions source definition");
+    let sellers = SourceDefinition::new(
+        "sellers",
+        vec![
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("region", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("sellers source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let auctions_schema = auctions.to_arrow_schema();
+    let sellers_schema = sellers.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+        ],
+    )
+    .expect("initial bids batch");
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .expect("initial auctions batch");
+    let initial_sellers = RecordBatch::try_new(
+        Arc::clone(&sellers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+            Arc::new(Int64Array::from(vec![1000, 2000, 3000])),
+        ],
+    )
+    .expect("initial sellers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    sources.register(auctions);
+    sources.register(sellers);
+    let table = build_operator_state_table("vectorized-columnar-join-over-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("region", DataType::Int64, false),
+    ]));
+    let query = "SELECT j.auction, s.region \
+        FROM (\
+            SELECT b.auction, a.seller \
+            FROM bids b JOIN auctions a ON b.auction = a.id\
+        ) j \
+        JOIN sellers s ON j.seller = s.seller";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_join_over_join",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "sellers",
+            vec![initial_sellers.clone()],
+            vec![initial_sellers],
+        )
+        .await
+        .expect("append initial sellers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_join_over_join")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 1000), (2, 2000)]);
+
+    let auction_insert = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(Int64Array::from(vec![30])),
+        ],
+    )
+    .expect("auction insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![auction_insert.clone()],
+            vec![auction_insert],
+        )
+        .await
+        .expect("append auction insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        id_count_rows(&snapshot),
+        vec![(1, 1000), (2, 2000), (3, 3000)]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_id_count_rows(&delta), vec![(3, 3000, 1)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_join_over_join",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&recovered, "snapshot_diff");
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_join_over_join")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        id_count_rows(&recovered_snapshot),
+        vec![(1, 1000), (2, 2000), (3, 3000)]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+}
+
+#[tokio::test]
 async fn global_outer_join_topn_uses_slate_backed_columnar_join_topn_operator_semantics() {
     let orders = SourceDefinition::new(
         "orders",

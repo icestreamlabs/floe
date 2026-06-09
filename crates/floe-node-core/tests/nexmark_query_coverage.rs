@@ -242,6 +242,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT t.auction, p.name FROM (SELECT b.auction, a.seller, b.price FROM bid b JOIN auction a ON b.auction = a.id ORDER BY b.price DESC LIMIT 5) t JOIN person p ON t.seller = p.id",
     },
     ValidPlanRuntimeCase {
+        id: "join_over_join",
+        sql: "SELECT j.auction, p.name FROM (SELECT b.auction, a.seller FROM bid b JOIN auction a ON b.auction = a.id) j JOIN person p ON j.seller = p.id",
+    },
+    ValidPlanRuntimeCase {
         id: "topn_over_left_join",
         sql: "SELECT b.auction, a.seller FROM bid b LEFT JOIN auction a ON b.auction = a.id ORDER BY b.price DESC LIMIT 5",
     },
@@ -1079,6 +1083,7 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("filter_over_join_topn", "columnar_join_topn"),
         ("ordered_over_join_topn", "columnar_join_topn"),
         ("join_over_join_topn", "columnar_join"),
+        ("join_over_join", "columnar_join"),
         ("topn_over_left_join", "columnar_join_topn"),
         ("join_over_topn", "columnar_join"),
         ("join_over_row_number_topn", "columnar_join"),
