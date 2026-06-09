@@ -36,6 +36,7 @@ pub(super) struct ColumnarTopNPlan {
     logical_plan: LogicalPlan,
     source_name: String,
     partition_columns: Vec<String>,
+    full_snapshot_diff: bool,
 }
 
 pub(super) struct ColumnarTopNMaterializedViewState {
@@ -48,6 +49,7 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     partition_converter: RowConverter,
     source_snapshot: Vec<RecordBatch>,
     initial_snapshot: Vec<RecordBatch>,
+    full_snapshot_diff: bool,
 }
 
 impl ColumnarTopNMaterializedViewState {
@@ -105,6 +107,7 @@ pub(super) fn columnar_topn_plan_for_plan(
     }
 
     Ok(Some(ColumnarTopNPlan {
+        full_snapshot_diff: contains_aggregate(plan),
         logical_plan: plan.clone(),
         source_name,
         partition_columns,
@@ -177,6 +180,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state(
         partition_converter,
         source_snapshot,
         initial_snapshot,
+        full_snapshot_diff: plan.full_snapshot_diff,
     })
 }
 
@@ -195,6 +199,16 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     let input_delta = source_input_delta(columnar, insert_batches, weighted_delta_batches)?;
     let persisted_input_delta =
         persisted_source_delta(&mut columnar.input_zset, input_delta).await?;
+    if columnar.full_snapshot_diff {
+        return run_columnar_topn_full_snapshot_diff_tick(
+            registry,
+            mv,
+            version,
+            persisted_input_delta,
+            plan_start,
+        )
+        .await;
+    }
     let touched_partitions = touched_partition_keys(
         &columnar.partition_converter,
         &columnar.partition_indices,
@@ -282,6 +296,93 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
         total_ms = plan_start.elapsed().as_millis() as u64,
         mode = "columnar_topn",
         "SlateDB-backed topn columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+async fn run_columnar_topn_full_snapshot_diff_tick(
+    registry: &MaterializedViewRegistry,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+    persisted_input_delta: ColumnarZSet,
+    plan_start: Instant,
+) -> Result<bool> {
+    let Some(columnar) = mv.columnar_topn.as_mut() else {
+        return Ok(false);
+    };
+    let has_input_change = !persisted_input_delta.batches().is_empty();
+    let next_source_snapshot = if has_input_change {
+        apply_source_snapshot_delta(
+            &columnar.source_schema,
+            &columnar.source_snapshot,
+            &persisted_input_delta,
+        )
+        .await?
+    } else {
+        columnar.source_snapshot.clone()
+    };
+
+    let output_delta_batches = if has_input_change {
+        let next_output = columnar
+            .evaluator
+            .evaluate(&next_source_snapshot)
+            .await
+            .context("evaluate next aggregate-topn output")?;
+        diff_snapshot_batches(
+            Arc::clone(&mv.output_schema),
+            &mv.previous_snapshot,
+            &next_output,
+        )
+        .await
+        .context("diff aggregate-topn output")?
+        .batches
+    } else {
+        Vec::new()
+    };
+
+    let output_delta =
+        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
+            .context("build aggregate-topn output zset delta")?;
+    let persisted_output_delta = if let Some(handle) = columnar
+        .output_zset
+        .create_version(
+            &output_delta,
+            columnar
+                .output_zset
+                .current_handle()
+                .map(|handle| handle.version),
+        )
+        .await?
+    {
+        columnar.output_zset.read_delta(&handle).await?
+    } else {
+        output_delta
+    };
+
+    let delta_batches = persisted_output_delta.batches().to_vec();
+    let next_snapshot = apply_weighted_snapshot_delta(
+        &mv.output_schema,
+        &mv.previous_snapshot,
+        delta_batches.clone(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "apply Slate-backed aggregate-topn columnar snapshot delta for '{}'",
+            mv.view_name
+        )
+    })?;
+
+    columnar.source_snapshot = next_source_snapshot;
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "columnar_aggregate_topn",
+        "SlateDB-backed aggregate-topn columnar DBSP materialized view tick completed"
     );
     Ok(true)
 }
@@ -742,6 +843,9 @@ fn collect_sources(
         }
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
+        LogicalPlan::Aggregate(aggregate) => {
+            collect_sources(aggregate.input.as_ref(), sources, out)
+        }
         LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
         LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
         LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
@@ -765,11 +869,27 @@ fn contains_unsupported_topn_wrapper(plan: &LogicalPlan) -> bool {
         LogicalPlan::SubqueryAlias(alias) => {
             contains_unsupported_topn_wrapper(alias.input.as_ref())
         }
+        LogicalPlan::Aggregate(aggregate) => {
+            contains_unsupported_topn_wrapper(aggregate.input.as_ref())
+        }
         LogicalPlan::Window(window) => contains_unsupported_topn_wrapper(window.input.as_ref()),
         LogicalPlan::Limit(limit) => contains_unsupported_topn_wrapper(limit.input.as_ref()),
         LogicalPlan::Sort(sort) => contains_unsupported_topn_wrapper(sort.input.as_ref()),
         LogicalPlan::TableScan(_) => false,
         _ => true,
+    }
+}
+
+fn contains_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(_) => true,
+        LogicalPlan::Projection(projection) => contains_aggregate(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_aggregate(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_aggregate(alias.input.as_ref()),
+        LogicalPlan::Window(window) => contains_aggregate(window.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_aggregate(limit.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_aggregate(sort.input.as_ref()),
+        _ => false,
     }
 }
 

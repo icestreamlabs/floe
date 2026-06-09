@@ -6604,7 +6604,7 @@ async fn sum_group_by_requires_slate_backed_operator_state_table() {
 }
 
 #[tokio::test]
-async fn aggregate_topn_uses_slate_backed_columnar_composed_operator_semantics() {
+async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",
         vec![
@@ -6650,7 +6650,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_composed_operator_semantics()
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarTopN
     );
 
     runtime
@@ -6710,7 +6710,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_composed_operator_semantics()
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
 
