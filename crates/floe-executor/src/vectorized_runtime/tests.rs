@@ -99,6 +99,24 @@ fn grouped_stats_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64, 
     rows
 }
 
+fn join_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let order_ids = int64_values(batch, 0);
+        let regions = string_values(batch, 1);
+        let amounts = int64_values(batch, 2);
+        rows.extend(
+            order_ids
+                .into_iter()
+                .zip(regions)
+                .zip(amounts)
+                .map(|((order_id, region), amount)| (order_id, region, amount)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn weighted_id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -114,6 +132,30 @@ fn weighted_id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64)> {
                 .zip(notes)
                 .zip(weights)
                 .map(|((id, note), weight)| (id, note, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_join_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let order_ids = int64_values(batch, 0);
+        let regions = string_values(batch, 1);
+        let amounts = int64_values(batch, 2);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            order_ids
+                .into_iter()
+                .zip(regions)
+                .zip(amounts)
+                .zip(weights)
+                .map(|(((order_id, region), amount), weight)| (order_id, region, amount, weight)),
         );
     }
     rows.sort();
@@ -1058,6 +1100,232 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
     assert_eq!(
         grouped_stats_rows(&snapshot),
         vec![(1, 2, 2, 10, 30, 20.0, 40), (2, 1, 0, 100, 100, 100.0, 100),]
+    );
+}
+
+#[tokio::test]
+async fn join_uses_slate_backed_columnar_operator_incrementally() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("customer_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("orders source definition");
+    let customers = SourceDefinition::new(
+        "customers",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("region", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("customers source definition");
+    let orders_schema = orders.to_arrow_schema();
+    let customers_schema = customers.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 11, 12])),
+            Arc::new(Int64Array::from(vec![50, 60, 70])),
+        ],
+    )
+    .expect("initial orders batch");
+    let initial_customers = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 11])),
+            Arc::new(StringArray::from(vec!["west", "east"])),
+        ],
+    )
+    .expect("initial customers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(customers);
+    let table = build_operator_state_table("vectorized-columnar-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("order_id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+    ]));
+    let query = "SELECT o.id AS order_id, c.region, o.amount \
+        FROM orders o JOIN customers c ON o.customer_id = c.id \
+        WHERE c.region = 'west'";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_west_orders",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![initial_customers.clone()],
+            vec![initial_customers],
+        )
+        .await
+        .expect("append initial customers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_west_orders").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(join_rows(&snapshot), vec![(1, "west".to_string(), 50)]);
+
+    let customer_insert = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![12])),
+            Arc::new(StringArray::from(vec!["west"])),
+        ],
+    )
+    .expect("customer insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "customers",
+            vec![customer_insert.clone()],
+            vec![customer_insert],
+        )
+        .await
+        .expect("append customer insert");
+    runtime.run_tick(2).await.expect("right delta tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        join_rows(&snapshot),
+        vec![(1, "west".to_string(), 50), (3, "west".to_string(), 70)]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_join_rows(&delta),
+        vec![(3, "west".to_string(), 70, 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_west_orders",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_west_orders")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        join_rows(&recovered_snapshot),
+        vec![(1, "west".to_string(), 50), (3, "west".to_string(), 70)]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let order_insert = RecordBatch::try_new(
+        Arc::clone(&orders_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4])),
+            Arc::new(Int64Array::from(vec![12])),
+            Arc::new(Int64Array::from(vec![80])),
+        ],
+    )
+    .expect("order insert batch");
+    recovered
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![order_insert.clone()],
+            vec![order_insert],
+        )
+        .await
+        .expect("append order insert");
+    recovered.run_tick(4).await.expect("left delta tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-insert snapshot");
+    assert_eq!(
+        join_rows(&snapshot),
+        vec![
+            (1, "west".to_string(), 50),
+            (3, "west".to_string(), 70),
+            (4, "west".to_string(), 80),
+        ]
+    );
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-insert delta");
+    assert_eq!(
+        weighted_join_rows(&delta),
+        vec![(4, "west".to_string(), 80, 1)]
+    );
+
+    let customer_retract = RecordBatch::try_new(
+        Arc::clone(&customers_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(StringArray::from(vec!["west"])),
+        ],
+    )
+    .expect("customer retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&customers_schema)
+        .expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&customer_retract, &weighted_schema, &[-1])
+        .expect("weighted customer retract");
+    recovered
+        .apply_weighted_source_delta("customers", weighted)
+        .await
+        .expect("apply customer retract");
+    recovered.run_tick(5).await.expect("right retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(5)
+        .expect("post-retract snapshot");
+    assert_eq!(
+        join_rows(&snapshot),
+        vec![(3, "west".to_string(), 70), (4, "west".to_string(), 80)]
+    );
+    let delta = recovered_handle
+        .arrow_delta_for(5)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_join_rows(&delta),
+        vec![(1, "west".to_string(), 50, -1)]
     );
 }
 

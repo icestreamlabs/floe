@@ -23,13 +23,23 @@ const ROWS_PER_TICK: usize = 8_192;
 const TICKS: usize = 8;
 
 #[derive(Clone, Copy)]
+struct NexmarkRuntimeSource {
+    source_name: &'static str,
+    batch: fn(SchemaRef, usize, usize) -> Result<RecordBatch>,
+}
+
+#[derive(Clone, Copy)]
 struct NexmarkRuntimeCase {
     id: &'static str,
-    source_name: &'static str,
+    sources: &'static [NexmarkRuntimeSource],
     view_name: &'static str,
     query: &'static str,
     output_schema: fn() -> SchemaRef,
-    batch: fn(SchemaRef, usize, usize) -> Result<RecordBatch>,
+}
+
+struct NexmarkRuntimeSourceBatches {
+    source_name: &'static str,
+    batches: Vec<RecordBatch>,
 }
 
 fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
@@ -37,65 +47,129 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
     let cases = [
         NexmarkRuntimeCase {
             id: "q1",
-            source_name: "nexmark_bid",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
             view_name: "mv_nexmark_q1",
             query: r#"SELECT auction, bidder, price * 89 / 100 AS converted_price, date_time AS "dateTime", extra FROM nexmark_bid"#,
             output_schema: q1_output_schema,
-            batch: bid_batch,
         },
         NexmarkRuntimeCase {
             id: "q2",
-            source_name: "nexmark_bid",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
             view_name: "mv_nexmark_q2",
             query: "SELECT auction, price FROM nexmark_bid WHERE auction % 123 = 0",
             output_schema: q2_output_schema,
-            batch: bid_batch,
+        },
+        NexmarkRuntimeCase {
+            id: "q3",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_person",
+                    batch: person_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_q3",
+            query: "SELECT p.name, p.city, p.state, a.id FROM auction AS a JOIN person AS p ON a.seller = p.id WHERE a.category = 10 AND p.state IN ('or', 'id', 'ca')",
+            output_schema: q3_output_schema,
         },
         NexmarkRuntimeCase {
             id: "q5",
-            source_name: "nexmark_bid",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
             view_name: "mv_nexmark_q5",
             query: r#"SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP("dateTime", 2000, 10000)"#,
             output_schema: q5_output_schema,
-            batch: bid_batch,
         },
         NexmarkRuntimeCase {
             id: "q7",
-            source_name: "nexmark_bid",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
             view_name: "mv_nexmark_q7",
             query: r#"SELECT MAX(price) AS maxprice FROM bid GROUP BY TUMBLE("dateTime", 10000)"#,
             output_schema: q7_output_schema,
-            batch: bid_batch,
         },
         NexmarkRuntimeCase {
             id: "q8",
-            source_name: "nexmark_person",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_person",
+                batch: person_batch,
+            }],
             view_name: "mv_nexmark_q8",
             query: r#"SELECT id, name, COUNT(*) AS person_count FROM person GROUP BY id, name, TUMBLE("dateTime", 10000)"#,
             output_schema: q8_output_schema,
-            batch: person_batch,
         },
         NexmarkRuntimeCase {
             id: "q12",
-            source_name: "nexmark_bid",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
             view_name: "mv_nexmark_q12",
             query: r#"SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, TUMBLE("dateTime", 10000)"#,
             output_schema: q12_output_schema,
-            batch: bid_batch,
+        },
+        NexmarkRuntimeCase {
+            id: "q13",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_q13",
+            query: r#"SELECT b.auction, b.bidder, b.price, b."dateTime", a.seller AS value FROM (SELECT *, PROCTIME() AS p_time FROM bid) b JOIN auction AS a ON b.auction = a.id WHERE b.auction % 10000 = a.id % 10000"#,
+            output_schema: q13_output_schema,
         },
         NexmarkRuntimeCase {
             id: "q17",
-            source_name: "nexmark_bid",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
             view_name: "mv_nexmark_q17",
             query: r#"SELECT auction, DATE_FORMAT("dateTime", 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, AVG(price) AS avg_price, SUM(price) AS sum_price FROM bid GROUP BY auction, DATE_FORMAT("dateTime", 'yyyy-MM-dd')"#,
             output_schema: q17_output_schema,
-            batch: bid_batch,
+        },
+        NexmarkRuntimeCase {
+            id: "q20",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_q20",
+            query: r#"SELECT b.auction, b.bidder, b.price, b.channel, b.url, b."dateTime", b.extra, a."itemName", a.description, a."initialBid", a.reserve, a."dateTime" AS auction_time, a.expires, a.seller, a.category, a.extra AS auction_extra FROM bid AS b JOIN auction AS a ON b.auction = a.id WHERE a.category = 10"#,
+            output_schema: q20_output_schema,
         },
     ];
 
     let mut group = c.benchmark_group("nexmark_vectorized_runtime_columnar");
     for case in cases {
-        group.throughput(Throughput::Elements((ROWS_PER_TICK * TICKS) as u64));
+        group.throughput(Throughput::Elements(
+            (ROWS_PER_TICK * TICKS * case.sources.len()) as u64,
+        ));
         group.bench_with_input(
             BenchmarkId::new(case.id, format!("{ROWS_PER_TICK}x{TICKS}")),
             &case,
@@ -124,15 +198,11 @@ async fn build_runtime_case(
 ) -> Result<(
     VectorizedExecutionRuntime,
     Arc<MaterializedViewRegistry>,
-    Vec<RecordBatch>,
+    Vec<NexmarkRuntimeSourceBatches>,
 )> {
     let mut sources = SourceRegistry::new();
-    sources.extend(generator::definitions()?);
-    let source_schema = generator::definitions()?
-        .into_iter()
-        .find(|definition| definition.name() == case.source_name)
-        .ok_or_else(|| anyhow::anyhow!("missing {} definition", case.source_name))?
-        .to_arrow_schema();
+    let definitions = generator::definitions()?;
+    sources.extend(definitions.clone());
     let output_schema = (case.output_schema)();
     let table = build_operator_state_table(case.id).await?;
     let registry = Arc::new(MaterializedViewRegistry::new());
@@ -149,33 +219,49 @@ async fn build_runtime_case(
     )
     .await
     .with_context(|| format!("build vectorized runtime for {}", case.id))?;
-    let batches = (0..TICKS)
-        .map(|tick| {
-            (case.batch)(
-                Arc::clone(&source_schema),
-                tick * ROWS_PER_TICK,
-                ROWS_PER_TICK,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((execution, registry, batches))
+
+    let mut source_batches = Vec::with_capacity(case.sources.len());
+    for source in case.sources {
+        let source_schema = definitions
+            .iter()
+            .find(|definition| definition.name() == source.source_name)
+            .ok_or_else(|| anyhow::anyhow!("missing {} definition", source.source_name))?
+            .to_arrow_schema();
+        let batches = (0..TICKS)
+            .map(|tick| {
+                (source.batch)(
+                    Arc::clone(&source_schema),
+                    tick * ROWS_PER_TICK,
+                    ROWS_PER_TICK,
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("build input batches for {}", source.source_name))?;
+        source_batches.push(NexmarkRuntimeSourceBatches {
+            source_name: source.source_name,
+            batches,
+        });
+    }
+    Ok((execution, registry, source_batches))
 }
 
 async fn run_runtime_case(
     case: &NexmarkRuntimeCase,
     execution: &mut VectorizedExecutionRuntime,
     registry: Arc<MaterializedViewRegistry>,
-    batches: Vec<RecordBatch>,
+    source_batches: Vec<NexmarkRuntimeSourceBatches>,
 ) -> Result<()> {
-    for (idx, batch) in batches.into_iter().enumerate() {
-        execution
-            .append_source_batches_for_execution_and_query(
-                case.source_name,
-                vec![batch],
-                Vec::new(),
-            )
-            .await?;
-        execution.run_tick((idx + 1) as i64).await?;
+    for tick in 0..TICKS {
+        for source in &source_batches {
+            execution
+                .append_source_batches_for_execution_and_query(
+                    source.source_name,
+                    vec![source.batches[tick].clone()],
+                    Vec::new(),
+                )
+                .await?;
+        }
+        execution.run_tick((tick + 1) as i64).await?;
     }
     let handle = registry
         .get(case.view_name)
@@ -237,6 +323,49 @@ fn bid_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBatch
     .context("build nexmark bid batch")
 }
 
+fn bid_join_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBatch> {
+    let mut auctions = Vec::with_capacity(rows);
+    let mut bidders = Vec::with_capacity(rows);
+    let mut prices = Vec::with_capacity(rows);
+    let mut channels = Vec::with_capacity(rows);
+    let mut urls = Vec::with_capacity(rows);
+    let mut date_times = Vec::with_capacity(rows);
+    let mut extras = Vec::with_capacity(rows);
+
+    for offset in 0..rows {
+        let seq = start + offset;
+        auctions.push(seq as i64);
+        bidders.push(seq as i64);
+        prices.push(1_000 + (seq % 1_000_000) as i64);
+        channels.push(match seq % 4 {
+            0 => "apple".to_string(),
+            1 => "google".to_string(),
+            2 => "facebook".to_string(),
+            _ => "baidu".to_string(),
+        });
+        urls.push(format!(
+            "https://example.test/path/{seq}?channel_id={}",
+            seq % 16
+        ));
+        date_times.push(1_700_000_000_000_i64 + seq as i64);
+        extras.push(format!("extra-{seq}"));
+    }
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(auctions)) as ArrayRef,
+            Arc::new(Int64Array::from(bidders)) as ArrayRef,
+            Arc::new(Int64Array::from(prices)) as ArrayRef,
+            Arc::new(StringArray::from(channels)) as ArrayRef,
+            Arc::new(StringArray::from(urls)) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(date_times)) as ArrayRef,
+            Arc::new(StringArray::from(extras)) as ArrayRef,
+        ],
+    )
+    .context("build nexmark bid join batch")
+}
+
 fn person_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBatch> {
     let mut ids = Vec::with_capacity(rows);
     let mut names = Vec::with_capacity(rows);
@@ -285,6 +414,99 @@ fn person_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBa
     .context("build nexmark person batch")
 }
 
+fn person_join_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBatch> {
+    let mut ids = Vec::with_capacity(rows);
+    let mut names = Vec::with_capacity(rows);
+    let mut emails = Vec::with_capacity(rows);
+    let mut credit_cards = Vec::with_capacity(rows);
+    let mut cities = Vec::with_capacity(rows);
+    let mut states = Vec::with_capacity(rows);
+    let mut date_times = Vec::with_capacity(rows);
+    let mut extras = Vec::with_capacity(rows);
+
+    for offset in 0..rows {
+        let seq = start + offset;
+        ids.push(seq as i64);
+        names.push(format!("person-{seq}"));
+        emails.push(format!("person-{seq}@example.test"));
+        credit_cards.push(format!("411111111111{:04}", seq % 10_000));
+        cities.push(match seq % 4 {
+            0 => "portland".to_string(),
+            1 => "boise".to_string(),
+            2 => "san francisco".to_string(),
+            _ => "seattle".to_string(),
+        });
+        states.push(match seq % 4 {
+            0 => "or".to_string(),
+            1 => "id".to_string(),
+            2 => "ca".to_string(),
+            _ => "wa".to_string(),
+        });
+        date_times.push(1_700_000_000_000_i64 + seq as i64);
+        extras.push(format!("extra-{seq}"));
+    }
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(names)) as ArrayRef,
+            Arc::new(StringArray::from(emails)) as ArrayRef,
+            Arc::new(StringArray::from(credit_cards)) as ArrayRef,
+            Arc::new(StringArray::from(cities)) as ArrayRef,
+            Arc::new(StringArray::from(states)) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(date_times)) as ArrayRef,
+            Arc::new(StringArray::from(extras)) as ArrayRef,
+        ],
+    )
+    .context("build nexmark person join batch")
+}
+
+fn auction_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBatch> {
+    let mut ids = Vec::with_capacity(rows);
+    let mut item_names = Vec::with_capacity(rows);
+    let mut descriptions = Vec::with_capacity(rows);
+    let mut initial_bids = Vec::with_capacity(rows);
+    let mut reserves = Vec::with_capacity(rows);
+    let mut sellers = Vec::with_capacity(rows);
+    let mut categories = Vec::with_capacity(rows);
+    let mut expires = Vec::with_capacity(rows);
+    let mut date_times = Vec::with_capacity(rows);
+    let mut extras = Vec::with_capacity(rows);
+
+    for offset in 0..rows {
+        let seq = start + offset;
+        ids.push(seq as i64);
+        item_names.push(format!("item-{seq}"));
+        descriptions.push(format!("description-{seq}"));
+        initial_bids.push(100 + (seq % 10_000) as i64);
+        reserves.push(1_000 + (seq % 100_000) as i64);
+        sellers.push(seq as i64);
+        categories.push(10_i64);
+        let date_time = 1_700_000_000_000_i64 + seq as i64;
+        expires.push(date_time + 600_000);
+        date_times.push(date_time);
+        extras.push(format!("auction-extra-{seq}"));
+    }
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(item_names)) as ArrayRef,
+            Arc::new(StringArray::from(descriptions)) as ArrayRef,
+            Arc::new(Int64Array::from(initial_bids)) as ArrayRef,
+            Arc::new(Int64Array::from(reserves)) as ArrayRef,
+            Arc::new(Int64Array::from(sellers)) as ArrayRef,
+            Arc::new(Int64Array::from(categories)) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(expires)) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(date_times)) as ArrayRef,
+            Arc::new(StringArray::from(extras)) as ArrayRef,
+        ],
+    )
+    .context("build nexmark auction batch")
+}
+
 fn q1_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, true),
@@ -303,6 +525,15 @@ fn q2_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, true),
         Field::new("price", DataType::Int64, true),
+    ]))
+}
+
+fn q3_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, true),
+        Field::new("city", DataType::Utf8, true),
+        Field::new("state", DataType::Utf8, true),
+        Field::new("id", DataType::Int64, true),
     ]))
 }
 
@@ -336,6 +567,20 @@ fn q12_output_schema() -> SchemaRef {
     ]))
 }
 
+fn q13_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("value", DataType::Int64, true),
+    ]))
+}
+
 fn q17_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, true),
@@ -348,6 +593,39 @@ fn q17_output_schema() -> SchemaRef {
         Field::new("max_price", DataType::Int64, true),
         Field::new("avg_price", DataType::Float64, true),
         Field::new("sum_price", DataType::Int64, true),
+    ]))
+}
+
+fn q20_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new("channel", DataType::Utf8, true),
+        Field::new("url", DataType::Utf8, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("extra", DataType::Utf8, true),
+        Field::new("itemName", DataType::Utf8, true),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("initialBid", DataType::Int64, true),
+        Field::new("reserve", DataType::Int64, true),
+        Field::new(
+            "auction_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new(
+            "expires",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("seller", DataType::Int64, true),
+        Field::new("category", DataType::Int64, true),
+        Field::new("auction_extra", DataType::Utf8, true),
     ]))
 }
 
