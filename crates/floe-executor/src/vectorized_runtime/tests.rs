@@ -723,6 +723,7 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
 
     let mut sources = SourceRegistry::new();
     sources.register(definition);
+    let table = build_operator_state_table("vectorized-query-provider-pruned").await;
     let registry = Arc::new(MaterializedViewRegistry::new());
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
@@ -733,7 +734,9 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
             Arc::clone(&output_schema),
         )],
         Arc::clone(&registry),
-        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_source_query_tables()
+            .with_operator_state_table(table),
     )
     .await
     .expect("runtime");
@@ -805,6 +808,7 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
 
     let mut sources = SourceRegistry::new();
     sources.register(definition);
+    let table = build_operator_state_table("vectorized-primary-key-cdc-stateless").await;
     let registry = Arc::new(MaterializedViewRegistry::new());
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -818,7 +822,9 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
             Arc::clone(&output_schema),
         )],
         Arc::clone(&registry),
-        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_source_query_tables()
+            .with_operator_state_table(table),
     )
     .await
     .expect("runtime");
@@ -854,23 +860,13 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     let handle = registry.get("mv_orders").expect("materialized view");
     let version = handle.latest_version().expect("mv version");
     let snapshot = handle.arrow_snapshot_for(version).expect("mv snapshot");
-    assert_eq!(snapshot.len(), 1);
-    assert_eq!(int64_values(&snapshot[0], 0), vec![1]);
-    assert_eq!(int64_values(&snapshot[0], 1), vec![40]);
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 40)]);
 
     let delta = handle.arrow_delta_for(2).expect("mv delta");
-    let delta = delta
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .collect::<Vec<_>>();
-    assert_eq!(delta.len(), 1);
-    let weight_idx = delta[0]
-        .schema()
-        .index_of(WEIGHT_COLUMN_NAME)
-        .expect("weight column");
-    assert_eq!(int64_values(delta[0], 0), vec![1, 2]);
-    assert_eq!(int64_values(delta[0], 1), vec![40, 30]);
-    assert_eq!(int64_values(delta[0], weight_idx), vec![1, -1]);
+    assert_eq!(
+        weighted_id_count_rows(&delta),
+        vec![(1, 40, 1), (2, 30, -1)]
+    );
 
     let provider = runtime
         .table_providers()
@@ -7661,6 +7657,43 @@ async fn count_group_by_requires_slate_backed_operator_state_table() {
 }
 
 #[tokio::test]
+async fn filter_project_requires_slate_backed_operator_state_table() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new("id", SourceDataType::Int64),
+            SourceColumn::new("amount", SourceDataType::Int64),
+        ],
+    )
+    .expect("source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let result = VectorizedExecutionRuntime::new(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders",
+            "SELECT id FROM orders WHERE amount > 10",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+    )
+    .await;
+
+    let err = match result {
+        Ok(_) => panic!("filter/project MV should require SlateDB-backed operator state"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("requires SlateDB-backed operator state"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
 async fn source_query_tables_are_not_maintained_by_default() {
     let definition = SourceDefinition::new(
         "orders",
@@ -7669,10 +7702,11 @@ async fn source_query_tables_are_not_maintained_by_default() {
     .expect("source definition");
     let mut sources = SourceRegistry::new();
     sources.register(definition);
+    let table = build_operator_state_table("vectorized-source-query-default").await;
     let registry = Arc::new(MaterializedViewRegistry::new());
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
-    let runtime = VectorizedExecutionRuntime::new(
+    let runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
             "mv_orders",
@@ -7680,6 +7714,7 @@ async fn source_query_tables_are_not_maintained_by_default() {
             Arc::clone(&output_schema),
         )],
         registry,
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
     )
     .await
     .expect("runtime");

@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::{ArrayRef, Int64Array};
-use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
@@ -18,24 +17,20 @@ use dbsp::create_logical_plan_with_asof_preplanner;
 use dbsp::storage::KeyValueTable;
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
-use crate::delta_consolidation::{
-    DeltaConsolidator, add_weight_column_to_batches, diff_snapshot_batches,
-};
+use crate::delta_consolidation::{add_weight_column_to_batches, diff_snapshot_batches};
 use crate::metrics;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_source_delta::{
     apply_source_delta, apply_weighted_snapshot_delta, insert_only_source_delta_batch,
-    prepare_source_delta, unit_source_delta_batches, validate_unit_source_delta,
+    prepare_source_delta, validate_unit_source_delta,
 };
 use source_state::{
-    camel_case_schema, dynamic_state_provider, incremental_source_for_plan, rename_batches,
-    source_key_indices, source_primary_key_columns,
+    camel_case_schema, dynamic_state_provider, rename_batches, source_key_indices,
+    source_primary_key_columns,
 };
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
-const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
-const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
 
 mod columnar_composed;
 mod columnar_count;
@@ -231,7 +226,6 @@ struct VectorizedMaterializedViewState {
     output_schema: SchemaRef,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     previous_snapshot: Vec<RecordBatch>,
-    incremental: Option<IncrementalMaterializedViewState>,
     columnar_stateless: Option<ColumnarStatelessMaterializedViewState>,
     columnar_grouped_count: Option<ColumnarGroupedCountMaterializedViewState>,
     columnar_grouped_max: Option<ColumnarGroupedMaxMaterializedViewState>,
@@ -266,8 +260,6 @@ struct VectorizedMaterializedViewState {
 }
 
 struct IncrementalMaterializedViewState {
-    source_name: String,
-    source_schema: SchemaRef,
     ctx: SessionContext,
     source_provider: Arc<DynamicStateTableProvider>,
     alias_schema: Option<SchemaRef>,
@@ -307,7 +299,6 @@ enum MaterializedViewExecutionMode {
     ColumnarCountByKey,
     ColumnarSubquery,
     ColumnarComposed,
-    IncrementalFilterProject,
     FullRefresh,
 }
 
@@ -344,7 +335,6 @@ impl MaterializedViewExecutionMode {
             Self::ColumnarCountByKey => "columnar_count_by_key",
             Self::ColumnarSubquery => "columnar_subquery",
             Self::ColumnarComposed => "columnar_composed",
-            Self::IncrementalFilterProject => "incremental_filter_project",
             Self::FullRefresh => "full_refresh",
         }
     }
@@ -963,41 +953,16 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
                 _ => None,
-            };
-            let incremental_source = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-                && columnar_topn.is_none()
-                && columnar_join_topn.is_none()
-                && columnar_join_top_avg.is_none()
-                && columnar_multijoin.is_none()
-                && columnar_union.is_none()
-                && columnar_stateless.is_none()
-            {
-                incremental_source_for_plan(df.logical_plan(), &source_states)
-            } else {
-                None
-            };
-            let incremental = match incremental_source {
-                Some(source_name) => Some(
-                    build_incremental_materialized_view_state(
-                        &mv.query,
-                        &source_name,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build isolated incremental vectorized plan for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                None => None,
             };
             let columnar_asof_join_plan = if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
@@ -1010,7 +975,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && df_has_asof_extension
             {
                 columnar_asof_join_plan_for_plan(df.logical_plan(), &source_states)?
@@ -1060,7 +1024,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
             {
                 columnar_self_join_aggregate_plan_for_plan(df.logical_plan(), &source_states)?
@@ -1110,7 +1073,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
             {
@@ -1161,7 +1123,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1213,7 +1174,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1266,7 +1226,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1320,7 +1279,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1375,7 +1333,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1431,7 +1388,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1488,7 +1444,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1546,7 +1501,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1605,7 +1559,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1665,7 +1618,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1726,7 +1678,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1788,7 +1739,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1851,7 +1801,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1915,7 +1864,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -1980,7 +1928,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -2046,7 +1993,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -2113,7 +2059,6 @@ impl VectorizedExecutionRuntime {
                 && columnar_multijoin.is_none()
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
-                && incremental.is_none()
                 && columnar_asof_join.is_none()
                 && columnar_self_join_aggregate.is_none()
                 && columnar_join_aggregate.is_none()
@@ -2136,7 +2081,7 @@ impl VectorizedExecutionRuntime {
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
             {
                 bail!(
-                    "materialized view '{}' requires full-refresh vectorized execution; only filter/project source plans are currently incremental",
+                    "materialized view '{}' requires a supported SlateDB-backed columnar DBSP operator; explicit full-refresh policy is required for unsupported plans",
                     mv.view_name
                 );
             }
@@ -2200,8 +2145,6 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarSubquery
             } else if columnar_composed.is_some() {
                 MaterializedViewExecutionMode::ColumnarComposed
-            } else if incremental.is_some() {
-                MaterializedViewExecutionMode::IncrementalFilterProject
             } else {
                 requires_full_refresh_execution_state = true;
                 MaterializedViewExecutionMode::FullRefresh
@@ -2369,7 +2312,6 @@ impl VectorizedExecutionRuntime {
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
                     })
                     .unwrap_or_default(),
-                incremental,
                 columnar_stateless,
                 columnar_grouped_count,
                 columnar_grouped_max,
@@ -2912,17 +2854,6 @@ impl VectorizedExecutionRuntime {
             {
                 continue;
             }
-            if run_incremental_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
             run_full_refresh_materialized_view_tick(ctx, registry, mv, version).await?;
         }
         self.current_insert_batches.clear();
@@ -2987,12 +2918,7 @@ async fn build_incremental_materialized_view_state(
         incremental_context_providers(&ctx, source_name, sources)?;
     let df = ctx.sql(query).await?;
     let plan = df.create_physical_plan().await?;
-    let source = sources
-        .get(source_name)
-        .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;
     Ok(IncrementalMaterializedViewState {
-        source_name: source_name.to_string(),
-        source_schema: Arc::clone(&source.schema),
         ctx,
         source_provider,
         alias_schema,
@@ -3017,12 +2943,7 @@ async fn build_incremental_materialized_view_state_from_logical_plan(
         alias_provider.as_ref(),
     )?;
     let plan = ctx.state().create_physical_plan(&logical_plan).await?;
-    let source = sources
-        .get(source_name)
-        .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;
     Ok(IncrementalMaterializedViewState {
-        source_name: source_name.to_string(),
-        source_schema: Arc::clone(&source.schema),
         ctx,
         source_provider,
         alias_schema,
@@ -3143,150 +3064,6 @@ async fn run_full_refresh_materialized_view_tick(
     Ok(())
 }
 
-async fn run_incremental_materialized_view_tick(
-    registry: &MaterializedViewRegistry,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    mv: &mut VectorizedMaterializedViewState,
-    version: i64,
-) -> Result<bool> {
-    let Some(incremental) = mv.incremental.as_ref() else {
-        return Ok(false);
-    };
-    let source_name = incremental.source_name.as_str();
-    if let Some(weighted_source_batches) = weighted_delta_batches.get(source_name) {
-        return run_signed_incremental_materialized_view_tick(
-            registry,
-            weighted_source_batches,
-            mv,
-            version,
-        )
-        .await;
-    }
-
-    let plan_start = Instant::now();
-    let delta = if let Some(source_batches) = insert_batches.get(source_name) {
-        incremental.set_delta_batches(source_batches)?;
-        let collected = collect(Arc::clone(&incremental.plan), incremental.ctx.task_ctx()).await;
-        incremental.clear_delta_batches()?;
-        normalize_batches(
-            collected.with_context(|| {
-                format!(
-                    "execute incremental vectorized materialized view '{}'",
-                    mv.view_name
-                )
-            })?,
-            &mv.output_schema,
-        )?
-    } else {
-        Vec::new()
-    };
-
-    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&mv.output_schema)?;
-    let delta_batches = add_weight_column_to_batches(&delta, &weighted_schema, 1)?;
-    let mut next_snapshot = mv
-        .previous_snapshot
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .cloned()
-        .collect::<Vec<_>>();
-    next_snapshot.extend(delta.iter().filter(|batch| batch.num_rows() > 0).cloned());
-    compact_incremental_snapshot_batches(&mv.output_schema, &mut next_snapshot)?;
-    if next_snapshot.is_empty() {
-        next_snapshot.push(RecordBatch::new_empty(Arc::clone(&mv.output_schema)));
-    }
-
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "incremental_filter_project",
-        "vectorized materialized view tick completed"
-    );
-    Ok(true)
-}
-
-async fn run_signed_incremental_materialized_view_tick(
-    registry: &MaterializedViewRegistry,
-    weighted_source_batches: &[RecordBatch],
-    mv: &mut VectorizedMaterializedViewState,
-    version: i64,
-) -> Result<bool> {
-    let Some(incremental) = mv.incremental.as_ref() else {
-        return Ok(false);
-    };
-    let plan_start = Instant::now();
-    let mut positive_source_batches = Vec::new();
-    let mut negative_source_batches = Vec::new();
-    for batch in weighted_source_batches {
-        let unit_delta = unit_source_delta_batches(&incremental.source_schema, batch)?
-            .with_context(|| {
-                format!(
-                    "incremental vectorized materialized view '{}' received non-unit weighted source deltas",
-                    mv.view_name
-                )
-            })?;
-        positive_source_batches.extend(unit_delta.positive);
-        negative_source_batches.extend(unit_delta.negative);
-    }
-
-    let mut output_delta_batches = Vec::new();
-    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&mv.output_schema)?;
-    let positive_output =
-        collect_incremental_output(incremental, &positive_source_batches, &mv.output_schema)
-            .await?;
-    output_delta_batches.extend(add_weight_column_to_batches(
-        &positive_output,
-        &weighted_schema,
-        1,
-    )?);
-    let negative_output =
-        collect_incremental_output(incremental, &negative_source_batches, &mv.output_schema)
-            .await?;
-    output_delta_batches.extend(add_weight_column_to_batches(
-        &negative_output,
-        &weighted_schema,
-        -1,
-    )?);
-
-    let diff_start = Instant::now();
-    let consolidated = DeltaConsolidator::new(weighted_schema.clone())?
-        .consolidate_with_stats(output_delta_batches)
-        .await?;
-    metrics::observe_delta_consolidation(
-        consolidated.stats,
-        diff_start.elapsed().as_millis() as u64,
-    );
-    let delta_batches = consolidated.batches;
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply signed incremental snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
-
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "incremental_filter_project_signed",
-        "vectorized materialized view tick completed"
-    );
-    Ok(true)
-}
-
 async fn collect_incremental_output(
     incremental: &IncrementalMaterializedViewState,
     source_batches: &[RecordBatch],
@@ -3302,41 +3079,6 @@ async fn collect_incremental_output(
         collected.context("execute signed incremental vectorized materialized view")?,
         output_schema,
     )
-}
-
-fn compact_incremental_snapshot_batches(
-    schema: &SchemaRef,
-    batches: &mut Vec<RecordBatch>,
-) -> Result<()> {
-    if batches.len() <= INCREMENTAL_SNAPSHOT_MAX_BATCHES {
-        return Ok(());
-    }
-
-    let mut compacted = Vec::new();
-    let mut chunk = Vec::new();
-    let mut chunk_rows = 0usize;
-    for batch in batches.drain(..) {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        chunk_rows = chunk_rows.saturating_add(batch.num_rows());
-        chunk.push(batch);
-        if chunk_rows >= INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS {
-            compacted.push(concat_snapshot_chunk(schema, &chunk)?);
-            chunk.clear();
-            chunk_rows = 0;
-        }
-    }
-    if !chunk.is_empty() {
-        compacted.push(concat_snapshot_chunk(schema, &chunk)?);
-    }
-    *batches = compacted;
-    Ok(())
-}
-
-fn concat_snapshot_chunk(schema: &SchemaRef, chunk: &[RecordBatch]) -> Result<RecordBatch> {
-    let refs = chunk.iter().collect::<Vec<_>>();
-    concat_batches(schema, refs).context("compact incremental materialized view snapshot batches")
 }
 
 fn normalize_batches(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
