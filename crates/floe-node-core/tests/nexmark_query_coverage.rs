@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -1052,8 +1053,15 @@ async fn guards_active_vectorized_runtime_nexmark_columnar_subset() {
     }
 }
 
-#[tokio::test]
-async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
+#[test]
+fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
+    run_current_thread_coverage_test_on_explicit_stack(
+        "active-vectorized-runtime-coverage",
+        guards_active_vectorized_runtime_valid_dbsp_plan_shapes_inner(),
+    );
+}
+
+async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes_inner() {
     let mut registry = SourceRegistry::new();
     registry.extend(generator::definitions().expect("load nexmark source definitions"));
     let planner = DbspPlanBuilder::new(nexmark_config().expect("load nexmark planner config"));
@@ -1111,6 +1119,8 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("join_over_three_way_join", "columnar_join"),
         ("union_join", "columnar_join"),
         ("aggregate_join", "columnar_join"),
+        ("self_join_aggregate", "columnar_grouped_stats"),
+        ("join_aggregate", "columnar_grouped_stats"),
         ("grouped_stats_over_join", "columnar_grouped_stats"),
         ("topn_over_aggregate_join", "columnar_topn"),
         ("join_over_join_aggregate", "columnar_join"),
@@ -1137,8 +1147,34 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
     }
 }
 
-#[tokio::test]
-async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
+#[test]
+fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
+    run_current_thread_coverage_test_on_explicit_stack(
+        "generated-vectorized-runtime-coverage",
+        guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inner(),
+    );
+}
+
+fn run_current_thread_coverage_test_on_explicit_stack<F>(name: &str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build coverage runtime");
+            runtime.block_on(future);
+        })
+        .expect("spawn coverage thread")
+        .join()
+        .expect("coverage thread panicked");
+}
+
+async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inner() {
     let mut registry = SourceRegistry::new();
     registry.extend(generator::definitions().expect("load nexmark source definitions"));
     let planner = DbspPlanBuilder::new(nexmark_config().expect("load nexmark planner config"));

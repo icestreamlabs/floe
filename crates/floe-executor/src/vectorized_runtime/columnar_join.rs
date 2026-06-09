@@ -83,6 +83,10 @@ impl ColumnarJoinPlan {
             .chain(self.right.source_names())
             .collect()
     }
+
+    pub(super) fn force_snapshot_diff_execution(&mut self) {
+        self.execution_strategy = ColumnarJoinExecutionStrategy::SnapshotDiff;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,8 +99,8 @@ pub(super) struct ColumnarJoinMaterializedViewState {
     left: ColumnarJoinSourceState,
     right: ColumnarJoinSourceState,
     output_zset: SlateBackedColumnarZSet,
-    left_delta_right_state: JoinDeltaEvaluator,
-    left_state_right_delta: JoinDeltaEvaluator,
+    left_delta_right_state: Option<JoinDeltaEvaluator>,
+    left_state_right_delta: Option<JoinDeltaEvaluator>,
     left_delta_right_delta: JoinDeltaEvaluator,
     initial_snapshot: Vec<RecordBatch>,
     execution_strategy: ColumnarJoinExecutionStrategy,
@@ -252,6 +256,22 @@ struct JoinEvaluatorInput {
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
 }
 
+struct JoinEvaluatorInputPlan {
+    input_name: String,
+    schema: SchemaRef,
+    source_name: Option<String>,
+}
+
+impl JoinEvaluatorInputPlan {
+    fn from_join_input(input: &ColumnarJoinInputPlan) -> Self {
+        Self {
+            input_name: input.input_name.clone(),
+            schema: Arc::clone(&input.schema),
+            source_name: input.source_name(),
+        }
+    }
+}
+
 struct JoinSignedDelta {
     positive: Vec<RecordBatch>,
     negative: Vec<RecordBatch>,
@@ -383,40 +403,9 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
     )?;
     let output_initialized = output_zset.current_handle().is_some();
 
-    let rebuild_each_evaluate = execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff;
-    let left_delta_right_state = JoinDeltaEvaluator::build(
-        logical_plan.clone(),
-        sources,
-        udfs,
-        output_schema,
-        &left,
-        &right,
-        rebuild_each_evaluate,
-    )
-    .await
-    .context("build left-delta/right-state join evaluator")?;
-    let left_state_right_delta = JoinDeltaEvaluator::build(
-        logical_plan.clone(),
-        sources,
-        udfs,
-        output_schema,
-        &left,
-        &right,
-        rebuild_each_evaluate,
-    )
-    .await
-    .context("build left-state/right-delta join evaluator")?;
-    let left_delta_right_delta = JoinDeltaEvaluator::build(
-        logical_plan,
-        sources,
-        udfs,
-        output_schema,
-        &left,
-        &right,
-        rebuild_each_evaluate,
-    )
-    .await
-    .context("build left-delta/right-delta join evaluator")?;
+    let left_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&left);
+    let right_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&right);
+
     let left = build_join_input_state(
         Arc::clone(&table),
         &mv_namespace,
@@ -441,6 +430,55 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
     )
     .await
     .context("build SlateDB-backed right join input state")?;
+
+    let rebuild_each_evaluate = execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff;
+    let build_incremental_delta_evaluators =
+        execution_strategy == ColumnarJoinExecutionStrategy::IncrementalInner;
+    let left_delta_right_state = if build_incremental_delta_evaluators {
+        Some(
+            JoinDeltaEvaluator::build(
+                logical_plan.clone(),
+                sources,
+                udfs,
+                output_schema,
+                &left_evaluator_plan,
+                &right_evaluator_plan,
+                rebuild_each_evaluate,
+            )
+            .await
+            .context("build left-delta/right-state join evaluator")?,
+        )
+    } else {
+        None
+    };
+    let left_state_right_delta = if build_incremental_delta_evaluators {
+        Some(
+            JoinDeltaEvaluator::build(
+                logical_plan.clone(),
+                sources,
+                udfs,
+                output_schema,
+                &left_evaluator_plan,
+                &right_evaluator_plan,
+                rebuild_each_evaluate,
+            )
+            .await
+            .context("build left-state/right-delta join evaluator")?,
+        )
+    } else {
+        None
+    };
+    let left_delta_right_delta = JoinDeltaEvaluator::build(
+        logical_plan,
+        sources,
+        udfs,
+        output_schema,
+        &left_evaluator_plan,
+        &right_evaluator_plan,
+        rebuild_each_evaluate,
+    )
+    .await
+    .context("build left-delta/right-delta join evaluator")?;
 
     Ok(ColumnarJoinMaterializedViewState {
         left,
@@ -499,11 +537,13 @@ async fn build_join_side_input_zset(
     side: &str,
     input_name: &str,
 ) -> Result<SlateBackedColumnarZSet> {
-    SlateBackedColumnarZSet::new(table, namespace, Arc::clone(schema))
-        .await
-        .with_context(|| {
-            format!("initialize SlateDB-backed {side} join input zset for '{input_name}'")
-        })
+    Box::pin(SlateBackedColumnarZSet::new(
+        table,
+        namespace,
+        Arc::clone(schema),
+    ))
+    .await
+    .with_context(|| format!("initialize SlateDB-backed {side} join input zset for '{input_name}'"))
 }
 
 async fn build_join_input_state(
@@ -518,27 +558,28 @@ async fn build_join_input_state(
 ) -> Result<ColumnarJoinSourceState> {
     match input.kind {
         ColumnarJoinInputPlanKind::Source { source_name } => {
-            let input_zset = build_join_side_input_zset(
+            let input_zset = Box::pin(build_join_side_input_zset(
                 Arc::clone(&table),
                 namespace,
                 &input.schema,
                 side,
                 &input.input_name,
-            )
+            ))
             .await?;
             let source = sources
                 .get(&source_name)
                 .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
+            let snapshot = snapshot_batches_from_zset(
+                &input_zset
+                    .materialize_columnar()
+                    .await
+                    .with_context(|| format!("load {side} join input snapshot"))?,
+            )?;
             Ok(ColumnarJoinSourceState {
                 input_name: input.input_name,
                 source_name: Some(source_name),
                 schema: Arc::clone(&source.schema),
-                snapshot: snapshot_batches_from_zset(
-                    &input_zset
-                        .materialize_columnar()
-                        .await
-                        .with_context(|| format!("load {side} join input snapshot"))?,
-                )?,
+                snapshot,
                 input_zset: Some(input_zset),
                 constant: None,
                 topn: None,
@@ -1419,8 +1460,14 @@ async fn collect_join_outputs(
         return Ok(());
     }
     let evaluator = match kind {
-        JoinEvaluatorKind::LeftDeltaRightState => &columnar.left_delta_right_state,
-        JoinEvaluatorKind::LeftStateRightDelta => &columnar.left_state_right_delta,
+        JoinEvaluatorKind::LeftDeltaRightState => columnar
+            .left_delta_right_state
+            .as_ref()
+            .context("left-delta/right-state join evaluator was not built")?,
+        JoinEvaluatorKind::LeftStateRightDelta => columnar
+            .left_state_right_delta
+            .as_ref()
+            .context("left-state/right-delta join evaluator was not built")?,
         JoinEvaluatorKind::LeftDeltaRightDelta => &columnar.left_delta_right_delta,
     };
     let joined = evaluator
@@ -2134,8 +2181,8 @@ impl JoinDeltaEvaluator {
         sources: &HashMap<String, VectorizedSourceState>,
         udfs: &[ScalarUDF],
         output_schema: &SchemaRef,
-        left: &ColumnarJoinInputPlan,
-        right: &ColumnarJoinInputPlan,
+        left: &JoinEvaluatorInputPlan,
+        right: &JoinEvaluatorInputPlan,
         rebuild_each_evaluate: bool,
     ) -> Result<Self> {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
@@ -2217,13 +2264,13 @@ fn dynamic_join_provider(
 
 impl JoinEvaluatorInput {
     fn new(
-        input: &ColumnarJoinInputPlan,
+        input: &JoinEvaluatorInputPlan,
         sources: &HashMap<String, VectorizedSourceState>,
         single_partition_scan: bool,
     ) -> Result<Self> {
         let provider = dynamic_join_provider(Arc::clone(&input.schema), single_partition_scan);
-        let (alias_schema, alias_provider) = match &input.kind {
-            ColumnarJoinInputPlanKind::Source { source_name } => {
+        let (alias_schema, alias_provider) = match &input.source_name {
+            Some(source_name) => {
                 let source = sources
                     .get(source_name)
                     .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
@@ -2242,16 +2289,7 @@ impl JoinEvaluatorInput {
                     (None, None)
                 }
             }
-            ColumnarJoinInputPlanKind::Constant { .. }
-            | ColumnarJoinInputPlanKind::TopN { .. }
-            | ColumnarJoinInputPlanKind::JoinTopN { .. }
-            | ColumnarJoinInputPlanKind::Join { .. }
-            | ColumnarJoinInputPlanKind::MultiJoin { .. }
-            | ColumnarJoinInputPlanKind::Union { .. }
-            | ColumnarJoinInputPlanKind::GroupedMax { .. }
-            | ColumnarJoinInputPlanKind::GroupedCount { .. }
-            | ColumnarJoinInputPlanKind::GroupedStats { .. }
-            | ColumnarJoinInputPlanKind::JoinAggregate { .. } => (None, None),
+            None => (None, None),
         };
         Ok(Self {
             provider,
@@ -2262,12 +2300,10 @@ impl JoinEvaluatorInput {
 
     fn provider_for_table(
         &self,
-        input: &ColumnarJoinInputPlan,
+        input: &JoinEvaluatorInputPlan,
         table_name: &str,
     ) -> Option<Arc<dyn TableProvider>> {
-        let ColumnarJoinInputPlanKind::Source { source_name } = &input.kind else {
-            return None;
-        };
+        let source_name = input.source_name.as_ref()?;
         if table_name == source_name {
             return Some(Arc::clone(&self.provider) as Arc<dyn TableProvider>);
         }
@@ -2310,9 +2346,9 @@ impl JoinEvaluatorInput {
 
 fn rebind_join_logical_plan(
     logical_plan: LogicalPlan,
-    left: &ColumnarJoinInputPlan,
+    left: &JoinEvaluatorInputPlan,
     left_input: &JoinEvaluatorInput,
-    right: &ColumnarJoinInputPlan,
+    right: &JoinEvaluatorInputPlan,
     right_input: &JoinEvaluatorInput,
 ) -> Result<LogicalPlan> {
     match logical_plan {
@@ -2373,22 +2409,10 @@ fn rebind_join_logical_plan(
 
 fn rebind_join_side_logical_plan(
     logical_plan: LogicalPlan,
-    input_plan: &ColumnarJoinInputPlan,
+    input_plan: &JoinEvaluatorInputPlan,
     input: &JoinEvaluatorInput,
 ) -> Result<LogicalPlan> {
-    if matches!(
-        &input_plan.kind,
-        ColumnarJoinInputPlanKind::Constant { .. }
-            | ColumnarJoinInputPlanKind::TopN { .. }
-            | ColumnarJoinInputPlanKind::JoinTopN { .. }
-            | ColumnarJoinInputPlanKind::Join { .. }
-            | ColumnarJoinInputPlanKind::MultiJoin { .. }
-            | ColumnarJoinInputPlanKind::Union { .. }
-            | ColumnarJoinInputPlanKind::GroupedMax { .. }
-            | ColumnarJoinInputPlanKind::GroupedCount { .. }
-            | ColumnarJoinInputPlanKind::GroupedStats { .. }
-            | ColumnarJoinInputPlanKind::JoinAggregate { .. }
-    ) {
+    if input_plan.source_name.is_none() {
         return input.scan_plan(&input_plan.input_name);
     }
     let transformed = logical_plan.transform_up(|plan| match plan {
@@ -2503,38 +2527,6 @@ fn join_input_plan_for_side(
         }));
     }
 
-    if let Some(input_name) = derived_relation_name(plan)
-        && let Some(join) = columnar_join_plan_for_plan_with_options(plan, sources, false)?
-    {
-        return Ok(Some(ColumnarJoinInputPlan {
-            input_name,
-            schema: df_schema_to_arrow(plan.schema()),
-            kind: ColumnarJoinInputPlanKind::Join {
-                plan: Box::new(join),
-            },
-        }));
-    }
-
-    if let Some(input_name) = derived_relation_name(plan)
-        && let Some(multijoin) = columnar_multijoin_plan_for_plan(plan, sources)?
-    {
-        return Ok(Some(ColumnarJoinInputPlan {
-            input_name,
-            schema: df_schema_to_arrow(plan.schema()),
-            kind: ColumnarJoinInputPlanKind::MultiJoin { plan: multijoin },
-        }));
-    }
-
-    if let Some(input_name) = derived_relation_name(plan)
-        && let Some(union) = columnar_union_plan_for_plan(plan, sources)?
-    {
-        return Ok(Some(ColumnarJoinInputPlan {
-            input_name,
-            schema: df_schema_to_arrow(plan.schema()),
-            kind: ColumnarJoinInputPlanKind::Union { plan: union },
-        }));
-    }
-
     if let Some(input_name) = derived_relation_name(plan) {
         let schema = df_schema_to_arrow(plan.schema());
         if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(plan, sources, &schema)? {
@@ -2571,6 +2563,38 @@ fn join_input_plan_for_side(
                 },
             }));
         }
+    }
+
+    if let Some(input_name) = derived_relation_name(plan)
+        && let Some(join) = columnar_join_plan_for_plan_with_options(plan, sources, false)?
+    {
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarJoinInputPlanKind::Join {
+                plan: Box::new(join),
+            },
+        }));
+    }
+
+    if let Some(input_name) = derived_relation_name(plan)
+        && let Some(multijoin) = columnar_multijoin_plan_for_plan(plan, sources)?
+    {
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarJoinInputPlanKind::MultiJoin { plan: multijoin },
+        }));
+    }
+
+    if let Some(input_name) = derived_relation_name(plan)
+        && let Some(union) = columnar_union_plan_for_plan(plan, sources)?
+    {
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarJoinInputPlanKind::Union { plan: union },
+        }));
     }
 
     let Some(source_name) = single_source_for_plan(plan, sources) else {
@@ -2618,14 +2642,7 @@ fn collect_joins<'a>(
     }
     if skip_this_derived_join
         && derived_relation_name(plan).is_some()
-        && (columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
-            || columnar_multijoin_plan_for_plan(plan, sources)?.is_some()
-            || columnar_union_plan_for_plan(plan, sources)?.is_some()
-            || columnar_grouped_max_plan_for_plan(
-                plan,
-                sources,
-                &df_schema_to_arrow(plan.schema()),
-            )?
+        && (columnar_grouped_max_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
             .is_some()
             || columnar_grouped_count_plan_for_plan(
                 plan,
@@ -2639,6 +2656,9 @@ fn collect_joins<'a>(
                 &df_schema_to_arrow(plan.schema()),
             )?
             .is_some()
+            || columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+            || columnar_multijoin_plan_for_plan(plan, sources)?.is_some()
+            || columnar_union_plan_for_plan(plan, sources)?.is_some()
             || columnar_join_aggregate_plan_for_plan(plan, sources)?.is_some())
     {
         return Ok(());
@@ -2813,21 +2833,6 @@ fn contains_unsupported_join_side_wrapper(
         return Ok(false);
     }
     if derived_relation_name(plan).is_some()
-        && columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
-    {
-        return Ok(false);
-    }
-    if derived_relation_name(plan).is_some()
-        && columnar_multijoin_plan_for_plan(plan, sources)?.is_some()
-    {
-        return Ok(false);
-    }
-    if derived_relation_name(plan).is_some()
-        && columnar_union_plan_for_plan(plan, sources)?.is_some()
-    {
-        return Ok(false);
-    }
-    if derived_relation_name(plan).is_some()
         && columnar_grouped_max_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
             .is_some()
     {
@@ -2842,6 +2847,21 @@ fn contains_unsupported_join_side_wrapper(
     if derived_relation_name(plan).is_some()
         && columnar_grouped_stats_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
             .is_some()
+    {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+    {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_multijoin_plan_for_plan(plan, sources)?.is_some()
+    {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_union_plan_for_plan(plan, sources)?.is_some()
     {
         return Ok(false);
     }

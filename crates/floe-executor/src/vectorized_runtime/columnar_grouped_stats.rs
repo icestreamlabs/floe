@@ -80,7 +80,8 @@ enum ColumnarGroupedStatsInputPlan {
     },
     Join {
         input_name: String,
-        schema: SchemaRef,
+        source_schema: SchemaRef,
+        projection_input_schema: SchemaRef,
         plan: Box<ColumnarJoinPlan>,
     },
 }
@@ -112,6 +113,7 @@ enum GroupedStatsProjectionState {
 struct GroupedStatsDerivedProjectionState {
     ctx: SessionContext,
     provider: Arc<DynamicStateTableProvider>,
+    input_schema: SchemaRef,
     plan: Arc<dyn ExecutionPlan>,
 }
 
@@ -243,24 +245,25 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     if aggregate_schema.fields().len() != group_count + aggregate.aggr_expr.len() {
         return Ok(None);
     }
-    let input =
-        if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
-            ColumnarGroupedStatsInputPlan::Source { source_name }
-        } else if let Some(join) = columnar_join_plan_for_plan(aggregate.input.as_ref(), sources)? {
-            let schema = df_schema_to_arrow(aggregate.input.schema())?;
-            if schema_has_duplicate_field_names(&schema) {
-                return Ok(None);
-            }
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_join_input".to_string());
-            ColumnarGroupedStatsInputPlan::Join {
-                input_name,
-                schema,
-                plan: Box::new(join),
-            }
-        } else {
-            return Ok(None);
-        };
+    let input = if let Some(source_name) =
+        incremental_source_for_plan(aggregate.input.as_ref(), sources)
+    {
+        ColumnarGroupedStatsInputPlan::Source { source_name }
+    } else if let Some(mut join) = columnar_join_plan_for_plan(aggregate.input.as_ref(), sources)? {
+        join.force_snapshot_diff_execution();
+        let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        let input_name = derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_stats_join_input".to_string());
+        ColumnarGroupedStatsInputPlan::Join {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(join),
+        }
+    } else {
+        return Ok(None);
+    };
 
     let mut projection_expr = aggregate.group_expr.clone();
     let mut specs = Vec::with_capacity(aggregate.aggr_expr.len());
@@ -315,10 +318,16 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let projection_input = match &input {
         ColumnarGroupedStatsInputPlan::Source { .. } => aggregate.input.as_ref().clone(),
         ColumnarGroupedStatsInputPlan::Join {
-            input_name, schema, ..
+            input_name,
+            projection_input_schema,
+            ..
         } => {
-            projection_expr = rewrite_projection_exprs_for_derived_input(projection_expr)?;
-            scan_plan_for_derived_input(input_name, schema)?
+            projection_expr = rewrite_projection_exprs_for_derived_input(
+                projection_expr,
+                aggregate.input.schema(),
+                projection_input_schema,
+            )?;
+            scan_plan_for_derived_input(input_name, projection_input_schema)?
         }
     };
 
@@ -449,11 +458,11 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                     anyhow::anyhow!("unknown vectorized source '{}'", source_name)
                 })?;
                 let input_namespace = format!("{mv_namespace}/columnar/grouped_stats/input");
-                let input_zset = SlateBackedColumnarZSet::new(
+                let input_zset = Box::pin(SlateBackedColumnarZSet::new(
                     Arc::clone(&table),
                     input_namespace,
                     Arc::clone(&source.schema),
-                )
+                ))
                 .await
                 .context("initialize SlateDB-backed grouped-stats input zset")?;
                 let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
@@ -475,14 +484,15 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             }
             ColumnarGroupedStatsInputPlan::Join {
                 input_name,
-                schema,
+                source_schema,
+                projection_input_schema,
                 plan: join_plan,
             } => {
                 let join_namespace = format!("{mv_namespace}/columnar/grouped_stats/join_input");
                 let join = Box::pin(build_boxed_join_grouped_stats_input_state(
                     Arc::clone(&table),
                     join_namespace,
-                    &schema,
+                    &source_schema,
                     *join_plan,
                     sources,
                     udfs,
@@ -498,7 +508,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 let projection_delta = build_derived_projection_state(
                     LogicalPlan::Projection(plan.projection.clone()),
                     &input_name,
-                    &schema,
+                    &projection_input_schema,
                     udfs,
                 )
                 .await
@@ -510,7 +520,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 })?;
                 (
                     input_name,
-                    schema,
+                    source_schema,
                     None,
                     Some(join),
                     input_snapshot,
@@ -593,6 +603,7 @@ async fn build_derived_projection_state(
     Ok(GroupedStatsDerivedProjectionState {
         ctx,
         provider,
+        input_schema: Arc::clone(input_schema),
         plan,
     })
 }
@@ -826,7 +837,9 @@ async fn collect_grouped_stats_projection_output(
                 .await
         }
         GroupedStatsProjectionState::Derived(derived) => {
-            derived.provider.set_batches(source_batches.to_vec())?;
+            let provider_batches =
+                rewrap_record_batches_with_schema(source_batches, &derived.input_schema)?;
+            derived.provider.set_batches(provider_batches)?;
             let collected = collect(Arc::clone(&derived.plan), derived.ctx.task_ctx()).await;
             derived.provider.set_batches(Vec::new())?;
             normalize_batches(
@@ -2965,11 +2978,52 @@ fn rebind_post_aggregate_plan(
     Ok(transformed.data)
 }
 
-fn rewrite_projection_exprs_for_derived_input(exprs: Vec<Expr>) -> Result<Vec<Expr>> {
+fn derived_projection_input_schema(source_schema: &SchemaRef) -> SchemaRef {
+    let fields = source_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            Field::new(
+                format!("__floe_col_{idx}"),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
+}
+
+fn rewrite_projection_exprs_for_derived_input(
+    exprs: Vec<Expr>,
+    input_schema: &datafusion::common::DFSchemaRef,
+    projection_input_schema: &SchemaRef,
+) -> Result<Vec<Expr>> {
     exprs
         .into_iter()
-        .map(unqualify_post_aggregate_expr)
+        .map(|expr| {
+            rewrite_projection_expr_for_derived_input(expr, input_schema, projection_input_schema)
+        })
         .collect()
+}
+
+fn rewrite_projection_expr_for_derived_input(
+    expr: Expr,
+    input_schema: &datafusion::common::DFSchemaRef,
+    projection_input_schema: &SchemaRef,
+) -> Result<Expr> {
+    expr.transform_up(|expr| match expr {
+        Expr::Column(column) => {
+            let idx = input_schema.index_of_column(&column)?;
+            let field = projection_input_schema.field(idx);
+            Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
+                field.name().clone(),
+            ))))
+        }
+        other => Ok(Transformed::no(other)),
+    })
+    .map(|result| result.data)
+    .map_err(anyhow::Error::new)
 }
 
 fn scan_plan_for_derived_input(input_name: &str, schema: &SchemaRef) -> Result<LogicalPlan> {
@@ -2993,6 +3047,36 @@ fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn rewrap_record_batches_with_schema(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| {
+            if batch.num_columns() != schema.fields().len() {
+                bail!(
+                    "grouped-stats derived input batch width {} does not match schema width {}",
+                    batch.num_columns(),
+                    schema.fields().len()
+                );
+            }
+            for (idx, field) in schema.fields().iter().enumerate() {
+                let actual_type = batch.column(idx).data_type();
+                if actual_type != field.data_type() {
+                    bail!(
+                        "grouped-stats derived input column {} type {:?} does not match expected {:?}",
+                        idx,
+                        actual_type,
+                        field.data_type()
+                    );
+                }
+            }
+            RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec()).map_err(Into::into)
+        })
+        .collect()
 }
 
 fn unqualify_post_aggregate_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
@@ -3176,14 +3260,6 @@ fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> Result<Schema
         .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
         .collect::<Vec<_>>();
     Ok(Arc::new(Schema::new(fields)))
-}
-
-fn schema_has_duplicate_field_names(schema: &SchemaRef) -> bool {
-    let mut seen = BTreeSet::new();
-    schema
-        .fields()
-        .iter()
-        .any(|field| !seen.insert(field.name().clone()))
 }
 
 fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {

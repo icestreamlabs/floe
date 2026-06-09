@@ -298,6 +298,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: join_aggregate_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "join_aggregate",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_join_aggregate",
+            query: r#"SELECT a.category, COUNT(*) AS bid_count FROM auction a JOIN bid b ON a.id = b.auction GROUP BY a.category"#,
+            output_schema: grouped_stats_over_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "grouped_stats_over_join",
             sources: &[
                 NexmarkRuntimeSource {
