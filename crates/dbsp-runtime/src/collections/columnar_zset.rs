@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use arrow_array::builder::Int64Builder;
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
+use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
@@ -21,10 +22,105 @@ use crate::storage::segment::{ArrowSegmentStore, SegmentWriteStats, encode_segme
 pub const COLUMNAR_WEIGHT_COLUMN: &str = "__weight";
 
 #[derive(Clone, Debug)]
+pub struct ColumnarZSet {
+    value_schema: SchemaRef,
+    weighted_schema: SchemaRef,
+    value_column_count: usize,
+    batches: Vec<RecordBatch>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ColumnarI64ZSet {
     schema: SchemaRef,
     value_column_count: usize,
     batches: Vec<RecordBatch>,
+}
+
+impl ColumnarZSet {
+    pub fn empty(value_schema: SchemaRef) -> Result<Self> {
+        let weighted_schema = weighted_schema_for_value_schema(&value_schema)?;
+        Ok(Self {
+            value_column_count: value_schema.fields().len(),
+            value_schema,
+            weighted_schema,
+            batches: Vec::new(),
+        })
+    }
+
+    pub fn from_value_batches(
+        value_schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        weight: i64,
+    ) -> Result<Self> {
+        let weighted_schema = weighted_schema_for_value_schema(&value_schema)?;
+        let mut weighted_batches = Vec::with_capacity(batches.len());
+        for batch in batches {
+            validate_value_batch(&value_schema, &batch)?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(Int64Array::from_value(weight, batch.num_rows())) as ArrayRef);
+            weighted_batches.push(
+                RecordBatch::try_new(Arc::clone(&weighted_schema), columns)
+                    .context("build weighted columnar zset batch")?,
+            );
+        }
+        Self::try_new_weighted(value_schema, weighted_batches)
+    }
+
+    pub fn try_new_weighted(value_schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<Self> {
+        let weighted_schema = weighted_schema_for_value_schema(&value_schema)?;
+        for batch in &batches {
+            validate_weighted_batch(&weighted_schema, &value_schema, batch)?;
+        }
+        Ok(Self {
+            value_column_count: value_schema.fields().len(),
+            value_schema,
+            weighted_schema,
+            batches,
+        })
+    }
+
+    pub fn value_schema(&self) -> SchemaRef {
+        Arc::clone(&self.value_schema)
+    }
+
+    pub fn weighted_schema(&self) -> SchemaRef {
+        Arc::clone(&self.weighted_schema)
+    }
+
+    pub fn value_column_count(&self) -> usize {
+        self.value_column_count
+    }
+
+    pub fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.batches.iter().all(|batch| batch.num_rows() == 0)
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    pub fn push_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        validate_weighted_batch(&self.weighted_schema, &self.value_schema, &batch)?;
+        self.batches.push(batch);
+        Ok(())
+    }
+
+    pub fn extend(&mut self, other: ColumnarZSet) -> Result<()> {
+        if other.value_schema.as_ref() != self.value_schema.as_ref()
+            || other.weighted_schema.as_ref() != self.weighted_schema.as_ref()
+        {
+            bail!("columnar zset schema mismatch");
+        }
+        self.batches.extend(other.batches);
+        Ok(())
+    }
 }
 
 impl ColumnarI64ZSet {
@@ -217,6 +313,20 @@ impl ColumnarI64ZSet {
     }
 }
 
+pub struct SlateBackedColumnarZSet {
+    table: Arc<dyn KeyValueTable>,
+    namespace: String,
+    value_schema: SchemaRef,
+    weighted_schema: SchemaRef,
+    segment_store: ArrowSegmentStore,
+    manifest_prefix: Vec<u8>,
+    state_key: Vec<u8>,
+    current_version: u64,
+    persisted_version: u64,
+    manifest: Option<ColumnarVersionManifest>,
+    next_segment_id: u64,
+}
+
 pub struct SlateBackedColumnarI64ZSet {
     table: Arc<dyn KeyValueTable>,
     namespace: String,
@@ -242,6 +352,239 @@ struct ColumnarVersionManifest {
 struct ColumnarVersionState {
     persisted_version: u64,
     next_segment_id: u64,
+}
+
+impl SlateBackedColumnarZSet {
+    pub async fn new(
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+        value_schema: SchemaRef,
+    ) -> Result<Self> {
+        let namespace = namespace.into();
+        let weighted_schema = weighted_schema_for_value_schema(&value_schema)?;
+        let segment_store = ArrowSegmentStore::new(Arc::clone(&table), namespace.clone());
+        let mut manifest_prefix = keyspace::namespace_prefix(keyspace::prefix::ZSET, &namespace);
+        manifest_prefix.extend_from_slice(b"manifest/columnar_arrow/");
+        let mut state_key = keyspace::namespace_prefix(keyspace::prefix::ZSET, &namespace);
+        state_key.extend_from_slice(b"version_state/current_arrow");
+        let mut zset = Self {
+            table,
+            namespace,
+            value_schema,
+            weighted_schema,
+            segment_store,
+            manifest_prefix,
+            state_key,
+            current_version: 0,
+            persisted_version: 0,
+            manifest: None,
+            next_segment_id: 1,
+        };
+        zset.refresh_state().await?;
+        Ok(zset)
+    }
+
+    pub fn value_schema(&self) -> SchemaRef {
+        Arc::clone(&self.value_schema)
+    }
+
+    pub fn weighted_schema(&self) -> SchemaRef {
+        Arc::clone(&self.weighted_schema)
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn current_handle(&self) -> Option<ZSetHandle> {
+        (self.current_version != 0).then(|| self.handle_for_version(self.current_version))
+    }
+
+    pub fn handle_for_version(&self, version: u64) -> ZSetHandle {
+        ZSetHandle {
+            ns: self.namespace.clone(),
+            version,
+        }
+    }
+
+    pub async fn create_version(
+        &mut self,
+        delta: &ColumnarZSet,
+        base: Option<u64>,
+    ) -> Result<Option<ZSetHandle>> {
+        self.validate_delta(delta)?;
+        if delta.is_empty() {
+            return Ok(None);
+        }
+
+        let segment_id = self.next_segment_id;
+        self.next_segment_id = self.next_segment_id.saturating_add(1);
+        let stats = segment_stats_arrow(delta)?;
+        let (segment_bytes, _) =
+            encode_segment_envelope(Arc::clone(&self.weighted_schema), delta.batches(), stats)
+                .context("encode Arrow columnar zset segment")?;
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            self.segment_store.key_for_segment(segment_id),
+            segment_bytes,
+        );
+
+        if let Some(base_version) = base {
+            let mut base_manifest = self.load_manifest_record(base_version).await?;
+            base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
+            batch.put(
+                self.manifest_key(base_version),
+                encoding::encode(&base_manifest).context("encode Arrow columnar base manifest")?,
+            );
+        }
+
+        let next_version = self.current_version.saturating_add(1);
+        let manifest = ColumnarVersionManifest {
+            base,
+            segments: vec![segment_id],
+            reference_count: 1,
+        };
+        batch.put(
+            self.manifest_key(next_version),
+            encoding::encode(&manifest).context("encode Arrow columnar manifest")?,
+        );
+        let state = ColumnarVersionState {
+            persisted_version: next_version,
+            next_segment_id: self.next_segment_id,
+        };
+        batch.put(
+            self.state_key.clone(),
+            encoding::encode(&state).context("encode Arrow columnar version state")?,
+        );
+        self.table
+            .write_batch(batch)
+            .await
+            .context("write Arrow columnar zset version")?;
+        self.current_version = next_version;
+        self.persisted_version = next_version;
+        self.manifest = Some(manifest);
+        Ok(Some(self.handle_for_version(next_version)))
+    }
+
+    pub async fn read_delta(&self, handle: &ZSetHandle) -> Result<ColumnarZSet> {
+        if handle.ns != self.namespace {
+            bail!(
+                "columnar zset handle namespace '{}' does not match '{}'",
+                handle.ns,
+                self.namespace
+            );
+        }
+        if handle.version == 0 {
+            return Ok(self.empty_like());
+        }
+        let manifest = self.load_manifest_record(handle.version).await?;
+        self.read_manifest_delta(&manifest).await
+    }
+
+    pub async fn materialize_columnar(&self) -> Result<ColumnarZSet> {
+        self.materialize_columnar_version(self.current_version)
+            .await
+    }
+
+    pub async fn materialize_columnar_version(&self, version: u64) -> Result<ColumnarZSet> {
+        if version == 0 {
+            return Ok(self.empty_like());
+        }
+
+        let mut chain = Vec::new();
+        let mut current = Some(version);
+        while let Some(version) = current {
+            let manifest = self.load_manifest_record(version).await?;
+            current = manifest.base;
+            chain.push(manifest);
+        }
+
+        let mut delta = self.empty_like();
+        for manifest in chain.into_iter().rev() {
+            delta.extend(self.read_manifest_delta(&manifest).await?)?;
+        }
+        consolidate_columnar_zset(delta)
+    }
+
+    async fn read_manifest_delta(
+        &self,
+        manifest: &ColumnarVersionManifest,
+    ) -> Result<ColumnarZSet> {
+        let mut delta = self.empty_like();
+        for segment_id in &manifest.segments {
+            delta.extend(self.read_segment_delta(*segment_id).await?)?;
+        }
+        Ok(delta)
+    }
+
+    async fn read_segment_delta(&self, segment_id: u64) -> Result<ColumnarZSet> {
+        let segment = self
+            .segment_store
+            .read_segment(segment_id)
+            .await
+            .with_context(|| format!("read Arrow columnar zset segment {segment_id}"))?
+            .ok_or_else(|| anyhow::anyhow!("missing Arrow columnar zset segment {segment_id}"))?;
+        if segment.schema.as_ref() != self.weighted_schema.as_ref() {
+            bail!("Arrow columnar zset segment schema mismatch");
+        }
+        ColumnarZSet::try_new_weighted(Arc::clone(&self.value_schema), segment.batches)
+            .with_context(|| format!("decode Arrow columnar zset segment {segment_id}"))
+    }
+
+    async fn refresh_state(&mut self) -> Result<()> {
+        let Some(bytes) = self
+            .table
+            .get_bytes(&self.state_key)
+            .await
+            .context("read Arrow columnar zset version state")?
+        else {
+            return Ok(());
+        };
+        let state: ColumnarVersionState =
+            encoding::decode(bytes.as_ref()).context("decode Arrow columnar zset version state")?;
+        self.persisted_version = state.persisted_version;
+        self.current_version = state.persisted_version;
+        self.next_segment_id = state.next_segment_id.max(1);
+        self.manifest = if state.persisted_version == 0 {
+            None
+        } else {
+            Some(self.load_manifest_record(state.persisted_version).await?)
+        };
+        Ok(())
+    }
+
+    fn validate_delta(&self, delta: &ColumnarZSet) -> Result<()> {
+        if delta.value_schema.as_ref() != self.value_schema.as_ref()
+            || delta.weighted_schema.as_ref() != self.weighted_schema.as_ref()
+        {
+            bail!("Arrow columnar zset delta schema mismatch");
+        }
+        Ok(())
+    }
+
+    fn manifest_key(&self, version: u64) -> Vec<u8> {
+        keyspace::key_with_u64(&self.manifest_prefix, version)
+    }
+
+    async fn load_manifest_record(&self, version: u64) -> Result<ColumnarVersionManifest> {
+        let bytes = self
+            .table
+            .get_bytes(&self.manifest_key(version))
+            .await
+            .with_context(|| format!("read Arrow columnar zset manifest {version}"))?
+            .ok_or_else(|| anyhow::anyhow!("missing Arrow columnar zset manifest {version}"))?;
+        encoding::decode(bytes.as_ref()).context("decode Arrow columnar zset manifest")
+    }
+
+    fn empty_like(&self) -> ColumnarZSet {
+        ColumnarZSet {
+            value_schema: Arc::clone(&self.value_schema),
+            weighted_schema: Arc::clone(&self.weighted_schema),
+            value_column_count: self.value_schema.fields().len(),
+            batches: Vec::new(),
+        }
+    }
 }
 
 impl SlateBackedColumnarI64ZSet {
@@ -572,6 +915,194 @@ fn validate_batch(schema: &SchemaRef, batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+fn weighted_schema_for_value_schema(value_schema: &SchemaRef) -> Result<SchemaRef> {
+    if value_schema.index_of(COLUMNAR_WEIGHT_COLUMN).is_ok() {
+        bail!(
+            "value schema already contains reserved weight column '{}'",
+            COLUMNAR_WEIGHT_COLUMN
+        );
+    }
+    let mut fields = value_schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields.push(Field::new(COLUMNAR_WEIGHT_COLUMN, DataType::Int64, false));
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        value_schema.metadata().clone(),
+    )))
+}
+
+fn validate_value_batch(value_schema: &SchemaRef, batch: &RecordBatch) -> Result<()> {
+    if batch.schema().as_ref() != value_schema.as_ref() {
+        bail!("columnar zset value batch schema mismatch");
+    }
+    Ok(())
+}
+
+fn validate_weighted_batch(
+    weighted_schema: &SchemaRef,
+    value_schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<()> {
+    if batch.schema().as_ref() != weighted_schema.as_ref() {
+        bail!("columnar zset weighted batch schema mismatch");
+    }
+    let value_field_count = value_schema.fields().len();
+    let weight = batch
+        .column(value_field_count)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("columnar zset weight column is not Int64"))?;
+    if weight.null_count() != 0 {
+        bail!("columnar zset weight column contains NULL values");
+    }
+    Ok(())
+}
+
+fn value_array_refs(batch: &RecordBatch, value_column_count: usize) -> Vec<ArrayRef> {
+    (0..value_column_count)
+        .map(|idx| Arc::clone(batch.column(idx)))
+        .collect()
+}
+
+fn row_converter_for_schema(value_schema: &SchemaRef) -> Result<RowConverter> {
+    let fields = value_schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect::<Vec<_>>();
+    RowConverter::new(fields).context("build Arrow row converter for columnar zset")
+}
+
+fn segment_stats_arrow(delta: &ColumnarZSet) -> Result<SegmentWriteStats> {
+    let converter = row_converter_for_schema(&delta.value_schema)?;
+    let mut min_key_hash = u64::MAX;
+    let mut max_key_hash = 0_u64;
+    let mut tombstones = 0_usize;
+    let mut rows = 0_usize;
+
+    for batch in delta.batches() {
+        let weights = weight_column(batch, delta.value_column_count)?;
+        let row_values = converter
+            .convert_columns(&value_array_refs(batch, delta.value_column_count))
+            .context("encode Arrow columnar zset rows for stats")?;
+        for row_idx in 0..batch.num_rows() {
+            rows = rows.saturating_add(1);
+            let mut hasher = ahash::AHasher::default();
+            hasher.write(row_values.row(row_idx).data());
+            let hash = hasher.finish();
+            min_key_hash = min_key_hash.min(hash);
+            max_key_hash = max_key_hash.max(hash);
+            if weights.value(row_idx) < 0 {
+                tombstones = tombstones.saturating_add(1);
+            }
+        }
+    }
+
+    if rows == 0 {
+        return SegmentWriteStats::new(0, 0, 0.0);
+    }
+    SegmentWriteStats::new(min_key_hash, max_key_hash, tombstones as f64 / rows as f64)
+}
+
+fn consolidate_columnar_zset(delta: ColumnarZSet) -> Result<ColumnarZSet> {
+    if delta.is_empty() {
+        return Ok(delta);
+    }
+
+    let weighted_schema = delta.weighted_schema();
+    let value_schema = delta.value_schema();
+    let value_column_count = delta.value_column_count();
+    let batch = concat_batches(&weighted_schema, delta.batches())
+        .context("concat Arrow columnar zset batches for consolidation")?;
+    if batch.num_rows() == 0 {
+        return ColumnarZSet::empty(value_schema);
+    }
+
+    let sort_columns = (0..value_column_count)
+        .map(|index| SortColumn {
+            values: Arc::clone(batch.column(index)),
+            options: Some(SortOptions::new(false, false)),
+        })
+        .collect::<Vec<_>>();
+    let indices = lexsort_to_indices(&sort_columns, None).context("sort Arrow columnar zset")?;
+
+    let mut sorted_values = Vec::with_capacity(value_column_count);
+    for column_idx in 0..value_column_count {
+        sorted_values.push(
+            take(batch.column(column_idx).as_ref(), &indices, None)
+                .with_context(|| format!("take sorted Arrow value column {column_idx}"))?,
+        );
+    }
+    let sorted_weights_ref = take(batch.column(value_column_count).as_ref(), &indices, None)
+        .context("take sorted Arrow zset weights")?;
+    let sorted_weights = sorted_weights_ref
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .context("sorted Arrow zset weights are not Int64")?;
+    let row_values = row_converter_for_schema(&value_schema)?
+        .convert_columns(&sorted_values)
+        .context("encode sorted Arrow columnar zset rows")?;
+
+    let mut group_indices = Vec::new();
+    let mut group_weights = Vec::new();
+    let mut group_start = 0_usize;
+    let mut group_weight = 0_i64;
+
+    for row_idx in 0..sorted_weights.len() {
+        if row_idx != group_start
+            && row_values.row(row_idx).data() != row_values.row(group_start).data()
+        {
+            append_arrow_group(
+                group_start,
+                group_weight,
+                &mut group_indices,
+                &mut group_weights,
+            )?;
+            group_start = row_idx;
+            group_weight = 0;
+        }
+        group_weight = group_weight.saturating_add(sorted_weights.value(row_idx));
+    }
+    append_arrow_group(
+        group_start,
+        group_weight,
+        &mut group_indices,
+        &mut group_weights,
+    )?;
+
+    if group_indices.is_empty() {
+        return ColumnarZSet::empty(value_schema);
+    }
+
+    let take_indices = UInt32Array::from(group_indices);
+    let mut columns = Vec::with_capacity(value_column_count + 1);
+    for column in &sorted_values {
+        columns
+            .push(take(column.as_ref(), &take_indices, None).context("take grouped Arrow rows")?);
+    }
+    columns.push(Arc::new(Int64Array::from(group_weights)) as ArrayRef);
+    let batch = RecordBatch::try_new(Arc::clone(&weighted_schema), columns)
+        .context("build consolidated Arrow columnar zset batch")?;
+    ColumnarZSet::try_new_weighted(value_schema, vec![batch])
+}
+
+fn append_arrow_group(
+    row_idx: usize,
+    weight: i64,
+    group_indices: &mut Vec<u32>,
+    group_weights: &mut Vec<i64>,
+) -> Result<()> {
+    if weight == 0 {
+        return Ok(());
+    }
+    group_indices.push(u32::try_from(row_idx).context("columnar zset group index exceeds u32")?);
+    group_weights.push(weight);
+    Ok(())
+}
+
 fn segment_stats(delta: &ColumnarI64ZSet) -> Result<SegmentWriteStats> {
     let mut min_key_hash = u64::MAX;
     let mut max_key_hash = 0_u64;
@@ -729,6 +1260,7 @@ fn apply_delta_to_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::StringArray;
     use object_store::memory::InMemory;
     use slatedb::Db;
 
@@ -757,6 +1289,64 @@ mod tests {
         let grouped = zset.grouped_weights_by_first_column().expect("group");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped.get(&1), Some(&3));
+    }
+
+    fn generic_value_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn generic_weighted_zset(
+        ids: Vec<i64>,
+        names: Vec<Option<&str>>,
+        weights: Vec<i64>,
+    ) -> ColumnarZSet {
+        let value_schema = generic_value_schema();
+        let weighted_schema = weighted_schema_for_value_schema(&value_schema).expect("schema");
+        let batch = RecordBatch::try_new(
+            weighted_schema,
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(Int64Array::from(weights)) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        ColumnarZSet::try_new_weighted(value_schema, vec![batch]).expect("zset")
+    }
+
+    #[test]
+    fn generic_zset_consolidates_strings_and_nulls() {
+        let zset = generic_weighted_zset(
+            vec![1, 1, 2, 2],
+            vec![Some("a"), Some("a"), None, None],
+            vec![1, -1, 2, -1],
+        );
+
+        let consolidated = consolidate_columnar_zset(zset).expect("consolidate");
+
+        assert_eq!(consolidated.num_rows(), 1);
+        let batch = &consolidated.batches()[0];
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ids");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("names");
+        let weights = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("weights");
+        assert_eq!(ids.value(0), 2);
+        assert!(names.is_null(0));
+        assert_eq!(weights.value(0), 1);
     }
 
     async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
@@ -796,5 +1386,59 @@ mod tests {
         let materialized = zset.materialize().await.expect("materialize");
         assert_eq!(materialized.len(), 1);
         assert_eq!(materialized.get(&vec![2]), Some(&4));
+    }
+
+    #[tokio::test]
+    async fn slate_backed_generic_zset_materializes_arrow_rows() {
+        let table = build_table("generic-columnar-zset-slate-backed").await;
+        let value_schema = generic_value_schema();
+        let mut zset = SlateBackedColumnarZSet::new(
+            table,
+            "generic_columnar_state",
+            Arc::clone(&value_schema),
+        )
+        .await
+        .expect("zset");
+        let first = generic_weighted_zset(vec![1, 2], vec![Some("a"), None], vec![1, 1]);
+        let second = generic_weighted_zset(vec![1, 3], vec![Some("a"), Some("c")], vec![-1, 2]);
+
+        zset.create_version(&first, None)
+            .await
+            .expect("persist first")
+            .expect("first handle");
+        let base = zset.current_handle().map(|handle| handle.version);
+        zset.create_version(&second, base)
+            .await
+            .expect("persist second")
+            .expect("second handle");
+
+        let materialized = zset
+            .materialize_columnar()
+            .await
+            .expect("materialize columnar");
+
+        assert_eq!(materialized.num_rows(), 2);
+        let batch = &materialized.batches()[0];
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ids");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("names");
+        let weights = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("weights");
+        assert_eq!(ids.value(0), 2);
+        assert!(names.is_null(0));
+        assert_eq!(weights.value(0), 1);
+        assert_eq!(ids.value(1), 3);
+        assert_eq!(names.value(1), "c");
+        assert_eq!(weights.value(1), 2);
     }
 }
