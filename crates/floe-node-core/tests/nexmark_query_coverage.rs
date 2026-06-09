@@ -125,6 +125,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT p.name, a.\"itemName\" FROM person p JOIN auction a ON p.id = a.seller WHERE p.id > 10",
     },
     ValidPlanRuntimeCase {
+        id: "ordered_inner_join",
+        sql: "SELECT b.auction, a.seller FROM bid b JOIN auction a ON b.auction = a.id ORDER BY b.auction",
+    },
+    ValidPlanRuntimeCase {
         id: "join_expression_key_pruning",
         sql: "SELECT b.auction, a.seller FROM bid b JOIN auction a ON b.auction = a.id AND b.auction % 10000 = a.id % 10000",
     },
