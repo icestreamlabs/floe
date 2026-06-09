@@ -69,6 +69,31 @@ fn plans_aggregate_over_distinct_subquery() {
 }
 
 #[test]
+fn plans_global_count_star_without_empty_scan_projection() {
+    let bid = nexmark_bid_table();
+    #[allow(deprecated)]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::<WildcardOptions>::default(),
+    };
+    let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), Some(vec![]))
+        .unwrap()
+        .aggregate(Vec::<Expr>::new(), vec![count(wildcard).alias("c")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+    let DbspNodeKind::Aggregate(aggregate) = &root.kind else {
+        panic!("expected aggregate root, got {:?}", root.kind);
+    };
+    assert_eq!(aggregate.group_keys().len(), 0);
+    assert_eq!(aggregate.aggregates().len(), 1);
+}
+
+#[test]
 fn prunes_unused_aggregate_calls_under_projection() {
     let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)

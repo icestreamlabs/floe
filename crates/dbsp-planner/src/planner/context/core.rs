@@ -78,7 +78,9 @@ impl<'cfg> PlannerContext<'cfg> {
                     current.id = id;
                 }
 
-                if let Some(projection) = &scan.projection {
+                if let Some(projection) = &scan.projection
+                    && !projection.is_empty()
+                {
                     let mut items = Vec::with_capacity(projection.len());
                     for idx in projection {
                         let Some(field) = source_schema.field(*idx) else {

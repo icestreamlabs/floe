@@ -181,6 +181,26 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction HAVING SUM(price) > 1000",
     },
     ValidPlanRuntimeCase {
+        id: "global_count",
+        sql: "SELECT COUNT(*) AS c FROM bid",
+    },
+    ValidPlanRuntimeCase {
+        id: "global_stats_aggregate",
+        sql: "SELECT SUM(price) AS total_price, AVG(price) AS avg_price, MIN(price) AS min_price, MAX(price) AS max_price FROM bid",
+    },
+    ValidPlanRuntimeCase {
+        id: "ordered_grouped_aggregate",
+        sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "global_sort_limit_offset_topn",
+        sql: "SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5 OFFSET 2",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_different_sources",
+        sql: "SELECT id AS key FROM auction UNION ALL SELECT auction AS key FROM bid",
+    },
+    ValidPlanRuntimeCase {
         id: "filtered_distinct_aggregate",
         sql: "SELECT COUNT(*) FILTER (WHERE price > 100) AS filtered_rows, COUNT(DISTINCT bidder) FILTER (WHERE price > 100) AS filtered_distinct_bidders FROM bid",
     },
