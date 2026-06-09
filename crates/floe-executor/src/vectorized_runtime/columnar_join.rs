@@ -36,6 +36,13 @@ pub(super) struct ColumnarJoinPlan {
     logical_plan: LogicalPlan,
     left_source: String,
     right_source: String,
+    execution_strategy: ColumnarJoinExecutionStrategy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColumnarJoinExecutionStrategy {
+    IncrementalInner,
+    SnapshotDiff,
 }
 
 pub(super) struct ColumnarJoinMaterializedViewState {
@@ -46,6 +53,7 @@ pub(super) struct ColumnarJoinMaterializedViewState {
     left_state_right_delta: JoinDeltaEvaluator,
     left_delta_right_delta: JoinDeltaEvaluator,
     initial_snapshot: Vec<RecordBatch>,
+    execution_strategy: ColumnarJoinExecutionStrategy,
 }
 
 impl ColumnarJoinMaterializedViewState {
@@ -89,7 +97,7 @@ pub(super) fn columnar_join_plan_for_plan(
     let [join] = joins.as_slice() else {
         return Ok(None);
     };
-    if join.join_type != JoinType::Inner || (join.on.is_empty() && join.filter.is_none()) {
+    if !is_supported_join_type(&join.join_type) || (join.on.is_empty() && join.filter.is_none()) {
         return Ok(None);
     }
     let Some(left_source) = single_source_for_plan(join.left.as_ref(), sources) else {
@@ -109,11 +117,18 @@ pub(super) fn columnar_join_plan_for_plan(
     if contains_unsupported_join_wrapper(plan) {
         return Ok(None);
     }
+    let execution_strategy =
+        if matches!(join.join_type, JoinType::Inner) && left_source != right_source {
+            ColumnarJoinExecutionStrategy::IncrementalInner
+        } else {
+            ColumnarJoinExecutionStrategy::SnapshotDiff
+        };
 
     Ok(Some(ColumnarJoinPlan {
         logical_plan: plan.clone(),
         left_source,
         right_source,
+        execution_strategy,
     }))
 }
 
@@ -179,6 +194,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
             .context("load join output snapshot")?,
     )?;
 
+    let execution_strategy = plan.execution_strategy;
     let logical_plan = plan.logical_plan;
     let left_name = plan.left_source;
     let right_name = plan.right_source;
@@ -241,6 +257,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         left_state_right_delta,
         left_delta_right_delta,
         initial_snapshot,
+        execution_strategy,
     })
 }
 
@@ -251,15 +268,15 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
 ) -> Result<bool> {
-    let Some(is_self_join) = mv
+    let Some(execution_strategy) = mv
         .columnar_join
         .as_ref()
-        .map(|columnar| columnar.left.source_name == columnar.right.source_name)
+        .map(|columnar| columnar.execution_strategy)
     else {
         return Ok(false);
     };
-    if is_self_join {
-        return run_columnar_self_join_materialized_view_tick(
+    if execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff {
+        return run_columnar_snapshot_diff_join_materialized_view_tick(
             registry,
             insert_batches,
             weighted_delta_batches,
@@ -384,7 +401,7 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     Ok(true)
 }
 
-async fn run_columnar_self_join_materialized_view_tick(
+async fn run_columnar_snapshot_diff_join_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -404,42 +421,52 @@ async fn run_columnar_self_join_materialized_view_tick(
         persisted_source_delta(&mut columnar.left.input_zset, left_input_delta).await?;
     let right_delta =
         persisted_source_delta(&mut columnar.right.input_zset, right_input_delta).await?;
-    let next_source_snapshot = snapshot_batches_from_zset(
-        &columnar
-            .left
-            .input_zset
-            .materialize_columnar()
-            .await
-            .context("materialize self-join input zset")?,
-    )?;
-
-    let output_delta_batches =
-        if left_delta.batches().is_empty() && right_delta.batches().is_empty() {
-            Vec::new()
+    let has_input_change = !left_delta.batches().is_empty() || !right_delta.batches().is_empty();
+    let (next_left_snapshot, next_right_snapshot) = if has_input_change {
+        if columnar.left.source_name == columnar.right.source_name {
+            let next_source_snapshot =
+                materialize_join_input_snapshot(&columnar.left, "shared").await?;
+            (next_source_snapshot.clone(), next_source_snapshot)
         } else {
-            let next_output = columnar
-                .left_delta_right_delta
-                .evaluate(
-                    &columnar.left.source_name,
-                    &next_source_snapshot,
-                    &columnar.right.source_name,
-                    &next_source_snapshot,
-                )
-                .await
-                .context("evaluate next self-join output")?;
-            diff_snapshot_batches(
-                Arc::clone(&mv.output_schema),
-                &mv.previous_snapshot,
-                &next_output,
+            let next_left_snapshot =
+                next_join_source_snapshot(&columnar.left, &left_delta, "left").await?;
+            let next_right_snapshot =
+                next_join_source_snapshot(&columnar.right, &right_delta, "right").await?;
+            (next_left_snapshot, next_right_snapshot)
+        }
+    } else {
+        (
+            columnar.left.snapshot.clone(),
+            columnar.right.snapshot.clone(),
+        )
+    };
+
+    let output_delta_batches = if has_input_change {
+        let next_output = columnar
+            .left_delta_right_delta
+            .evaluate(
+                &columnar.left.source_name,
+                &next_left_snapshot,
+                &columnar.right.source_name,
+                &next_right_snapshot,
             )
             .await
-            .context("diff self-join output")?
-            .batches
-        };
+            .context("evaluate next snapshot-diff join output")?;
+        diff_snapshot_batches(
+            Arc::clone(&mv.output_schema),
+            &mv.previous_snapshot,
+            &next_output,
+        )
+        .await
+        .context("diff snapshot-diff join output")?
+        .batches
+    } else {
+        Vec::new()
+    };
 
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
-            .context("build self-join output zset delta")?;
+            .context("build snapshot-diff join output zset delta")?;
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(
@@ -465,13 +492,13 @@ async fn run_columnar_self_join_materialized_view_tick(
     .await
     .with_context(|| {
         format!(
-            "apply Slate-backed self-join columnar snapshot delta for '{}'",
+            "apply Slate-backed snapshot-diff join columnar snapshot delta for '{}'",
             mv.view_name
         )
     })?;
 
-    columnar.left.snapshot = next_source_snapshot.clone();
-    columnar.right.snapshot = next_source_snapshot;
+    columnar.left.snapshot = next_left_snapshot;
+    columnar.right.snapshot = next_right_snapshot;
     let handle = registry.register(mv.view_name.clone());
     handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
     mv.previous_snapshot = next_snapshot;
@@ -479,8 +506,8 @@ async fn run_columnar_self_join_materialized_view_tick(
         view = %mv.view_name,
         version,
         total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_self_join",
-        "SlateDB-backed self-join columnar DBSP materialized view tick completed"
+        mode = "columnar_join_snapshot_diff",
+        "SlateDB-backed snapshot-diff join columnar DBSP materialized view tick completed"
     );
     Ok(true)
 }
@@ -589,6 +616,30 @@ fn source_input_delta(
     } else {
         ColumnarZSet::empty(Arc::clone(&source.schema))
     }
+}
+
+async fn next_join_source_snapshot(
+    source: &ColumnarJoinSourceState,
+    delta: &ColumnarZSet,
+    side: &str,
+) -> Result<Vec<RecordBatch>> {
+    if delta.batches().is_empty() {
+        return Ok(source.snapshot.clone());
+    }
+    materialize_join_input_snapshot(source, side).await
+}
+
+async fn materialize_join_input_snapshot(
+    source: &ColumnarJoinSourceState,
+    side: &str,
+) -> Result<Vec<RecordBatch>> {
+    snapshot_batches_from_zset(
+        &source
+            .input_zset
+            .materialize_columnar()
+            .await
+            .with_context(|| format!("materialize {side} join input zset"))?,
+    )
 }
 
 async fn persisted_source_delta(
@@ -814,6 +865,20 @@ fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
         LogicalPlan::SubqueryAlias(alias) => collect_joins(alias.input.as_ref(), joins),
         _ => {}
     }
+}
+
+fn is_supported_join_type(join_type: &JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Inner
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Full
+            | JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+    )
 }
 
 fn single_source_for_plan(
