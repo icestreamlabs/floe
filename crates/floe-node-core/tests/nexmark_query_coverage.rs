@@ -178,6 +178,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT l.auction, COUNT(*) AS pair_count FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price GROUP BY l.auction",
     },
     ValidPlanRuntimeCase {
+        id: "distinct_over_self_join",
+        sql: "SELECT DISTINCT auction FROM (SELECT l.auction, r.price FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price) j",
+    },
+    ValidPlanRuntimeCase {
+        id: "topn_over_self_join",
+        sql: "SELECT auction, price FROM (SELECT l.auction, r.price FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price) j ORDER BY price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_over_self_join",
+        sql: "SELECT key FROM (SELECT auction AS key FROM (SELECT l.auction, r.price FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price) j UNION ALL SELECT auction AS key FROM bid) u",
+    },
+    ValidPlanRuntimeCase {
         id: "join_aggregate",
         sql: "SELECT a.category, COUNT(*) AS bid_count FROM auction a JOIN bid b ON a.id = b.auction GROUP BY a.category",
     },
