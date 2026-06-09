@@ -509,12 +509,32 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT auction AS key, price AS value FROM bid WHERE price > 100",
     ),
     (
+        "expression_projection",
+        "SELECT auction + 1 AS key, price * 2 AS value FROM bid WHERE price * 2 > 100",
+    ),
+    (
+        "case_projection",
+        "SELECT auction AS key, CASE WHEN price > 100 THEN price ELSE 0 END AS value FROM bid",
+    ),
+    (
+        "udf_projection",
+        "SELECT auction AS key, COUNT_CHAR(extra, 'c') AS value FROM bid",
+    ),
+    (
         "distinct",
         "SELECT DISTINCT auction AS key, bidder AS value FROM bid",
     ),
     (
         "aggregate",
         "SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction",
+    ),
+    (
+        "expression_group_aggregate",
+        "SELECT auction % 10 AS key, SUM(price) AS value FROM bid GROUP BY auction % 10",
+    ),
+    (
+        "distinct_count_aggregate",
+        "SELECT auction AS key, COUNT(DISTINCT bidder) AS value FROM bid GROUP BY auction",
     ),
     (
         "having_aggregate",
@@ -527,6 +547,10 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
     (
         "global_aggregate",
         "SELECT 0 AS key, SUM(price) AS value FROM bid",
+    ),
+    (
+        "filtered_distinct_aggregate",
+        "SELECT 0 AS key, COUNT(DISTINCT bidder) FILTER (WHERE price > 100) AS value FROM bid",
     ),
     (
         "aggregate_topn",
@@ -551,6 +575,10 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
     (
         "residual_join",
         "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction = a.id AND b.price > a.\"initialBid\"",
+    ),
+    (
+        "expression_join",
+        "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction % 10000 = a.id % 10000",
     ),
     (
         "left_join",
@@ -595,6 +623,10 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
     (
         "asof_join",
         "SELECT a.id AS key, b.price AS value FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction",
+    ),
+    (
+        "asof_join_without_equi_keys",
+        "SELECT a.id AS key, b.price AS value FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\")",
     ),
 ];
 
@@ -881,11 +913,15 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         serde_json::to_string_pretty(&execution_modes).expect("serialize execution modes")
     );
     eprintln!(
+        "generated active vectorized runtime DBSP-valid shape count: {}",
+        execution_modes.len()
+    );
+    eprintln!(
         "generated active vectorized runtime DBSP-unsupported shape count: {}",
         skipped.len()
     );
     assert!(
-        execution_modes.len() >= 400,
+        execution_modes.len() >= 500,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
         execution_modes.len(),
         skipped.len()
