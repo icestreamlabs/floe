@@ -180,6 +180,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: three_way_topn_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "filtered_join_topn",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_filtered_join_topn",
+            query: r#"SELECT auction, seller FROM (SELECT b.auction, a.seller, b.price FROM bid b JOIN auction a ON b.auction = a.id ORDER BY b.price DESC LIMIT 256) top_bids WHERE seller >= 0 ORDER BY auction"#,
+            output_schema: filtered_join_topn_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "q12",
             sources: &[NexmarkRuntimeSource {
                 source_name: "nexmark_bid",
@@ -718,6 +734,13 @@ fn three_way_topn_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("person_id", DataType::Int64, true),
         Field::new("price", DataType::Int64, true),
+    ]))
+}
+
+fn filtered_join_topn_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("seller", DataType::Int64, true),
     ]))
 }
 

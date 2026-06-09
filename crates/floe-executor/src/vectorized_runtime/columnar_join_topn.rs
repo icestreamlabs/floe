@@ -1318,10 +1318,13 @@ fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
             global_sort_limit_for_plan(projection.input.as_ref())
         }
         LogicalPlan::SubqueryAlias(alias) => global_sort_limit_for_plan(alias.input.as_ref()),
+        LogicalPlan::Filter(filter) => global_sort_limit_for_plan(filter.input.as_ref()),
         LogicalPlan::Limit(Limit { input, fetch, .. }) if fetch.is_some() => {
             contains_non_empty_sort(input.as_ref())
         }
-        LogicalPlan::Sort(Sort { expr, fetch, .. }) => fetch.is_some() && !expr.is_empty(),
+        LogicalPlan::Sort(Sort {
+            expr, fetch, input, ..
+        }) => !expr.is_empty() && (fetch.is_some() || global_sort_limit_for_plan(input.as_ref())),
         _ => false,
     }
 }
