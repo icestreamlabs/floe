@@ -210,6 +210,26 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: join_over_three_way_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "union_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_person",
+                    batch: person_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_union_join",
+            query: r#"SELECT u.key, p.id AS person_id FROM (SELECT seller AS key FROM auction UNION ALL SELECT bidder AS key FROM bid) u JOIN person p ON u.key = p.id"#,
+            output_schema: union_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "filtered_join_topn",
             sources: &[
                 NexmarkRuntimeSource {
@@ -826,6 +846,13 @@ fn three_way_topn_output_schema() -> SchemaRef {
 fn join_over_three_way_join_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("seller", DataType::Int64, true),
+        Field::new("person_id", DataType::Int64, true),
+    ]))
+}
+
+fn union_join_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, true),
         Field::new("person_id", DataType::Int64, true),
     ]))
 }

@@ -1097,6 +1097,7 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("topn_over_self_join", "columnar_join_topn"),
         ("topn_over_three_way_join", "columnar_multijoin"),
         ("join_over_three_way_join", "columnar_join"),
+        ("union_join", "columnar_join"),
     ];
     for (case_id, expected_mode) in expected_modes {
         if execution_modes.get(case_id).map(String::as_str) != Some(expected_mode) {

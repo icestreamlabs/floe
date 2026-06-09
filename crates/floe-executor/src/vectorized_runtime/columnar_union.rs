@@ -39,6 +39,18 @@ pub(super) struct ColumnarUnionPlan {
     distinct: bool,
 }
 
+impl ColumnarUnionPlan {
+    pub(super) fn source_names(&self) -> BTreeSet<String> {
+        self.inputs
+            .iter()
+            .filter_map(|input| match &input.kind {
+                ColumnarUnionInputPlanKind::Source { source_name } => Some(source_name.clone()),
+                ColumnarUnionInputPlanKind::Constant { .. } => None,
+            })
+            .collect()
+    }
+}
+
 pub(super) struct ColumnarUnionMaterializedViewState {
     sources: Vec<ColumnarUnionSourceState>,
     output_zset: SlateBackedColumnarZSet,
@@ -68,6 +80,12 @@ struct ColumnarUnionConstantState {
     pending_snapshot: Vec<RecordBatch>,
 }
 
+pub(super) struct ColumnarUnionTick {
+    pub(super) delta: ColumnarZSet,
+    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) input_changed: bool,
+}
+
 struct ColumnarUnionInputPlan {
     input_name: String,
     schema: SchemaRef,
@@ -81,7 +99,7 @@ enum ColumnarUnionInputPlanKind {
 
 struct UnionDeltaEvaluator {
     ctx: SessionContext,
-    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    logical_plan: LogicalPlan,
     inputs: HashMap<String, UnionEvaluatorInput>,
     output_schema: SchemaRef,
 }
@@ -160,12 +178,31 @@ pub(super) async fn build_columnar_union_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarUnionMaterializedViewState> {
+    let mv_namespace = namespaces::materialized_view(view_name)?;
+    build_columnar_union_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_union_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarUnionPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarUnionMaterializedViewState> {
     let ColumnarUnionPlan {
         logical_plan,
         inputs,
         distinct,
     } = plan;
-    let mv_namespace = namespaces::materialized_view(view_name)?;
     let output_namespace = format!("{mv_namespace}/columnar/union/output");
     let distinct_state_namespace = format!("{mv_namespace}/columnar/union/distinct_state");
     let output_zset = SlateBackedColumnarZSet::new(
@@ -341,13 +378,44 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
         return Ok(false);
     };
     let plan_start = Instant::now();
+    let tick = run_columnar_union_state_tick(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        &mv.output_schema,
+        &mv.previous_snapshot,
+    )
+    .await?;
 
+    let delta_batches = tick.delta.batches().to_vec();
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = tick.next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "columnar_union",
+        "SlateDB-backed union columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+pub(super) async fn run_columnar_union_state_tick(
+    columnar: &mut ColumnarUnionMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarUnionTick> {
     let mut positive_by_source = HashMap::new();
     let mut negative_by_source = HashMap::new();
+    let mut input_changed = false;
     for source in &mut columnar.sources {
         let signed = prepare_union_input_tick(source, insert_batches, weighted_delta_batches)
             .await
             .with_context(|| format!("prepare union input tick for '{}'", source.input_name))?;
+        input_changed |= !signed.positive.is_empty() || !signed.negative.is_empty();
         positive_by_source.insert(source.input_name.clone(), signed.positive);
         negative_by_source.insert(source.input_name.clone(), signed.negative);
     }
@@ -377,33 +445,19 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed union columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+            .await
+            .context("apply Slate-backed union columnar snapshot delta")?;
 
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
     for source in &mut columnar.sources {
         mark_union_constant_initialized(source).await?;
     }
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_union",
-        "SlateDB-backed union columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarUnionTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    })
 }
 
 async fn collect_union_outputs(
@@ -810,10 +864,10 @@ impl UnionDeltaEvaluator {
 
         let logical_plan =
             rebind_union_logical_plan(logical_plan, &provider_by_table, &constant_inputs)?;
-        let plan = ctx.state().create_physical_plan(&logical_plan).await?;
+        ctx.state().create_physical_plan(&logical_plan).await?;
         Ok(Self {
             ctx,
-            plan,
+            logical_plan,
             inputs,
             output_schema: Arc::clone(output_schema),
         })
@@ -824,7 +878,13 @@ impl UnionDeltaEvaluator {
         source_batches: &HashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>> {
         self.set_input_batches(source_batches)?;
-        let collected = collect(Arc::clone(&self.plan), self.ctx.task_ctx()).await;
+        let plan = self
+            .ctx
+            .state()
+            .create_physical_plan(&self.logical_plan)
+            .await
+            .context("rebuild vectorized union delta physical plan")?;
+        let collected = collect(plan, self.ctx.task_ctx()).await;
         self.clear_inputs()?;
         normalize_batches(
             collected.context("execute vectorized union delta evaluator")?,
