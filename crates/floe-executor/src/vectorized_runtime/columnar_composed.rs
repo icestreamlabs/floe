@@ -68,7 +68,7 @@ struct ColumnarComposedSourceState {
 
 struct ComposedEvaluator {
     ctx: SessionContext,
-    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    logical_plan: LogicalPlan,
     inputs: HashMap<String, ComposedEvaluatorInput>,
     asof_joins: Vec<ComposedAsofJoinEvaluator>,
     output_schema: SchemaRef,
@@ -183,6 +183,16 @@ pub(super) fn columnar_union_aggregate_plan_for_plan(
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarComposedPlan>> {
     if !contains_union_aggregate(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
+pub(super) fn columnar_union_join_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_union_join(plan) {
         return Ok(None);
     }
     columnar_composed_plan_for_plan(plan, sources)
@@ -327,6 +337,23 @@ fn contains_distinct(plan: &LogicalPlan) -> bool {
     }
 }
 
+fn contains_union_join(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Join(join) => {
+            contains_union(join.left.as_ref())
+                || contains_union(join.right.as_ref())
+                || contains_union_join(join.left.as_ref())
+                || contains_union_join(join.right.as_ref())
+        }
+        LogicalPlan::Projection(projection) => contains_union_join(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_union_join(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_union_join(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_union_join(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_union_join(limit.input.as_ref()),
+        _ => false,
+    }
+}
+
 fn contains_union_aggregate(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Aggregate(aggregate) => contains_union(aggregate.input.as_ref()),
@@ -465,6 +492,28 @@ pub(super) async fn build_columnar_union_aggregate_materialized_view_state(
         "union_aggregate",
         "union aggregate",
         "columnar_union_aggregate_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_union_join_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "union_join",
+        "union join",
+        "columnar_union_join_snapshot_diff",
     )
     .await
 }
@@ -658,6 +707,24 @@ pub(super) async fn run_columnar_union_aggregate_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_union_join_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::UnionJoin,
+    )
+    .await
+}
+
 pub(super) async fn run_columnar_distinct_aggregate_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -683,6 +750,7 @@ enum ColumnarSnapshotDiffSlot {
     SelfJoinAggregate,
     JoinAggregate,
     UnionAggregate,
+    UnionJoin,
     DistinctAggregate,
 }
 
@@ -700,6 +768,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::JoinAggregate => mv.columnar_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::UnionAggregate => mv.columnar_union_aggregate.as_mut(),
+        ColumnarSnapshotDiffSlot::UnionJoin => mv.columnar_union_join.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctAggregate => mv.columnar_distinct_aggregate.as_mut(),
     }) else {
         return Ok(false);
@@ -883,10 +952,9 @@ impl ComposedEvaluator {
                     .context("build composed ASOF evaluator")?,
             );
         }
-        let plan = ctx.state().create_physical_plan(&logical_plan).await?;
         Ok(Self {
             ctx,
-            plan,
+            logical_plan,
             inputs,
             asof_joins,
             output_schema: Arc::clone(output_schema),
@@ -910,7 +978,12 @@ impl ComposedEvaluator {
                 format!("evaluate composed ASOF input {}", asof_join.table_name)
             })?;
         }
-        let collected = collect(Arc::clone(&self.plan), self.ctx.task_ctx()).await;
+        let plan = self
+            .ctx
+            .state()
+            .create_physical_plan(&self.logical_plan)
+            .await?;
+        let collected = collect(plan, self.ctx.task_ctx()).await;
         self.clear_inputs()?;
         normalize_batches(
             collected.context("execute vectorized composed evaluator")?,
