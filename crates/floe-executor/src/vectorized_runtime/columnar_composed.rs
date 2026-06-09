@@ -3,17 +3,26 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
-use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Int64Array, TimestampMillisecondArray, UInt32Array,
+};
+use datafusion::arrow::compute::{concat_batches, take};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, DFSchemaRef};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Join, TableScan};
-use datafusion::logical_expr::{JoinType, LogicalPlan, ScalarUDF};
+use datafusion::logical_expr::{
+    BinaryExpr, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, ScalarUDF,
+    UserDefinedLogicalNodeCore,
+};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::collect;
+use dbsp::FloeAsofJoinNode;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
@@ -21,6 +30,7 @@ use dbsp::storage::KeyValueTable;
 use crate::delta_consolidation::diff_snapshot_batches;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 
@@ -58,6 +68,7 @@ struct ComposedEvaluator {
     ctx: SessionContext,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     inputs: HashMap<String, ComposedEvaluatorInput>,
+    asof_joins: Vec<ComposedAsofJoinEvaluator>,
     output_schema: SchemaRef,
 }
 
@@ -65,6 +76,41 @@ struct ComposedEvaluatorInput {
     provider: Arc<DynamicStateTableProvider>,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
+}
+
+struct ComposedAsofJoinSpec {
+    table_name: String,
+    provider: Arc<DynamicStateTableProvider>,
+    output_schema: SchemaRef,
+    left: LogicalPlan,
+    right: LogicalPlan,
+    join_type: JoinType,
+    on: Vec<(Expr, Expr)>,
+    filter: Option<Expr>,
+}
+
+struct ComposedAsofJoinEvaluator {
+    table_name: String,
+    provider: Arc<DynamicStateTableProvider>,
+    output_schema: SchemaRef,
+    left_plan: Arc<dyn ExecutionPlan>,
+    right_plan: Arc<dyn ExecutionPlan>,
+    join_type: JoinType,
+    key_pairs: Vec<AsofKeyPair>,
+    left_timestamp_idx: usize,
+    right_timestamp_idx: usize,
+}
+
+struct AsofKeyPair {
+    left_idx: usize,
+    right_idx: usize,
+}
+
+struct AsofColumnRewrite {
+    relation: Option<String>,
+    name: String,
+    table_name: String,
+    replacement_name: String,
 }
 
 pub(super) fn columnar_composed_plan_for_plan(
@@ -88,6 +134,39 @@ pub(super) fn columnar_composed_plan_for_plan(
         logical_plan: plan.clone(),
         source_names: source_names.into_iter().collect(),
     }))
+}
+
+pub(super) fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Extension(extension) => extension
+            .node
+            .as_any()
+            .downcast_ref::<FloeAsofJoinNode>()
+            .is_some(),
+        LogicalPlan::Projection(projection) => {
+            plan_contains_asof_extension(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => plan_contains_asof_extension(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => plan_contains_asof_extension(alias.input.as_ref()),
+        LogicalPlan::Subquery(subquery) => plan_contains_asof_extension(subquery.subquery.as_ref()),
+        LogicalPlan::Aggregate(aggregate) => plan_contains_asof_extension(aggregate.input.as_ref()),
+        LogicalPlan::Sort(sort) => plan_contains_asof_extension(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => plan_contains_asof_extension(limit.input.as_ref()),
+        LogicalPlan::Window(window) => plan_contains_asof_extension(window.input.as_ref()),
+        LogicalPlan::Repartition(repartition) => {
+            plan_contains_asof_extension(repartition.input.as_ref())
+        }
+        LogicalPlan::Distinct(distinct) => plan_contains_asof_extension(distinct.input()),
+        LogicalPlan::Join(join) => {
+            plan_contains_asof_extension(join.left.as_ref())
+                || plan_contains_asof_extension(join.right.as_ref())
+        }
+        LogicalPlan::Union(union) => union
+            .inputs
+            .iter()
+            .any(|input| plan_contains_asof_extension(input.as_ref())),
+        _ => false,
+    }
 }
 
 pub(super) async fn build_columnar_composed_materialized_view_state(
@@ -338,12 +417,23 @@ impl ComposedEvaluator {
                 ComposedEvaluatorInput::new(source_name, sources)?,
             );
         }
-        let logical_plan = rebind_composed_logical_plan(logical_plan, sources, &inputs)?;
+        let mut asof_specs = Vec::new();
+        let logical_plan =
+            rebind_composed_logical_plan(logical_plan, sources, &inputs, &mut asof_specs)?;
+        let mut asof_joins = Vec::with_capacity(asof_specs.len());
+        for spec in asof_specs {
+            asof_joins.push(
+                ComposedAsofJoinEvaluator::build(&ctx, spec)
+                    .await
+                    .context("build composed ASOF evaluator")?,
+            );
+        }
         let plan = ctx.state().create_physical_plan(&logical_plan).await?;
         Ok(Self {
             ctx,
             plan,
             inputs,
+            asof_joins,
             output_schema: Arc::clone(output_schema),
         })
     }
@@ -360,6 +450,11 @@ impl ComposedEvaluator {
                 .set_batches(source_name, batches)
                 .with_context(|| format!("set composed evaluator input for '{source_name}'"))?;
         }
+        for asof_join in &self.asof_joins {
+            asof_join.evaluate(&self.ctx).await.with_context(|| {
+                format!("evaluate composed ASOF input {}", asof_join.table_name)
+            })?;
+        }
         let collected = collect(Arc::clone(&self.plan), self.ctx.task_ctx()).await;
         self.clear_inputs()?;
         normalize_batches(
@@ -371,6 +466,9 @@ impl ComposedEvaluator {
     fn clear_inputs(&self) -> Result<()> {
         for input in self.inputs.values() {
             input.clear()?;
+        }
+        for asof_join in &self.asof_joins {
+            asof_join.clear()?;
         }
         Ok(())
     }
@@ -436,11 +534,93 @@ impl ComposedEvaluatorInput {
     }
 }
 
+impl ComposedAsofJoinEvaluator {
+    async fn build(ctx: &SessionContext, spec: ComposedAsofJoinSpec) -> Result<Self> {
+        let left_schema = spec.left.schema();
+        let right_schema = spec.right.schema();
+        let key_pairs = spec
+            .on
+            .iter()
+            .map(|(left, right)| {
+                Ok(AsofKeyPair {
+                    left_idx: column_expr_index(left, left_schema)
+                        .with_context(|| format!("analyze ASOF left key expression {left}"))?,
+                    right_idx: column_expr_index(right, right_schema)
+                        .with_context(|| format!("analyze ASOF right key expression {right}"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut key_pairs = key_pairs;
+        let (filter_key_pairs, left_timestamp_idx, right_timestamp_idx) =
+            analyze_asof_filter(spec.filter.as_ref(), left_schema, right_schema)?;
+        for pair in filter_key_pairs {
+            push_asof_key_pair(&mut key_pairs, pair);
+        }
+        validate_asof_key_types(&spec.left, &spec.right, &key_pairs)?;
+        validate_asof_timestamp_types(
+            &spec.left,
+            &spec.right,
+            left_timestamp_idx,
+            right_timestamp_idx,
+        )?;
+
+        let left_plan = ctx
+            .state()
+            .create_physical_plan(&spec.left)
+            .await
+            .context("create ASOF left physical plan")?;
+        let right_plan = ctx
+            .state()
+            .create_physical_plan(&spec.right)
+            .await
+            .context("create ASOF right physical plan")?;
+
+        Ok(Self {
+            table_name: spec.table_name,
+            provider: spec.provider,
+            output_schema: spec.output_schema,
+            left_plan,
+            right_plan,
+            join_type: spec.join_type,
+            key_pairs,
+            left_timestamp_idx,
+            right_timestamp_idx,
+        })
+    }
+
+    async fn evaluate(&self, ctx: &SessionContext) -> Result<()> {
+        let left = collect(Arc::clone(&self.left_plan), ctx.task_ctx())
+            .await
+            .context("execute ASOF left input")?;
+        let right = collect(Arc::clone(&self.right_plan), ctx.task_ctx())
+            .await
+            .context("execute ASOF right input")?;
+        let left = concat_or_empty(self.left_plan.schema(), left)?;
+        let right = concat_or_empty(self.right_plan.schema(), right)?;
+        let output = evaluate_asof_join(
+            &left,
+            &right,
+            &self.output_schema,
+            self.join_type,
+            &self.key_pairs,
+            self.left_timestamp_idx,
+            self.right_timestamp_idx,
+        )?;
+        self.provider.set_batches(vec![output])
+    }
+
+    fn clear(&self) -> Result<()> {
+        self.provider.set_batches(Vec::new())
+    }
+}
+
 fn rebind_composed_logical_plan(
     logical_plan: LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     inputs: &HashMap<String, ComposedEvaluatorInput>,
+    asof_specs: &mut Vec<ComposedAsofJoinSpec>,
 ) -> Result<LogicalPlan> {
+    let mut asof_rewrites = Vec::new();
     let transformed = logical_plan.transform_up(|plan| match plan {
         LogicalPlan::TableScan(mut scan) => {
             let table_name = scan.table_name.table();
@@ -464,9 +644,476 @@ fn rebind_composed_logical_plan(
             scan.source = provider_as_source(provider);
             Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
         }
+        LogicalPlan::Extension(extension) => {
+            let Some(asof) = extension.node.as_any().downcast_ref::<FloeAsofJoinNode>() else {
+                return Ok(Transformed::no(LogicalPlan::Extension(extension)));
+            };
+            let table_name = format!("__floe_composed_asof_{}", asof_specs.len());
+            let (output_schema, rewrites) =
+                asof_provider_schema_and_rewrites(table_name.as_str(), asof.schema());
+            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&output_schema)));
+            let table_provider = Arc::clone(&provider) as Arc<dyn TableProvider>;
+            let scan = LogicalPlanBuilder::scan(
+                table_name.as_str(),
+                provider_as_source(table_provider),
+                None,
+            )?
+            .build()?;
+            asof_specs.push(ComposedAsofJoinSpec {
+                table_name: table_name.clone(),
+                provider,
+                output_schema,
+                left: asof.left().clone(),
+                right: asof.right().clone(),
+                join_type: asof.join_type(),
+                on: asof.on().to_vec(),
+                filter: asof.filter().cloned(),
+            });
+            asof_rewrites.extend(rewrites);
+            Ok(Transformed::yes(scan))
+        }
         other => Ok(Transformed::no(other)),
     })?;
+    rewrite_asof_column_references(transformed.data, &asof_rewrites)
+}
+
+fn asof_provider_schema_and_rewrites(
+    table_name: &str,
+    schema: &DFSchemaRef,
+) -> (SchemaRef, Vec<AsofColumnRewrite>) {
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut rewrites = Vec::with_capacity(schema.fields().len());
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for (idx, (relation, field)) in schema.iter().enumerate() {
+        let count = name_counts.entry(field.name().to_string()).or_insert(0);
+        let replacement_name = if *count == 0 {
+            field.name().to_string()
+        } else {
+            format!("{}__floe_asof_{idx}", field.name())
+        };
+        *count += 1;
+        fields.push(Field::new(
+            replacement_name.clone(),
+            field.data_type().clone(),
+            field.is_nullable(),
+        ));
+        rewrites.push(AsofColumnRewrite {
+            relation: relation.map(ToString::to_string),
+            name: field.name().to_string(),
+            table_name: table_name.to_string(),
+            replacement_name,
+        });
+    }
+    (Arc::new(Schema::new(fields)), rewrites)
+}
+
+fn rewrite_asof_column_references(
+    logical_plan: LogicalPlan,
+    rewrites: &[AsofColumnRewrite],
+) -> Result<LogicalPlan> {
+    if rewrites.is_empty() {
+        return Ok(logical_plan);
+    }
+    let transformed = logical_plan
+        .transform_up(|plan| plan.map_expressions(|expr| rewrite_asof_expr(expr, rewrites)))?;
     Ok(transformed.data)
+}
+
+fn rewrite_asof_expr(
+    expr: Expr,
+    rewrites: &[AsofColumnRewrite],
+) -> datafusion::common::Result<Transformed<Expr>> {
+    let transformed = expr.transform(|expr| {
+        if let Expr::Column(column) = &expr
+            && let Some(rewrite) = asof_column_rewrite(column, rewrites)
+        {
+            return Ok(Transformed::yes(Expr::Column(Column::new(
+                Some(rewrite.table_name.as_str()),
+                rewrite.replacement_name.clone(),
+            ))));
+        }
+        Ok(Transformed::no(expr))
+    })?;
+    Ok(Transformed::yes(transformed.data))
+}
+
+fn asof_column_rewrite<'a>(
+    column: &Column,
+    rewrites: &'a [AsofColumnRewrite],
+) -> Option<&'a AsofColumnRewrite> {
+    let relation = column.relation.as_ref().map(ToString::to_string);
+    if let Some(rewrite) = rewrites
+        .iter()
+        .find(|rewrite| rewrite.relation == relation && rewrite.name == column.name)
+    {
+        return Some(rewrite);
+    }
+    if column.relation.is_none() {
+        let mut matches = rewrites
+            .iter()
+            .filter(|rewrite| rewrite.name == column.name);
+        let first = matches.next()?;
+        if matches.next().is_none() {
+            return Some(first);
+        }
+    }
+    None
+}
+
+fn concat_or_empty(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let non_empty = batches
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .collect::<Vec<_>>();
+    if non_empty.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    concat_batches(&schema, non_empty).context("concatenate ASOF input batches")
+}
+
+fn evaluate_asof_join(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    output_schema: &SchemaRef,
+    join_type: JoinType,
+    key_pairs: &[AsofKeyPair],
+    left_timestamp_idx: usize,
+    right_timestamp_idx: usize,
+) -> Result<RecordBatch> {
+    if !matches!(join_type, JoinType::Inner | JoinType::Left) {
+        bail!("composed ASOF evaluator supports INNER and LEFT ASOF joins only");
+    }
+    let left_width = left.num_columns();
+    let right_width = right.num_columns();
+    if output_schema.fields().len() != left_width + right_width {
+        bail!(
+            "ASOF output schema width {} does not match left/right widths {} + {}",
+            output_schema.fields().len(),
+            left_width,
+            right_width
+        );
+    }
+
+    let left_key_indices = key_pairs
+        .iter()
+        .map(|pair| pair.left_idx)
+        .collect::<Vec<_>>();
+    let right_key_indices = key_pairs
+        .iter()
+        .map(|pair| pair.right_idx)
+        .collect::<Vec<_>>();
+    let (left_keys, left_key_nulls) = encoded_join_keys(left, &left_key_indices)?;
+    let (right_keys, right_key_nulls) = encoded_join_keys(right, &right_key_indices)?;
+    let left_times = timestamp_values(left.column(left_timestamp_idx).as_ref())?;
+    let right_times = timestamp_values(right.column(right_timestamp_idx).as_ref())?;
+    let mut right_index: HashMap<Vec<u8>, Vec<(i64, usize)>> = HashMap::new();
+    for row_idx in 0..right.num_rows() {
+        if right_key_nulls[row_idx] {
+            continue;
+        }
+        let Some(timestamp) = right_times[row_idx] else {
+            continue;
+        };
+        right_index
+            .entry(right_keys[row_idx].clone())
+            .or_default()
+            .push((timestamp, row_idx));
+    }
+    for rows in right_index.values_mut() {
+        rows.sort_by(|(left_ts, left_row), (right_ts, right_row)| {
+            left_ts.cmp(right_ts).then_with(|| left_row.cmp(right_row))
+        });
+    }
+
+    let mut builders = output_schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), left.num_rows()))
+        .collect::<Result<Vec<_>>>()?;
+    for left_row in 0..left.num_rows() {
+        let right_match = if left_key_nulls[left_row] {
+            None
+        } else if let Some(left_timestamp) = left_times[left_row] {
+            right_index
+                .get(&left_keys[left_row])
+                .and_then(|candidates| asof_right_match(candidates, left_timestamp))
+        } else {
+            None
+        };
+        if right_match.is_none() && join_type == JoinType::Inner {
+            continue;
+        }
+        append_asof_output_row(
+            left,
+            right,
+            left_row,
+            right_match,
+            left_width,
+            &mut builders,
+        )?;
+    }
+
+    let arrays = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(Arc::clone(output_schema), arrays)?)
+}
+
+fn asof_right_match(candidates: &[(i64, usize)], left_timestamp: i64) -> Option<usize> {
+    let idx = candidates.partition_point(|(right_timestamp, _)| *right_timestamp <= left_timestamp);
+    idx.checked_sub(1).map(|idx| candidates[idx].1)
+}
+
+fn append_asof_output_row(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_row: usize,
+    right_row: Option<usize>,
+    left_width: usize,
+    builders: &mut [ScalarColumnBuilder],
+) -> Result<()> {
+    for column_idx in 0..left_width {
+        builders[column_idx].append_array_value(left.column(column_idx).as_ref(), left_row)?;
+    }
+    for column_idx in 0..right.num_columns() {
+        let builder = &mut builders[left_width + column_idx];
+        if let Some(right_row) = right_row {
+            builder.append_array_value(right.column(column_idx).as_ref(), right_row)?;
+        } else {
+            builder.append_encoded_scalar(None)?;
+        }
+    }
+    Ok(())
+}
+
+fn encoded_join_keys(batch: &RecordBatch, indices: &[usize]) -> Result<(Vec<Vec<u8>>, Vec<bool>)> {
+    if indices.is_empty() {
+        return Ok((
+            vec![Vec::new(); batch.num_rows()],
+            vec![false; batch.num_rows()],
+        ));
+    }
+    let sort_fields = indices
+        .iter()
+        .map(|idx| SortField::new(batch.schema().field(*idx).data_type().clone()))
+        .collect::<Vec<_>>();
+    let converter = RowConverter::new(sort_fields).map_err(anyhow::Error::new)?;
+    let columns = indices
+        .iter()
+        .map(|idx| Arc::clone(batch.column(*idx)))
+        .collect::<Vec<_>>();
+    let rows = converter
+        .convert_columns(&columns)
+        .map_err(anyhow::Error::new)?;
+    let mut keys = Vec::with_capacity(batch.num_rows());
+    let mut nulls = Vec::with_capacity(batch.num_rows());
+    for row_idx in 0..batch.num_rows() {
+        keys.push(rows.row(row_idx).data().to_vec());
+        nulls.push(
+            indices
+                .iter()
+                .any(|idx| batch.column(*idx).is_null(row_idx)),
+        );
+    }
+    Ok((keys, nulls))
+}
+
+fn timestamp_values(array: &dyn Array) -> Result<Vec<Option<i64>>> {
+    match array.data_type() {
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("expected Int64 ASOF timestamp array")?;
+            Ok((0..values.len())
+                .map(|idx| (!values.is_null(idx)).then(|| values.value(idx)))
+                .collect())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .context("expected timestamp(ms) ASOF timestamp array")?;
+            Ok((0..values.len())
+                .map(|idx| (!values.is_null(idx)).then(|| values.value(idx)))
+                .collect())
+        }
+        other => bail!("unsupported ASOF timestamp type {other:?}"),
+    }
+}
+
+fn column_expr_index(expr: &Expr, schema: &DFSchemaRef) -> Result<usize> {
+    let Expr::Column(column) = expr else {
+        bail!("ASOF composed evaluator currently supports column expressions only, found {expr}");
+    };
+    schema.index_of_column(column).map_err(anyhow::Error::new)
+}
+
+fn maybe_column_expr_index(expr: &Expr, schema: &DFSchemaRef) -> Option<usize> {
+    match expr {
+        Expr::Column(column) => schema.maybe_index_of_column(column),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AsofColumnSide {
+    Left(usize),
+    Right(usize),
+}
+
+fn analyze_asof_filter(
+    filter: Option<&Expr>,
+    left_schema: &DFSchemaRef,
+    right_schema: &DFSchemaRef,
+) -> Result<(Vec<AsofKeyPair>, usize, usize)> {
+    let filter = filter.context("ASOF joins require a MATCH_CONDITION filter")?;
+    let mut key_pairs = Vec::new();
+    let mut timestamp_pair = None;
+    analyze_asof_filter_expr(
+        filter,
+        left_schema,
+        right_schema,
+        &mut key_pairs,
+        &mut timestamp_pair,
+    )?;
+    let Some((left_timestamp_idx, right_timestamp_idx)) = timestamp_pair else {
+        bail!("ASOF joins require exactly one right_timestamp <= left_timestamp predicate");
+    };
+    Ok((key_pairs, left_timestamp_idx, right_timestamp_idx))
+}
+
+fn analyze_asof_filter_expr(
+    expr: &Expr,
+    left_schema: &DFSchemaRef,
+    right_schema: &DFSchemaRef,
+    key_pairs: &mut Vec<AsofKeyPair>,
+    timestamp_pair: &mut Option<(usize, usize)>,
+) -> Result<()> {
+    match expr {
+        Expr::Alias(alias) => analyze_asof_filter_expr(
+            alias.expr.as_ref(),
+            left_schema,
+            right_schema,
+            key_pairs,
+            timestamp_pair,
+        ),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {
+            analyze_asof_filter_expr(left, left_schema, right_schema, key_pairs, timestamp_pair)?;
+            analyze_asof_filter_expr(right, left_schema, right_schema, key_pairs, timestamp_pair)
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let left_side = asof_column_side(left, left_schema, right_schema);
+            let right_side = asof_column_side(right, left_schema, right_schema);
+            match (op, left_side, right_side) {
+                (
+                    Operator::Eq,
+                    Some(AsofColumnSide::Left(left_idx)),
+                    Some(AsofColumnSide::Right(right_idx)),
+                )
+                | (
+                    Operator::Eq,
+                    Some(AsofColumnSide::Right(right_idx)),
+                    Some(AsofColumnSide::Left(left_idx)),
+                ) => {
+                    push_asof_key_pair(
+                        key_pairs,
+                        AsofKeyPair {
+                            left_idx,
+                            right_idx,
+                        },
+                    );
+                    Ok(())
+                }
+                (
+                    Operator::LtEq,
+                    Some(AsofColumnSide::Right(right_idx)),
+                    Some(AsofColumnSide::Left(left_idx)),
+                )
+                | (
+                    Operator::GtEq,
+                    Some(AsofColumnSide::Left(left_idx)),
+                    Some(AsofColumnSide::Right(right_idx)),
+                ) => {
+                    if timestamp_pair.replace((left_idx, right_idx)).is_some() {
+                        bail!("ASOF joins require exactly one timestamp predicate");
+                    }
+                    Ok(())
+                }
+                _ => bail!("unsupported ASOF residual predicate {expr}"),
+            }
+        }
+        _ => bail!("unsupported ASOF residual predicate {expr}"),
+    }
+}
+
+fn asof_column_side(
+    expr: &Expr,
+    left_schema: &DFSchemaRef,
+    right_schema: &DFSchemaRef,
+) -> Option<AsofColumnSide> {
+    let left_idx = maybe_column_expr_index(expr, left_schema);
+    let right_idx = maybe_column_expr_index(expr, right_schema);
+    match (left_idx, right_idx) {
+        (Some(idx), None) => Some(AsofColumnSide::Left(idx)),
+        (None, Some(idx)) => Some(AsofColumnSide::Right(idx)),
+        _ => None,
+    }
+}
+
+fn push_asof_key_pair(key_pairs: &mut Vec<AsofKeyPair>, pair: AsofKeyPair) {
+    if !key_pairs
+        .iter()
+        .any(|existing| existing.left_idx == pair.left_idx && existing.right_idx == pair.right_idx)
+    {
+        key_pairs.push(pair);
+    }
+}
+
+fn validate_asof_key_types(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    key_pairs: &[AsofKeyPair],
+) -> Result<()> {
+    let left_schema = left.schema().as_arrow();
+    let right_schema = right.schema().as_arrow();
+    for pair in key_pairs {
+        let left_type = left_schema.field(pair.left_idx).data_type();
+        let right_type = right_schema.field(pair.right_idx).data_type();
+        if left_type != right_type {
+            bail!("ASOF key type mismatch: left {left_type:?}, right {right_type:?}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_asof_timestamp_types(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    left_timestamp_idx: usize,
+    right_timestamp_idx: usize,
+) -> Result<()> {
+    let left_type = left
+        .schema()
+        .as_arrow()
+        .field(left_timestamp_idx)
+        .data_type();
+    let right_type = right
+        .schema()
+        .as_arrow()
+        .field(right_timestamp_idx)
+        .data_type();
+    if left_type != right_type {
+        bail!("ASOF timestamp type mismatch: left {left_type:?}, right {right_type:?}");
+    }
+    if !matches!(
+        left_type,
+        DataType::Int64 | DataType::Timestamp(TimeUnit::Millisecond, _)
+    ) {
+        bail!("ASOF timestamp type must be Int64 or timestamp(ms), found {left_type:?}");
+    }
+    Ok(())
 }
 
 fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
@@ -489,6 +1136,12 @@ fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
         LogicalPlan::Union(union) => {
             for input in &union.inputs {
                 collect_joins(input.as_ref(), joins);
+            }
+        }
+        LogicalPlan::Extension(extension) => {
+            if let Some(asof) = extension.node.as_any().downcast_ref::<FloeAsofJoinNode>() {
+                collect_joins(asof.left(), joins);
+                collect_joins(asof.right(), joins);
             }
         }
         _ => {}
@@ -554,6 +1207,12 @@ fn collect_sources(
         LogicalPlan::Union(union) => {
             for input in &union.inputs {
                 collect_sources(input.as_ref(), sources, out);
+            }
+        }
+        LogicalPlan::Extension(extension) => {
+            if let Some(asof) = extension.node.as_any().downcast_ref::<FloeAsofJoinNode>() {
+                collect_sources(asof.left(), sources, out);
+                collect_sources(asof.right(), sources, out);
             }
         }
         _ => {}

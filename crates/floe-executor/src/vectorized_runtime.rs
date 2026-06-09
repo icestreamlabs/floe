@@ -13,6 +13,8 @@ use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
+use datafusion::physical_plan::empty::EmptyExec;
+use dbsp::create_logical_plan_with_asof_preplanner;
 use dbsp::storage::KeyValueTable;
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
@@ -51,7 +53,8 @@ mod source_state;
 
 use columnar_composed::{
     ColumnarComposedMaterializedViewState, build_columnar_composed_materialized_view_state,
-    columnar_composed_plan_for_plan, run_columnar_composed_materialized_view_tick,
+    columnar_composed_plan_for_plan, plan_contains_asof_extension,
+    run_columnar_composed_materialized_view_tick,
 };
 use columnar_count::{
     ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
@@ -379,10 +382,21 @@ impl VectorizedExecutionRuntime {
         let mut requires_full_refresh_execution_state = false;
         for mv in materialized_views {
             registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
-            let df = ctx
-                .sql(&mv.query)
+            let state = ctx.state();
+            let asof_preplanned = create_logical_plan_with_asof_preplanner(&state, &mv.query)
                 .await
                 .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
+            let df = if plan_contains_asof_extension(&asof_preplanned) {
+                ctx.execute_logical_plan(asof_preplanned)
+                    .await
+                    .with_context(|| {
+                        format!("build vectorized ASOF DataFrame for {}", mv.view_name)
+                    })?
+            } else {
+                ctx.sql(&mv.query)
+                    .await
+                    .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
+            };
             let columnar_count_plan =
                 columnar_count_plan_for_plan(df.logical_plan(), &source_states, &mv.output_schema)?;
             let columnar_count = match (columnar_count_plan, options.operator_state_table.as_ref())
@@ -964,10 +978,19 @@ impl VectorizedExecutionRuntime {
                 requires_full_refresh_execution_state = true;
                 MaterializedViewExecutionMode::FullRefresh
             };
-            let plan = df
-                .create_physical_plan()
-                .await
-                .with_context(|| format!("create vectorized physical plan for {}", mv.view_name))?;
+            let df_has_asof_extension = plan_contains_asof_extension(df.logical_plan());
+            let plan = match df.create_physical_plan().await {
+                Ok(plan) => plan,
+                Err(err) if columnar_composed.is_some() && df_has_asof_extension => {
+                    Arc::new(EmptyExec::new(Arc::clone(&mv.output_schema)))
+                        as Arc<dyn datafusion::physical_plan::ExecutionPlan>
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::new(err)).with_context(|| {
+                        format!("create vectorized physical plan for {}", mv.view_name)
+                    });
+                }
+            };
             mv_states.push(VectorizedMaterializedViewState {
                 view_name: mv.view_name,
                 output_schema: mv.output_schema,

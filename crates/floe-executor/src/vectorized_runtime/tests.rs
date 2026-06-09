@@ -50,6 +50,23 @@ fn nullable_string_values(batch: &RecordBatch, column_idx: usize) -> Vec<Option<
         .collect()
 }
 
+fn nullable_int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<Option<i64>> {
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("int64 column");
+    (0..values.len())
+        .map(|idx| {
+            if values.is_null(idx) {
+                None
+            } else {
+                Some(values.value(idx))
+            }
+        })
+        .collect()
+}
+
 fn float64_values(batch: &RecordBatch, column_idx: usize) -> Vec<f64> {
     let values = batch
         .column(column_idx)
@@ -249,6 +266,17 @@ fn outer_join_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<String>, i64)> {
     rows
 }
 
+fn asof_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<i64>)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let ids = int64_values(batch, 0);
+        let prices = nullable_int64_values(batch, 1);
+        rows.extend(ids.into_iter().zip(prices));
+    }
+    rows.sort();
+    rows
+}
+
 fn weighted_id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -288,6 +316,27 @@ fn weighted_outer_join_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<String>
                 .zip(amounts)
                 .zip(weights)
                 .map(|(((order_id, region), amount), weight)| (order_id, region, amount, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_asof_rows(batches: &[RecordBatch]) -> Vec<(i64, Option<i64>, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let ids = int64_values(batch, 0);
+        let prices = nullable_int64_values(batch, 1);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            ids.into_iter()
+                .zip(prices)
+                .zip(weights)
+                .map(|((id, price), weight)| (id, price, weight)),
         );
     }
     rows.sort();
@@ -4766,6 +4815,159 @@ async fn aggregate_topn_uses_slate_backed_columnar_composed_operator_semantics()
         weighted_id_count_rows(&delta),
         vec![(1, 15, 1), (2, 20, -1)]
     );
+}
+
+#[tokio::test]
+async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
+    let auctions = SourceDefinition::new(
+        "auction",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("auction source definition");
+    let bids = SourceDefinition::new(
+        "bid",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("bid source definition");
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auction_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 500])),
+        ],
+    )
+    .expect("initial auctions batch");
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+            Arc::new(TimestampMillisecondArray::from(vec![800, 950, 700])),
+        ],
+    )
+    .expect("initial bids batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-asof-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("price", DataType::Int64, true),
+    ]));
+    let query = "SELECT a.id, b.price \
+        FROM auction a ASOF JOIN bid b \
+        MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") \
+        ON a.id = b.auction";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_asof_prices",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auction",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bid",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_asof_prices").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(asof_rows(&snapshot), vec![(1, Some(20)), (2, None)]);
+
+    let bid_insert = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(Int64Array::from(vec![40])),
+            Arc::new(TimestampMillisecondArray::from(vec![400])),
+        ],
+    )
+    .expect("bid insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bid",
+            vec![bid_insert.clone()],
+            vec![bid_insert],
+        )
+        .await
+        .expect("append bid insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(asof_rows(&snapshot), vec![(1, Some(20)), (2, Some(40))]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_asof_rows(&delta),
+        vec![(2, None, -1), (2, Some(40), 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_asof_prices",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_asof_prices")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        asof_rows(&recovered_snapshot),
+        vec![(1, Some(20)), (2, Some(40))]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
 }
 
 #[tokio::test]
