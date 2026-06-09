@@ -11855,6 +11855,13 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
                     JOIN auctions a ON j.auction = a.id",
                 Arc::clone(&join_schema),
             ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_topn_over_self_join",
+                "SELECT auction, price \
+                    FROM (SELECT l.auction, r.price FROM bids l JOIN bids r ON l.auction = r.auction WHERE l.price < r.price) j \
+                    ORDER BY price DESC LIMIT 2",
+                Arc::clone(&bid_pair_schema),
+            ),
         ],
         Arc::clone(&registry),
         VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
@@ -11900,6 +11907,10 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     assert_eq!(
         runtime.materialized_views[9].execution_mode,
         MaterializedViewExecutionMode::ColumnarJoinJoin
+    );
+    assert_eq!(
+        runtime.materialized_views[10].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoinTopN
     );
 
     runtime
@@ -12010,6 +12021,14 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     assert_eq!(
         id_count_rows(&join_over_self_join.arrow_snapshot_for(1).expect("snapshot")),
         vec![(1, 10)]
+    );
+
+    let topn_over_self_join = registry
+        .get("mv_topn_over_self_join")
+        .expect("topn-over-self-join materialized view");
+    assert_eq!(
+        id_count_rows(&topn_over_self_join.arrow_snapshot_for(1).expect("snapshot")),
+        vec![(1, 100)]
     );
 }
 

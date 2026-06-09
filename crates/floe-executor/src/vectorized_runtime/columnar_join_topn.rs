@@ -225,14 +225,11 @@ fn global_join_topn_plan_for_plan(
     let Some(right_source) = single_source_for_plan(join.right.as_ref(), sources) else {
         return Ok(None);
     };
-    if left_source == right_source {
-        return Ok(None);
-    }
     let all_sources = source_set_for_plan(plan, sources);
-    if all_sources.len() != 2
-        || !all_sources.contains(&left_source)
-        || !all_sources.contains(&right_source)
-    {
+    let expected_sources = [left_source.clone(), right_source.clone()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if all_sources != expected_sources {
         return Ok(None);
     }
     if contains_unsupported_global_join_topn_wrapper(plan) {
@@ -283,14 +280,29 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
     };
 
     let mv_namespace = namespaces::materialized_view(view_name)?;
-    let left_namespace = format!(
-        "{mv_namespace}/columnar/join_topn/{}/input",
-        plan.left_source
-    );
-    let right_namespace = format!(
-        "{mv_namespace}/columnar/join_topn/{}/input",
-        plan.right_source
-    );
+    let (left_namespace, right_namespace) = if plan.left_source == plan.right_source {
+        (
+            format!(
+                "{mv_namespace}/columnar/join_topn/left/{}/input",
+                plan.left_source
+            ),
+            format!(
+                "{mv_namespace}/columnar/join_topn/right/{}/input",
+                plan.right_source
+            ),
+        )
+    } else {
+        (
+            format!(
+                "{mv_namespace}/columnar/join_topn/{}/input",
+                plan.left_source
+            ),
+            format!(
+                "{mv_namespace}/columnar/join_topn/{}/input",
+                plan.right_source
+            ),
+        )
+    };
     let output_namespace = format!("{mv_namespace}/columnar/join_topn/output");
 
     let left_zset = SlateBackedColumnarZSet::new(
@@ -1313,6 +1325,9 @@ fn contains_unsupported_global_join_topn_wrapper(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::SubqueryAlias(alias) => {
             contains_unsupported_global_join_topn_wrapper(alias.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => {
+            contains_unsupported_global_join_topn_wrapper(filter.input.as_ref())
         }
         LogicalPlan::Limit(limit) => {
             limit.fetch.is_none()
