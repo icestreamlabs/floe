@@ -112,6 +112,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: q8_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "q9",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_q9",
+            query: r#"SELECT id, "itemName", description, "initialBid", reserve, "dateTime", expires, seller, category, extra, auction, bidder, price, "bidTime", "bidExtra" FROM (SELECT a.id, a."itemName", a.description, a."initialBid", a.reserve, a."dateTime", a.expires, a.seller, a.category, a.extra, b.auction, b.bidder, b.price, b."dateTime" AS "bidTime", b.extra AS "bidExtra", ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b."dateTime" ASC) AS rownum FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires) ranked WHERE rownum <= 1"#,
+            output_schema: q9_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "q12",
             sources: &[NexmarkRuntimeSource {
                 source_name: "nexmark_bid",
@@ -597,6 +613,38 @@ fn q8_output_schema() -> SchemaRef {
         Field::new("id", DataType::Int64, true),
         Field::new("name", DataType::Utf8, true),
         Field::new("person_count", DataType::Int64, false),
+    ]))
+}
+
+fn q9_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("itemName", DataType::Utf8, true),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("initialBid", DataType::Int64, true),
+        Field::new("reserve", DataType::Int64, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new(
+            "expires",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("seller", DataType::Int64, true),
+        Field::new("category", DataType::Int64, true),
+        Field::new("extra", DataType::Utf8, true),
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new(
+            "bidTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("bidExtra", DataType::Utf8, true),
     ]))
 }
 
