@@ -27,6 +27,7 @@ use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
+use super::columnar_topn::{TopNEvaluator, columnar_topn_plan_for_plan};
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
     normalize_batches,
@@ -77,6 +78,7 @@ struct ColumnarJoinSourceState {
     input_zset: SlateBackedColumnarZSet,
     snapshot: Vec<RecordBatch>,
     constant: Option<ColumnarJoinConstantState>,
+    topn: Option<ColumnarJoinTopNInputState>,
 }
 
 struct ColumnarJoinConstantState {
@@ -86,6 +88,14 @@ struct ColumnarJoinConstantState {
     pending_snapshot: Vec<RecordBatch>,
 }
 
+struct ColumnarJoinTopNInputState {
+    source_name: String,
+    source_schema: SchemaRef,
+    source_input_zset: SlateBackedColumnarZSet,
+    source_snapshot: Vec<RecordBatch>,
+    evaluator: TopNEvaluator,
+}
+
 struct ColumnarJoinInputPlan {
     input_name: String,
     schema: SchemaRef,
@@ -93,8 +103,16 @@ struct ColumnarJoinInputPlan {
 }
 
 enum ColumnarJoinInputPlanKind {
-    Source { source_name: String },
-    Constant { logical_plan: LogicalPlan },
+    Source {
+        source_name: String,
+    },
+    Constant {
+        logical_plan: LogicalPlan,
+    },
+    TopN {
+        source_name: String,
+        logical_plan: LogicalPlan,
+    },
 }
 
 struct JoinInputTick {
@@ -136,10 +154,10 @@ pub(super) fn columnar_join_plan_for_plan(
     if !is_supported_join_type(&join.join_type) || (join.on.is_empty() && join.filter.is_none()) {
         return Ok(None);
     }
-    let Some(left) = join_input_plan_for_side(join.left.as_ref(), sources, "left") else {
+    let Some(left) = join_input_plan_for_side(join.left.as_ref(), sources, "left")? else {
         return Ok(None);
     };
-    let Some(right) = join_input_plan_for_side(join.right.as_ref(), sources, "right") else {
+    let Some(right) = join_input_plan_for_side(join.right.as_ref(), sources, "right")? else {
         return Ok(None);
     };
     let all_sources = source_set_for_plan(plan, sources);
@@ -150,7 +168,7 @@ pub(super) fn columnar_join_plan_for_plan(
     if all_sources != expected_sources {
         return Ok(None);
     }
-    if contains_unsupported_join_wrapper(plan) {
+    if contains_unsupported_join_wrapper(plan, sources)? {
         return Ok(None);
     }
     let execution_strategy = if matches!(join.join_type, JoinType::Inner)
@@ -301,6 +319,9 @@ fn join_input_namespace(mv_namespace: &str, side: &str, input: &ColumnarJoinInpu
         ColumnarJoinInputPlanKind::Constant { .. } => {
             format!("{mv_namespace}/columnar/join/{side}/constant/input")
         }
+        ColumnarJoinInputPlanKind::TopN { .. } => {
+            format!("{mv_namespace}/columnar/join/{side}/topn/input")
+        }
     }
 }
 
@@ -341,6 +362,7 @@ async fn build_join_input_state(
                 )?,
                 input_zset,
                 constant: None,
+                topn: None,
             })
         }
         ColumnarJoinInputPlanKind::Constant { logical_plan } => {
@@ -389,6 +411,65 @@ async fn build_join_input_state(
                     initialized_key,
                     initialized,
                     pending_snapshot,
+                }),
+                topn: None,
+            })
+        }
+        ColumnarJoinInputPlanKind::TopN {
+            source_name,
+            logical_plan,
+        } => {
+            let source = sources
+                .get(&source_name)
+                .ok_or_else(|| anyhow::anyhow!("unknown topn join source '{source_name}'"))?;
+            let source_input_namespace =
+                format!("{mv_namespace}/columnar/join/{side}/topn/source_input");
+            let source_input_zset = SlateBackedColumnarZSet::new(
+                Arc::clone(&table),
+                source_input_namespace,
+                Arc::clone(&source.schema),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "initialize SlateDB-backed {side} join topn raw input zset for '{}'",
+                    input.input_name
+                )
+            })?;
+            let source_snapshot = snapshot_batches_from_zset(
+                &source_input_zset
+                    .materialize_columnar()
+                    .await
+                    .with_context(|| format!("load {side} join topn raw input snapshot"))?,
+            )?;
+            let snapshot = snapshot_batches_from_zset(
+                &input_zset
+                    .materialize_columnar()
+                    .await
+                    .with_context(|| format!("load {side} join topn input snapshot"))?,
+            )?;
+            let evaluator =
+                TopNEvaluator::build(logical_plan, &source_name, source, udfs, &input.schema)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed {side} join topn evaluator for '{}'",
+                            input.input_name
+                        )
+                    })?;
+            Ok(ColumnarJoinSourceState {
+                input_name: input.input_name,
+                source_name: None,
+                schema: input.schema,
+                input_zset,
+                snapshot,
+                constant: None,
+                topn: Some(ColumnarJoinTopNInputState {
+                    source_name,
+                    source_schema: Arc::clone(&source.schema),
+                    source_input_zset,
+                    source_snapshot,
+                    evaluator,
                 }),
             })
         }
@@ -765,6 +846,9 @@ async fn prepare_join_input_tick(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<JoinInputTick> {
+    if source.topn.is_some() {
+        return prepare_topn_join_input_tick(source, insert_batches, weighted_delta_batches).await;
+    }
     if source.constant.is_some() {
         return prepare_constant_join_input_tick(source).await;
     }
@@ -776,6 +860,67 @@ async fn prepare_join_input_tick(
         delta,
         changed,
         next_snapshot: None,
+    })
+}
+
+async fn prepare_topn_join_input_tick(
+    source: &mut ColumnarJoinSourceState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<JoinInputTick> {
+    let Some(topn) = source.topn.as_mut() else {
+        return Ok(JoinInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&source.schema))?,
+            changed: false,
+            next_snapshot: None,
+        });
+    };
+    let raw_input_delta = topn_source_input_delta(topn, insert_batches, weighted_delta_batches)?;
+    let raw_delta = persisted_source_delta(&mut topn.source_input_zset, raw_input_delta).await?;
+    let has_raw_change = !raw_delta.batches().is_empty();
+    if !has_raw_change {
+        return Ok(JoinInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&source.schema))?,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+
+    let next_source_snapshot =
+        apply_source_snapshot_delta(&topn.source_schema, &topn.source_snapshot, &raw_delta).await?;
+    let next_topn_snapshot = topn
+        .evaluator
+        .evaluate(&next_source_snapshot)
+        .await
+        .with_context(|| format!("evaluate join topn input '{}'", source.input_name))?;
+    let topn_delta_batches = diff_snapshot_batches(
+        Arc::clone(&source.schema),
+        &source.snapshot,
+        &next_topn_snapshot,
+    )
+    .await
+    .with_context(|| format!("diff join topn input '{}'", source.input_name))?
+    .batches;
+    let topn_delta =
+        ColumnarZSet::try_new_weighted(source.input_zset.value_schema(), topn_delta_batches)
+            .with_context(|| format!("build join topn input delta for '{}'", source.input_name))?;
+    let delta = persisted_source_delta(&mut source.input_zset, topn_delta).await?;
+    let changed = !delta.batches().is_empty();
+
+    topn.source_snapshot = next_source_snapshot;
+    if !changed {
+        source.snapshot = next_topn_snapshot;
+        return Ok(JoinInputTick {
+            delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+
+    Ok(JoinInputTick {
+        delta,
+        changed: true,
+        next_snapshot: Some(next_topn_snapshot),
     })
 }
 
@@ -865,6 +1010,32 @@ fn source_input_delta(
             .with_context(|| format!("build insert join input delta for '{}'", source.input_name))
     } else {
         ColumnarZSet::empty(Arc::clone(&source.schema))
+    }
+}
+
+fn topn_source_input_delta(
+    topn: &ColumnarJoinTopNInputState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<ColumnarZSet> {
+    if let Some(weighted_batches) = weighted_delta_batches.get(topn.source_name.as_str()) {
+        ColumnarZSet::try_new_weighted(Arc::clone(&topn.source_schema), weighted_batches.clone())
+            .with_context(|| {
+                format!(
+                    "build weighted join topn raw input delta for '{}'",
+                    topn.source_name
+                )
+            })
+    } else if let Some(source_batches) = insert_batches.get(topn.source_name.as_str()) {
+        ColumnarZSet::from_value_batches(Arc::clone(&topn.source_schema), source_batches.clone(), 1)
+            .with_context(|| {
+                format!(
+                    "build insert join topn raw input delta for '{}'",
+                    topn.source_name
+                )
+            })
+    } else {
+        ColumnarZSet::empty(Arc::clone(&topn.source_schema))
     }
 }
 
@@ -1044,7 +1215,9 @@ impl JoinEvaluatorInput {
                     (None, None)
                 }
             }
-            ColumnarJoinInputPlanKind::Constant { .. } => (None, None),
+            ColumnarJoinInputPlanKind::Constant { .. } | ColumnarJoinInputPlanKind::TopN { .. } => {
+                (None, None)
+            }
         };
         Ok(Self {
             provider,
@@ -1130,7 +1303,10 @@ fn rebind_join_side_logical_plan(
     input_plan: &ColumnarJoinInputPlan,
     input: &JoinEvaluatorInput,
 ) -> Result<LogicalPlan> {
-    if matches!(&input_plan.kind, ColumnarJoinInputPlanKind::Constant { .. }) {
+    if matches!(
+        &input_plan.kind,
+        ColumnarJoinInputPlanKind::Constant { .. } | ColumnarJoinInputPlanKind::TopN { .. }
+    ) {
         return input.scan_plan(&input_plan.input_name);
     }
     let transformed = logical_plan.transform_up(|plan| match plan {
@@ -1155,6 +1331,7 @@ impl ColumnarJoinInputPlan {
         match &self.kind {
             ColumnarJoinInputPlanKind::Source { source_name } => Some(source_name.clone()),
             ColumnarJoinInputPlanKind::Constant { .. } => None,
+            ColumnarJoinInputPlanKind::TopN { source_name, .. } => Some(source_name.clone()),
         }
     }
 
@@ -1173,26 +1350,43 @@ fn join_input_plan_for_side(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     side: &str,
-) -> Option<ColumnarJoinInputPlan> {
+) -> Result<Option<ColumnarJoinInputPlan>> {
     if !plan_contains_table_scan(plan) {
         let input_name =
             constant_relation_name(plan).unwrap_or_else(|| format!("__floe_join_{side}_constant"));
-        return Some(ColumnarJoinInputPlan {
+        return Ok(Some(ColumnarJoinInputPlan {
             input_name,
             schema: df_schema_to_arrow(plan.schema()),
             kind: ColumnarJoinInputPlanKind::Constant {
                 logical_plan: plan.clone(),
             },
-        });
+        }));
     }
 
-    let source_name = single_source_for_plan(plan, sources)?;
-    let source = sources.get(&source_name)?;
-    Some(ColumnarJoinInputPlan {
+    if let Some(topn) = columnar_topn_plan_for_plan(plan, sources)? {
+        let input_name =
+            constant_relation_name(plan).unwrap_or_else(|| format!("__floe_join_{side}_topn"));
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarJoinInputPlanKind::TopN {
+                source_name: topn.source_name,
+                logical_plan: topn.logical_plan,
+            },
+        }));
+    }
+
+    let Some(source_name) = single_source_for_plan(plan, sources) else {
+        return Ok(None);
+    };
+    let Some(source) = sources.get(&source_name) else {
+        return Ok(None);
+    };
+    Ok(Some(ColumnarJoinInputPlan {
         input_name: source_name.clone(),
         schema: Arc::clone(&source.schema),
         kind: ColumnarJoinInputPlanKind::Source { source_name },
-    })
+    }))
 }
 
 fn constant_relation_name(plan: &LogicalPlan) -> Option<String> {
@@ -1269,9 +1463,8 @@ fn collect_sources(
         }
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
-        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            collect_sources(sort.input.as_ref(), sources, out)
-        }
+        LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
+        LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
         LogicalPlan::Join(join) => {
             collect_sources(join.left.as_ref(), sources, out);
             collect_sources(join.right.as_ref(), sources, out);
@@ -1287,46 +1480,59 @@ fn table_scan_source(
     resolve_source_table(scan.table_name.table().to_string(), sources)
 }
 
-fn contains_unsupported_join_wrapper(plan: &LogicalPlan) -> bool {
+fn contains_unsupported_join_wrapper(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<bool> {
     match plan {
         LogicalPlan::Projection(projection) => {
-            contains_unsupported_join_wrapper(projection.input.as_ref())
+            contains_unsupported_join_wrapper(projection.input.as_ref(), sources)
         }
-        LogicalPlan::Filter(filter) => contains_unsupported_join_wrapper(filter.input.as_ref()),
+        LogicalPlan::Filter(filter) => {
+            contains_unsupported_join_wrapper(filter.input.as_ref(), sources)
+        }
         LogicalPlan::SubqueryAlias(alias) => {
-            contains_unsupported_join_wrapper(alias.input.as_ref())
+            contains_unsupported_join_wrapper(alias.input.as_ref(), sources)
         }
         LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            contains_unsupported_join_wrapper(sort.input.as_ref())
+            contains_unsupported_join_wrapper(sort.input.as_ref(), sources)
         }
         LogicalPlan::Join(join) => {
-            contains_unsupported_join_side_wrapper(join.left.as_ref())
-                || contains_unsupported_join_side_wrapper(join.right.as_ref())
+            Ok(
+                contains_unsupported_join_side_wrapper(join.left.as_ref(), sources)?
+                    || contains_unsupported_join_side_wrapper(join.right.as_ref(), sources)?,
+            )
         }
-        LogicalPlan::TableScan(_) => false,
-        _ => true,
+        LogicalPlan::TableScan(_) => Ok(false),
+        _ => Ok(true),
     }
 }
 
-fn contains_unsupported_join_side_wrapper(plan: &LogicalPlan) -> bool {
+fn contains_unsupported_join_side_wrapper(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<bool> {
     if !plan_contains_table_scan(plan) {
-        return false;
+        return Ok(false);
+    }
+    if columnar_topn_plan_for_plan(plan, sources)?.is_some() {
+        return Ok(false);
     }
     match plan {
         LogicalPlan::Projection(projection) => {
-            contains_unsupported_join_side_wrapper(projection.input.as_ref())
+            contains_unsupported_join_side_wrapper(projection.input.as_ref(), sources)
         }
         LogicalPlan::Filter(filter) => {
-            contains_unsupported_join_side_wrapper(filter.input.as_ref())
+            contains_unsupported_join_side_wrapper(filter.input.as_ref(), sources)
         }
         LogicalPlan::SubqueryAlias(alias) => {
-            contains_unsupported_join_side_wrapper(alias.input.as_ref())
+            contains_unsupported_join_side_wrapper(alias.input.as_ref(), sources)
         }
         LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            contains_unsupported_join_side_wrapper(sort.input.as_ref())
+            contains_unsupported_join_side_wrapper(sort.input.as_ref(), sources)
         }
-        LogicalPlan::TableScan(_) => false,
-        _ => true,
+        LogicalPlan::TableScan(_) => Ok(false),
+        _ => Ok(true),
     }
 }
 

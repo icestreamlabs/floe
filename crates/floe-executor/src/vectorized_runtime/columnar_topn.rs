@@ -33,8 +33,8 @@ use super::{
 };
 
 pub(super) struct ColumnarTopNPlan {
-    logical_plan: LogicalPlan,
-    source_name: String,
+    pub(super) logical_plan: LogicalPlan,
+    pub(super) source_name: String,
     partition_columns: Vec<String>,
     full_snapshot_diff: bool,
 }
@@ -58,7 +58,7 @@ impl ColumnarTopNMaterializedViewState {
     }
 }
 
-struct TopNEvaluator {
+pub(super) struct TopNEvaluator {
     ctx: SessionContext,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     provider: Arc<DynamicStateTableProvider>,
@@ -444,7 +444,7 @@ async fn apply_source_snapshot_delta(
 }
 
 impl TopNEvaluator {
-    async fn build(
+    pub(super) async fn build(
         logical_plan: LogicalPlan,
         source_name: &str,
         source: &VectorizedSourceState,
@@ -486,7 +486,7 @@ impl TopNEvaluator {
         })
     }
 
-    async fn evaluate(&self, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+    pub(super) async fn evaluate(&self, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
         self.provider.set_batches(batches.to_vec())?;
         if let (Some(alias_schema), Some(alias_provider)) =
             (self.alias_schema.as_ref(), self.alias_provider.as_ref())

@@ -11867,7 +11867,7 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     );
     assert_eq!(
         runtime.materialized_views[1].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposedJoinTopN
+        MaterializedViewExecutionMode::ColumnarJoin
     );
     assert_eq!(
         runtime.materialized_views[2].execution_mode,

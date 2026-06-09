@@ -1038,7 +1038,10 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
             ));
         }
     }
-    let expected_modes = [("join_topn", "columnar_join_topn")];
+    let expected_modes = [
+        ("join_topn", "columnar_join_topn"),
+        ("join_over_topn", "columnar_join"),
+    ];
     for (case_id, expected_mode) in expected_modes {
         if execution_modes.get(case_id).map(String::as_str) != Some(expected_mode) {
             failures.push(format!(
