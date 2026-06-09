@@ -83,11 +83,6 @@ pub(super) fn columnar_composed_plan_for_plan(
     if source_names.is_empty() {
         return Ok(None);
     }
-    let mut scan_sources = Vec::new();
-    collect_table_scan_sources(plan, sources, &mut scan_sources);
-    if scan_sources.len() != source_names.len() {
-        return Ok(None);
-    }
 
     Ok(Some(ColumnarComposedPlan {
         logical_plan: plan.clone(),
@@ -493,53 +488,6 @@ fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
         LogicalPlan::Union(union) => {
             for input in &union.inputs {
                 collect_joins(input.as_ref(), joins);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_table_scan_sources(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-    out: &mut Vec<String>,
-) {
-    match plan {
-        LogicalPlan::TableScan(scan) => {
-            if let Some(source_name) = table_scan_source(scan, sources) {
-                out.push(source_name);
-            }
-        }
-        LogicalPlan::Projection(projection) => {
-            collect_table_scan_sources(projection.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Filter(filter) => {
-            collect_table_scan_sources(filter.input.as_ref(), sources, out)
-        }
-        LogicalPlan::SubqueryAlias(alias) => {
-            collect_table_scan_sources(alias.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Aggregate(aggregate) => {
-            collect_table_scan_sources(aggregate.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Sort(sort) => collect_table_scan_sources(sort.input.as_ref(), sources, out),
-        LogicalPlan::Limit(limit) => collect_table_scan_sources(limit.input.as_ref(), sources, out),
-        LogicalPlan::Window(window) => {
-            collect_table_scan_sources(window.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Repartition(repartition) => {
-            collect_table_scan_sources(repartition.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Distinct(distinct) => {
-            collect_table_scan_sources(distinct.input(), sources, out)
-        }
-        LogicalPlan::Join(join) => {
-            collect_table_scan_sources(join.left.as_ref(), sources, out);
-            collect_table_scan_sources(join.right.as_ref(), sources, out);
-        }
-        LogicalPlan::Union(union) => {
-            for input in &union.inputs {
-                collect_table_scan_sources(input.as_ref(), sources, out);
             }
         }
         _ => {}

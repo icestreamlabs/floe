@@ -4769,6 +4769,149 @@ async fn aggregate_topn_uses_slate_backed_columnar_composed_operator_semantics()
 }
 
 #[tokio::test]
+async fn aggregate_over_self_join_uses_slate_backed_columnar_composed_operator_semantics() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("amount", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("orders source definition");
+    let schema = orders.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 5])),
+        ],
+    )
+    .expect("initial orders batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    let table = build_operator_state_table("vectorized-columnar-self-join-aggregate").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("pair_count", DataType::Int64, false),
+    ]));
+    let query = "SELECT l.id, COUNT(*) AS pair_count \
+        FROM orders l JOIN orders r ON l.id = r.id \
+        WHERE l.amount < r.amount \
+        GROUP BY l.id";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_order_pair_counts",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial orders");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_order_pair_counts")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 1)]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![30])),
+        ],
+    )
+    .expect("order insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query("orders", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append order insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 3)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_id_count_rows(&delta), vec![(1, 1, -1), (1, 3, 1)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_order_pair_counts",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_order_pair_counts")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(id_count_rows(&recovered_snapshot), vec![(1, 3)]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![20])),
+        ],
+    )
+    .expect("order retract batch");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&retract, &weighted_schema, &[-1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 1)]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(weighted_id_count_rows(&delta), vec![(1, 1, 1), (1, 3, -1)]);
+}
+
+#[tokio::test]
 async fn explicit_full_refresh_policy_allows_non_incremental_mv() {
     let definition = SourceDefinition::new(
         "orders",
