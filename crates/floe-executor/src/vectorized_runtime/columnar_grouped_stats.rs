@@ -140,7 +140,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let Some((aggregate, projection)) = grouped_stats_aggregate_for_plan(plan) else {
         return Ok(None);
     };
-    if aggregate.group_expr.is_empty() || aggregate.aggr_expr.is_empty() {
+    if aggregate.aggr_expr.is_empty() {
         return Ok(None);
     }
     if aggregate
@@ -184,6 +184,11 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         if output_field.data_type() != aggregate_schema.field(*source_idx).data_type() {
             return Ok(None);
         }
+    }
+    if projection_expr.is_empty() {
+        projection_expr.push(
+            Expr::Literal(ScalarValue::Int64(Some(1)), None).alias("__floe_grouped_stats_row"),
+        );
     }
 
     let projection_plan = Projection::try_new(projection_expr, Arc::clone(&aggregate.input))
@@ -436,113 +441,149 @@ fn add_projected_stats_batches_to_pending(
     if batches.is_empty() {
         return Ok(());
     }
-    let converter = row_converter_for_schema(&columnar.group_schema)?;
+    let converter = if columnar.group_count == 0 {
+        None
+    } else {
+        Some(row_converter_for_schema(&columnar.group_schema)?)
+    };
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
         }
-        let group_columns = (0..columnar.group_count)
-            .map(|idx| Arc::clone(batch.column(idx)))
-            .collect::<Vec<ArrayRef>>();
-        let group_rows = converter
-            .convert_columns(&group_columns)
-            .context("encode grouped-stats group keys")?;
         let value_arrays = projected_value_arrays(batch, &columnar.specs)?;
         let filter_arrays = projected_filter_arrays(batch, &columnar.specs)?;
-        for row_idx in 0..batch.num_rows() {
-            let key = group_rows.row(row_idx).data().to_vec();
-            let group = pending
-                .entry(key)
-                .or_insert_with(|| PendingStatsGroupDelta {
-                    row_count_delta: 0,
-                    agg_deltas: columnar
-                        .specs
-                        .iter()
-                        .map(AggregateDelta::for_spec)
-                        .collect(),
-                    batch: batch.clone(),
-                    row_idx,
-                });
-            group.row_count_delta = group
-                .row_count_delta
-                .checked_add(sign)
-                .ok_or_else(|| anyhow::anyhow!("grouped-stats row count delta overflow"))?;
-            for (agg_idx, spec) in columnar.specs.iter().enumerate() {
-                if !filter_allows(&filter_arrays[agg_idx], row_idx) {
-                    continue;
-                }
-                match (&mut group.agg_deltas[agg_idx], spec.kind) {
-                    (AggregateDelta::Count { count_delta }, AggregateKind::Count) => {
-                        *count_delta = count_delta
-                            .checked_add(sign)
-                            .ok_or_else(|| anyhow::anyhow!("grouped-stats count delta overflow"))?;
-                    }
-                    (
-                        AggregateDelta::DistinctCount { value_deltas },
-                        AggregateKind::DistinctCount,
-                    ) => {
-                        let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
-                        else {
-                            continue;
-                        };
-                        update_i64_value_delta(value_deltas, value, sign)?;
-                    }
-                    (AggregateDelta::Sum { sum_delta }, AggregateKind::Sum) => {
-                        let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
-                        else {
-                            continue;
-                        };
-                        let signed = value
-                            .checked_mul(sign)
-                            .ok_or_else(|| anyhow::anyhow!("grouped-stats sum delta overflow"))?;
-                        *sum_delta = sum_delta
-                            .checked_add(signed)
-                            .ok_or_else(|| anyhow::anyhow!("grouped-stats sum delta overflow"))?;
-                    }
-                    (
-                        AggregateDelta::Avg {
-                            sum_delta,
-                            count_delta,
-                        },
-                        AggregateKind::Avg,
-                    ) => {
-                        let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
-                        else {
-                            continue;
-                        };
-                        let signed = value.checked_mul(sign).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats avg sum delta overflow")
-                        })?;
-                        *sum_delta = sum_delta.checked_add(signed).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats avg sum delta overflow")
-                        })?;
-                        *count_delta = count_delta.checked_add(sign).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats avg count delta overflow")
-                        })?;
-                    }
-                    (
-                        AggregateDelta::MinMaxI64 { value_deltas },
-                        AggregateKind::Min | AggregateKind::Max,
-                    ) => {
-                        let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
-                        else {
-                            continue;
-                        };
-                        update_i64_value_delta(value_deltas, value, sign)?;
-                    }
-                    (
-                        AggregateDelta::MinMaxUtf8 { value_deltas },
-                        AggregateKind::Min | AggregateKind::Max,
-                    ) => {
-                        let Some(value) = projected_utf8_value(&value_arrays[agg_idx], row_idx)
-                        else {
-                            continue;
-                        };
-                        update_string_value_delta(value_deltas, value.to_string(), sign)?;
-                    }
-                    _ => bail!("grouped-stats aggregate delta kind mismatch"),
+        match converter.as_ref() {
+            Some(converter) => {
+                let group_columns = (0..columnar.group_count)
+                    .map(|idx| Arc::clone(batch.column(idx)))
+                    .collect::<Vec<ArrayRef>>();
+                let group_rows = converter
+                    .convert_columns(&group_columns)
+                    .context("encode grouped-stats group keys")?;
+                for row_idx in 0..batch.num_rows() {
+                    add_projected_stats_row_to_pending(
+                        columnar,
+                        batch,
+                        row_idx,
+                        group_rows.row(row_idx).data().to_vec(),
+                        &value_arrays,
+                        &filter_arrays,
+                        sign,
+                        pending,
+                    )?;
                 }
             }
+            None => {
+                for row_idx in 0..batch.num_rows() {
+                    add_projected_stats_row_to_pending(
+                        columnar,
+                        batch,
+                        row_idx,
+                        Vec::new(),
+                        &value_arrays,
+                        &filter_arrays,
+                        sign,
+                        pending,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_projected_stats_row_to_pending(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    batch: &RecordBatch,
+    row_idx: usize,
+    key: Vec<u8>,
+    value_arrays: &[ProjectedValueArray<'_>],
+    filter_arrays: &[Option<&BooleanArray>],
+    sign: i64,
+    pending: &mut HashMap<Vec<u8>, PendingStatsGroupDelta>,
+) -> Result<()> {
+    let group = pending
+        .entry(key)
+        .or_insert_with(|| PendingStatsGroupDelta {
+            row_count_delta: 0,
+            agg_deltas: columnar
+                .specs
+                .iter()
+                .map(AggregateDelta::for_spec)
+                .collect(),
+            batch: batch.clone(),
+            row_idx,
+        });
+    group.row_count_delta = group
+        .row_count_delta
+        .checked_add(sign)
+        .ok_or_else(|| anyhow::anyhow!("grouped-stats row count delta overflow"))?;
+    for (agg_idx, spec) in columnar.specs.iter().enumerate() {
+        if !filter_allows(&filter_arrays[agg_idx], row_idx) {
+            continue;
+        }
+        match (&mut group.agg_deltas[agg_idx], spec.kind) {
+            (AggregateDelta::Count { count_delta }, AggregateKind::Count) => {
+                *count_delta = count_delta
+                    .checked_add(sign)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats count delta overflow"))?;
+            }
+            (AggregateDelta::DistinctCount { value_deltas }, AggregateKind::DistinctCount) => {
+                let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                update_i64_value_delta(value_deltas, value, sign)?;
+            }
+            (AggregateDelta::Sum { sum_delta }, AggregateKind::Sum) => {
+                let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                let signed = value
+                    .checked_mul(sign)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats sum delta overflow"))?;
+                *sum_delta = sum_delta
+                    .checked_add(signed)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats sum delta overflow"))?;
+            }
+            (
+                AggregateDelta::Avg {
+                    sum_delta,
+                    count_delta,
+                },
+                AggregateKind::Avg,
+            ) => {
+                let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                let signed = value
+                    .checked_mul(sign)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg sum delta overflow"))?;
+                *sum_delta = sum_delta
+                    .checked_add(signed)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg sum delta overflow"))?;
+                *count_delta = count_delta
+                    .checked_add(sign)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg count delta overflow"))?;
+            }
+            (
+                AggregateDelta::MinMaxI64 { value_deltas },
+                AggregateKind::Min | AggregateKind::Max,
+            ) => {
+                let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                update_i64_value_delta(value_deltas, value, sign)?;
+            }
+            (
+                AggregateDelta::MinMaxUtf8 { value_deltas },
+                AggregateKind::Min | AggregateKind::Max,
+            ) => {
+                let Some(value) = projected_utf8_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                update_string_value_delta(value_deltas, value.to_string(), sign)?;
+            }
+            _ => bail!("grouped-stats aggregate delta kind mismatch"),
         }
     }
     Ok(())
