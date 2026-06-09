@@ -14,7 +14,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::expr::WindowFunction;
-use datafusion::logical_expr::logical_plan::{Filter, TableScan, Window};
+use datafusion::logical_expr::logical_plan::{Filter, Limit, Sort, TableScan, Window};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator, ScalarUDF, WindowFunctionDefinition};
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
@@ -69,30 +69,35 @@ pub(super) fn columnar_topn_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarTopNPlan>> {
-    let Some((rank_column, filter)) = row_number_filter_for_plan(plan) else {
-        return Ok(None);
-    };
-    let Some((window, _projection_without_rank)) =
-        extract_window_plan(filter.input.as_ref(), &rank_column)
-    else {
-        return Ok(None);
-    };
-    if window.window_expr.len() != 1 {
-        return Ok(None);
-    }
-    let Some((_alias, window_function)) = row_number_window_function(&window.window_expr[0]) else {
-        return Ok(None);
-    };
-    if window_function.params.partition_by.is_empty() {
-        return Ok(None);
-    }
-    let partition_columns = window_function
-        .params
-        .partition_by
-        .iter()
-        .map(partition_column_name)
-        .collect::<Option<Vec<_>>>();
-    let Some(partition_columns) = partition_columns else {
+    let partition_columns = if let Some((rank_column, filter)) = row_number_filter_for_plan(plan) {
+        let Some((window, _projection_without_rank)) =
+            extract_window_plan(filter.input.as_ref(), &rank_column)
+        else {
+            return Ok(None);
+        };
+        if window.window_expr.len() != 1 {
+            return Ok(None);
+        }
+        let Some((_alias, window_function)) = row_number_window_function(&window.window_expr[0])
+        else {
+            return Ok(None);
+        };
+        if window_function.params.partition_by.is_empty() {
+            return Ok(None);
+        }
+        let partition_columns = window_function
+            .params
+            .partition_by
+            .iter()
+            .map(partition_column_name)
+            .collect::<Option<Vec<_>>>();
+        let Some(partition_columns) = partition_columns else {
+            return Ok(None);
+        };
+        partition_columns
+    } else if global_sort_limit_for_plan(plan) {
+        Vec::new()
+    } else {
         return Ok(None);
     };
     let Some(source_name) = single_source_for_plan(plan, sources) else {
@@ -408,6 +413,12 @@ fn touched_partition_keys(
     batches: &[RecordBatch],
 ) -> Result<HashSet<Vec<u8>>> {
     let mut keys = HashSet::new();
+    if partition_indices.is_empty() {
+        if batches.iter().any(|batch| batch.num_rows() > 0) {
+            keys.insert(Vec::new());
+        }
+        return Ok(keys);
+    }
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
         let rows = converter
             .convert_columns(&project_columns(batch, partition_indices))
@@ -428,6 +439,9 @@ fn filter_batches_to_partition_keys(
 ) -> Result<Vec<RecordBatch>> {
     if keys.is_empty() {
         return Ok(Vec::new());
+    }
+    if partition_indices.is_empty() {
+        return Ok(batches.to_vec());
     }
     let mut output = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -513,6 +527,43 @@ fn row_number_filter_for_plan(plan: &LogicalPlan) -> Option<(String, &Filter)> {
     }
 }
 
+fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            global_sort_limit_for_plan(projection.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => global_sort_limit_for_plan(alias.input.as_ref()),
+        LogicalPlan::Limit(limit) => {
+            limit_has_zero_skip_and_positive_fetch(limit)
+                && sort_input_for_limit(limit.input.as_ref())
+        }
+        LogicalPlan::Sort(sort) => sort_has_positive_fetch(sort),
+        _ => false,
+    }
+}
+
+fn limit_has_zero_skip_and_positive_fetch(limit: &Limit) -> bool {
+    let skip = limit
+        .skip
+        .as_deref()
+        .map(literal_to_nonnegative_usize)
+        .unwrap_or(Some(0));
+    let fetch = limit.fetch.as_deref().and_then(literal_to_positive_usize);
+    skip == Some(0) && fetch.is_some()
+}
+
+fn sort_input_for_limit(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::SubqueryAlias(alias) => sort_input_for_limit(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => !sort.expr.is_empty(),
+        _ => false,
+    }
+}
+
+fn sort_has_positive_fetch(sort: &Sort) -> bool {
+    !sort.expr.is_empty() && sort.fetch.is_some_and(|fetch| fetch > 0)
+}
+
 fn extract_row_number_limit(predicate: &Expr) -> Option<(String, usize)> {
     let Expr::BinaryExpr(binary) = predicate else {
         return None;
@@ -536,25 +587,33 @@ fn extract_row_number_limit(predicate: &Expr) -> Option<(String, usize)> {
     (limit > 0).then_some((column, limit))
 }
 
+fn literal_to_nonnegative_usize(expr: &Expr) -> Option<usize> {
+    literal_to_i128(expr)
+        .filter(|value| *value >= 0)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
 fn literal_to_positive_usize(expr: &Expr) -> Option<usize> {
+    literal_to_i128(expr)
+        .filter(|value| *value > 0)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn literal_to_i128(expr: &Expr) -> Option<i128> {
     let Expr::Literal(value, _) = expr else {
         return None;
     };
-    let value = match value {
-        ScalarValue::Int8(Some(value)) => i128::from(*value),
-        ScalarValue::Int16(Some(value)) => i128::from(*value),
-        ScalarValue::Int32(Some(value)) => i128::from(*value),
-        ScalarValue::Int64(Some(value)) => i128::from(*value),
-        ScalarValue::UInt8(Some(value)) => i128::from(*value),
-        ScalarValue::UInt16(Some(value)) => i128::from(*value),
-        ScalarValue::UInt32(Some(value)) => i128::from(*value),
-        ScalarValue::UInt64(Some(value)) => i128::from(*value),
-        _ => return None,
-    };
-    if value <= 0 {
-        return None;
+    match value {
+        ScalarValue::Int8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int64(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt64(Some(value)) => Some(i128::from(*value)),
+        _ => None,
     }
-    usize::try_from(value).ok()
 }
 
 fn extract_window_plan<'a>(
@@ -687,6 +746,8 @@ fn collect_sources(
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
         LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
+        LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
+        LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
         _ => {}
     }
 }
@@ -708,6 +769,8 @@ fn contains_unsupported_topn_wrapper(plan: &LogicalPlan) -> bool {
             contains_unsupported_topn_wrapper(alias.input.as_ref())
         }
         LogicalPlan::Window(window) => contains_unsupported_topn_wrapper(window.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_unsupported_topn_wrapper(limit.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_unsupported_topn_wrapper(sort.input.as_ref()),
         LogicalPlan::TableScan(_) => false,
         _ => true,
     }
