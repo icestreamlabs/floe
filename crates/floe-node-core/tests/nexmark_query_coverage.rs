@@ -549,6 +549,22 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT auction AS key, price AS value FROM bid WHERE price > (SELECT MIN(\"initialBid\") FROM auction)",
     ),
     (
+        "distinct_in_subquery",
+        "SELECT auction AS key, price AS value FROM bid WHERE auction IN (SELECT DISTINCT id FROM auction)",
+    ),
+    (
+        "aggregate_in_subquery",
+        "SELECT auction AS key, price AS value FROM bid WHERE auction IN (SELECT seller FROM auction GROUP BY seller)",
+    ),
+    (
+        "intersect_sources",
+        "SELECT auction AS key, price AS value FROM bid INTERSECT SELECT id AS key, \"initialBid\" AS value FROM auction",
+    ),
+    (
+        "except_sources",
+        "SELECT auction AS key, price AS value FROM bid EXCEPT SELECT id AS key, \"initialBid\" AS value FROM auction",
+    ),
+    (
         "distinct",
         "SELECT DISTINCT auction AS key, bidder AS value FROM bid",
     ),
@@ -989,7 +1005,7 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         skipped.len()
     );
     assert!(
-        execution_modes.len() >= 650,
+        execution_modes.len() >= 800,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
         execution_modes.len(),
         skipped.len()
