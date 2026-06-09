@@ -32,6 +32,11 @@ use super::columnar_join_topn::{
     build_columnar_join_topn_materialized_view_state_in_namespaces,
     columnar_join_topn_plan_for_plan, run_columnar_join_topn_state_tick,
 };
+use super::columnar_multijoin::{
+    ColumnarMultiJoinMaterializedViewState, ColumnarMultiJoinPlan,
+    build_columnar_multijoin_materialized_view_state_in_namespace,
+    columnar_multijoin_plan_for_plan, run_columnar_multijoin_state_tick,
+};
 use super::columnar_topn::{TopNEvaluator, columnar_topn_plan_for_plan};
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
@@ -86,6 +91,7 @@ struct ColumnarJoinSourceState {
     topn: Option<ColumnarJoinTopNInputState>,
     join_topn: Option<ColumnarJoinJoinTopNInputState>,
     join: Option<ColumnarJoinJoinInputState>,
+    multijoin: Option<ColumnarJoinMultiJoinInputState>,
 }
 
 struct ColumnarJoinConstantState {
@@ -111,6 +117,10 @@ struct ColumnarJoinJoinInputState {
     state: Box<ColumnarJoinMaterializedViewState>,
 }
 
+struct ColumnarJoinMultiJoinInputState {
+    state: ColumnarMultiJoinMaterializedViewState,
+}
+
 struct ColumnarJoinInputPlan {
     input_name: String,
     schema: SchemaRef,
@@ -133,6 +143,9 @@ enum ColumnarJoinInputPlanKind {
     },
     Join {
         plan: Box<ColumnarJoinPlan>,
+    },
+    MultiJoin {
+        plan: ColumnarMultiJoinPlan,
     },
 }
 
@@ -383,6 +396,9 @@ fn join_input_namespace(mv_namespace: &str, side: &str, input: &ColumnarJoinInpu
         ColumnarJoinInputPlanKind::Join { .. } => {
             format!("{mv_namespace}/columnar/join/{side}/join")
         }
+        ColumnarJoinInputPlanKind::MultiJoin { .. } => {
+            format!("{mv_namespace}/columnar/join/{side}/multijoin")
+        }
     }
 }
 
@@ -438,6 +454,7 @@ async fn build_join_input_state(
                 topn: None,
                 join_topn: None,
                 join: None,
+                multijoin: None,
             })
         }
         ColumnarJoinInputPlanKind::Constant { logical_plan } => {
@@ -498,6 +515,7 @@ async fn build_join_input_state(
                 topn: None,
                 join_topn: None,
                 join: None,
+                multijoin: None,
             })
         }
         ColumnarJoinInputPlanKind::TopN {
@@ -566,6 +584,7 @@ async fn build_join_input_state(
                 }),
                 join_topn: None,
                 join: None,
+                multijoin: None,
             })
         }
         ColumnarJoinInputPlanKind::JoinTopN { plan } => {
@@ -600,6 +619,7 @@ async fn build_join_input_state(
                 topn: None,
                 join_topn: Some(ColumnarJoinJoinTopNInputState { state }),
                 join: None,
+                multijoin: None,
             })
         }
         ColumnarJoinInputPlanKind::Join { plan } => {
@@ -632,6 +652,38 @@ async fn build_join_input_state(
                 join: Some(ColumnarJoinJoinInputState {
                     state: Box::new(state),
                 }),
+                multijoin: None,
+            })
+        }
+        ColumnarJoinInputPlanKind::MultiJoin { plan } => {
+            let multijoin_namespace = format!("{namespace}/state");
+            let state = build_columnar_multijoin_materialized_view_state_in_namespace(
+                table,
+                multijoin_namespace,
+                &input.schema,
+                plan,
+                sources,
+                udfs,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed {side} nested multijoin input for '{}'",
+                    input.input_name
+                )
+            })?;
+            let snapshot = state.initial_snapshot();
+            Ok(ColumnarJoinSourceState {
+                input_name: input.input_name,
+                source_name: None,
+                schema: input.schema,
+                input_zset: None,
+                snapshot,
+                constant: None,
+                topn: None,
+                join_topn: None,
+                join: None,
+                multijoin: Some(ColumnarJoinMultiJoinInputState { state }),
             })
         }
     }
@@ -1013,6 +1065,10 @@ async fn prepare_join_input_tick(
         return prepare_nested_join_input_tick(source, insert_batches, weighted_delta_batches)
             .await;
     }
+    if source.multijoin.is_some() {
+        return prepare_nested_multijoin_input_tick(source, insert_batches, weighted_delta_batches)
+            .await;
+    }
     if source.join_topn.is_some() {
         return prepare_join_topn_join_input_tick(source, insert_batches, weighted_delta_batches)
             .await;
@@ -1035,6 +1091,50 @@ async fn prepare_join_input_tick(
         delta,
         changed,
         next_snapshot: None,
+    })
+}
+
+async fn prepare_nested_multijoin_input_tick(
+    source: &mut ColumnarJoinSourceState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<JoinInputTick> {
+    let Some(multijoin) = source.multijoin.as_mut() else {
+        return Ok(JoinInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&source.schema))?,
+            changed: false,
+            next_snapshot: None,
+        });
+    };
+    let tick = run_columnar_multijoin_state_tick(
+        &mut multijoin.state,
+        insert_batches,
+        weighted_delta_batches,
+        &source.schema,
+        &source.snapshot,
+    )
+    .await
+    .with_context(|| format!("evaluate nested multijoin input '{}'", source.input_name))?;
+    let changed = !tick.delta.batches().is_empty();
+    if !tick.input_changed {
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    if !changed {
+        source.snapshot = tick.next_snapshot;
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    Ok(JoinInputTick {
+        delta: tick.delta,
+        changed: true,
+        next_snapshot: Some(tick.next_snapshot),
     })
 }
 
@@ -1490,7 +1590,8 @@ impl JoinEvaluatorInput {
             ColumnarJoinInputPlanKind::Constant { .. }
             | ColumnarJoinInputPlanKind::TopN { .. }
             | ColumnarJoinInputPlanKind::JoinTopN { .. }
-            | ColumnarJoinInputPlanKind::Join { .. } => (None, None),
+            | ColumnarJoinInputPlanKind::Join { .. }
+            | ColumnarJoinInputPlanKind::MultiJoin { .. } => (None, None),
         };
         Ok(Self {
             provider,
@@ -1621,6 +1722,7 @@ fn rebind_join_side_logical_plan(
             | ColumnarJoinInputPlanKind::TopN { .. }
             | ColumnarJoinInputPlanKind::JoinTopN { .. }
             | ColumnarJoinInputPlanKind::Join { .. }
+            | ColumnarJoinInputPlanKind::MultiJoin { .. }
     ) {
         return input.scan_plan(&input_plan.input_name);
     }
@@ -1649,6 +1751,7 @@ impl ColumnarJoinInputPlan {
             ColumnarJoinInputPlanKind::TopN { source_name, .. } => Some(source_name.clone()),
             ColumnarJoinInputPlanKind::JoinTopN { .. } => None,
             ColumnarJoinInputPlanKind::Join { .. } => None,
+            ColumnarJoinInputPlanKind::MultiJoin { .. } => None,
         }
     }
 
@@ -1667,6 +1770,7 @@ impl ColumnarJoinInputPlan {
                 .into_iter()
                 .chain(plan.right.source_names())
                 .collect(),
+            ColumnarJoinInputPlanKind::MultiJoin { plan } => plan.source_names(),
             ColumnarJoinInputPlanKind::Constant { .. } => BTreeSet::new(),
         }
     }
@@ -1734,6 +1838,16 @@ fn join_input_plan_for_side(
         }));
     }
 
+    if let Some(input_name) = constant_relation_name(plan)
+        && let Some(multijoin) = columnar_multijoin_plan_for_plan(plan, sources)?
+    {
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarJoinInputPlanKind::MultiJoin { plan: multijoin },
+        }));
+    }
+
     let Some(source_name) = single_source_for_plan(plan, sources) else {
         return Ok(None);
     };
@@ -1777,7 +1891,8 @@ fn collect_joins<'a>(
     }
     if skip_this_derived_join
         && derived_relation_name(plan).is_some()
-        && columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+        && (columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+            || columnar_multijoin_plan_for_plan(plan, sources)?.is_some())
     {
         return Ok(());
     }
@@ -1944,6 +2059,11 @@ fn contains_unsupported_join_side_wrapper(
     }
     if derived_relation_name(plan).is_some()
         && columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
+    {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_multijoin_plan_for_plan(plan, sources)?.is_some()
     {
         return Ok(false);
     }
