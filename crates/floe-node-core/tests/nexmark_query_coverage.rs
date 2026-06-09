@@ -122,6 +122,22 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve",
     },
     ValidPlanRuntimeCase {
+        id: "aggregate_over_range_join",
+        sql: "SELECT COUNT(price) AS c FROM (SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve) r",
+    },
+    ValidPlanRuntimeCase {
+        id: "distinct_over_range_join",
+        sql: "SELECT DISTINCT id FROM (SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve) r",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_over_range_join",
+        sql: "SELECT key FROM (SELECT id AS key FROM (SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve) r UNION ALL SELECT id AS key FROM auction) u",
+    },
+    ValidPlanRuntimeCase {
+        id: "topn_over_range_join",
+        sql: "SELECT id, price FROM (SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve) r ORDER BY price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "multi_column_join",
         sql: "SELECT p.id, a.id AS auction_id FROM person p JOIN auction a ON p.id = a.seller AND p.\"dateTime\" = a.expires",
     },
