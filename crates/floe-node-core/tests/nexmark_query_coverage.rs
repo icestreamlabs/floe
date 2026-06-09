@@ -517,12 +517,28 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction",
     ),
     (
+        "having_aggregate",
+        "SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction HAVING SUM(price) > 1000",
+    ),
+    (
+        "window_aggregate",
+        "SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)",
+    ),
+    (
         "global_aggregate",
         "SELECT 0 AS key, SUM(price) AS value FROM bid",
     ),
     (
+        "aggregate_topn",
+        "SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction ORDER BY value DESC LIMIT 5",
+    ),
+    (
         "topn",
         "SELECT auction AS key, price AS value FROM bid ORDER BY price DESC LIMIT 5",
+    ),
+    (
+        "offset_topn",
+        "SELECT auction AS key, price AS value FROM bid ORDER BY price DESC LIMIT 5 OFFSET 2",
     ),
     (
         "row_number_topn",
@@ -531,6 +547,22 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
     (
         "join",
         "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "residual_join",
+        "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction = a.id AND b.price > a.\"initialBid\"",
+    ),
+    (
+        "left_join",
+        "SELECT b.auction AS key, a.seller AS value FROM bid b LEFT JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "semi_join",
+        "SELECT b.auction AS key, b.price AS value FROM bid b LEFT SEMI JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "anti_join",
+        "SELECT b.auction AS key, b.price AS value FROM bid b LEFT ANTI JOIN auction a ON b.auction = a.id",
     ),
     (
         "range_join",
@@ -547,6 +579,18 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
     (
         "union",
         "SELECT auction AS key, price AS value FROM bid UNION ALL SELECT id AS key, \"initialBid\" AS value FROM auction",
+    ),
+    (
+        "union_distinct",
+        "SELECT auction AS key, price AS value FROM bid UNION SELECT id AS key, \"initialBid\" AS value FROM auction",
+    ),
+    (
+        "distinct_union",
+        "SELECT DISTINCT key, value FROM (SELECT auction AS key, price AS value FROM bid UNION ALL SELECT id AS key, \"initialBid\" AS value FROM auction) u",
+    ),
+    (
+        "aggregate_join",
+        "SELECT a.auction AS key, au.seller AS value FROM (SELECT auction, MAX(price) AS max_price FROM bid GROUP BY auction) a JOIN auction au ON a.auction = au.id",
     ),
     (
         "asof_join",
@@ -841,7 +885,7 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         skipped.len()
     );
     assert!(
-        execution_modes.len() >= 200,
+        execution_modes.len() >= 400,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
         execution_modes.len(),
         skipped.len()
