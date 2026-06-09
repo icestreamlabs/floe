@@ -1086,6 +1086,10 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         "generated active vectorized runtime DBSP-unsupported shape count: {}",
         skipped.len()
     );
+    eprintln!(
+        "generated active vectorized runtime DBSP-unsupported shapes:\n{}",
+        serde_json::to_string_pretty(&skipped).expect("serialize skipped generated cases")
+    );
     assert!(
         execution_modes.len() >= 1100,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",

@@ -565,6 +565,70 @@ fn plans_right_anti_join_with_right_schema_output() {
     }
 }
 
+#[tokio::test]
+async fn plans_projected_right_semi_join_output_columns() {
+    let plan = sql_plan(
+        "SELECT key, value \
+        FROM (SELECT a.id AS key, a.seller AS value \
+            FROM bid b RIGHT SEMI JOIN auction a ON b.auction = a.id) s",
+    )
+    .await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+
+    assert_eq!(
+        root.output_schema
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["key", "value"]
+    );
+    let join = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Join(join) => Some(join),
+            _ => None,
+        })
+        .expect("right semi join");
+    assert!(matches!(join.join_type, DbspJoinType::RightSemi));
+}
+
+#[tokio::test]
+async fn plans_projected_right_anti_join_output_columns() {
+    let plan = sql_plan(
+        "SELECT key, value \
+        FROM (SELECT a.id AS key, a.seller AS value \
+            FROM bid b RIGHT ANTI JOIN auction a ON b.auction = a.id) s",
+    )
+    .await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).expect("root");
+
+    assert_eq!(
+        root.output_schema
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["key", "value"]
+    );
+    let join = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Join(join) => Some(join),
+            _ => None,
+        })
+        .expect("right anti join");
+    assert!(matches!(join.join_type, DbspJoinType::RightAnti));
+}
+
 #[test]
 fn plans_multi_column_join() {
     let person = nexmark_person_table();

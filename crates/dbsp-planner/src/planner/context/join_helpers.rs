@@ -140,25 +140,42 @@ pub(super) fn resolve_join_output_column_index(
         && let Some(side) = relation_sides.get(&relation)
     {
         return match side {
-            JoinInputSide::Left => join
-                .left_schema
-                .field_index(column.name.as_str())
-                .ok_or_else(|| {
+            JoinInputSide::Left => {
+                let input_idx = join
+                    .left_schema
+                    .field_index(column.name.as_str())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "column '{}.{}' not found in left join input schema",
+                            relation, column.name
+                        ))
+                    })?;
+                join_output_index_for_input(join, JoinInputSide::Left, input_idx).ok_or_else(|| {
                     DataFusionError::Plan(format!(
-                        "column '{}.{}' not found in left join input schema",
-                        relation, column.name
+                        "left join input column '{}.{}' is not present in {:?} output",
+                        relation, column.name, join.join_type
                     ))
-                }),
-            JoinInputSide::Right => join
-                .right_schema
-                .field_index(column.name.as_str())
-                .map(|idx| join.left_schema.len() + idx)
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "column '{}.{}' not found in right join input schema",
-                        relation, column.name
-                    ))
-                }),
+                })
+            }
+            JoinInputSide::Right => {
+                let input_idx = join
+                    .right_schema
+                    .field_index(column.name.as_str())
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "column '{}.{}' not found in right join input schema",
+                            relation, column.name
+                        ))
+                    })?;
+                join_output_index_for_input(join, JoinInputSide::Right, input_idx).ok_or_else(
+                    || {
+                        DataFusionError::Plan(format!(
+                            "right join input column '{}.{}' is not present in {:?} output",
+                            relation, column.name, join.join_type
+                        ))
+                    },
+                )
+            }
         };
     }
 
@@ -170,12 +187,54 @@ pub(super) fn resolve_join_output_column_index(
         join.left_schema.field_index(column.name.as_str()),
         join.right_schema.field_index(column.name.as_str()),
     ) {
-        (Some(output_idx), None) => Ok(output_idx),
-        (None, Some(right_idx)) => Ok(join.left_schema.len() + right_idx),
+        (Some(left_idx), None) => join_output_index_for_input(join, JoinInputSide::Left, left_idx)
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "left join input column '{}' is not present in {:?} output",
+                    column.name, join.join_type
+                ))
+            }),
+        (None, Some(right_idx)) => {
+            join_output_index_for_input(join, JoinInputSide::Right, right_idx).ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "right join input column '{}' is not present in {:?} output",
+                    column.name, join.join_type
+                ))
+            })
+        }
         _ => Err(DataFusionError::Plan(format!(
             "column '{}' could not be resolved in join output schema",
             column.flat_name()
         ))),
+    }
+}
+
+fn join_output_index_for_input(
+    join: &DbspJoinNode,
+    side: JoinInputSide,
+    input_idx: usize,
+) -> Option<usize> {
+    match (&join.join_type, side) {
+        (
+            DbspJoinType::Inner
+            | DbspJoinType::LeftOuter
+            | DbspJoinType::RightOuter
+            | DbspJoinType::FullOuter,
+            JoinInputSide::Left,
+        )
+        | (DbspJoinType::LeftSemi | DbspJoinType::LeftAnti, JoinInputSide::Left) => Some(input_idx),
+        (
+            DbspJoinType::Inner
+            | DbspJoinType::LeftOuter
+            | DbspJoinType::RightOuter
+            | DbspJoinType::FullOuter,
+            JoinInputSide::Right,
+        ) => Some(join.left_schema.len() + input_idx),
+        (DbspJoinType::RightSemi | DbspJoinType::RightAnti, JoinInputSide::Right) => {
+            Some(input_idx)
+        }
+        (DbspJoinType::LeftSemi | DbspJoinType::LeftAnti, JoinInputSide::Right)
+        | (DbspJoinType::RightSemi | DbspJoinType::RightAnti, JoinInputSide::Left) => None,
     }
 }
 
