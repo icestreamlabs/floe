@@ -1038,6 +1038,18 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
             ));
         }
     }
+    let expected_modes = [("join_topn", "columnar_join_topn")];
+    for (case_id, expected_mode) in expected_modes {
+        if execution_modes.get(case_id).map(String::as_str) != Some(expected_mode) {
+            failures.push(format!(
+                "{case_id}: expected active vectorized runtime mode {expected_mode}, got {}",
+                execution_modes
+                    .get(case_id)
+                    .map(String::as_str)
+                    .unwrap_or("<missing>")
+            ));
+        }
+    }
 
     if !failures.is_empty() {
         panic!(

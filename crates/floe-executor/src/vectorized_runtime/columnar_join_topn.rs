@@ -9,8 +9,13 @@ use datafusion::arrow::array::{
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::logical_expr::logical_plan::{Filter, Join, TableScan, Window};
+use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::datasource::provider_as_source;
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::logical_expr::logical_plan::{Filter, Join, Limit, Sort, TableScan, Window};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, ScalarUDF};
+use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
@@ -20,17 +25,28 @@ use crate::encoding::EncodedRowScalar;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
-use crate::vectorized_runtime::source_state::resolve_source_table;
+use crate::table_provider::DynamicStateTableProvider;
+use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
+    normalize_batches,
 };
 
 pub(super) struct ColumnarJoinTopNPlan {
     left_source: String,
     right_source: String,
-    left_key_column: String,
-    right_key_column: String,
+    kind: ColumnarJoinTopNPlanKind,
+}
+
+enum ColumnarJoinTopNPlanKind {
+    PartitionedBestBid {
+        left_key_column: String,
+        right_key_column: String,
+    },
+    GlobalSnapshotDiff {
+        logical_plan: LogicalPlan,
+    },
 }
 
 pub(super) struct ColumnarJoinTopNMaterializedViewState {
@@ -50,16 +66,35 @@ impl ColumnarJoinTopNMaterializedViewState {
 struct JoinTopNSourceState {
     source_name: String,
     schema: SchemaRef,
-    key_idx: usize,
+    key_idx: Option<usize>,
     input_zset: SlateBackedColumnarZSet,
     snapshot: Vec<RecordBatch>,
 }
 
-struct JoinTopNEvaluator {
+enum JoinTopNEvaluator {
+    PartitionedBestBid(JoinTopNBestBidEvaluator),
+    GlobalSnapshotDiff(GlobalJoinTopNEvaluator),
+}
+
+struct JoinTopNBestBidEvaluator {
     output_schema: SchemaRef,
     left: JoinTopNLeftIndices,
     right: JoinTopNRightIndices,
     output_mapping: Vec<JoinTopNOutputSource>,
+}
+
+struct GlobalJoinTopNEvaluator {
+    ctx: SessionContext,
+    logical_plan: LogicalPlan,
+    left_input: GlobalJoinTopNInput,
+    right_input: GlobalJoinTopNInput,
+    output_schema: SchemaRef,
+}
+
+struct GlobalJoinTopNInput {
+    provider: Arc<DynamicStateTableProvider>,
+    alias_schema: Option<SchemaRef>,
+    alias_provider: Option<Arc<DynamicStateTableProvider>>,
 }
 
 struct JoinTopNLeftIndices {
@@ -104,6 +139,16 @@ pub(super) fn columnar_join_topn_plan_for_plan(
     if contains_aggregate(plan) {
         return Ok(None);
     }
+    if let Some(plan) = partitioned_best_bid_join_topn_plan_for_plan(plan, sources)? {
+        return Ok(Some(plan));
+    }
+    global_join_topn_plan_for_plan(plan, sources)
+}
+
+fn partitioned_best_bid_join_topn_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarJoinTopNPlan>> {
     let Some((_rank_column, filter)) = row_number_filter_for_plan(plan) else {
         return Ok(None);
     };
@@ -153,8 +198,52 @@ pub(super) fn columnar_join_topn_plan_for_plan(
     Ok(Some(ColumnarJoinTopNPlan {
         left_source,
         right_source,
-        left_key_column,
-        right_key_column,
+        kind: ColumnarJoinTopNPlanKind::PartitionedBestBid {
+            left_key_column,
+            right_key_column,
+        },
+    }))
+}
+
+fn global_join_topn_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarJoinTopNPlan>> {
+    if !global_sort_limit_for_plan(plan) {
+        return Ok(None);
+    }
+    let joins = joins_for_plan(plan);
+    let [join] = joins.as_slice() else {
+        return Ok(None);
+    };
+    if join.join_type != JoinType::Inner || (join.on.is_empty() && join.filter.is_none()) {
+        return Ok(None);
+    }
+    let Some(left_source) = single_source_for_plan(join.left.as_ref(), sources) else {
+        return Ok(None);
+    };
+    let Some(right_source) = single_source_for_plan(join.right.as_ref(), sources) else {
+        return Ok(None);
+    };
+    if left_source == right_source {
+        return Ok(None);
+    }
+    let all_sources = source_set_for_plan(plan, sources);
+    if all_sources.len() != 2
+        || !all_sources.contains(&left_source)
+        || !all_sources.contains(&right_source)
+    {
+        return Ok(None);
+    }
+    if contains_unsupported_global_join_topn_wrapper(plan) {
+        return Ok(None);
+    }
+    Ok(Some(ColumnarJoinTopNPlan {
+        left_source,
+        right_source,
+        kind: ColumnarJoinTopNPlanKind::GlobalSnapshotDiff {
+            logical_plan: plan.clone(),
+        },
     }))
 }
 
@@ -164,7 +253,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
     output_schema: &SchemaRef,
     plan: ColumnarJoinTopNPlan,
     sources: &HashMap<String, VectorizedSourceState>,
-    _udfs: &[ScalarUDF],
+    udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinTopNMaterializedViewState> {
     let left_source = sources
         .get(&plan.left_source)
@@ -172,14 +261,26 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
     let right_source = sources
         .get(&plan.right_source)
         .ok_or_else(|| anyhow::anyhow!("unknown join-topn source '{}'", plan.right_source))?;
-    let left_key_idx = left_source
-        .schema
-        .index_of(&plan.left_key_column)
-        .with_context(|| format!("find join-topn left key '{}'", plan.left_key_column))?;
-    let right_key_idx = right_source
-        .schema
-        .index_of(&plan.right_key_column)
-        .with_context(|| format!("find join-topn right key '{}'", plan.right_key_column))?;
+    let (left_key_idx, right_key_idx) = match &plan.kind {
+        ColumnarJoinTopNPlanKind::PartitionedBestBid {
+            left_key_column,
+            right_key_column,
+        } => (
+            Some(
+                left_source
+                    .schema
+                    .index_of(left_key_column)
+                    .with_context(|| format!("find join-topn left key '{left_key_column}'"))?,
+            ),
+            Some(
+                right_source
+                    .schema
+                    .index_of(right_key_column)
+                    .with_context(|| format!("find join-topn right key '{right_key_column}'"))?,
+            ),
+        ),
+        ColumnarJoinTopNPlanKind::GlobalSnapshotDiff { .. } => (None, None),
+    };
 
     let mv_namespace = namespaces::materialized_view(view_name)?;
     let left_namespace = format!(
@@ -222,9 +323,32 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
 
     let left_name = plan.left_source;
     let right_name = plan.right_source;
-    let evaluator =
-        JoinTopNEvaluator::build(&left_source.schema, &right_source.schema, output_schema)
-            .context("build join-topn vectorized evaluator")?;
+    let evaluator = match plan.kind {
+        ColumnarJoinTopNPlanKind::PartitionedBestBid { .. } => {
+            JoinTopNEvaluator::PartitionedBestBid(
+                JoinTopNBestBidEvaluator::build(
+                    &left_source.schema,
+                    &right_source.schema,
+                    output_schema,
+                )
+                .context("build join-topn vectorized evaluator")?,
+            )
+        }
+        ColumnarJoinTopNPlanKind::GlobalSnapshotDiff { logical_plan } => {
+            JoinTopNEvaluator::GlobalSnapshotDiff(
+                GlobalJoinTopNEvaluator::build(
+                    logical_plan,
+                    &left_name,
+                    &right_name,
+                    sources,
+                    output_schema,
+                    udfs,
+                )
+                .await
+                .context("build global join-topn vectorized evaluator")?,
+            )
+        }
+    };
 
     Ok(ColumnarJoinTopNMaterializedViewState {
         left: JoinTopNSourceState {
@@ -277,22 +401,7 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
         persisted_source_delta(&mut columnar.left.input_zset, left_input_delta).await?;
     let right_delta =
         persisted_source_delta(&mut columnar.right.input_zset, right_input_delta).await?;
-    let mut touched_keys = HashSet::new();
-    collect_i64_keys_from_delta(&left_delta, columnar.left.key_idx, &mut touched_keys)?;
-    collect_i64_keys_from_delta(&right_delta, columnar.right.key_idx, &mut touched_keys)?;
 
-    let previous_left = filter_batches_to_i64_keys(
-        &columnar.left.schema,
-        columnar.left.key_idx,
-        &columnar.left.snapshot,
-        &touched_keys,
-    )?;
-    let previous_right = filter_batches_to_i64_keys(
-        &columnar.right.schema,
-        columnar.right.key_idx,
-        &columnar.right.snapshot,
-        &touched_keys,
-    )?;
     let next_left_snapshot =
         apply_source_snapshot_delta(&columnar.left.schema, &columnar.left.snapshot, &left_delta)
             .await?;
@@ -302,55 +411,95 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
         &right_delta,
     )
     .await?;
-    let next_left = filter_batches_to_i64_keys(
-        &columnar.left.schema,
-        columnar.left.key_idx,
-        &next_left_snapshot,
-        &touched_keys,
-    )?;
-    let next_right = filter_batches_to_i64_keys(
-        &columnar.right.schema,
-        columnar.right.key_idx,
-        &next_right_snapshot,
-        &touched_keys,
-    )?;
+    let output_delta_batches = match &columnar.evaluator {
+        JoinTopNEvaluator::PartitionedBestBid(evaluator) => {
+            let left_key_idx = columnar
+                .left
+                .key_idx
+                .context("partitioned join-topn left key index is missing")?;
+            let right_key_idx = columnar
+                .right
+                .key_idx
+                .context("partitioned join-topn right key index is missing")?;
+            let mut touched_keys = HashSet::new();
+            collect_i64_keys_from_delta(&left_delta, left_key_idx, &mut touched_keys)?;
+            collect_i64_keys_from_delta(&right_delta, right_key_idx, &mut touched_keys)?;
 
-    let (previous_output, next_output) = if touched_keys.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        (
-            columnar
-                .evaluator
-                .evaluate(
-                    &columnar.left.source_name,
-                    &previous_left,
-                    &columnar.right.source_name,
-                    &previous_right,
+            let previous_left = filter_batches_to_i64_keys(
+                &columnar.left.schema,
+                left_key_idx,
+                &columnar.left.snapshot,
+                &touched_keys,
+            )?;
+            let previous_right = filter_batches_to_i64_keys(
+                &columnar.right.schema,
+                right_key_idx,
+                &columnar.right.snapshot,
+                &touched_keys,
+            )?;
+            let next_left = filter_batches_to_i64_keys(
+                &columnar.left.schema,
+                left_key_idx,
+                &next_left_snapshot,
+                &touched_keys,
+            )?;
+            let next_right = filter_batches_to_i64_keys(
+                &columnar.right.schema,
+                right_key_idx,
+                &next_right_snapshot,
+                &touched_keys,
+            )?;
+
+            let (previous_output, next_output) = if touched_keys.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    evaluator
+                        .evaluate(&previous_left, &previous_right)
+                        .await
+                        .context("evaluate previous join-topn partition outputs")?,
+                    evaluator
+                        .evaluate(&next_left, &next_right)
+                        .await
+                        .context("evaluate next join-topn partition outputs")?,
+                )
+            };
+            diff_snapshot_batches(
+                Arc::clone(&mv.output_schema),
+                &previous_output,
+                &next_output,
+            )
+            .await
+            .context("diff join-topn partition outputs")?
+            .batches
+        }
+        JoinTopNEvaluator::GlobalSnapshotDiff(evaluator) => {
+            if left_delta.batches().is_empty() && right_delta.batches().is_empty() {
+                Vec::new()
+            } else {
+                let next_output = evaluator
+                    .evaluate(
+                        &columnar.left.source_name,
+                        &next_left_snapshot,
+                        &columnar.right.source_name,
+                        &next_right_snapshot,
+                    )
+                    .await
+                    .context("evaluate global join-topn output")?;
+                diff_snapshot_batches(
+                    Arc::clone(&mv.output_schema),
+                    &mv.previous_snapshot,
+                    &next_output,
                 )
                 .await
-                .context("evaluate previous join-topn partition outputs")?,
-            columnar
-                .evaluator
-                .evaluate(
-                    &columnar.left.source_name,
-                    &next_left,
-                    &columnar.right.source_name,
-                    &next_right,
-                )
-                .await
-                .context("evaluate next join-topn partition outputs")?,
-        )
+                .context("diff global join-topn output")?
+                .batches
+            }
+        }
     };
-    let diff = diff_snapshot_batches(
-        Arc::clone(&mv.output_schema),
-        &previous_output,
-        &next_output,
-    )
-    .await
-    .context("diff join-topn partition outputs")?;
 
     let output_delta =
-        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
+        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build join-topn output zset delta")?;
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
@@ -509,7 +658,7 @@ fn filter_batches_to_i64_keys(
     Ok(output)
 }
 
-impl JoinTopNEvaluator {
+impl JoinTopNBestBidEvaluator {
     fn build(
         left_schema: &SchemaRef,
         right_schema: &SchemaRef,
@@ -566,9 +715,7 @@ impl JoinTopNEvaluator {
 
     async fn evaluate(
         &self,
-        _left_source: &str,
         left_batches: &[RecordBatch],
-        _right_source: &str,
         right_batches: &[RecordBatch],
     ) -> Result<Vec<RecordBatch>> {
         let mut builders = self
@@ -681,6 +828,154 @@ impl JoinTopNEvaluator {
         }
         Ok(())
     }
+}
+
+impl GlobalJoinTopNEvaluator {
+    async fn build(
+        logical_plan: LogicalPlan,
+        left_source_name: &str,
+        right_source_name: &str,
+        sources: &HashMap<String, VectorizedSourceState>,
+        output_schema: &SchemaRef,
+        udfs: &[ScalarUDF],
+    ) -> Result<Self> {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        for udf in udfs.iter().cloned() {
+            ctx.register_udf(udf);
+        }
+        let left_input = GlobalJoinTopNInput::new(left_source_name, sources)?;
+        let right_input = GlobalJoinTopNInput::new(right_source_name, sources)?;
+        let logical_plan = rebind_global_join_topn_logical_plan(
+            logical_plan,
+            left_source_name,
+            &left_input,
+            right_source_name,
+            &right_input,
+        )?;
+        Ok(Self {
+            ctx,
+            logical_plan,
+            left_input,
+            right_input,
+            output_schema: Arc::clone(output_schema),
+        })
+    }
+
+    async fn evaluate(
+        &self,
+        left_source_name: &str,
+        left_batches: &[RecordBatch],
+        right_source_name: &str,
+        right_batches: &[RecordBatch],
+    ) -> Result<Vec<RecordBatch>> {
+        self.left_input
+            .set_batches(left_batches)
+            .with_context(|| format!("set global join-topn left input for '{left_source_name}'"))?;
+        self.right_input
+            .set_batches(right_batches)
+            .with_context(|| {
+                format!("set global join-topn right input for '{right_source_name}'")
+            })?;
+        let plan = self
+            .ctx
+            .state()
+            .create_physical_plan(&self.logical_plan)
+            .await
+            .context("rebuild global join-topn physical plan")?;
+        let collected = collect(plan, self.ctx.task_ctx()).await;
+        self.clear_inputs()?;
+        normalize_batches(
+            collected.context("execute global join-topn evaluator")?,
+            &self.output_schema,
+        )
+    }
+
+    fn clear_inputs(&self) -> Result<()> {
+        self.left_input.clear()?;
+        self.right_input.clear()?;
+        Ok(())
+    }
+}
+
+impl GlobalJoinTopNInput {
+    fn new(source_name: &str, sources: &HashMap<String, VectorizedSourceState>) -> Result<Self> {
+        let source = sources
+            .get(source_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown global join-topn source '{source_name}'"))?;
+        let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&source.schema)));
+        let (alias_schema, alias_provider) = if let (Some(_alias), Some(alias_schema)) = (
+            source_name.strip_prefix("nexmark_"),
+            source.alias_schema.as_ref(),
+        ) {
+            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
+            (Some(Arc::clone(alias_schema)), Some(provider))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            provider,
+            alias_schema,
+            alias_provider,
+        })
+    }
+
+    fn provider_for_table(
+        &self,
+        source_name: &str,
+        table_name: &str,
+    ) -> Option<Arc<dyn TableProvider>> {
+        if table_name == source_name {
+            return Some(Arc::clone(&self.provider) as Arc<dyn TableProvider>);
+        }
+        if source_name.strip_prefix("nexmark_") == Some(table_name)
+            && let Some(alias_provider) = self.alias_provider.as_ref()
+        {
+            return Some(Arc::clone(alias_provider) as Arc<dyn TableProvider>);
+        }
+        None
+    }
+
+    fn set_batches(&self, batches: &[RecordBatch]) -> Result<()> {
+        self.provider.set_batches(batches.to_vec())?;
+        if let (Some(alias_schema), Some(alias_provider)) =
+            (self.alias_schema.as_ref(), self.alias_provider.as_ref())
+        {
+            alias_provider.set_batches(rename_batches(batches, alias_schema)?)?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<()> {
+        self.provider.set_batches(Vec::new())?;
+        if let Some(alias_provider) = self.alias_provider.as_ref() {
+            alias_provider.set_batches(Vec::new())?;
+        }
+        Ok(())
+    }
+}
+
+fn rebind_global_join_topn_logical_plan(
+    logical_plan: LogicalPlan,
+    left_source_name: &str,
+    left_input: &GlobalJoinTopNInput,
+    right_source_name: &str,
+    right_input: &GlobalJoinTopNInput,
+) -> Result<LogicalPlan> {
+    let transformed = logical_plan.transform_up(|plan| match plan {
+        LogicalPlan::TableScan(mut scan) => {
+            let table_name = scan.table_name.table();
+            let provider = left_input
+                .provider_for_table(left_source_name, table_name)
+                .or_else(|| right_input.provider_for_table(right_source_name, table_name));
+            let Some(provider) = provider else {
+                return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+            };
+            scan.source = provider_as_source(provider);
+            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        }
+        other => Ok(Transformed::no(other)),
+    })?;
+    Ok(transformed.data)
 }
 
 fn int64_column(batch: &RecordBatch, idx: usize) -> Result<&Int64Array> {
@@ -833,6 +1128,8 @@ fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
         LogicalPlan::Projection(projection) => collect_joins(projection.input.as_ref(), joins),
         LogicalPlan::Filter(filter) => collect_joins(filter.input.as_ref(), joins),
         LogicalPlan::SubqueryAlias(alias) => collect_joins(alias.input.as_ref(), joins),
+        LogicalPlan::Sort(sort) => collect_joins(sort.input.as_ref(), joins),
+        LogicalPlan::Limit(limit) => collect_joins(limit.input.as_ref(), joins),
         LogicalPlan::Window(window) => collect_joins(window.input.as_ref(), joins),
         _ => {}
     }
@@ -920,6 +1217,8 @@ fn contains_aggregate(plan: &LogicalPlan) -> bool {
         LogicalPlan::Projection(projection) => contains_aggregate(projection.input.as_ref()),
         LogicalPlan::Filter(filter) => contains_aggregate(filter.input.as_ref()),
         LogicalPlan::SubqueryAlias(alias) => contains_aggregate(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_aggregate(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_aggregate(limit.input.as_ref()),
         LogicalPlan::Window(window) => contains_aggregate(window.input.as_ref()),
         LogicalPlan::Join(join) => {
             contains_aggregate(join.left.as_ref()) || contains_aggregate(join.right.as_ref())
@@ -965,6 +1264,8 @@ fn collect_sources(
         }
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
+        LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
+        LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
         LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
         LogicalPlan::Join(join) => {
             collect_sources(join.left.as_ref(), sources, out);
@@ -979,6 +1280,71 @@ fn table_scan_source(
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Option<String> {
     resolve_source_table(scan.table_name.table().to_string(), sources)
+}
+
+fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            global_sort_limit_for_plan(projection.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => global_sort_limit_for_plan(alias.input.as_ref()),
+        LogicalPlan::Limit(Limit { input, fetch, .. }) if fetch.is_some() => {
+            contains_non_empty_sort(input.as_ref())
+        }
+        LogicalPlan::Sort(Sort { expr, fetch, .. }) => fetch.is_some() && !expr.is_empty(),
+        _ => false,
+    }
+}
+
+fn contains_non_empty_sort(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Sort(sort) => !sort.expr.is_empty(),
+        LogicalPlan::Projection(projection) => contains_non_empty_sort(projection.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_non_empty_sort(alias.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_non_empty_sort(filter.input.as_ref()),
+        _ => false,
+    }
+}
+
+fn contains_unsupported_global_join_topn_wrapper(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            contains_unsupported_global_join_topn_wrapper(projection.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            contains_unsupported_global_join_topn_wrapper(alias.input.as_ref())
+        }
+        LogicalPlan::Limit(limit) => {
+            limit.fetch.is_none()
+                || contains_unsupported_global_join_topn_wrapper(limit.input.as_ref())
+        }
+        LogicalPlan::Sort(sort) => {
+            sort.expr.is_empty()
+                || contains_unsupported_global_join_topn_wrapper(sort.input.as_ref())
+        }
+        LogicalPlan::Join(join) => {
+            contains_unsupported_global_join_input_wrapper(join.left.as_ref())
+                || contains_unsupported_global_join_input_wrapper(join.right.as_ref())
+        }
+        LogicalPlan::TableScan(_) => false,
+        _ => true,
+    }
+}
+
+fn contains_unsupported_global_join_input_wrapper(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            contains_unsupported_global_join_input_wrapper(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => {
+            contains_unsupported_global_join_input_wrapper(filter.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            contains_unsupported_global_join_input_wrapper(alias.input.as_ref())
+        }
+        LogicalPlan::TableScan(_) => false,
+        _ => true,
+    }
 }
 
 fn contains_unsupported_join_topn_wrapper(plan: &LogicalPlan) -> bool {
