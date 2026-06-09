@@ -99,6 +99,7 @@ enum AggregateKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregateValueType {
+    Any,
     Int64,
     Utf8,
 }
@@ -241,10 +242,13 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     for spec in &specs {
         if let (Some(value_idx), Some(value_type)) = (spec.value_idx, spec.value_type) {
             let expected = match value_type {
-                AggregateValueType::Int64 => &DataType::Int64,
-                AggregateValueType::Utf8 => &DataType::Utf8,
+                AggregateValueType::Any => None,
+                AggregateValueType::Int64 => Some(&DataType::Int64),
+                AggregateValueType::Utf8 => Some(&DataType::Utf8),
             };
-            if projection_schema.field(value_idx).data_type() != expected {
+            if let Some(expected) = expected
+                && projection_schema.field(value_idx).data_type() != expected
+            {
                 return Ok(None);
             }
         }
@@ -584,6 +588,11 @@ fn add_projected_stats_row_to_pending(
         }
         match (&mut group.agg_deltas[agg_idx], spec.kind) {
             (AggregateDelta::Count { count_delta }, AggregateKind::Count) => {
+                if spec.value_idx.is_some()
+                    && !projected_value_is_non_null(&value_arrays[agg_idx], row_idx)
+                {
+                    continue;
+                }
                 *count_delta = count_delta
                     .checked_add(sign)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats count delta overflow"))?;
@@ -769,7 +778,7 @@ async fn load_aggregate_values(
                     .await?
                     .map(AggregateValue::Utf8)
                     .unwrap_or(AggregateValue::Null),
-                None => AggregateValue::Null,
+                Some(AggregateValueType::Any) | None => AggregateValue::Null,
             },
         });
     }
@@ -982,6 +991,7 @@ fn aggregate_deltas_empty(deltas: &[AggregateDelta]) -> bool {
 
 enum ProjectedValueArray<'a> {
     None,
+    Any(&'a dyn Array),
     Int64(&'a Int64Array),
     Utf8(&'a StringArray),
 }
@@ -997,6 +1007,9 @@ fn projected_value_arrays<'a>(
                 return Ok(ProjectedValueArray::None);
             };
             match spec.value_type {
+                Some(AggregateValueType::Any) => {
+                    Ok(ProjectedValueArray::Any(batch.column(idx).as_ref()))
+                }
                 Some(AggregateValueType::Int64) => batch
                     .column(idx)
                     .as_any()
@@ -1040,6 +1053,15 @@ fn projected_i64_value(values: &ProjectedValueArray<'_>, row_idx: usize) -> Opti
         return None;
     };
     (!values.is_null(row_idx)).then(|| values.value(row_idx))
+}
+
+fn projected_value_is_non_null(values: &ProjectedValueArray<'_>, row_idx: usize) -> bool {
+    match values {
+        ProjectedValueArray::None => true,
+        ProjectedValueArray::Any(values) => !values.is_null(row_idx),
+        ProjectedValueArray::Int64(values) => !values.is_null(row_idx),
+        ProjectedValueArray::Utf8(values) => !values.is_null(row_idx),
+    }
 }
 
 fn projected_utf8_value<'a>(
@@ -1881,7 +1903,21 @@ fn aggregate_spec_for_expr(
             });
         }
         if !is_count_star_args(&params.args) {
-            return None;
+            let [value_expr] = params.args.as_slice() else {
+                return None;
+            };
+            let value_idx = projection_expr.len();
+            projection_expr.push(
+                value_expr
+                    .clone()
+                    .alias(format!("__floe_grouped_stats_count_value_{value_idx}")),
+            );
+            return Some(AggregateSpec {
+                kind: AggregateKind::Count,
+                value_idx: Some(value_idx),
+                filter_idx,
+                value_type: Some(AggregateValueType::Any),
+            });
         }
         return Some(AggregateSpec {
             kind: AggregateKind::Count,
@@ -2055,9 +2091,21 @@ fn grouped_stats_aggregate_for_plan(plan: &LogicalPlan) -> Option<GroupedStatsPl
                     projection: None,
                     post_aggregate_plan: Some(plan.clone()),
                 }),
-                _ => None,
+                _ => aggregate_under_post_aggregate_transform(projection.input.as_ref()).map(
+                    |aggregate| GroupedStatsPlanMatch {
+                        aggregate,
+                        projection: None,
+                        post_aggregate_plan: Some(plan.clone()),
+                    },
+                ),
             },
-            _ => None,
+            _ => aggregate_under_post_aggregate_transform(projection.input.as_ref()).map(
+                |aggregate| GroupedStatsPlanMatch {
+                    aggregate,
+                    projection: None,
+                    post_aggregate_plan: Some(plan.clone()),
+                },
+            ),
         },
         LogicalPlan::Filter(filter) => match filter.input.as_ref() {
             LogicalPlan::Aggregate(aggregate) => Some(GroupedStatsPlanMatch {
@@ -2065,12 +2113,40 @@ fn grouped_stats_aggregate_for_plan(plan: &LogicalPlan) -> Option<GroupedStatsPl
                 projection: None,
                 post_aggregate_plan: Some(plan.clone()),
             }),
-            _ => None,
+            _ => aggregate_under_post_aggregate_transform(filter.input.as_ref()).map(|aggregate| {
+                GroupedStatsPlanMatch {
+                    aggregate,
+                    projection: None,
+                    post_aggregate_plan: Some(plan.clone()),
+                }
+            }),
         },
         LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
             grouped_stats_aggregate_for_plan(sort.input.as_ref())
         }
         LogicalPlan::SubqueryAlias(alias) => grouped_stats_aggregate_for_plan(alias.input.as_ref()),
+        _ => {
+            aggregate_under_post_aggregate_transform(plan).map(|aggregate| GroupedStatsPlanMatch {
+                aggregate,
+                projection: None,
+                post_aggregate_plan: Some(plan.clone()),
+            })
+        }
+    }
+}
+
+fn aggregate_under_post_aggregate_transform(plan: &LogicalPlan) -> Option<&Aggregate> {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+        LogicalPlan::Projection(projection) => {
+            aggregate_under_post_aggregate_transform(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => {
+            aggregate_under_post_aggregate_transform(filter.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            aggregate_under_post_aggregate_transform(alias.input.as_ref())
+        }
         _ => None,
     }
 }

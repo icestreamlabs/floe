@@ -150,6 +150,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
     },
     ValidPlanRuntimeCase {
+        id: "aggregate_stats_topn",
+        sql: "SELECT bidder, SUM(price) AS total_price, COUNT(price) AS bid_count, AVG(price) AS avg_price FROM bid GROUP BY bidder ORDER BY total_price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "global_sort_limit_topn",
         sql: "SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5",
     },
@@ -206,6 +210,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction HAVING SUM(price) > 1000",
     },
     ValidPlanRuntimeCase {
+        id: "aggregate_projection_prune",
+        sql: "SELECT auction, total_price FROM (SELECT auction, SUM(price) AS total_price, COUNT(price) AS bid_count, AVG(price) AS avg_price FROM bid GROUP BY auction) a",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_having_projection_prune",
+        sql: "SELECT auction, total_price FROM (SELECT auction, SUM(price) AS total_price, COUNT(price) AS bid_count, AVG(price) AS avg_price FROM bid GROUP BY auction) a WHERE bid_count > 1",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_group_key_and_value_filter",
+        sql: "SELECT auction, COUNT(price) AS bid_count FROM bid GROUP BY auction HAVING auction > 10 AND COUNT(price) > 1",
+    },
+    ValidPlanRuntimeCase {
         id: "global_count",
         sql: "SELECT COUNT(*) AS c FROM bid",
     },
@@ -234,8 +250,16 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT COUNT(*) FILTER (WHERE price > 100) AS filtered_rows, COUNT(DISTINCT bidder) FILTER (WHERE price > 100) AS filtered_distinct_bidders FROM bid",
     },
     ValidPlanRuntimeCase {
+        id: "hop_window_aggregate",
+        sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)",
+    },
+    ValidPlanRuntimeCase {
         id: "hop_allowed_lateness_window",
         sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000, 1500)",
+    },
+    ValidPlanRuntimeCase {
+        id: "tumble_window_aggregate",
+        sql: "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, TUMBLE(\"dateTime\", 10000)",
     },
     ValidPlanRuntimeCase {
         id: "tumble_allowed_lateness_window",
