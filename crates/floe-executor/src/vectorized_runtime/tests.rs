@@ -6758,7 +6758,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
 }
 
 #[tokio::test]
-async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
+async fn asof_join_uses_slate_backed_columnar_operator_semantics() {
     let auctions = SourceDefinition::new(
         "auction",
         vec![
@@ -6823,7 +6823,7 @@ async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarAsofJoin
     );
 
     runtime
@@ -6890,7 +6890,7 @@ async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarAsofJoin
     );
     recovered.run_tick(3).await.expect("recovered tick");
 
@@ -6911,7 +6911,7 @@ async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
 }
 
 #[tokio::test]
-async fn asof_join_without_equi_keys_uses_slate_backed_columnar_composed_operator_semantics() {
+async fn asof_join_without_equi_keys_uses_slate_backed_columnar_operator_semantics() {
     let auctions = SourceDefinition::new(
         "auction",
         vec![
@@ -6973,7 +6973,7 @@ async fn asof_join_without_equi_keys_uses_slate_backed_columnar_composed_operato
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarAsofJoin
     );
 
     runtime

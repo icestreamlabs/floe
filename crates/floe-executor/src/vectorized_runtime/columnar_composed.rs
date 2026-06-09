@@ -49,6 +49,8 @@ pub(super) struct ColumnarComposedMaterializedViewState {
     output_zset: SlateBackedColumnarZSet,
     evaluator: ComposedEvaluator,
     initial_snapshot: Vec<RecordBatch>,
+    operator_label: &'static str,
+    log_mode: &'static str,
 }
 
 impl ColumnarComposedMaterializedViewState {
@@ -136,6 +138,16 @@ pub(super) fn columnar_composed_plan_for_plan(
     }))
 }
 
+pub(super) fn columnar_asof_join_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !plan_contains_asof_extension(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Extension(extension) => extension
@@ -177,15 +189,62 @@ pub(super) async fn build_columnar_composed_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "composed",
+        "composed",
+        "columnar_composed_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_asof_join_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "asof_join",
+        "ASOF join",
+        "columnar_asof_join_snapshot_diff",
+    )
+    .await
+}
+
+async fn build_columnar_snapshot_diff_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+    namespace_segment: &'static str,
+    operator_label: &'static str,
+    log_mode: &'static str,
+) -> Result<ColumnarComposedMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
-    let output_namespace = format!("{mv_namespace}/columnar/composed/output");
+    let output_namespace = format!("{mv_namespace}/columnar/{namespace_segment}/output");
     let output_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
         output_namespace,
         Arc::clone(output_schema),
     )
     .await
-    .context("initialize SlateDB-backed composed output zset")?;
+    .with_context(|| format!("initialize SlateDB-backed {operator_label} output zset"))?;
     let initial_snapshot = snapshot_batches_from_zset(
         &output_zset
             .materialize_columnar()
@@ -198,7 +257,8 @@ pub(super) async fn build_columnar_composed_materialized_view_state(
         let source = sources
             .get(source_name)
             .ok_or_else(|| anyhow::anyhow!("unknown composed source '{source_name}'"))?;
-        let input_namespace = format!("{mv_namespace}/columnar/composed/{source_name}/input");
+        let input_namespace =
+            format!("{mv_namespace}/columnar/{namespace_segment}/{source_name}/input");
         let input_zset = SlateBackedColumnarZSet::new(
             Arc::clone(&table),
             input_namespace,
@@ -206,7 +266,7 @@ pub(super) async fn build_columnar_composed_materialized_view_state(
         )
         .await
         .with_context(|| {
-            format!("initialize SlateDB-backed composed input zset for '{source_name}'")
+            format!("initialize SlateDB-backed {operator_label} input zset for '{source_name}'")
         })?;
         let snapshot = snapshot_batches_from_zset(
             &input_zset
@@ -237,6 +297,8 @@ pub(super) async fn build_columnar_composed_materialized_view_state(
         output_zset,
         evaluator,
         initial_snapshot,
+        operator_label,
+        log_mode,
     })
 }
 
@@ -247,7 +309,53 @@ pub(super) async fn run_columnar_composed_materialized_view_tick(
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
 ) -> Result<bool> {
-    let Some(columnar) = mv.columnar_composed.as_mut() else {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::Composed,
+    )
+    .await
+}
+
+pub(super) async fn run_columnar_asof_join_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::AsofJoin,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ColumnarSnapshotDiffSlot {
+    Composed,
+    AsofJoin,
+}
+
+async fn run_columnar_snapshot_diff_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+    slot: ColumnarSnapshotDiffSlot,
+) -> Result<bool> {
+    let Some(columnar) = (match slot {
+        ColumnarSnapshotDiffSlot::Composed => mv.columnar_composed.as_mut(),
+        ColumnarSnapshotDiffSlot::AsofJoin => mv.columnar_asof_join.as_mut(),
+    }) else {
         return Ok(false);
     };
     let plan_start = Instant::now();
@@ -320,8 +428,8 @@ pub(super) async fn run_columnar_composed_materialized_view_tick(
     .await
     .with_context(|| {
         format!(
-            "apply Slate-backed snapshot-diff composed columnar snapshot delta for '{}'",
-            mv.view_name
+            "apply Slate-backed snapshot-diff {} columnar snapshot delta for '{}'",
+            columnar.operator_label, mv.view_name
         )
     })?;
     for source in &mut columnar.sources {
@@ -337,8 +445,9 @@ pub(super) async fn run_columnar_composed_materialized_view_tick(
         view = %mv.view_name,
         version,
         total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_composed_snapshot_diff",
-        "SlateDB-backed snapshot-diff composed columnar DBSP materialized view tick completed"
+        mode = columnar.log_mode,
+        operator = columnar.operator_label,
+        "SlateDB-backed snapshot-diff columnar DBSP materialized view tick completed"
     );
     Ok(true)
 }

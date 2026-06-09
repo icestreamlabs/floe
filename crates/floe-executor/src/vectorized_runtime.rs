@@ -52,9 +52,10 @@ mod columnar_union;
 mod source_state;
 
 use columnar_composed::{
-    ColumnarComposedMaterializedViewState, build_columnar_composed_materialized_view_state,
+    ColumnarComposedMaterializedViewState, build_columnar_asof_join_materialized_view_state,
+    build_columnar_composed_materialized_view_state, columnar_asof_join_plan_for_plan,
     columnar_composed_plan_for_plan, plan_contains_asof_extension,
-    run_columnar_composed_materialized_view_tick,
+    run_columnar_asof_join_materialized_view_tick, run_columnar_composed_materialized_view_tick,
 };
 use columnar_count::{
     ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
@@ -196,6 +197,7 @@ struct VectorizedMaterializedViewState {
     columnar_join_top_avg: Option<ColumnarJoinTopAvgMaterializedViewState>,
     columnar_join_topn: Option<ColumnarJoinTopNMaterializedViewState>,
     columnar_multijoin: Option<ColumnarMultiJoinMaterializedViewState>,
+    columnar_asof_join: Option<ColumnarComposedMaterializedViewState>,
     columnar_topn: Option<ColumnarTopNMaterializedViewState>,
     columnar_union: Option<ColumnarUnionMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
@@ -223,6 +225,7 @@ enum MaterializedViewExecutionMode {
     ColumnarJoinTopAvg,
     ColumnarJoinTopN,
     ColumnarMultiJoin,
+    ColumnarAsofJoin,
     ColumnarTopN,
     ColumnarUnion,
     ColumnarCountByKey,
@@ -397,6 +400,7 @@ impl VectorizedExecutionRuntime {
                     .await
                     .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
             };
+            let df_has_asof_extension = plan_contains_asof_extension(df.logical_plan());
             let columnar_count_plan =
                 columnar_count_plan_for_plan(df.logical_plan(), &source_states, &mv.output_schema)?;
             let columnar_count = match (columnar_count_plan, options.operator_state_table.as_ref())
@@ -879,6 +883,56 @@ impl VectorizedExecutionRuntime {
                 ),
                 None => None,
             };
+            let columnar_asof_join_plan = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_grouped_max.is_none()
+                && columnar_grouped_stats.is_none()
+                && columnar_join.is_none()
+                && columnar_topn.is_none()
+                && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
+                && columnar_multijoin.is_none()
+                && columnar_union.is_none()
+                && columnar_stateless.is_none()
+                && incremental.is_none()
+                && df_has_asof_extension
+            {
+                columnar_asof_join_plan_for_plan(df.logical_plan(), &source_states)?
+            } else {
+                None
+            };
+            let columnar_asof_join = match (
+                columnar_asof_join_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_asof_join_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar ASOF join operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
             let columnar_composed_plan = if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
@@ -891,6 +945,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
                 && incremental.is_none()
+                && columnar_asof_join.is_none()
             {
                 columnar_composed_plan_for_plan(df.logical_plan(), &source_states)?
             } else {
@@ -940,6 +995,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
                 && incremental.is_none()
+                && columnar_asof_join.is_none()
                 && columnar_composed.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
             {
@@ -964,6 +1020,8 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarJoinTopN
             } else if columnar_multijoin.is_some() {
                 MaterializedViewExecutionMode::ColumnarMultiJoin
+            } else if columnar_asof_join.is_some() {
+                MaterializedViewExecutionMode::ColumnarAsofJoin
             } else if columnar_topn.is_some() {
                 MaterializedViewExecutionMode::ColumnarTopN
             } else if columnar_union.is_some() {
@@ -978,10 +1036,12 @@ impl VectorizedExecutionRuntime {
                 requires_full_refresh_execution_state = true;
                 MaterializedViewExecutionMode::FullRefresh
             };
-            let df_has_asof_extension = plan_contains_asof_extension(df.logical_plan());
             let plan = match df.create_physical_plan().await {
                 Ok(plan) => plan,
-                Err(err) if columnar_composed.is_some() && df_has_asof_extension => {
+                Err(err)
+                    if (columnar_asof_join.is_some() || columnar_composed.is_some())
+                        && df_has_asof_extension =>
+                {
                     Arc::new(EmptyExec::new(Arc::clone(&mv.output_schema)))
                         as Arc<dyn datafusion::physical_plan::ExecutionPlan>
                 }
@@ -1044,6 +1104,11 @@ impl VectorizedExecutionRuntime {
                             .map(ColumnarUnionMaterializedViewState::initial_snapshot)
                     })
                     .or_else(|| {
+                        columnar_asof_join
+                            .as_ref()
+                            .map(ColumnarComposedMaterializedViewState::initial_snapshot)
+                    })
+                    .or_else(|| {
                         columnar_composed
                             .as_ref()
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
@@ -1058,6 +1123,7 @@ impl VectorizedExecutionRuntime {
                 columnar_join_top_avg,
                 columnar_join_topn,
                 columnar_multijoin,
+                columnar_asof_join,
                 columnar_topn,
                 columnar_union,
                 columnar_count,
@@ -1348,6 +1414,17 @@ impl VectorizedExecutionRuntime {
                 continue;
             }
             if run_columnar_union_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            if run_columnar_asof_join_materialized_view_tick(
                 registry,
                 insert_batches,
                 weighted_delta_batches,
