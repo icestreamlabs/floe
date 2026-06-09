@@ -34,6 +34,11 @@ use super::columnar_composed::{
     build_columnar_aggregate_join_materialized_view_state_in_namespace,
     columnar_aggregate_join_plan_for_plan, run_columnar_composed_state_tick,
 };
+use super::columnar_grouped_stats::{
+    ColumnarGroupedStatsMaterializedViewState, ColumnarGroupedStatsPlan,
+    build_columnar_grouped_stats_materialized_view_state_in_namespace,
+    columnar_grouped_stats_plan_for_plan, run_columnar_grouped_stats_state_tick,
+};
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
     normalize_batches,
@@ -50,6 +55,11 @@ enum ColumnarTopNInputPlan {
     Source {
         source_name: String,
     },
+    GroupedStats {
+        input_name: String,
+        schema: SchemaRef,
+        plan: Box<ColumnarGroupedStatsPlan>,
+    },
     AggregateJoin {
         input_name: String,
         schema: SchemaRef,
@@ -61,6 +71,7 @@ impl ColumnarTopNPlan {
     pub(super) fn source_name(&self) -> Option<String> {
         match &self.input {
             ColumnarTopNInputPlan::Source { source_name } => Some(source_name.clone()),
+            ColumnarTopNInputPlan::GroupedStats { .. } => None,
             ColumnarTopNInputPlan::AggregateJoin { .. } => None,
         }
     }
@@ -70,6 +81,7 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     input_name: String,
     source_schema: SchemaRef,
     input_zset: Option<SlateBackedColumnarZSet>,
+    grouped_stats: Option<Box<ColumnarGroupedStatsMaterializedViewState>>,
     aggregate_join: Option<Box<ColumnarComposedMaterializedViewState>>,
     output_zset: SlateBackedColumnarZSet,
     evaluator: TopNEvaluator,
@@ -138,6 +150,14 @@ pub(super) fn columnar_topn_plan_for_plan(
             return Ok(None);
         }
         ColumnarTopNInputPlan::Source { source_name }
+    } else if let Some((input_name, schema, grouped_stats)) =
+        grouped_stats_topn_input_for_plan(plan, sources)?
+    {
+        ColumnarTopNInputPlan::GroupedStats {
+            input_name,
+            schema,
+            plan: Box::new(grouped_stats),
+        }
     } else if let Some((input_name, schema, aggregate_join)) =
         aggregate_join_topn_input_for_plan(plan, sources)?
     {
@@ -149,8 +169,12 @@ pub(super) fn columnar_topn_plan_for_plan(
     } else {
         return Ok(None);
     };
-    let full_snapshot_diff =
-        contains_aggregate(plan) || matches!(input, ColumnarTopNInputPlan::AggregateJoin { .. });
+    let full_snapshot_diff = contains_aggregate(plan)
+        || matches!(
+            input,
+            ColumnarTopNInputPlan::GroupedStats { .. }
+                | ColumnarTopNInputPlan::AggregateJoin { .. }
+        );
 
     Ok(Some(ColumnarTopNPlan {
         full_snapshot_diff,
@@ -218,6 +242,60 @@ pub(super) async fn build_columnar_topn_materialized_view_state(
                 input_name: source_name,
                 source_schema: Arc::clone(&source.schema),
                 input_zset: Some(input_zset),
+                grouped_stats: None,
+                aggregate_join: None,
+                output_zset,
+                evaluator,
+                partition_indices,
+                partition_converter,
+                source_snapshot,
+                initial_snapshot,
+                full_snapshot_diff: plan.full_snapshot_diff,
+            })
+        }
+        ColumnarTopNInputPlan::GroupedStats {
+            input_name,
+            schema,
+            plan: grouped_stats_plan,
+        } => {
+            let partition_indices = plan
+                .partition_columns
+                .iter()
+                .map(|column| partition_column_index_for_schema(&schema, column))
+                .collect::<Result<Vec<_>>>()?;
+            let partition_converter = row_converter_for_indices(&schema, &partition_indices)?;
+            let grouped_stats_namespace = format!("{mv_namespace}/columnar/topn/grouped_stats");
+            let grouped_stats = Box::pin(build_boxed_grouped_stats_topn_input_state(
+                Arc::clone(&table),
+                grouped_stats_namespace,
+                &schema,
+                *grouped_stats_plan,
+                sources,
+                udfs,
+            ))
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed topn grouped-stats input for '{}'",
+                    input_name
+                )
+            })?;
+            let source_snapshot = grouped_stats.initial_snapshot();
+            let evaluator = TopNEvaluator::build_derived_input(
+                plan.logical_plan,
+                &input_name,
+                &schema,
+                udfs,
+                output_schema,
+            )
+            .await
+            .context("build grouped-stats topn vectorized evaluator")?;
+
+            Ok(ColumnarTopNMaterializedViewState {
+                input_name,
+                source_schema: schema,
+                input_zset: None,
+                grouped_stats: Some(grouped_stats),
                 aggregate_join: None,
                 output_zset,
                 evaluator,
@@ -270,6 +348,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state(
                 input_name,
                 source_schema: schema,
                 input_zset: None,
+                grouped_stats: None,
                 aggregate_join: Some(aggregate_join),
                 output_zset,
                 evaluator,
@@ -281,6 +360,27 @@ pub(super) async fn build_columnar_topn_materialized_view_state(
             })
         }
     }
+}
+
+async fn build_boxed_grouped_stats_topn_input_state(
+    table: Arc<dyn KeyValueTable>,
+    namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarGroupedStatsPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<Box<ColumnarGroupedStatsMaterializedViewState>> {
+    Ok(Box::new(
+        build_columnar_grouped_stats_materialized_view_state_in_namespace(
+            table,
+            namespace,
+            output_schema,
+            plan,
+            sources,
+            udfs,
+        )
+        .await?,
+    ))
 }
 
 async fn build_boxed_aggregate_join_topn_input_state(
@@ -514,6 +614,14 @@ async fn prepare_topn_input_tick(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<TopNInputTick> {
+    if columnar.grouped_stats.is_some() {
+        return prepare_grouped_stats_topn_input_tick(
+            columnar,
+            insert_batches,
+            weighted_delta_batches,
+        )
+        .await;
+    }
     if columnar.aggregate_join.is_some() {
         return prepare_aggregate_join_topn_input_tick(
             columnar,
@@ -533,6 +641,48 @@ async fn prepare_topn_input_tick(
         delta,
         input_changed,
         next_source_snapshot: None,
+    })
+}
+
+async fn prepare_grouped_stats_topn_input_tick(
+    columnar: &mut ColumnarTopNMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<TopNInputTick> {
+    let Some(grouped_stats) = columnar.grouped_stats.as_mut() else {
+        return Ok(TopNInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?,
+            input_changed: false,
+            next_source_snapshot: None,
+        });
+    };
+    let tick = run_columnar_grouped_stats_state_tick(
+        grouped_stats.as_mut(),
+        insert_batches,
+        weighted_delta_batches,
+        &columnar.source_schema,
+        &columnar.source_snapshot,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "evaluate topn grouped-stats input '{}'",
+            columnar.input_name
+        )
+    })?;
+    let input_changed = !tick.delta.batches().is_empty();
+    if tick.input_changed && !input_changed {
+        columnar.source_snapshot = tick.next_snapshot;
+        return Ok(TopNInputTick {
+            delta: tick.delta,
+            input_changed: false,
+            next_source_snapshot: None,
+        });
+    }
+    Ok(TopNInputTick {
+        delta: tick.delta,
+        input_changed,
+        next_source_snapshot: input_changed.then_some(tick.next_snapshot),
     })
 }
 
@@ -879,6 +1029,17 @@ fn rebind_topn_derived_input_logical_plan(
             )?);
             Ok(LogicalPlan::Filter(filter))
         }
+        LogicalPlan::Limit(mut limit)
+            if limit_has_nonnegative_skip_and_positive_fetch(&limit)
+                && sort_input_for_limit(limit.input.as_ref()) =>
+        {
+            limit.input = Arc::new(rebind_topn_limit_sort_input_logical_plan(
+                limit.input.as_ref().clone(),
+                input_name,
+                provider,
+            )?);
+            Ok(LogicalPlan::Limit(limit))
+        }
         LogicalPlan::Limit(mut limit) => {
             limit.input = Arc::new(rebind_topn_derived_input_logical_plan(
                 limit.input.as_ref().clone(),
@@ -886,6 +1047,10 @@ fn rebind_topn_derived_input_logical_plan(
                 provider,
             )?);
             Ok(LogicalPlan::Limit(limit))
+        }
+        LogicalPlan::Sort(mut sort) if sort_has_positive_fetch(&sort) => {
+            sort.input = Arc::new(scan_plan_for_provider(input_name, provider)?);
+            Ok(LogicalPlan::Sort(sort))
         }
         LogicalPlan::Sort(mut sort) => {
             sort.input = Arc::new(rebind_topn_derived_input_logical_plan(
@@ -907,6 +1072,39 @@ fn rebind_topn_derived_input_logical_plan(
             Ok(LogicalPlan::SubqueryAlias(alias))
         }
         other => Ok(other),
+    }
+}
+
+fn rebind_topn_limit_sort_input_logical_plan(
+    logical_plan: LogicalPlan,
+    input_name: &str,
+    provider: Arc<dyn TableProvider>,
+) -> Result<LogicalPlan> {
+    match logical_plan {
+        LogicalPlan::Projection(mut projection) => {
+            projection.input = Arc::new(rebind_topn_limit_sort_input_logical_plan(
+                projection.input.as_ref().clone(),
+                input_name,
+                provider,
+            )?);
+            Ok(LogicalPlan::Projection(projection))
+        }
+        LogicalPlan::SubqueryAlias(mut alias) => {
+            if alias.alias.table() == input_name {
+                return scan_plan_for_provider(input_name, provider);
+            }
+            alias.input = Arc::new(rebind_topn_limit_sort_input_logical_plan(
+                alias.input.as_ref().clone(),
+                input_name,
+                provider,
+            )?);
+            Ok(LogicalPlan::SubqueryAlias(alias))
+        }
+        LogicalPlan::Sort(mut sort) if !sort.expr.is_empty() => {
+            sort.input = Arc::new(scan_plan_for_provider(input_name, provider)?);
+            Ok(LogicalPlan::Sort(sort))
+        }
+        other => rebind_topn_derived_input_logical_plan(other, input_name, provider),
     }
 }
 
@@ -958,6 +1156,25 @@ fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
     }
 }
 
+fn grouped_stats_topn_input_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<(String, SchemaRef, ColumnarGroupedStatsPlan)>> {
+    if !global_sort_limit_for_plan(plan) {
+        return Ok(None);
+    }
+    let Some(input) = global_topn_input_plan(plan) else {
+        return Ok(None);
+    };
+    let input_name =
+        derived_relation_name(input).unwrap_or_else(|| "__floe_topn_grouped_stats_input".into());
+    let schema = df_schema_to_arrow(input.schema());
+    let Some(grouped_stats) = columnar_grouped_stats_plan_for_plan(input, sources, &schema)? else {
+        return Ok(None);
+    };
+    Ok(Some((input_name, schema, grouped_stats)))
+}
+
 fn aggregate_join_topn_input_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -985,6 +1202,7 @@ fn global_topn_input_plan(plan: &LogicalPlan) -> Option<&LogicalPlan> {
     match plan {
         LogicalPlan::Projection(projection) => global_topn_input_plan(projection.input.as_ref()),
         LogicalPlan::Filter(filter) => global_topn_input_plan(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => global_topn_input_plan(alias.input.as_ref()),
         LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
             global_topn_input_plan(sort.input.as_ref())
         }
