@@ -210,6 +210,26 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: join_over_three_way_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "aggregate_over_three_way_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_person",
+                    batch: person_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_aggregate_over_three_way_join",
+            query: r#"SELECT p.id AS person_id, COUNT(b.price) AS bid_count FROM person p JOIN auction a ON p.id = a.seller JOIN bid b ON a.id = b.auction GROUP BY p.id"#,
+            output_schema: aggregate_over_three_way_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "union_join",
             sources: &[
                 NexmarkRuntimeSource {
@@ -979,6 +999,13 @@ fn join_over_three_way_join_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("seller", DataType::Int64, true),
         Field::new("person_id", DataType::Int64, true),
+    ]))
+}
+
+fn aggregate_over_three_way_join_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("person_id", DataType::Int64, true),
+        Field::new("bid_count", DataType::Int64, false),
     ]))
 }
 
