@@ -40,6 +40,7 @@ mod columnar_grouped_count;
 mod columnar_grouped_max;
 mod columnar_grouped_stats;
 mod columnar_join;
+mod columnar_join_top_avg;
 mod columnar_join_topn;
 mod columnar_stateless;
 mod columnar_topn;
@@ -66,6 +67,10 @@ use columnar_grouped_stats::{
 use columnar_join::{
     ColumnarJoinMaterializedViewState, build_columnar_join_materialized_view_state,
     columnar_join_plan_for_plan, run_columnar_join_materialized_view_tick,
+};
+use columnar_join_top_avg::{
+    ColumnarJoinTopAvgMaterializedViewState, build_columnar_join_top_avg_materialized_view_state,
+    columnar_join_top_avg_plan_for_plan, run_columnar_join_top_avg_materialized_view_tick,
 };
 use columnar_join_topn::{
     ColumnarJoinTopNMaterializedViewState, build_columnar_join_topn_materialized_view_state,
@@ -170,6 +175,7 @@ struct VectorizedMaterializedViewState {
     columnar_grouped_max: Option<ColumnarGroupedMaxMaterializedViewState>,
     columnar_grouped_stats: Option<ColumnarGroupedStatsMaterializedViewState>,
     columnar_join: Option<ColumnarJoinMaterializedViewState>,
+    columnar_join_top_avg: Option<ColumnarJoinTopAvgMaterializedViewState>,
     columnar_join_topn: Option<ColumnarJoinTopNMaterializedViewState>,
     columnar_topn: Option<ColumnarTopNMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
@@ -193,6 +199,7 @@ enum MaterializedViewExecutionMode {
     ColumnarGroupedMax,
     ColumnarGroupedStats,
     ColumnarJoin,
+    ColumnarJoinTopAvg,
     ColumnarJoinTopN,
     ColumnarTopN,
     ColumnarCountByKey,
@@ -604,6 +611,50 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
+            let columnar_join_top_avg_plan = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_grouped_max.is_none()
+                && columnar_grouped_stats.is_none()
+                && columnar_join.is_none()
+                && columnar_topn.is_none()
+                && columnar_join_topn.is_none()
+            {
+                columnar_join_top_avg_plan_for_plan(df.logical_plan(), &source_states)?
+            } else {
+                None
+            };
+            let columnar_join_top_avg = match (
+                columnar_join_top_avg_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_join_top_avg_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar join-top-avg operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
             let columnar_stateless_plan = if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
@@ -611,6 +662,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join.is_none()
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
             {
                 columnar_stateless_plan_for_plan(df.logical_plan(), &source_states)
             } else {
@@ -647,6 +699,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join.is_none()
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
                 && columnar_stateless.is_none()
             {
                 incremental_source_for_plan(df.logical_plan(), &source_states)
@@ -678,6 +731,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join.is_none()
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
                 && columnar_stateless.is_none()
                 && incremental.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
@@ -697,6 +751,8 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarGroupedStats
             } else if columnar_join.is_some() {
                 MaterializedViewExecutionMode::ColumnarJoin
+            } else if columnar_join_top_avg.is_some() {
+                MaterializedViewExecutionMode::ColumnarJoinTopAvg
             } else if columnar_join_topn.is_some() {
                 MaterializedViewExecutionMode::ColumnarJoinTopN
             } else if columnar_topn.is_some() {
@@ -741,6 +797,11 @@ impl VectorizedExecutionRuntime {
                             .map(ColumnarJoinMaterializedViewState::initial_snapshot)
                     })
                     .or_else(|| {
+                        columnar_join_top_avg
+                            .as_ref()
+                            .map(ColumnarJoinTopAvgMaterializedViewState::initial_snapshot)
+                    })
+                    .or_else(|| {
                         columnar_join_topn
                             .as_ref()
                             .map(ColumnarJoinTopNMaterializedViewState::initial_snapshot)
@@ -757,6 +818,7 @@ impl VectorizedExecutionRuntime {
                 columnar_grouped_max,
                 columnar_grouped_stats,
                 columnar_join,
+                columnar_join_top_avg,
                 columnar_join_topn,
                 columnar_topn,
                 columnar_count,
@@ -1002,6 +1064,17 @@ impl VectorizedExecutionRuntime {
                 continue;
             }
             if run_columnar_join_topn_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            if run_columnar_join_top_avg_materialized_view_tick(
                 registry,
                 insert_batches,
                 weighted_delta_batches,

@@ -82,6 +82,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: q3_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "q4",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_q4",
+            query: r#"SELECT category, AVG(max) FROM (SELECT MAX(b.price) AS max, a.category FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category"#,
+            output_schema: q4_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "q5",
             sources: &[NexmarkRuntimeSource {
                 source_name: "nexmark_bid",
@@ -90,6 +106,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             view_name: "mv_nexmark_q5",
             query: r#"SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP("dateTime", 2000, 10000)"#,
             output_schema: q5_output_schema,
+        },
+        NexmarkRuntimeCase {
+            id: "q6",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_q6",
+            query: r#"SELECT seller, AVG(price) AS moving_avg_price FROM (SELECT a.seller, b.price, b."dateTime", ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires) ranked WHERE rownum <= 1 GROUP BY seller"#,
+            output_schema: q6_output_schema,
         },
         NexmarkRuntimeCase {
             id: "q7",
@@ -593,10 +625,24 @@ fn q3_output_schema() -> SchemaRef {
     ]))
 }
 
+fn q4_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Int64, true),
+        Field::new("avg_max", DataType::Float64, true),
+    ]))
+}
+
 fn q5_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, true),
         Field::new("num", DataType::Int64, false),
+    ]))
+}
+
+fn q6_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, true),
+        Field::new("moving_avg_price", DataType::Float64, true),
     ]))
 }
 
