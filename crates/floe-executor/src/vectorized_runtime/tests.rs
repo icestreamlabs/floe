@@ -1206,6 +1206,133 @@ async fn empty_values_relation_persists_columnar_constant_state() {
 }
 
 #[tokio::test]
+async fn source_join_values_relation_uses_slate_backed_columnar_composed_operator() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![
+            SourceColumn::new("id", SourceDataType::Int64),
+            SourceColumn::new("amount", SourceDataType::Int64),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-composed-values-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("note", DataType::Utf8, false),
+    ]));
+    let query = "SELECT o.id, v.note FROM orders AS o JOIN \
+                 (VALUES (1, 'one'), (3, 'three')) AS v(id, note) ON o.id = v.id";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_orders_values").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("initial snapshot");
+    assert_eq!(id_note_rows(&snapshot), vec![(1, "one".to_string())]);
+    let delta = handle.arrow_delta_for(1).expect("initial delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(1, "one".to_string(), 1)]
+    );
+
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let source_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 3])),
+            Arc::new(Int64Array::from(vec![10, 30])),
+        ],
+    )
+    .expect("source delta rows");
+    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, 1])
+        .expect("weighted source rows");
+    runtime
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply weighted delta");
+    runtime.run_tick(2).await.expect("weighted tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("updated snapshot");
+    assert_eq!(id_note_rows(&snapshot), vec![(3, "three".to_string())]);
+    let delta = handle.arrow_delta_for(2).expect("updated delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(1, "one".to_string(), -1), (3, "three".to_string(), 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_orders_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_orders_values")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        id_note_rows(&recovered_snapshot),
+        vec![(3, "three".to_string())]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+}
+
+#[tokio::test]
 async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incrementally() {
     let definition = SourceDefinition::new(
         "orders",
