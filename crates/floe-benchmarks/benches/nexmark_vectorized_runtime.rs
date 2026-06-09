@@ -298,6 +298,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: join_aggregate_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "grouped_stats_over_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_grouped_stats_over_join",
+            query: r#"SELECT category, COUNT(*) AS bid_count FROM (SELECT a.category AS category, b.price AS price FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires) j GROUP BY category"#,
+            output_schema: grouped_stats_over_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "topn_over_aggregate_join",
             sources: &[
                 NexmarkRuntimeSource {
@@ -970,6 +986,13 @@ fn join_aggregate_join_output_schema() -> SchemaRef {
         Field::new("auction", DataType::Int64, false),
         Field::new("total_price", DataType::Int64, true),
         Field::new("person_id", DataType::Int64, false),
+    ]))
+}
+
+fn grouped_stats_over_join_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Int64, true),
+        Field::new("bid_count", DataType::Int64, false),
     ]))
 }
 

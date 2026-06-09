@@ -75,6 +75,16 @@ pub(super) struct ColumnarJoinPlan {
     execution_strategy: ColumnarJoinExecutionStrategy,
 }
 
+impl ColumnarJoinPlan {
+    pub(super) fn source_names(&self) -> BTreeSet<String> {
+        self.left
+            .source_names()
+            .into_iter()
+            .chain(self.right.source_names())
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ColumnarJoinExecutionStrategy {
     IncrementalInner,
@@ -221,9 +231,9 @@ struct JoinInputTick {
 }
 
 pub(super) struct ColumnarJoinTick {
-    delta: ColumnarZSet,
-    next_snapshot: Vec<RecordBatch>,
-    input_changed: bool,
+    pub(super) delta: ColumnarZSet,
+    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) input_changed: bool,
 }
 
 struct JoinDeltaEvaluator {
@@ -323,7 +333,7 @@ pub(super) async fn build_columnar_join_materialized_view_state(
     .await
 }
 
-async fn build_columnar_join_materialized_view_state_in_namespace(
+pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
     table: Arc<dyn KeyValueTable>,
     mv_namespace: String,
     output_schema: &SchemaRef,
@@ -1125,7 +1135,7 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     Ok(true)
 }
 
-async fn run_columnar_join_state_tick(
+pub(super) async fn run_columnar_join_state_tick(
     columnar: &mut ColumnarJoinMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,

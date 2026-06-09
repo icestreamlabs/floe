@@ -15,9 +15,10 @@ use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, ScalarValue};
+use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
-use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
@@ -34,6 +35,11 @@ use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::incremental_source_for_plan;
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
+use super::columnar_join::{
+    ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
+    build_columnar_join_materialized_view_state_in_namespace, columnar_join_plan_for_plan,
+    run_columnar_join_state_tick,
+};
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
@@ -46,7 +52,7 @@ const MINMAX_TAG: u8 = b'm';
 const VALUE_TAG: u8 = b'v';
 
 pub(super) struct ColumnarGroupedStatsPlan {
-    source_name: String,
+    input: ColumnarGroupedStatsInputPlan,
     projection: Projection,
     projection_schema: SchemaRef,
     aggregate_schema: SchemaRef,
@@ -59,17 +65,35 @@ pub(super) struct ColumnarGroupedStatsPlan {
 
 impl ColumnarGroupedStatsPlan {
     pub(super) fn source_names(&self) -> BTreeSet<String> {
-        [self.source_name.clone()].into_iter().collect()
+        match &self.input {
+            ColumnarGroupedStatsInputPlan::Source { source_name } => {
+                [source_name.clone()].into_iter().collect()
+            }
+            ColumnarGroupedStatsInputPlan::Join { plan, .. } => plan.source_names(),
+        }
     }
 }
 
+enum ColumnarGroupedStatsInputPlan {
+    Source {
+        source_name: String,
+    },
+    Join {
+        input_name: String,
+        schema: SchemaRef,
+        plan: Box<ColumnarJoinPlan>,
+    },
+}
+
 pub(super) struct ColumnarGroupedStatsMaterializedViewState {
-    source_name: String,
+    input_name: String,
     source_schema: SchemaRef,
-    input_zset: SlateBackedColumnarZSet,
+    input_zset: Option<SlateBackedColumnarZSet>,
+    join: Option<Box<ColumnarJoinMaterializedViewState>>,
+    input_snapshot: Vec<RecordBatch>,
     output_zset: SlateBackedColumnarZSet,
     stats_state: SlateGroupedStatsState,
-    projection_delta: IncrementalMaterializedViewState,
+    projection_delta: GroupedStatsProjectionState,
     projection_schema: SchemaRef,
     aggregate_schema: SchemaRef,
     post_aggregate: Option<PostAggregateTransformState>,
@@ -78,6 +102,17 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     output_mapping: Vec<usize>,
     group_count: usize,
     initial_snapshot: Vec<RecordBatch>,
+}
+
+enum GroupedStatsProjectionState {
+    Source(IncrementalMaterializedViewState),
+    Derived(GroupedStatsDerivedProjectionState),
+}
+
+struct GroupedStatsDerivedProjectionState {
+    ctx: SessionContext,
+    provider: Arc<DynamicStateTableProvider>,
+    plan: Arc<dyn ExecutionPlan>,
 }
 
 impl ColumnarGroupedStatsMaterializedViewState {
@@ -208,9 +243,24 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     if aggregate_schema.fields().len() != group_count + aggregate.aggr_expr.len() {
         return Ok(None);
     }
-    let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) else {
-        return Ok(None);
-    };
+    let input =
+        if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
+            ColumnarGroupedStatsInputPlan::Source { source_name }
+        } else if let Some(join) = columnar_join_plan_for_plan(aggregate.input.as_ref(), sources)? {
+            let schema = df_schema_to_arrow(aggregate.input.schema())?;
+            if schema_has_duplicate_field_names(&schema) {
+                return Ok(None);
+            }
+            let input_name = derived_relation_name(aggregate.input.as_ref())
+                .unwrap_or_else(|| "__floe_grouped_stats_join_input".to_string());
+            ColumnarGroupedStatsInputPlan::Join {
+                input_name,
+                schema,
+                plan: Box::new(join),
+            }
+        } else {
+            return Ok(None);
+        };
 
     let mut projection_expr = aggregate.group_expr.clone();
     let mut specs = Vec::with_capacity(aggregate.aggr_expr.len());
@@ -262,8 +312,17 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
             Expr::Literal(ScalarValue::Int64(Some(1)), None).alias("__floe_grouped_stats_row"),
         );
     }
+    let projection_input = match &input {
+        ColumnarGroupedStatsInputPlan::Source { .. } => aggregate.input.as_ref().clone(),
+        ColumnarGroupedStatsInputPlan::Join {
+            input_name, schema, ..
+        } => {
+            projection_expr = rewrite_projection_exprs_for_derived_input(projection_expr)?;
+            scan_plan_for_derived_input(input_name, schema)?
+        }
+    };
 
-    let projection_plan = Projection::try_new(projection_expr, Arc::clone(&aggregate.input))
+    let projection_plan = Projection::try_new(projection_expr, Arc::new(projection_input))
         .context("build grouped-stats value projection")?;
     let projection_schema = df_schema_to_arrow(&projection_plan.schema)?;
     for spec in &mut specs {
@@ -328,7 +387,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let group_schema = Arc::new(Schema::new(group_fields));
 
     Ok(Some(ColumnarGroupedStatsPlan {
-        source_name,
+        input,
         projection: projection_plan,
         projection_schema,
         aggregate_schema,
@@ -368,10 +427,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarGroupedStatsMaterializedViewState> {
-    let source = sources
-        .get(&plan.source_name)
-        .ok_or_else(|| anyhow::anyhow!("unknown vectorized source '{}'", plan.source_name))?;
-    let input_namespace = format!("{mv_namespace}/columnar/grouped_stats/input");
     let output_namespace = format!("{mv_namespace}/columnar/grouped_stats/output");
     let state_namespace = format!("{mv_namespace}/columnar/grouped_stats/state");
     let output_zset = SlateBackedColumnarZSet::new(
@@ -387,14 +442,82 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             .await
             .context("load grouped-stats output snapshot")?,
     )?;
-    let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
-        &plan.source_name,
-        sources,
-        udfs,
-        &LogicalPlan::Projection(plan.projection.clone()),
-    )
-    .await
-    .context("build grouped-stats vectorized projection delta plan")?;
+    let (input_name, source_schema, input_zset, join, input_snapshot, projection_delta) =
+        match plan.input {
+            ColumnarGroupedStatsInputPlan::Source { source_name } => {
+                let source = sources.get(&source_name).ok_or_else(|| {
+                    anyhow::anyhow!("unknown vectorized source '{}'", source_name)
+                })?;
+                let input_namespace = format!("{mv_namespace}/columnar/grouped_stats/input");
+                let input_zset = SlateBackedColumnarZSet::new(
+                    Arc::clone(&table),
+                    input_namespace,
+                    Arc::clone(&source.schema),
+                )
+                .await
+                .context("initialize SlateDB-backed grouped-stats input zset")?;
+                let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
+                    &source_name,
+                    sources,
+                    udfs,
+                    &LogicalPlan::Projection(plan.projection.clone()),
+                )
+                .await
+                .context("build grouped-stats vectorized projection delta plan")?;
+                (
+                    source_name,
+                    Arc::clone(&source.schema),
+                    Some(input_zset),
+                    None,
+                    Vec::new(),
+                    GroupedStatsProjectionState::Source(projection_delta),
+                )
+            }
+            ColumnarGroupedStatsInputPlan::Join {
+                input_name,
+                schema,
+                plan: join_plan,
+            } => {
+                let join_namespace = format!("{mv_namespace}/columnar/grouped_stats/join_input");
+                let join = Box::pin(build_boxed_join_grouped_stats_input_state(
+                    Arc::clone(&table),
+                    join_namespace,
+                    &schema,
+                    *join_plan,
+                    sources,
+                    udfs,
+                ))
+                .await
+                .with_context(|| {
+                    format!(
+                        "build SlateDB-backed grouped-stats join input for '{}'",
+                        input_name
+                    )
+                })?;
+                let input_snapshot = join.initial_snapshot();
+                let projection_delta = build_derived_projection_state(
+                    LogicalPlan::Projection(plan.projection.clone()),
+                    &input_name,
+                    &schema,
+                    udfs,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "build grouped-stats derived projection delta plan for '{}'",
+                        input_name
+                    )
+                })?;
+                (
+                    input_name,
+                    schema,
+                    None,
+                    Some(join),
+                    input_snapshot,
+                    GroupedStatsProjectionState::Derived(projection_delta),
+                )
+            }
+        };
     let post_aggregate = match plan.post_aggregate_plan {
         Some(post_plan) => Some(
             build_post_aggregate_transform_state(
@@ -409,15 +532,11 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
     };
 
     Ok(ColumnarGroupedStatsMaterializedViewState {
-        source_name: plan.source_name,
-        source_schema: Arc::clone(&source.schema),
-        input_zset: SlateBackedColumnarZSet::new(
-            Arc::clone(&table),
-            input_namespace,
-            Arc::clone(&source.schema),
-        )
-        .await
-        .context("initialize SlateDB-backed grouped-stats input zset")?,
+        input_name,
+        source_schema,
+        input_zset,
+        join,
+        input_snapshot,
         stats_state: SlateGroupedStatsState::new(
             table,
             &state_namespace,
@@ -434,6 +553,63 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         group_count: plan.group_count,
         initial_snapshot,
     })
+}
+
+async fn build_boxed_join_grouped_stats_input_state(
+    table: Arc<dyn KeyValueTable>,
+    namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarJoinPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<Box<ColumnarJoinMaterializedViewState>> {
+    Ok(Box::new(
+        build_columnar_join_materialized_view_state_in_namespace(
+            table,
+            namespace,
+            output_schema,
+            plan,
+            sources,
+            udfs,
+        )
+        .await?,
+    ))
+}
+
+async fn build_derived_projection_state(
+    logical_plan: LogicalPlan,
+    input_name: &str,
+    input_schema: &SchemaRef,
+    udfs: &[ScalarUDF],
+) -> Result<GroupedStatsDerivedProjectionState> {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    for udf in udfs.iter().cloned() {
+        ctx.register_udf(udf);
+    }
+    let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(input_schema)));
+    let logical_plan =
+        rebind_derived_projection_plan(logical_plan, input_name, Arc::clone(&provider))?;
+    let plan = ctx.state().create_physical_plan(&logical_plan).await?;
+    Ok(GroupedStatsDerivedProjectionState {
+        ctx,
+        provider,
+        plan,
+    })
+}
+
+fn rebind_derived_projection_plan(
+    logical_plan: LogicalPlan,
+    input_name: &str,
+    provider: Arc<DynamicStateTableProvider>,
+) -> Result<LogicalPlan> {
+    let transformed = logical_plan.transform_up(|plan| match plan {
+        LogicalPlan::TableScan(mut scan) if scan.table_name.table() == input_name => {
+            scan.source = provider_as_source(Arc::clone(&provider) as Arc<dyn TableProvider>);
+            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        }
+        other => Ok(Transformed::no(other)),
+    })?;
+    Ok(transformed.data)
 }
 
 pub(super) async fn run_columnar_grouped_stats_materialized_view_tick(
@@ -484,43 +660,8 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedStatsTick> {
-    let input_delta =
-        if let Some(weighted_batches) = weighted_delta_batches.get(columnar.source_name.as_str()) {
-            ColumnarZSet::try_new_weighted(
-                Arc::clone(&columnar.source_schema),
-                weighted_batches.clone(),
-            )
-            .with_context(|| {
-                format!(
-                    "build weighted grouped-stats input delta for '{}'",
-                    columnar.source_name
-                )
-            })?
-        } else if let Some(source_batches) = insert_batches.get(columnar.source_name.as_str()) {
-            ColumnarZSet::from_value_batches(
-                Arc::clone(&columnar.source_schema),
-                source_batches.clone(),
-                1,
-            )
-            .with_context(|| {
-                format!(
-                    "build insert grouped-stats input delta for '{}'",
-                    columnar.source_name
-                )
-            })?
-        } else {
-            ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
-        };
-
-    let persisted_input_delta = if let Some(handle) = columnar
-        .input_zset
-        .create_version(&input_delta, None)
-        .await?
-    {
-        columnar.input_zset.read_delta(&handle).await?
-    } else {
-        input_delta
-    };
+    let persisted_input_delta =
+        prepare_grouped_stats_input_delta(columnar, insert_batches, weighted_delta_batches).await?;
     let input_changed = !persisted_input_delta.batches().is_empty();
     let pending = grouped_stats_pending_delta(columnar, persisted_input_delta.batches()).await?;
     let output_delta_batches = apply_grouped_stats_delta(columnar, pending).await?;
@@ -556,6 +697,87 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
     })
 }
 
+async fn prepare_grouped_stats_input_delta(
+    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<ColumnarZSet> {
+    if columnar.join.is_some() {
+        return prepare_join_grouped_stats_input_delta(
+            columnar,
+            insert_batches,
+            weighted_delta_batches,
+        )
+        .await;
+    }
+
+    let input_delta =
+        if let Some(weighted_batches) = weighted_delta_batches.get(columnar.input_name.as_str()) {
+            ColumnarZSet::try_new_weighted(
+                Arc::clone(&columnar.source_schema),
+                weighted_batches.clone(),
+            )
+            .with_context(|| {
+                format!(
+                    "build weighted grouped-stats input delta for '{}'",
+                    columnar.input_name
+                )
+            })?
+        } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
+            ColumnarZSet::from_value_batches(
+                Arc::clone(&columnar.source_schema),
+                source_batches.clone(),
+                1,
+            )
+            .with_context(|| {
+                format!(
+                    "build insert grouped-stats input delta for '{}'",
+                    columnar.input_name
+                )
+            })?
+        } else {
+            ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
+        };
+
+    let input_zset = columnar
+        .input_zset
+        .as_mut()
+        .context("grouped-stats source input zset missing")?;
+    if let Some(handle) = input_zset.create_version(&input_delta, None).await? {
+        input_zset.read_delta(&handle).await
+    } else {
+        Ok(input_delta)
+    }
+}
+
+async fn prepare_join_grouped_stats_input_delta(
+    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<ColumnarZSet> {
+    let Some(join) = columnar.join.as_mut() else {
+        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
+    };
+    let tick = Box::pin(run_columnar_join_state_tick(
+        join.as_mut(),
+        insert_batches,
+        weighted_delta_batches,
+        &columnar.source_schema,
+        &columnar.input_snapshot,
+    ))
+    .await
+    .with_context(|| {
+        format!(
+            "evaluate grouped-stats nested join input '{}'",
+            columnar.input_name
+        )
+    })?;
+    if tick.input_changed {
+        columnar.input_snapshot = tick.next_snapshot;
+    }
+    Ok(tick.delta)
+}
+
 async fn grouped_stats_pending_delta(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     input_batches: &[RecordBatch],
@@ -572,31 +794,47 @@ async fn grouped_stats_pending_delta(
             unit_source_delta_batches(&columnar.source_schema, batch)?.with_context(|| {
                 format!(
                     "grouped-stats materialized view received non-unit weighted source deltas for '{}'",
-                    columnar.source_name
+                    columnar.input_name
                 )
             })?;
         positive_source_batches.extend(unit_delta.positive);
         negative_source_batches.extend(unit_delta.negative);
     }
 
-    let positive_output = collect_incremental_output(
-        &columnar.projection_delta,
-        &positive_source_batches,
-        &columnar.projection_schema,
-    )
-    .await?;
+    let positive_output =
+        collect_grouped_stats_projection_output(columnar, &positive_source_batches).await?;
     add_projected_stats_batches_to_pending(columnar, &positive_output, 1, &mut pending)?;
-    let negative_output = collect_incremental_output(
-        &columnar.projection_delta,
-        &negative_source_batches,
-        &columnar.projection_schema,
-    )
-    .await?;
+    let negative_output =
+        collect_grouped_stats_projection_output(columnar, &negative_source_batches).await?;
     add_projected_stats_batches_to_pending(columnar, &negative_output, -1, &mut pending)?;
     pending.retain(|_, delta| {
         delta.row_count_delta != 0 || !aggregate_deltas_empty(&delta.agg_deltas)
     });
     Ok(pending)
+}
+
+async fn collect_grouped_stats_projection_output(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    source_batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    if source_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    match &columnar.projection_delta {
+        GroupedStatsProjectionState::Source(incremental) => {
+            collect_incremental_output(incremental, source_batches, &columnar.projection_schema)
+                .await
+        }
+        GroupedStatsProjectionState::Derived(derived) => {
+            derived.provider.set_batches(source_batches.to_vec())?;
+            let collected = collect(Arc::clone(&derived.plan), derived.ctx.task_ctx()).await;
+            derived.provider.set_batches(Vec::new())?;
+            normalize_batches(
+                collected.context("execute grouped-stats derived projection")?,
+                &columnar.projection_schema,
+            )
+        }
+    }
 }
 
 fn add_projected_stats_batches_to_pending(
@@ -2727,6 +2965,36 @@ fn rebind_post_aggregate_plan(
     Ok(transformed.data)
 }
 
+fn rewrite_projection_exprs_for_derived_input(exprs: Vec<Expr>) -> Result<Vec<Expr>> {
+    exprs
+        .into_iter()
+        .map(unqualify_post_aggregate_expr)
+        .collect()
+}
+
+fn scan_plan_for_derived_input(input_name: &str, schema: &SchemaRef) -> Result<LogicalPlan> {
+    let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(schema)));
+    LogicalPlanBuilder::scan(
+        input_name,
+        provider_as_source(provider as Arc<dyn TableProvider>),
+        None,
+    )?
+    .build()
+    .map_err(Into::into)
+}
+
+fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Projection(projection) => derived_relation_name(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => derived_relation_name(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.to_string()),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            derived_relation_name(sort.input.as_ref())
+        }
+        _ => None,
+    }
+}
+
 fn unqualify_post_aggregate_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
     Ok(match plan {
         LogicalPlan::Projection(mut projection) => {
@@ -2908,6 +3176,14 @@ fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> Result<Schema
         .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
         .collect::<Vec<_>>();
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn schema_has_duplicate_field_names(schema: &SchemaRef) -> bool {
+    let mut seen = BTreeSet::new();
+    schema
+        .fields()
+        .iter()
+        .any(|field| !seen.insert(field.name().clone()))
 }
 
 fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
