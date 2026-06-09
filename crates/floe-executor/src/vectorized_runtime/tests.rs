@@ -9827,6 +9827,269 @@ async fn subquery_predicates_use_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
+async fn distinct_and_aggregate_in_subqueries_use_slate_backed_columnar_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+        ],
+    )
+    .expect("initial bids batch");
+    let sellers = SourceDefinition::new(
+        "auction_sellers",
+        vec![SourceColumn::new_nullable(
+            "seller",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("auction sellers source definition");
+    let sellers_schema = sellers.to_arrow_schema();
+    let initial_sellers = RecordBatch::try_new(
+        Arc::clone(&sellers_schema),
+        vec![Arc::new(Int64Array::from(vec![1, 1, 3]))],
+    )
+    .expect("initial sellers batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    sources.register(sellers);
+    let table = build_operator_state_table("vectorized-columnar-subquery-distinct-aggregate").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let distinct_query = "SELECT auction, price FROM bids \
+        WHERE auction IN (SELECT DISTINCT seller FROM auction_sellers)";
+    let aggregate_query = "SELECT auction, price FROM bids \
+        WHERE auction IN (SELECT seller FROM auction_sellers GROUP BY seller)";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_distinct_in_bids",
+                distinct_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_aggregate_in_bids",
+                aggregate_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+    assert_eq!(
+        runtime.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auction_sellers",
+            vec![initial_sellers.clone()],
+            vec![initial_sellers],
+        )
+        .await
+        .expect("append initial sellers");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let distinct_handle = registry
+        .get("mv_distinct_in_bids")
+        .expect("distinct IN materialized view");
+    assert_eq!(
+        id_count_rows(
+            &distinct_handle
+                .arrow_snapshot_for(1)
+                .expect("distinct IN snapshot")
+        ),
+        vec![(1, 100), (3, 300)]
+    );
+    let aggregate_handle = registry
+        .get("mv_aggregate_in_bids")
+        .expect("aggregate IN materialized view");
+    assert_eq!(
+        id_count_rows(
+            &aggregate_handle
+                .arrow_snapshot_for(1)
+                .expect("aggregate IN snapshot")
+        ),
+        vec![(1, 100), (3, 300)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_distinct_in_bids",
+                distinct_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_aggregate_in_bids",
+                aggregate_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+    assert_eq!(
+        recovered.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+    recovered.run_tick(2).await.expect("recovered tick");
+
+    let recovered_distinct = recovery_registry
+        .get("mv_distinct_in_bids")
+        .expect("recovered distinct IN materialized view");
+    let recovered_aggregate = recovery_registry
+        .get("mv_aggregate_in_bids")
+        .expect("recovered aggregate IN materialized view");
+    assert_eq!(
+        id_count_rows(
+            &recovered_distinct
+                .arrow_snapshot_for(2)
+                .expect("distinct IN recovered snapshot")
+        ),
+        vec![(1, 100), (3, 300)]
+    );
+    assert_eq!(
+        id_count_rows(
+            &recovered_aggregate
+                .arrow_snapshot_for(2)
+                .expect("aggregate IN recovered snapshot")
+        ),
+        vec![(1, 100), (3, 300)]
+    );
+
+    let seller_retract = RecordBatch::try_new(
+        Arc::clone(&sellers_schema),
+        vec![Arc::new(Int64Array::from(vec![1]))],
+    )
+    .expect("duplicate seller retract");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&sellers_schema)
+        .expect("weighted sellers schema");
+    let weighted = weighted_batch_from_diffs(&seller_retract, &weighted_schema, &[-1])
+        .expect("weighted duplicate seller retract");
+    recovered
+        .apply_weighted_source_delta("auction_sellers", weighted)
+        .await
+        .expect("apply duplicate seller retract");
+    recovered.run_tick(3).await.expect("duplicate retract tick");
+
+    assert_eq!(
+        id_count_rows(
+            &recovered_distinct
+                .arrow_snapshot_for(3)
+                .expect("distinct IN duplicate-retract snapshot")
+        ),
+        vec![(1, 100), (3, 300)]
+    );
+    assert!(
+        recovered_distinct
+            .arrow_delta_for(3)
+            .expect("distinct IN empty duplicate-retract delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+    assert_eq!(
+        id_count_rows(
+            &recovered_aggregate
+                .arrow_snapshot_for(3)
+                .expect("aggregate IN duplicate-retract snapshot")
+        ),
+        vec![(1, 100), (3, 300)]
+    );
+    assert!(
+        recovered_aggregate
+            .arrow_delta_for(3)
+            .expect("aggregate IN empty duplicate-retract delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+
+    let seller_retract = RecordBatch::try_new(
+        Arc::clone(&sellers_schema),
+        vec![Arc::new(Int64Array::from(vec![3]))],
+    )
+    .expect("seller retract");
+    let weighted = weighted_batch_from_diffs(&seller_retract, &weighted_schema, &[-1])
+        .expect("weighted seller retract");
+    recovered
+        .apply_weighted_source_delta("auction_sellers", weighted)
+        .await
+        .expect("apply seller retract");
+    recovered.run_tick(4).await.expect("seller retract tick");
+
+    assert_eq!(
+        id_count_rows(
+            &recovered_distinct
+                .arrow_snapshot_for(4)
+                .expect("distinct IN seller-retract snapshot")
+        ),
+        vec![(1, 100)]
+    );
+    assert_eq!(
+        weighted_id_count_rows(
+            &recovered_distinct
+                .arrow_delta_for(4)
+                .expect("distinct IN seller-retract delta")
+        ),
+        vec![(3, 300, -1)]
+    );
+    assert_eq!(
+        id_count_rows(
+            &recovered_aggregate
+                .arrow_snapshot_for(4)
+                .expect("aggregate IN seller-retract snapshot")
+        ),
+        vec![(1, 100)]
+    );
+    assert_eq!(
+        weighted_id_count_rows(
+            &recovered_aggregate
+                .arrow_delta_for(4)
+                .expect("aggregate IN seller-retract delta")
+        ),
+        vec![(3, 300, -1)]
+    );
+}
+
+#[tokio::test]
 async fn distinct_topn_uses_slate_backed_columnar_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",
