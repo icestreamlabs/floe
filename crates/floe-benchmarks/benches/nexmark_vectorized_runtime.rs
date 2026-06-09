@@ -262,6 +262,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: grouped_count_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "grouped_sum_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_grouped_sum_join",
+            query: r#"SELECT s.auction, s.total_price, a.seller FROM (SELECT auction, SUM(price) AS total_price FROM bid GROUP BY auction) s JOIN auction a ON s.auction = a.id"#,
+            output_schema: grouped_sum_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "filtered_join_topn",
             sources: &[
                 NexmarkRuntimeSource {
@@ -901,6 +917,14 @@ fn grouped_count_join_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("auction", DataType::Int64, false),
         Field::new("bid_count", DataType::Int64, false),
+        Field::new("seller", DataType::Int64, false),
+    ]))
+}
+
+fn grouped_sum_join_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("total_price", DataType::Int64, true),
         Field::new("seller", DataType::Int64, false),
     ]))
 }

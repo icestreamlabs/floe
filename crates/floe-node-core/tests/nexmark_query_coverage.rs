@@ -1099,6 +1099,7 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("join_over_three_way_join", "columnar_join"),
         ("union_join", "columnar_join"),
         ("aggregate_join", "columnar_join"),
+        ("join_over_global_aggregate", "columnar_join"),
         ("join_over_window_aggregate", "columnar_join"),
     ];
     for (case_id, expected_mode) in expected_modes {
