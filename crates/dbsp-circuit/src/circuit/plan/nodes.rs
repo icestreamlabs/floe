@@ -59,6 +59,55 @@ impl DbspOneRowNode {
 }
 
 #[derive(Clone, Debug)]
+pub struct DbspValuesNode {
+    output_schema: Arc<RowSchema>,
+    rows: Vec<Vec<DbspExpression>>,
+}
+
+impl DbspValuesNode {
+    pub fn try_new(output_schema: Arc<RowSchema>, rows: Vec<Vec<Expr>>) -> Result<Self> {
+        let empty_schema = RowSchema::try_new(Vec::new())?;
+        let mut typed_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != output_schema.len() {
+                bail!(
+                    "VALUES row has {} columns but schema has {}",
+                    row.len(),
+                    output_schema.len()
+                );
+            }
+            let mut typed_row = Vec::with_capacity(row.len());
+            for (idx, expr) in row.into_iter().enumerate() {
+                let expression = DbspExpression::analyze(expr, empty_schema.clone())?;
+                let field = output_schema.field(idx).expect("schema index checked");
+                if expression.data_type() != &field.data_type {
+                    bail!(
+                        "VALUES column {} type mismatch: expected {}, found {}",
+                        field.name,
+                        field.data_type.name(),
+                        expression.data_type().name()
+                    );
+                }
+                typed_row.push(expression);
+            }
+            typed_rows.push(typed_row);
+        }
+        Ok(Self {
+            output_schema,
+            rows: typed_rows,
+        })
+    }
+
+    pub fn output_schema(&self) -> &Arc<RowSchema> {
+        &self.output_schema
+    }
+
+    pub fn rows(&self) -> &[Vec<DbspExpression>] {
+        &self.rows
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DbspEmptyNode {
     output_schema: Arc<RowSchema>,
 }

@@ -33,7 +33,7 @@ pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSou
                     .or_default()
                     .extend(required_columns);
             }
-            DbspNodeKind::Empty(_) | DbspNodeKind::OneRow(_) => {}
+            DbspNodeKind::Empty(_) | DbspNodeKind::OneRow(_) | DbspNodeKind::Values(_) => {}
             DbspNodeKind::Select(select) => {
                 let input_idx = first_input(node, "select")?;
                 let mut input_columns = required_columns;

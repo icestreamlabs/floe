@@ -9,8 +9,8 @@ use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, col, lit, table_sca
 
 use floe_executor::dbsp_plan::{
     CircuitNode, CircuitPlan, DbspAggregateFunction, DbspAggregateNode, DbspNodeKind,
-    DbspPlanBuilder, DbspScalarType, DbspSourceNode, DbspWindowAggregateNode, DbspWindowPolicy,
-    DbspWindowSpec, Field, PlannerConfig, RowSchema, TableDescriptor,
+    DbspPlanBuilder, DbspScalarType, DbspSourceNode, DbspValuesNode, DbspWindowAggregateNode,
+    DbspWindowPolicy, DbspWindowSpec, Field, PlannerConfig, RowSchema, TableDescriptor,
     nexmark_auction_table as raw_nexmark_auction_table, nexmark_bid_table as raw_nexmark_bid_table,
     nexmark_config as raw_nexmark_config, nexmark_person_table as raw_nexmark_person_table,
     validate_dbsp_plan,
@@ -123,6 +123,19 @@ fn accepts_empty_operator_without_sources() -> Result<()> {
     assert!(validated.required_sources.is_empty());
     let root = plan.node(plan.root).expect("root");
     assert!(matches!(root.kind, DbspNodeKind::Empty(_)));
+    Ok(())
+}
+
+#[test]
+fn accepts_values_operator_without_sources() -> Result<()> {
+    let plan = values_plan()?;
+    let sources = BTreeSet::new();
+
+    let validated = validate_dbsp_plan(&plan, &sources, "mv_values")?;
+    assert_eq!(validated.root_node, plan.root);
+    assert!(validated.required_sources.is_empty());
+    let root = plan.node(plan.root).expect("root");
+    assert!(matches!(root.kind, DbspNodeKind::Values(_)));
     Ok(())
 }
 
@@ -316,6 +329,27 @@ fn empty_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
         .limit(0, Some(0))?
         .build()?;
     Ok(planner.build(&logical_plan)?)
+}
+
+fn values_plan() -> Result<CircuitPlan> {
+    let schema = RowSchema::try_new(vec![
+        Field::new("id", DbspScalarType::Int64, false),
+        Field::new("note", DbspScalarType::Utf8, false),
+    ])?;
+    let values = DbspValuesNode::try_new(
+        Arc::clone(&schema),
+        vec![vec![lit(1_i64), lit("a")], vec![lit(2_i64), lit("b")]],
+    )?;
+    let node = CircuitNode {
+        id: 0,
+        kind: DbspNodeKind::Values(values),
+        inputs: vec![],
+        output_schema: schema,
+    };
+    Ok(CircuitPlan {
+        root: 0,
+        nodes: vec![node],
+    })
 }
 
 fn union_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {

@@ -1047,6 +1047,165 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
 }
 
 #[tokio::test]
+async fn values_relation_uses_slate_backed_columnar_constant_operator() {
+    let sources = SourceRegistry::new();
+    let table = build_operator_state_table("vectorized-columnar-constant-values").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("note", DataType::Utf8, false),
+    ]));
+    let query = "SELECT id, note FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, note)";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarConstant
+    );
+
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_values").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("initial snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(1, "a".to_string()), (2, "b".to_string())]
+    );
+    let delta = handle.arrow_delta_for(1).expect("initial delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![(1, "a".to_string(), 1), (2, "b".to_string(), 1)]
+    );
+
+    runtime.run_tick(2).await.expect("stable tick");
+    let snapshot = handle.arrow_snapshot_for(2).expect("stable snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(1, "a".to_string()), (2, "b".to_string())]
+    );
+    let delta = handle.arrow_delta_for(2).expect("stable empty delta");
+    assert!(delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarConstant
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_values")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        id_note_rows(&recovered_snapshot),
+        vec![(1, "a".to_string()), (2, "b".to_string())]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+}
+
+#[tokio::test]
+async fn empty_values_relation_persists_columnar_constant_state() {
+    let sources = SourceRegistry::new();
+    let table = build_operator_state_table("vectorized-columnar-constant-empty-values").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("note", DataType::Utf8, false),
+    ]));
+    let query = "SELECT id, note FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, note) WHERE id > 10";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_empty_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarConstant
+    );
+
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_empty_values").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("empty snapshot");
+    assert!(id_note_rows(&snapshot).is_empty());
+    let delta = handle.arrow_delta_for(1).expect("empty delta");
+    assert!(delta.iter().all(|batch| batch.num_rows() == 0));
+    assert!(
+        table
+            .get_bytes(b"mv/mv_empty_values/columnar/constant/state/initialized")
+            .await
+            .expect("read initialized marker")
+            .is_some()
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_empty_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarConstant
+    );
+    recovered.run_tick(2).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_empty_values")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(2)
+        .expect("recovered empty snapshot");
+    assert!(id_note_rows(&recovered_snapshot).is_empty());
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(2)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+}
+
+#[tokio::test]
 async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incrementally() {
     let definition = SourceDefinition::new(
         "orders",

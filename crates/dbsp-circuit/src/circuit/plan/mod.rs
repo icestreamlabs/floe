@@ -6,7 +6,7 @@ pub use nodes::{
     DbspAggregateExpr, DbspAggregateFunction, DbspAggregateNode, DbspAsofJoinSpec,
     DbspDistinctNode, DbspEmptyNode, DbspJoinKey, DbspJoinNode, DbspJoinType, DbspNodeKind,
     DbspOneRowNode, DbspPredicate, DbspProjectExpr, DbspProjectNode, DbspRangeJoinSpec,
-    DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
+    DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspValuesNode,
     DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, GroupKeyExpr, OrderExpr,
     ProjectItem,
 };

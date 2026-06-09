@@ -133,6 +133,25 @@ fn plans_zero_row_empty_relation_projection() {
     );
 }
 
+#[tokio::test]
+async fn plans_values_relation() {
+    let plan = sql_plan("SELECT id, note FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, note)").await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let values = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Values(values) => Some(values),
+            _ => None,
+        })
+        .expect("values node");
+    assert_eq!(values.rows().len(), 2);
+    assert_eq!(values.output_schema().len(), 2);
+}
+
 #[test]
 fn prunes_unused_aggregate_calls_under_projection() {
     let bid = nexmark_bid_table();

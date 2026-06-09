@@ -33,6 +33,7 @@ use source_state::{
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 
 mod columnar_composed;
+mod columnar_constant;
 mod columnar_count;
 mod columnar_grouped_count;
 mod columnar_grouped_max;
@@ -94,6 +95,10 @@ use columnar_composed::{
     run_columnar_topn_composed_materialized_view_tick,
     run_columnar_union_aggregate_materialized_view_tick,
     run_columnar_union_join_materialized_view_tick, run_columnar_union_topn_materialized_view_tick,
+};
+use columnar_constant::{
+    ColumnarConstantMaterializedViewState, build_columnar_constant_materialized_view_state,
+    columnar_constant_plan_for_plan, run_columnar_constant_materialized_view_tick,
 };
 use columnar_count::{
     ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
@@ -225,6 +230,7 @@ struct VectorizedMaterializedViewState {
     view_name: String,
     output_schema: SchemaRef,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    columnar_constant: Option<ColumnarConstantMaterializedViewState>,
     previous_snapshot: Vec<RecordBatch>,
     columnar_stateless: Option<ColumnarStatelessMaterializedViewState>,
     columnar_grouped_count: Option<ColumnarGroupedCountMaterializedViewState>,
@@ -269,6 +275,7 @@ struct IncrementalMaterializedViewState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializedViewExecutionMode {
+    ColumnarConstant,
     ColumnarStateless,
     ColumnarGroupedCount,
     ColumnarGroupedMax,
@@ -305,6 +312,7 @@ enum MaterializedViewExecutionMode {
 impl MaterializedViewExecutionMode {
     fn as_str(self) -> &'static str {
         match self {
+            Self::ColumnarConstant => "columnar_constant",
             Self::ColumnarStateless => "columnar_stateless",
             Self::ColumnarGroupedCount => "columnar_grouped_count",
             Self::ColumnarGroupedMax => "columnar_grouped_max",
@@ -507,8 +515,43 @@ impl VectorizedExecutionRuntime {
                     .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
             };
             let df_has_asof_extension = plan_contains_asof_extension(df.logical_plan());
-            let columnar_count_plan =
-                columnar_count_plan_for_plan(df.logical_plan(), &source_states, &mv.output_schema)?;
+            let columnar_constant_plan = columnar_constant_plan_for_plan(df.logical_plan());
+            let columnar_constant = match (
+                columnar_constant_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_constant_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &ctx,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar constant operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
+            let columnar_count_plan = if columnar_constant.is_none() {
+                columnar_count_plan_for_plan(df.logical_plan(), &source_states, &mv.output_schema)?
+            } else {
+                None
+            };
             let columnar_count = match (columnar_count_plan, options.operator_state_table.as_ref())
             {
                 (Some(plan), Some(table)) => Some(
@@ -2049,6 +2092,7 @@ impl VectorizedExecutionRuntime {
                 _ => None,
             };
             if columnar_count.is_none()
+                && columnar_constant.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
                 && columnar_grouped_stats.is_none()
@@ -2085,7 +2129,9 @@ impl VectorizedExecutionRuntime {
                     mv.view_name
                 );
             }
-            let execution_mode = if columnar_stateless.is_some() {
+            let execution_mode = if columnar_constant.is_some() {
+                MaterializedViewExecutionMode::ColumnarConstant
+            } else if columnar_stateless.is_some() {
                 MaterializedViewExecutionMode::ColumnarStateless
             } else if columnar_grouped_count.is_some() {
                 MaterializedViewExecutionMode::ColumnarGroupedCount
@@ -2168,9 +2214,14 @@ impl VectorizedExecutionRuntime {
                 view_name: mv.view_name,
                 output_schema: mv.output_schema,
                 plan,
-                previous_snapshot: columnar_stateless
+                previous_snapshot: columnar_constant
                     .as_ref()
-                    .map(ColumnarStatelessMaterializedViewState::initial_snapshot)
+                    .map(ColumnarConstantMaterializedViewState::initial_snapshot)
+                    .or_else(|| {
+                        columnar_stateless
+                            .as_ref()
+                            .map(ColumnarStatelessMaterializedViewState::initial_snapshot)
+                    })
                     .or_else(|| {
                         columnar_grouped_count
                             .as_ref()
@@ -2312,6 +2363,7 @@ impl VectorizedExecutionRuntime {
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
                     })
                     .unwrap_or_default(),
+                columnar_constant,
                 columnar_stateless,
                 columnar_grouped_count,
                 columnar_grouped_max,
@@ -2524,6 +2576,9 @@ impl VectorizedExecutionRuntime {
         let insert_batches = &self.current_insert_batches;
         let weighted_delta_batches = &self.current_weighted_delta_batches;
         for mv in &mut self.materialized_views {
+            if run_columnar_constant_materialized_view_tick(registry, mv, version).await? {
+                continue;
+            }
             if run_columnar_stateless_materialized_view_tick(
                 registry,
                 insert_batches,

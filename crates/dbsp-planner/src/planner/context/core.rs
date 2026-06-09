@@ -227,9 +227,20 @@ impl<'cfg> PlannerContext<'cfg> {
                     schema: output_schema,
                 })
             }
-            LogicalPlan::Values(_) => Err(PlannerError::UnsupportedPlan(
-                "VALUES lists are not supported".to_string(),
-            )),
+            LogicalPlan::Values(values) => {
+                let output_schema = row_schema_from_dfschema(values.schema.as_ref())?;
+                let values_node =
+                    DbspValuesNode::try_new(output_schema.clone(), values.values.clone())?;
+                let id = self.add_node(
+                    vec![],
+                    DbspNodeKind::Values(values_node),
+                    output_schema.clone(),
+                );
+                Ok(PlannedNode {
+                    id,
+                    schema: output_schema,
+                })
+            }
             LogicalPlan::Explain(_) => Err(PlannerError::UnsupportedPlan(
                 "EXPLAIN plans are not supported".to_string(),
             )),

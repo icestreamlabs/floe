@@ -11,8 +11,8 @@ pub use plan::{
     DbspAggregateFunction, DbspAggregateNode, DbspAsofJoinSpec, DbspDistinctNode, DbspEmptyNode,
     DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspOneRowNode, DbspPredicate,
     DbspProjectNode, DbspRangeJoinSpec, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode,
-    DbspUnionNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, OrderExpr,
-    ProjectItem,
+    DbspUnionNode, DbspValuesNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec,
+    OrderExpr, ProjectItem,
 };
 pub use schema::{Field, FieldRef, PrimaryKey, RowSchema};
 pub use tables::{

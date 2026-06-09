@@ -66,6 +66,7 @@ pub enum DbspNodeKind {
     Source(DbspSourceNode),
     Empty(DbspEmptyNode),
     OneRow(DbspOneRowNode),
+    Values(DbspValuesNode),
     Select(DbspSelectNode),
     Project(DbspProjectNode),
     Join(Box<DbspJoinNode>),
