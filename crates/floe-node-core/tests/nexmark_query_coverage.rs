@@ -569,6 +569,10 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT auction AS key, price AS value FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) t WHERE rn <= 5",
     ),
     (
+        "partitioned_row_number_topn",
+        "SELECT auction AS key, price AS value FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) t WHERE rn <= 2",
+    ),
+    (
         "join",
         "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction = a.id",
     ),
@@ -585,12 +589,28 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT b.auction AS key, a.seller AS value FROM bid b LEFT JOIN auction a ON b.auction = a.id",
     ),
     (
+        "right_join",
+        "SELECT b.auction AS key, a.seller AS value FROM bid b RIGHT JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "full_join",
+        "SELECT b.auction AS key, a.seller AS value FROM bid b FULL OUTER JOIN auction a ON b.auction = a.id",
+    ),
+    (
         "semi_join",
         "SELECT b.auction AS key, b.price AS value FROM bid b LEFT SEMI JOIN auction a ON b.auction = a.id",
     ),
     (
         "anti_join",
         "SELECT b.auction AS key, b.price AS value FROM bid b LEFT ANTI JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "right_semi_join",
+        "SELECT a.id AS key, a.seller AS value FROM bid b RIGHT SEMI JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "right_anti_join",
+        "SELECT a.id AS key, a.seller AS value FROM bid b RIGHT ANTI JOIN auction a ON b.auction = a.id",
     ),
     (
         "range_join",
@@ -605,12 +625,32 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT a.seller AS key, b.price AS value FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction",
     ),
     (
+        "join_topn",
+        "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction = a.id ORDER BY b.price DESC LIMIT 5",
+    ),
+    (
+        "join_top_avg",
+        "SELECT auction AS key, CAST(avg_price AS BIGINT) AS value FROM (SELECT b.auction, AVG(b.price) AS avg_price FROM bid b JOIN auction a ON b.auction = a.id GROUP BY b.auction) j ORDER BY avg_price DESC LIMIT 5",
+    ),
+    (
         "union",
         "SELECT auction AS key, price AS value FROM bid UNION ALL SELECT id AS key, \"initialBid\" AS value FROM auction",
     ),
     (
+        "three_input_union",
+        "SELECT auction AS key, price AS value FROM bid UNION ALL SELECT id AS key, \"initialBid\" AS value FROM auction UNION ALL SELECT bidder AS key, price AS value FROM bid",
+    ),
+    (
         "union_distinct",
         "SELECT auction AS key, price AS value FROM bid UNION SELECT id AS key, \"initialBid\" AS value FROM auction",
+    ),
+    (
+        "intersect",
+        "SELECT auction AS key, price AS value FROM bid INTERSECT SELECT auction AS key, price AS value FROM bid WHERE price > 100",
+    ),
+    (
+        "except",
+        "SELECT auction AS key, price AS value FROM bid EXCEPT SELECT auction AS key, price AS value FROM bid WHERE price <= 100",
     ),
     (
         "distinct_union",
@@ -921,7 +961,7 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         skipped.len()
     );
     assert!(
-        execution_modes.len() >= 500,
+        execution_modes.len() >= 650,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
         execution_modes.len(),
         skipped.len()
