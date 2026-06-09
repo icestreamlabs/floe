@@ -158,6 +158,16 @@ pub(super) fn columnar_self_join_aggregate_plan_for_plan(
     columnar_composed_plan_for_plan(plan, sources)
 }
 
+pub(super) fn columnar_distinct_aggregate_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_distinct_aggregate(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Extension(extension) => extension
@@ -244,6 +254,43 @@ fn contains_self_join(
     }
 }
 
+fn contains_distinct_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => contains_distinct(aggregate.input.as_ref()),
+        LogicalPlan::Projection(projection) => {
+            contains_distinct_aggregate(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => contains_distinct_aggregate(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_distinct_aggregate(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_distinct_aggregate(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_distinct_aggregate(limit.input.as_ref()),
+        _ => false,
+    }
+}
+
+fn contains_distinct(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Distinct(_) => true,
+        LogicalPlan::Projection(projection) => contains_distinct(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_distinct(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_distinct(alias.input.as_ref()),
+        LogicalPlan::Subquery(subquery) => contains_distinct(subquery.subquery.as_ref()),
+        LogicalPlan::Aggregate(aggregate) => contains_distinct(aggregate.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_distinct(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_distinct(limit.input.as_ref()),
+        LogicalPlan::Window(window) => contains_distinct(window.input.as_ref()),
+        LogicalPlan::Repartition(repartition) => contains_distinct(repartition.input.as_ref()),
+        LogicalPlan::Join(join) => {
+            contains_distinct(join.left.as_ref()) || contains_distinct(join.right.as_ref())
+        }
+        LogicalPlan::Union(union) => union
+            .inputs
+            .iter()
+            .any(|input| contains_distinct(input.as_ref())),
+        _ => false,
+    }
+}
+
 pub(super) async fn build_columnar_composed_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
@@ -306,6 +353,28 @@ pub(super) async fn build_columnar_self_join_aggregate_materialized_view_state(
         "self_join_aggregate",
         "self-join aggregate",
         "columnar_self_join_aggregate_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_distinct_aggregate_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "distinct_aggregate",
+        "distinct aggregate",
+        "columnar_distinct_aggregate_snapshot_diff",
     )
     .await
 }
@@ -441,11 +510,30 @@ pub(super) async fn run_columnar_self_join_aggregate_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_distinct_aggregate_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::DistinctAggregate,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum ColumnarSnapshotDiffSlot {
     Composed,
     AsofJoin,
     SelfJoinAggregate,
+    DistinctAggregate,
 }
 
 async fn run_columnar_snapshot_diff_materialized_view_tick(
@@ -460,6 +548,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         ColumnarSnapshotDiffSlot::Composed => mv.columnar_composed.as_mut(),
         ColumnarSnapshotDiffSlot::AsofJoin => mv.columnar_asof_join.as_mut(),
         ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
+        ColumnarSnapshotDiffSlot::DistinctAggregate => mv.columnar_distinct_aggregate.as_mut(),
     }) else {
         return Ok(false);
     };

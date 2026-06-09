@@ -41,6 +41,7 @@ struct QueryCoverageResult {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct ActiveRuntimeCoverage {
     vectorized_runtime: bool,
+    execution_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +345,16 @@ async fn guards_active_vectorized_runtime_nexmark_columnar_subset() {
             "{query}: active vectorized runtime rejected supported columnar stateless plan ({})",
             result.error.as_deref().unwrap_or("no diagnostic provided")
         );
+        assert_ne!(
+            result.coverage.execution_mode.as_deref(),
+            Some("columnar_composed"),
+            "{query}: active vectorized runtime used generic columnar composed fallback"
+        );
+        assert_ne!(
+            result.coverage.execution_mode.as_deref(),
+            Some("full_refresh"),
+            "{query}: active vectorized runtime used full-refresh fallback"
+        );
     }
 }
 
@@ -355,12 +366,38 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
     let available_sources = available_nexmark_sources();
 
     let mut failures = Vec::new();
+    let mut execution_modes = BTreeMap::new();
     for case in VALID_DBSP_RUNTIME_PLAN_CASES {
-        if let Err(err) =
-            validate_active_vectorized_runtime_case(&registry, &planner, &available_sources, *case)
-                .await
+        match validate_active_vectorized_runtime_case(
+            &registry,
+            &planner,
+            &available_sources,
+            *case,
+        )
+        .await
         {
-            failures.push(format!("{}: {err:#}", case.id));
+            Ok(execution_mode) => {
+                execution_modes.insert(case.id, execution_mode);
+            }
+            Err(err) => {
+                failures.push(format!("{}: {err:#}", case.id));
+            }
+        }
+    }
+    eprintln!(
+        "active vectorized runtime DBSP-valid shape modes:\n{}",
+        serde_json::to_string_pretty(&execution_modes).expect("serialize execution modes")
+    );
+    for (case_id, execution_mode) in &execution_modes {
+        if execution_mode == "columnar_composed" {
+            failures.push(format!(
+                "{case_id}: active vectorized runtime used generic columnar composed fallback"
+            ));
+        }
+        if execution_mode == "full_refresh" {
+            failures.push(format!(
+                "{case_id}: active vectorized runtime used full-refresh fallback"
+            ));
         }
     }
 
@@ -478,7 +515,7 @@ async fn validate_active_vectorized_runtime_case(
     planner: &DbspPlanBuilder,
     available_sources: &BTreeSet<String>,
     case: ValidPlanRuntimeCase,
-) -> Result<()> {
+) -> Result<String> {
     let definition = parse_materialized_view(&format!(
         "CREATE MATERIALIZED VIEW {} AS {}",
         case.id, case.sql
@@ -504,7 +541,7 @@ async fn validate_active_vectorized_runtime_case(
         planned.definition().query().to_string(),
         output_schema,
     );
-    VectorizedExecutionRuntime::new_with_udfs_and_options(
+    let runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
         registry,
         vec![mv_plan],
         Arc::new(MaterializedViewRegistry::new()),
@@ -514,7 +551,12 @@ async fn validate_active_vectorized_runtime_case(
     .await
     .with_context(|| format!("active vectorized runtime rejected {}", case.id))?;
 
-    Ok(())
+    runtime
+        .materialized_view_execution_modes()
+        .into_iter()
+        .find(|(view_name, _)| *view_name == case.id)
+        .map(|(_, mode)| mode.to_string())
+        .with_context(|| format!("runtime did not expose execution mode for {}", case.id))
 }
 
 async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRuntimeCoverageResult>>
@@ -535,6 +577,7 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
                     ActiveRuntimeCoverageResult {
                         coverage: ActiveRuntimeCoverage {
                             vectorized_runtime: false,
+                            execution_mode: None,
                         },
                         error: Some(format!("SQL parse failed: {err}")),
                     },
@@ -551,6 +594,7 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
                     ActiveRuntimeCoverageResult {
                         coverage: ActiveRuntimeCoverage {
                             vectorized_runtime: false,
+                            execution_mode: None,
                         },
                         error: Some(format!("logical planning failed: {err}")),
                     },
@@ -567,6 +611,7 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
                     ActiveRuntimeCoverageResult {
                         coverage: ActiveRuntimeCoverage {
                             vectorized_runtime: false,
+                            execution_mode: None,
                         },
                         error: Some(format!("Arrow schema conversion failed: {err}")),
                     },
@@ -590,12 +635,18 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
         .await;
 
         match runtime {
-            Ok(_) => {
+            Ok(runtime) => {
+                let execution_mode = runtime
+                    .materialized_view_execution_modes()
+                    .into_iter()
+                    .find(|(view_name, _)| *view_name == query.id)
+                    .map(|(_, mode)| mode.to_string());
                 out.insert(
                     query.id.to_string(),
                     ActiveRuntimeCoverageResult {
                         coverage: ActiveRuntimeCoverage {
                             vectorized_runtime: true,
+                            execution_mode,
                         },
                         error: None,
                     },
@@ -607,6 +658,7 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
                     ActiveRuntimeCoverageResult {
                         coverage: ActiveRuntimeCoverage {
                             vectorized_runtime: false,
+                            execution_mode: None,
                         },
                         error: Some(format!("active vectorized runtime rejected plan: {err}")),
                     },

@@ -3005,6 +3005,140 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
 }
 
 #[tokio::test]
+async fn aggregate_over_distinct_subquery_uses_slate_backed_columnar_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let schema = bids.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 10, 20, 10])),
+        ],
+    )
+    .expect("initial bids batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-distinct-aggregate").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)]));
+    let query = "SELECT COUNT(auction) AS c \
+        FROM (SELECT DISTINCT auction, bidder FROM bids) d";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_distinct_bid_count",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctAggregate
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial bids");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_distinct_bid_count")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![3]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 3])),
+            Arc::new(Int64Array::from(vec![10, 30])),
+        ],
+    )
+    .expect("bid insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append bid insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![4]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(3, -1), (4, 1)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_distinct_bid_count",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctAggregate
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_distinct_bid_count")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(single_int_rows(&recovered_snapshot), vec![4]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![20])),
+        ],
+    )
+    .expect("bid retract batch");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&retract, &weighted_schema, &[-1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![3]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(3, 1), (4, -1)]);
+}
+
+#[tokio::test]
 async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     let definition = SourceDefinition::new(
         "orders",
