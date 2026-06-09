@@ -2527,6 +2527,20 @@ fn join_input_plan_for_side(
         }));
     }
 
+    let schema = df_schema_to_arrow(plan.schema());
+    if let Some(grouped_count) = columnar_grouped_count_plan_for_plan(plan, sources, &schema)? {
+        let input_name = constant_relation_name(plan)
+            .or_else(|| derived_relation_name(plan))
+            .unwrap_or_else(|| format!("__floe_join_{side}_grouped_count"));
+        return Ok(Some(ColumnarJoinInputPlan {
+            input_name,
+            schema,
+            kind: ColumnarJoinInputPlanKind::GroupedCount {
+                plan: grouped_count,
+            },
+        }));
+    }
+
     if let Some(input_name) = derived_relation_name(plan) {
         let schema = df_schema_to_arrow(plan.schema());
         if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(plan, sources, &schema)? {
@@ -2534,15 +2548,6 @@ fn join_input_plan_for_side(
                 input_name,
                 schema,
                 kind: ColumnarJoinInputPlanKind::GroupedMax { plan: grouped_max },
-            }));
-        }
-        if let Some(grouped_count) = columnar_grouped_count_plan_for_plan(plan, sources, &schema)? {
-            return Ok(Some(ColumnarJoinInputPlan {
-                input_name,
-                schema,
-                kind: ColumnarJoinInputPlanKind::GroupedCount {
-                    plan: grouped_count,
-                },
             }));
         }
         if let Some(grouped_stats) = columnar_grouped_stats_plan_for_plan(plan, sources, &schema)? {
@@ -2771,6 +2776,7 @@ fn collect_sources(
         LogicalPlan::Aggregate(aggregate) => {
             collect_sources(aggregate.input.as_ref(), sources, out)
         }
+        LogicalPlan::Distinct(distinct) => collect_sources(distinct.input(), sources, out),
         LogicalPlan::Union(union) => {
             for input in &union.inputs {
                 collect_sources(input.as_ref(), sources, out);
@@ -2838,9 +2844,8 @@ fn contains_unsupported_join_side_wrapper(
     {
         return Ok(false);
     }
-    if derived_relation_name(plan).is_some()
-        && columnar_grouped_count_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
-            .is_some()
+    if columnar_grouped_count_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
+        .is_some()
     {
         return Ok(false);
     }

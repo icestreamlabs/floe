@@ -414,6 +414,38 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: aggregate_over_join_avg_topn_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "aggregate_over_except_sources",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_aggregate_over_except_sources",
+            query: r#"SELECT key, SUM(value) AS total FROM (SELECT auction AS key, price AS value FROM bid EXCEPT SELECT id AS key, "initialBid" AS value FROM auction) s GROUP BY key"#,
+            output_schema: aggregate_over_except_sources_output_schema,
+        },
+        NexmarkRuntimeCase {
+            id: "aggregate_over_intersect_sources",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_aggregate_over_intersect_sources",
+            query: r#"SELECT SUM(value) AS total FROM (SELECT auction AS key, price AS value FROM bid INTERSECT SELECT id AS key, "initialBid" AS value FROM auction) s"#,
+            output_schema: aggregate_over_intersect_sources_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "filtered_join_topn",
             sources: &[
                 NexmarkRuntimeSource {
@@ -1109,6 +1141,21 @@ fn aggregate_over_join_topn_output_schema() -> SchemaRef {
 }
 
 fn aggregate_over_join_avg_topn_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "total",
+        DataType::Int64,
+        true,
+    )]))
+}
+
+fn aggregate_over_except_sources_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, true),
+        Field::new("total", DataType::Int64, true),
+    ]))
+}
+
+fn aggregate_over_intersect_sources_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "total",
         DataType::Int64,
