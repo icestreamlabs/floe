@@ -75,6 +75,16 @@ impl ColumnarTopNPlan {
             ColumnarTopNInputPlan::AggregateJoin { .. } => None,
         }
     }
+
+    pub(super) fn source_names(&self) -> BTreeSet<String> {
+        match &self.input {
+            ColumnarTopNInputPlan::Source { source_name } => {
+                [source_name.clone()].into_iter().collect()
+            }
+            ColumnarTopNInputPlan::GroupedStats { plan, .. } => plan.source_names(),
+            ColumnarTopNInputPlan::AggregateJoin { plan, .. } => plan.source_names(),
+        }
+    }
 }
 
 pub(super) struct ColumnarTopNMaterializedViewState {
@@ -96,6 +106,12 @@ struct TopNInputTick {
     delta: ColumnarZSet,
     input_changed: bool,
     next_source_snapshot: Option<Vec<RecordBatch>>,
+}
+
+pub(super) struct ColumnarTopNTick {
+    pub(super) delta: ColumnarZSet,
+    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) input_changed: bool,
 }
 
 impl ColumnarTopNMaterializedViewState {
@@ -193,6 +209,25 @@ pub(super) async fn build_columnar_topn_materialized_view_state(
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarTopNMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
+    build_columnar_topn_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarTopNPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarTopNMaterializedViewState> {
     let output_namespace = format!("{mv_namespace}/columnar/topn/output");
     let output_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
@@ -416,18 +451,57 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     };
     let plan_start = Instant::now();
 
+    let full_snapshot_diff = columnar.full_snapshot_diff;
+    let tick = run_columnar_topn_state_tick(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        &mv.output_schema,
+        &mv.previous_snapshot,
+    )
+    .await?;
+
+    let delta_batches = tick.delta.batches().to_vec();
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = tick.next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = if full_snapshot_diff {
+            "columnar_aggregate_topn"
+        } else {
+            "columnar_topn"
+        },
+        "SlateDB-backed topn columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+pub(super) async fn run_columnar_topn_state_tick(
+    columnar: &mut ColumnarTopNMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarTopNTick> {
     let input_tick = prepare_topn_input_tick(columnar, insert_batches, weighted_delta_batches)
         .await
         .context("prepare SlateDB-backed topn input tick")?;
     if columnar.full_snapshot_diff {
-        return run_columnar_topn_full_snapshot_diff_tick(
-            registry, mv, version, input_tick, plan_start,
+        return run_columnar_topn_full_snapshot_diff_state_tick(
+            columnar,
+            input_tick,
+            output_schema,
+            previous_snapshot,
         )
         .await;
     }
     if columnar.input_zset.is_none() {
         bail!("non-snapshot-diff topn requires a source input zset");
     }
+    let input_changed = input_tick.input_changed;
     let persisted_input_delta = input_tick.delta;
     let touched_partitions = touched_partition_keys(
         &columnar.partition_converter,
@@ -465,13 +539,9 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
         .evaluate(&next_source_for_keys)
         .await
         .context("evaluate next topn partition outputs")?;
-    let diff = diff_snapshot_batches(
-        Arc::clone(&mv.output_schema),
-        &previous_output,
-        &next_output,
-    )
-    .await
-    .context("diff topn partition outputs")?;
+    let diff = diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
+        .await
+        .context("diff topn partition outputs")?;
 
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
@@ -493,43 +563,25 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed topn columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
+            .await
+            .context("apply Slate-backed topn columnar snapshot delta")?;
 
     columnar.source_snapshot = next_source_snapshot;
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_topn",
-        "SlateDB-backed topn columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarTopNTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    })
 }
 
-async fn run_columnar_topn_full_snapshot_diff_tick(
-    registry: &MaterializedViewRegistry,
-    mv: &mut VectorizedMaterializedViewState,
-    version: i64,
+async fn run_columnar_topn_full_snapshot_diff_state_tick(
+    columnar: &mut ColumnarTopNMaterializedViewState,
     input_tick: TopNInputTick,
-    plan_start: Instant,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_topn.as_mut() else {
-        return Ok(false);
-    };
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarTopNTick> {
     let has_input_change = input_tick.input_changed;
     let next_source_snapshot = if let Some(snapshot) = input_tick.next_source_snapshot {
         snapshot
@@ -550,14 +602,10 @@ async fn run_columnar_topn_full_snapshot_diff_tick(
             .evaluate(&next_source_snapshot)
             .await
             .context("evaluate next aggregate-topn output")?;
-        diff_snapshot_batches(
-            Arc::clone(&mv.output_schema),
-            &mv.previous_snapshot,
-            &next_output,
-        )
-        .await
-        .context("diff aggregate-topn output")?
-        .batches
+        diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
+            .await
+            .context("diff aggregate-topn output")?
+            .batches
     } else {
         Vec::new()
     };
@@ -582,31 +630,17 @@ async fn run_columnar_topn_full_snapshot_diff_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed aggregate-topn columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
+            .await
+            .context("apply Slate-backed aggregate-topn columnar snapshot delta")?;
 
     columnar.source_snapshot = next_source_snapshot;
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_aggregate_topn",
-        "SlateDB-backed aggregate-topn columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarTopNTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed: has_input_change,
+    })
 }
 
 async fn prepare_topn_input_tick(

@@ -398,6 +398,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: aggregate_over_join_topn_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "aggregate_over_join_avg_topn",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_aggregate_over_join_avg_topn",
+            query: r#"SELECT SUM(value) AS total FROM (SELECT auction AS key, CAST(avg_price AS BIGINT) AS value FROM (SELECT b.auction, AVG(b.price) AS avg_price FROM bid b JOIN auction a ON b.auction = a.id GROUP BY b.auction) j ORDER BY avg_price DESC LIMIT 256) s"#,
+            output_schema: aggregate_over_join_avg_topn_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "filtered_join_topn",
             sources: &[
                 NexmarkRuntimeSource {
@@ -1090,6 +1106,14 @@ fn aggregate_over_join_topn_output_schema() -> SchemaRef {
         Field::new("key", DataType::Int64, true),
         Field::new("total", DataType::Int64, true),
     ]))
+}
+
+fn aggregate_over_join_avg_topn_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "total",
+        DataType::Int64,
+        true,
+    )]))
 }
 
 fn filtered_join_topn_output_schema() -> SchemaRef {
