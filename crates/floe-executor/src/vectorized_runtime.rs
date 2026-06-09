@@ -35,6 +35,7 @@ const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
 const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
 
+mod columnar_composed;
 mod columnar_count;
 mod columnar_grouped_count;
 mod columnar_grouped_max;
@@ -48,6 +49,10 @@ mod columnar_topn;
 mod columnar_union;
 mod source_state;
 
+use columnar_composed::{
+    ColumnarComposedMaterializedViewState, build_columnar_composed_materialized_view_state,
+    columnar_composed_plan_for_plan, run_columnar_composed_materialized_view_tick,
+};
 use columnar_count::{
     ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
     columnar_count_plan_for_plan, run_columnar_count_materialized_view_tick,
@@ -191,6 +196,7 @@ struct VectorizedMaterializedViewState {
     columnar_topn: Option<ColumnarTopNMaterializedViewState>,
     columnar_union: Option<ColumnarUnionMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
+    columnar_composed: Option<ColumnarComposedMaterializedViewState>,
     execution_mode: MaterializedViewExecutionMode,
 }
 
@@ -217,6 +223,7 @@ enum MaterializedViewExecutionMode {
     ColumnarTopN,
     ColumnarUnion,
     ColumnarCountByKey,
+    ColumnarComposed,
     IncrementalFilterProject,
     FullRefresh,
 }
@@ -858,6 +865,55 @@ impl VectorizedExecutionRuntime {
                 ),
                 None => None,
             };
+            let columnar_composed_plan = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_grouped_max.is_none()
+                && columnar_grouped_stats.is_none()
+                && columnar_join.is_none()
+                && columnar_topn.is_none()
+                && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
+                && columnar_multijoin.is_none()
+                && columnar_union.is_none()
+                && columnar_stateless.is_none()
+                && incremental.is_none()
+            {
+                columnar_composed_plan_for_plan(df.logical_plan(), &source_states)?
+            } else {
+                None
+            };
+            let columnar_composed = match (
+                columnar_composed_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_composed_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar composed operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
             if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
@@ -870,6 +926,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_union.is_none()
                 && columnar_stateless.is_none()
                 && incremental.is_none()
+                && columnar_composed.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
             {
                 bail!(
@@ -899,6 +956,8 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarUnion
             } else if columnar_count.is_some() {
                 MaterializedViewExecutionMode::ColumnarCountByKey
+            } else if columnar_composed.is_some() {
+                MaterializedViewExecutionMode::ColumnarComposed
             } else if incremental.is_some() {
                 MaterializedViewExecutionMode::IncrementalFilterProject
             } else {
@@ -961,6 +1020,11 @@ impl VectorizedExecutionRuntime {
                             .as_ref()
                             .map(ColumnarUnionMaterializedViewState::initial_snapshot)
                     })
+                    .or_else(|| {
+                        columnar_composed
+                            .as_ref()
+                            .map(ColumnarComposedMaterializedViewState::initial_snapshot)
+                    })
                     .unwrap_or_default(),
                 incremental,
                 columnar_stateless,
@@ -974,6 +1038,7 @@ impl VectorizedExecutionRuntime {
                 columnar_topn,
                 columnar_union,
                 columnar_count,
+                columnar_composed,
                 execution_mode,
             });
         }
@@ -1260,6 +1325,17 @@ impl VectorizedExecutionRuntime {
                 continue;
             }
             if run_columnar_union_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            if run_columnar_composed_materialized_view_tick(
                 registry,
                 insert_batches,
                 weighted_delta_batches,
