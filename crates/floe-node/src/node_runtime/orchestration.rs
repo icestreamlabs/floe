@@ -522,11 +522,11 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let maintain_source_query_tables = !run_args.disable_pgwire;
-    let vectorized_runtime_options = if maintain_source_query_tables {
-        VectorizedExecutionRuntimeOptions::default().with_source_query_tables()
-    } else {
-        VectorizedExecutionRuntimeOptions::default()
-    };
+    let mut vectorized_runtime_options = VectorizedExecutionRuntimeOptions::default()
+        .with_operator_state_table(checkpoint_manager.store().table());
+    if maintain_source_query_tables {
+        vectorized_runtime_options = vectorized_runtime_options.with_source_query_tables();
+    }
     let mut vectorized_runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &source_registry,
         vectorized_mv_plans,

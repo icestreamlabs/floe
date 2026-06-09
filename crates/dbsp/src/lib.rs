@@ -45,6 +45,7 @@ pub use operator_state_registry::{
     snapshot_operator_states, snapshot_operator_states_for_graph,
 };
 pub use operators::aggregate::{AggregateOp, AggregateSpec};
+pub use operators::columnar_count::{ColumnarCountByKeyOp, SlateBackedColumnarCountByKeyOp};
 pub use operators::count_aggregate::{
     CountAggregateOp, CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,
     GroupedCountState,

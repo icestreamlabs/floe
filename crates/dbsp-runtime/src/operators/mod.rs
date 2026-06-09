@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod columnar_count;
 pub mod count_aggregate;
 pub mod distinct;
 mod group_by;

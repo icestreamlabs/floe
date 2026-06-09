@@ -65,7 +65,7 @@ pub(super) fn incremental_source_for_plan(
     }
 }
 
-fn resolve_source_table(
+pub(super) fn resolve_source_table(
     table_name: String,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Option<String> {

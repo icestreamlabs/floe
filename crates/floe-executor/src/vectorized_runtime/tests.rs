@@ -3,10 +3,13 @@ use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::storage::{KeyValueTable, SlateTable};
 use floe_core::source::{
     AppendIngestEvent, SourceColumn, SourceDataType, SourceDefinition, SourceRegistry,
 };
+use object_store::memory::InMemory;
 use serde_json::json;
+use slatedb::Db;
 
 fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
     let values = batch
@@ -15,6 +18,12 @@ fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
         .downcast_ref::<Int64Array>()
         .expect("int64 column");
     (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
+async fn build_operator_state_table(name: &str) -> Arc<dyn KeyValueTable> {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
+    Arc::new(SlateTable::new(db))
 }
 
 #[tokio::test]
@@ -213,6 +222,167 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     assert_eq!(source_rows.len(), 1);
     assert_eq!(int64_values(&source_rows[0], 0), vec![1]);
     assert_eq!(int64_values(&source_rows[0], 1), vec![40]);
+}
+
+#[tokio::test]
+async fn count_group_by_uses_slate_backed_columnar_operator_incrementally() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 1, 2]))],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-count").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_order_counts",
+            "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_order_counts").expect("materialized view");
+    let version = handle.latest_version().expect("mv version");
+    let snapshot = handle.arrow_snapshot_for(version).expect("mv snapshot");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(int64_values(&snapshot[0], 0), vec![1, 2]);
+    assert_eq!(int64_values(&snapshot[0], 1), vec![2, 1]);
+
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let source_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    )
+    .expect("source delta rows");
+    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, 1, 1])
+        .expect("weighted source rows");
+    runtime
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply weighted delta");
+    runtime.run_tick(2).await.expect("weighted tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(int64_values(&snapshot[0], 0), vec![1, 2, 3]);
+    assert_eq!(int64_values(&snapshot[0], 1), vec![1, 2, 1]);
+
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    let delta = delta
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .collect::<Vec<_>>();
+    assert_eq!(delta.len(), 1);
+    let weight_idx = delta[0]
+        .schema()
+        .index_of(WEIGHT_COLUMN_NAME)
+        .expect("weight column");
+    assert_eq!(int64_values(delta[0], 0), vec![1, 1, 2, 2, 3]);
+    assert_eq!(int64_values(delta[0], 1), vec![2, 1, 1, 2, 1]);
+    assert_eq!(int64_values(delta[0], weight_idx), vec![-1, 1, -1, 1, 1]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_order_counts",
+            "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_order_counts")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(recovered_snapshot.len(), 1);
+    assert_eq!(int64_values(&recovered_snapshot[0], 0), vec![1, 2, 3]);
+    assert_eq!(int64_values(&recovered_snapshot[0], 1), vec![1, 2, 1]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+}
+
+#[tokio::test]
+async fn count_group_by_requires_slate_backed_operator_state_table() {
+    let definition = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+
+    let result = VectorizedExecutionRuntime::new(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_order_counts",
+            "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+    )
+    .await;
+
+    let err = match result {
+        Ok(_) => panic!("count MV should require SlateDB-backed operator state"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("requires SlateDB-backed operator state"),
+        "{err:#}"
+    );
 }
 
 #[tokio::test]

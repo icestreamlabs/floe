@@ -11,6 +11,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
+use dbsp::storage::KeyValueTable;
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
 use crate::delta_consolidation::{
@@ -32,7 +33,13 @@ const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
 const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
 
+mod columnar_count;
 mod source_state;
+
+use columnar_count::{
+    ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
+    columnar_count_plan_for_plan, run_columnar_count_materialized_view_tick,
+};
 
 #[derive(Debug, Clone)]
 pub struct VectorizedMaterializedViewPlan {
@@ -68,15 +75,36 @@ pub enum VectorizedMaterializedViewExecutionPolicy {
     AllowFullRefresh,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Default)]
 pub struct VectorizedExecutionRuntimeOptions {
     pub maintain_source_query_tables: bool,
+    pub operator_state_table: Option<Arc<dyn KeyValueTable>>,
 }
 
 impl VectorizedExecutionRuntimeOptions {
     pub fn with_source_query_tables(mut self) -> Self {
         self.maintain_source_query_tables = true;
         self
+    }
+
+    pub fn with_operator_state_table(mut self, table: Arc<dyn KeyValueTable>) -> Self {
+        self.operator_state_table = Some(table);
+        self
+    }
+}
+
+impl std::fmt::Debug for VectorizedExecutionRuntimeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorizedExecutionRuntimeOptions")
+            .field(
+                "maintain_source_query_tables",
+                &self.maintain_source_query_tables,
+            )
+            .field(
+                "operator_state_table",
+                &self.operator_state_table.as_ref().map(|_| "SlateDB"),
+            )
+            .finish()
     }
 }
 
@@ -98,6 +126,7 @@ struct VectorizedMaterializedViewState {
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     previous_snapshot: Vec<RecordBatch>,
     incremental: Option<IncrementalMaterializedViewState>,
+    columnar_count: Option<ColumnarCountMaterializedViewState>,
     execution_mode: MaterializedViewExecutionMode,
 }
 
@@ -113,6 +142,7 @@ struct IncrementalMaterializedViewState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializedViewExecutionMode {
+    ColumnarCountByKey,
     IncrementalFilterProject,
     FullRefresh,
 }
@@ -272,7 +302,40 @@ impl VectorizedExecutionRuntime {
                 .sql(&mv.query)
                 .await
                 .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
-            let incremental_source = incremental_source_for_plan(df.logical_plan(), &source_states);
+            let columnar_count_plan =
+                columnar_count_plan_for_plan(df.logical_plan(), &source_states, &mv.output_schema)?;
+            let columnar_count = match (columnar_count_plan, options.operator_state_table.as_ref())
+            {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_count_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        plan,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar count operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
+            let incremental_source = if columnar_count.is_none() {
+                incremental_source_for_plan(df.logical_plan(), &source_states)
+            } else {
+                None
+            };
             let incremental = match incremental_source {
                 Some(source_name) => Some(
                     build_incremental_materialized_view_state(
@@ -291,7 +354,8 @@ impl VectorizedExecutionRuntime {
                 ),
                 None => None,
             };
-            if incremental.is_none()
+            if columnar_count.is_none()
+                && incremental.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
             {
                 bail!(
@@ -299,7 +363,9 @@ impl VectorizedExecutionRuntime {
                     mv.view_name
                 );
             }
-            let execution_mode = if incremental.is_some() {
+            let execution_mode = if columnar_count.is_some() {
+                MaterializedViewExecutionMode::ColumnarCountByKey
+            } else if incremental.is_some() {
                 MaterializedViewExecutionMode::IncrementalFilterProject
             } else {
                 requires_full_refresh_execution_state = true;
@@ -315,6 +381,7 @@ impl VectorizedExecutionRuntime {
                 plan,
                 previous_snapshot: Vec::new(),
                 incremental,
+                columnar_count,
                 execution_mode,
             });
         }
@@ -490,6 +557,17 @@ impl VectorizedExecutionRuntime {
         let insert_batches = &self.current_insert_batches;
         let weighted_delta_batches = &self.current_weighted_delta_batches;
         for mv in &mut self.materialized_views {
+            if run_columnar_count_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
             if run_incremental_materialized_view_tick(
                 registry,
                 insert_batches,
