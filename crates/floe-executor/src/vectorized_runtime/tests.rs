@@ -1,7 +1,7 @@
 use super::*;
 use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
 use datafusion::arrow::array::{
-    Array, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
     TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
@@ -38,6 +38,15 @@ fn date_days_values(batch: &RecordBatch, column_idx: usize) -> Vec<i32> {
         .as_any()
         .downcast_ref::<Date32Array>()
         .expect("Date32 column");
+    (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
+fn decimal128_values(batch: &RecordBatch, column_idx: usize) -> Vec<i128> {
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("Decimal128 column");
     (0..values.len()).map(|idx| values.value(idx)).collect()
 }
 
@@ -143,6 +152,25 @@ fn date_pair_rows(batches: &[RecordBatch]) -> Vec<(i32, i32)> {
         let first = date_days_values(batch, 0);
         let last = date_days_values(batch, 1);
         rows.extend(first.into_iter().zip(last));
+    }
+    rows.sort();
+    rows
+}
+
+fn decimal_stats_rows(batches: &[RecordBatch]) -> Vec<(i128, i128, i128, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let sums = decimal128_values(batch, 0);
+        let mins = decimal128_values(batch, 1);
+        let maxes = decimal128_values(batch, 2);
+        let distincts = int64_values(batch, 3);
+        rows.extend(
+            sums.into_iter()
+                .zip(mins)
+                .zip(maxes)
+                .zip(distincts)
+                .map(|(((sum, min), max), distinct)| (sum, min, max, distinct)),
+        );
     }
     rows.sort();
     rows
@@ -570,6 +598,31 @@ fn weighted_date_pair_rows(batches: &[RecordBatch]) -> Vec<(i32, i32, i64)> {
                 .zip(last)
                 .zip(weights)
                 .map(|((first, last), weight)| (first, last, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_decimal_stats_rows(batches: &[RecordBatch]) -> Vec<(i128, i128, i128, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let sums = decimal128_values(batch, 0);
+        let mins = decimal128_values(batch, 1);
+        let maxes = decimal128_values(batch, 2);
+        let distincts = int64_values(batch, 3);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            sums.into_iter()
+                .zip(mins)
+                .zip(maxes)
+                .zip(distincts)
+                .zip(weights)
+                .map(|((((sum, min), max), distinct), weight)| (sum, min, max, distinct, weight)),
         );
     }
     rows.sort();
@@ -4274,6 +4327,161 @@ async fn grouped_stats_supports_boolean_distinct_count_incrementally() {
     assert_eq!(single_int_rows(&snapshot), vec![2]);
     let delta = handle.arrow_delta_for(2).expect("mv delta");
     assert_eq!(weighted_single_int_rows(&delta), vec![(1, -1), (2, 1)]);
+}
+
+#[tokio::test]
+async fn grouped_stats_supports_decimal_stats_incrementally() {
+    let definition = SourceDefinition::new(
+        "payments",
+        vec![SourceColumn::new_nullable(
+            "amount",
+            SourceDataType::Decimal128 {
+                precision: 10,
+                scale: 2,
+            },
+            false,
+        )],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let amount_type = DataType::Decimal128(10, 2);
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![1000_i128, 2000, 1000]).with_data_type(amount_type.clone()),
+        )],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-stats-decimal").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("total_amount", DataType::Decimal128(20, 2), false),
+        Field::new("min_amount", amount_type.clone(), false),
+        Field::new("max_amount", amount_type.clone(), false),
+        Field::new("distinct_amounts", DataType::Int64, false),
+    ]));
+    let query = "SELECT SUM(amount) AS total_amount, MIN(amount) AS min_amount, MAX(amount) AS max_amount, COUNT(DISTINCT amount) AS distinct_amounts FROM payments";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_payment_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "payments",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_payment_stats").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(decimal_stats_rows(&snapshot), vec![(4000, 1000, 2000, 2)]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![500_i128, 3000]).with_data_type(amount_type.clone()),
+        )],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "payments",
+            vec![insert.clone()],
+            vec![insert],
+        )
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(decimal_stats_rows(&snapshot), vec![(7500, 500, 3000, 4)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_decimal_stats_rows(&delta),
+        vec![(4000, 1000, 2000, 2, -1), (7500, 500, 3000, 4, 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_payment_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_payment_stats")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        decimal_stats_rows(&recovered_snapshot),
+        vec![(7500, 500, 3000, 4)]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(
+            Decimal128Array::from(vec![500_i128]).with_data_type(amount_type),
+        )],
+    )
+    .expect("source retract rows");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&retract, &weighted_schema, &[-1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("payments", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(decimal_stats_rows(&snapshot), vec![(7000, 1000, 3000, 3)]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_decimal_stats_rows(&delta),
+        vec![(7000, 1000, 3000, 3, 1), (7500, 500, 3000, 4, -1)]
+    );
 }
 
 #[tokio::test]
