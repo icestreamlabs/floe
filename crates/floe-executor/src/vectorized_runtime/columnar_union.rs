@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,20 +7,23 @@ use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion::logical_expr::logical_plan::TableScan;
+use datafusion::logical_expr::logical_plan::{Distinct, TableScan};
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
-use dbsp::storage::KeyValueTable;
+use dbsp::storage::{KeyValueTable, keyspace};
+use slatedb::WriteBatch;
 
 use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 use crate::vectorized_source_delta::unit_source_delta_batches;
@@ -33,12 +36,14 @@ use super::{
 pub(super) struct ColumnarUnionPlan {
     logical_plan: LogicalPlan,
     source_names: Vec<String>,
+    distinct: bool,
 }
 
 pub(super) struct ColumnarUnionMaterializedViewState {
     sources: Vec<ColumnarUnionSourceState>,
     output_zset: SlateBackedColumnarZSet,
     evaluator: UnionDeltaEvaluator,
+    distinct_state: Option<SlateUnionDistinctState>,
     initial_snapshot: Vec<RecordBatch>,
 }
 
@@ -72,14 +77,28 @@ struct UnionSignedDelta {
     negative: Vec<RecordBatch>,
 }
 
+struct SlateUnionDistinctState {
+    table: Arc<dyn KeyValueTable>,
+    key_prefix: Vec<u8>,
+}
+
+struct PendingDistinctDelta {
+    delta: i64,
+    batch: RecordBatch,
+    row_idx: usize,
+}
+
 pub(super) fn columnar_union_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarUnionPlan>> {
-    if !contains_union(plan) || contains_unsupported_union_wrapper(plan) {
+    let Some((logical_plan, distinct)) = union_execution_plan(plan) else {
+        return Ok(None);
+    };
+    if contains_unsupported_union_wrapper(&logical_plan) {
         return Ok(None);
     }
-    let source_names = source_set_for_plan(plan, sources)
+    let source_names = source_set_for_plan(&logical_plan, sources)
         .into_iter()
         .collect::<Vec<_>>();
     if source_names.is_empty() {
@@ -87,9 +106,21 @@ pub(super) fn columnar_union_plan_for_plan(
     }
 
     Ok(Some(ColumnarUnionPlan {
-        logical_plan: plan.clone(),
+        logical_plan,
         source_names,
+        distinct,
     }))
+}
+
+fn union_execution_plan(plan: &LogicalPlan) -> Option<(LogicalPlan, bool)> {
+    match plan {
+        LogicalPlan::Distinct(Distinct::All(input)) if contains_union(input.as_ref()) => {
+            Some((input.as_ref().clone(), true))
+        }
+        LogicalPlan::SubqueryAlias(alias) => union_execution_plan(alias.input.as_ref()),
+        _ if contains_union(plan) => Some((plan.clone(), false)),
+        _ => None,
+    }
 }
 
 pub(super) async fn build_columnar_union_materialized_view_state(
@@ -102,6 +133,7 @@ pub(super) async fn build_columnar_union_materialized_view_state(
 ) -> Result<ColumnarUnionMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
     let output_namespace = format!("{mv_namespace}/columnar/union/output");
+    let distinct_state_namespace = format!("{mv_namespace}/columnar/union/distinct_state");
     let output_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
         output_namespace,
@@ -151,6 +183,9 @@ pub(super) async fn build_columnar_union_materialized_view_state(
         sources: source_states,
         output_zset,
         evaluator,
+        distinct_state: plan
+            .distinct
+            .then(|| SlateUnionDistinctState::new(table, &distinct_state_namespace)),
         initial_snapshot,
     })
 }
@@ -181,6 +216,7 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
     let mut output_delta_batches = Vec::new();
     collect_union_outputs(columnar, &positive_by_source, &mut output_delta_batches, 1).await?;
     collect_union_outputs(columnar, &negative_by_source, &mut output_delta_batches, -1).await?;
+    let output_delta_batches = union_output_delta_batches(columnar, output_delta_batches).await?;
 
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
@@ -250,6 +286,118 @@ async fn collect_union_outputs(
     Ok(())
 }
 
+async fn union_output_delta_batches(
+    columnar: &ColumnarUnionMaterializedViewState,
+    raw_delta_batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    if columnar.distinct_state.is_none() || raw_delta_batches.is_empty() {
+        return Ok(raw_delta_batches);
+    }
+    let pending =
+        union_distinct_pending_delta(&columnar.evaluator.output_schema, &raw_delta_batches)?;
+    apply_union_distinct_delta(columnar, pending).await
+}
+
+fn union_distinct_pending_delta(
+    output_schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<HashMap<Vec<u8>, PendingDistinctDelta>> {
+    let mut pending = HashMap::new();
+    if batches.is_empty() {
+        return Ok(pending);
+    }
+    let converter = row_converter_for_schema(output_schema)?;
+    let value_column_count = output_schema.fields().len();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let weight_idx = batch.schema().index_of(WEIGHT_COLUMN_NAME)?;
+        let value_columns = batch
+            .columns()
+            .iter()
+            .take(value_column_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        let rows = converter
+            .convert_columns(&value_columns)
+            .context("encode union distinct output row keys")?;
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("union output weight column must be Int64"))?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) {
+                bail!("union output weight cannot be NULL");
+            }
+            let delta = weights.value(row_idx);
+            if delta == 0 {
+                continue;
+            }
+            let key = rows.row(row_idx).data().to_vec();
+            match pending.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let current = entry.get().delta;
+                    entry.get_mut().delta = current
+                        .checked_add(delta)
+                        .ok_or_else(|| anyhow::anyhow!("union distinct pending delta overflow"))?;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(PendingDistinctDelta {
+                        delta,
+                        batch: batch.clone(),
+                        row_idx,
+                    });
+                }
+            }
+        }
+    }
+    pending.retain(|_, delta| delta.delta != 0);
+    Ok(pending)
+}
+
+async fn apply_union_distinct_delta(
+    columnar: &ColumnarUnionMaterializedViewState,
+    pending: HashMap<Vec<u8>, PendingDistinctDelta>,
+) -> Result<Vec<RecordBatch>> {
+    let mut builder = UnionDistinctOutputBuilder::new(&columnar.evaluator.output_schema)?;
+    if pending.is_empty() {
+        return builder.finish();
+    }
+    let distinct_state = columnar
+        .distinct_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("union distinct state is not initialized"))?;
+    let mut writes = WriteBatch::new();
+    let mut wrote_state = false;
+    for (row_key, delta) in pending {
+        let old_count = distinct_state.load_count(&row_key).await?;
+        let new_count = old_count
+            .checked_add(delta.delta)
+            .ok_or_else(|| anyhow::anyhow!("union distinct state overflow"))?;
+        if new_count < 0 {
+            bail!("union distinct state removed more rows than were present");
+        }
+        if old_count > 0 && new_count == 0 {
+            builder.append(&delta.batch, delta.row_idx, -1)?;
+        }
+        if old_count == 0 && new_count > 0 {
+            builder.append(&delta.batch, delta.row_idx, 1)?;
+        }
+        distinct_state.write_count(&mut writes, &row_key, new_count);
+        wrote_state = true;
+    }
+    if wrote_state {
+        distinct_state
+            .table
+            .write_batch(writes)
+            .await
+            .context("persist union distinct state updates")?;
+    }
+    builder.finish()
+}
+
 fn source_input_delta(
     source: &ColumnarUnionSourceState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -301,6 +449,87 @@ fn signed_source_delta(
         negative.extend(unit_delta.negative);
     }
     Ok(UnionSignedDelta { positive, negative })
+}
+
+struct UnionDistinctOutputBuilder {
+    weighted_schema: SchemaRef,
+    builders: Vec<ScalarColumnBuilder>,
+    weights: datafusion::arrow::array::Int64Builder,
+    rows: usize,
+}
+
+impl UnionDistinctOutputBuilder {
+    fn new(schema: &SchemaRef) -> Result<Self> {
+        let builders = schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), 1024))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            weighted_schema: weighted_snapshot_schema(schema)?,
+            builders,
+            weights: datafusion::arrow::array::Int64Builder::with_capacity(1024),
+            rows: 0,
+        })
+    }
+
+    fn append(&mut self, batch: &RecordBatch, row_idx: usize, weight: i64) -> Result<()> {
+        for (column_idx, builder) in self.builders.iter_mut().enumerate() {
+            builder.append_array_value(batch.column(column_idx).as_ref(), row_idx)?;
+        }
+        self.weights.append_value(weight);
+        self.rows = self.rows.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        if self.rows == 0 {
+            return Ok(Vec::new());
+        }
+        let mut columns = self
+            .builders
+            .iter_mut()
+            .map(ScalarColumnBuilder::finish_array)
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(self.weights.finish()) as ArrayRef);
+        Ok(vec![RecordBatch::try_new(self.weighted_schema, columns)?])
+    }
+}
+
+impl SlateUnionDistinctState {
+    fn new(table: Arc<dyn KeyValueTable>, namespace: &str) -> Self {
+        Self {
+            table,
+            key_prefix: keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace),
+        }
+    }
+
+    async fn load_count(&self, row_key: &[u8]) -> Result<i64> {
+        let Some(bytes) = self
+            .table
+            .get_bytes(&self.state_key(row_key))
+            .await
+            .context("read union distinct state")?
+        else {
+            return Ok(0);
+        };
+        decode_i64(bytes.as_ref())
+    }
+
+    fn write_count(&self, batch: &mut WriteBatch, row_key: &[u8], count: i64) {
+        let key = self.state_key(row_key);
+        if count == 0 {
+            batch.delete(key);
+        } else {
+            batch.put(key, count.to_be_bytes());
+        }
+    }
+
+    fn state_key(&self, row_key: &[u8]) -> Vec<u8> {
+        let mut key = self.key_prefix.clone();
+        key.extend_from_slice(row_key);
+        key
+    }
 }
 
 impl UnionDeltaEvaluator {
@@ -528,4 +757,20 @@ fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
         batches.push(RecordBatch::new_empty(zset.value_schema()));
     }
     Ok(batches)
+}
+
+fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect::<Vec<_>>();
+    RowConverter::new(fields).context("build union distinct Arrow row converter")
+}
+
+fn decode_i64(bytes: &[u8]) -> Result<i64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("union distinct state value must be 8 bytes"))?;
+    Ok(i64::from_be_bytes(bytes))
 }
