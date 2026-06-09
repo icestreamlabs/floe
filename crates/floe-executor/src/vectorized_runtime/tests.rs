@@ -4971,6 +4971,120 @@ async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
 }
 
 #[tokio::test]
+async fn range_join_uses_slate_backed_columnar_operator_semantics() {
+    let windows = SourceDefinition::new(
+        "windows",
+        vec![
+            SourceColumn::new_nullable("window_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("start_ts", SourceDataType::TimestampMillis, false),
+            SourceColumn::new_nullable("end_ts", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("windows source definition");
+    let events = SourceDefinition::new(
+        "events",
+        vec![
+            SourceColumn::new_nullable("event_id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("event_ts", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("events source definition");
+    let windows_schema = windows.to_arrow_schema();
+    let events_schema = events.to_arrow_schema();
+    let initial_windows = RecordBatch::try_new(
+        Arc::clone(&windows_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(TimestampMillisecondArray::from(vec![100, 200])),
+            Arc::new(TimestampMillisecondArray::from(vec![200, 300])),
+        ],
+    )
+    .expect("initial windows batch");
+    let initial_events = RecordBatch::try_new(
+        Arc::clone(&events_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 11, 12])),
+            Arc::new(TimestampMillisecondArray::from(vec![150, 250, 300])),
+        ],
+    )
+    .expect("initial events batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(windows);
+    sources.register(events);
+    let table = build_operator_state_table("vectorized-columnar-range-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("window_id", DataType::Int64, false),
+        Field::new("event_id", DataType::Int64, false),
+    ]));
+    let query = "SELECT w.window_id, e.event_id \
+        FROM windows w JOIN events e \
+        ON e.event_ts >= w.start_ts AND e.event_ts < w.end_ts";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_window_events",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "windows",
+            vec![initial_windows.clone()],
+            vec![initial_windows],
+        )
+        .await
+        .expect("append initial windows");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "events",
+            vec![initial_events.clone()],
+            vec![initial_events],
+        )
+        .await
+        .expect("append initial events");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_window_events").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 10), (2, 11)]);
+
+    let event_insert = RecordBatch::try_new(
+        Arc::clone(&events_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![13])),
+            Arc::new(TimestampMillisecondArray::from(vec![199])),
+        ],
+    )
+    .expect("event insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "events",
+            vec![event_insert.clone()],
+            vec![event_insert],
+        )
+        .await
+        .expect("append event insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 10), (1, 13), (2, 11)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_id_count_rows(&delta), vec![(1, 13, 1)]);
+}
+
+#[tokio::test]
 async fn aggregate_over_self_join_uses_slate_backed_columnar_composed_operator_semantics() {
     let orders = SourceDefinition::new(
         "orders",

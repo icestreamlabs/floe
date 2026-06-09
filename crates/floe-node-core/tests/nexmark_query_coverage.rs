@@ -77,6 +77,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT b.auction, b.bidder FROM bid b LEFT ANTI JOIN auction a ON b.auction = a.id",
     },
     ValidPlanRuntimeCase {
+        id: "right_semi_join",
+        sql: "SELECT a.id, a.seller FROM bid b RIGHT SEMI JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "right_anti_join",
+        sql: "SELECT a.id, a.seller FROM bid b RIGHT ANTI JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "range_join",
+        sql: "SELECT a.id, b.price FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve",
+    },
+    ValidPlanRuntimeCase {
         id: "three_way_join",
         sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction",
     },
@@ -99,6 +111,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "union_duplicate_source",
         sql: "SELECT auction FROM (SELECT auction, price FROM bid WHERE price > 100 UNION ALL SELECT auction, price FROM bid WHERE price <= 100) u",
+    },
+    ValidPlanRuntimeCase {
+        id: "distinct_over_union",
+        sql: "SELECT DISTINCT auction FROM (SELECT auction FROM bid WHERE price > 100 UNION ALL SELECT auction FROM bid WHERE price <= 100) u",
     },
     ValidPlanRuntimeCase {
         id: "having_aggregate",
