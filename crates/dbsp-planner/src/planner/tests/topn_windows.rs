@@ -110,6 +110,37 @@ async fn lowers_row_number_filter_to_partitioned_topn() {
 }
 
 #[tokio::test]
+async fn lowers_row_number_filter_with_residual_predicate_to_topn_select() {
+    let sql = "SELECT auction, price \
+        FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked \
+        WHERE rn <= 2 AND price > 100";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let topn_nodes = circuit_plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.kind {
+            DbspNodeKind::TopN(topn) => Some(topn),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(topn_nodes.len(), 1, "expected exactly one TopN node");
+    assert_eq!(topn_nodes[0].limit(), 2);
+    assert_eq!(topn_nodes[0].partition_by().len(), 1);
+
+    assert!(
+        circuit_plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, DbspNodeKind::Select(_))),
+        "expected residual predicate to be planned as a Select node"
+    );
+}
+
+#[tokio::test]
 async fn preserves_subquery_projection_aliases_after_row_number_lowering() {
     let sql = "SELECT auction, bidder, price, \"bidTime\" \
         FROM (SELECT b.auction, b.bidder, b.price, b.\"dateTime\" AS \"bidTime\", \

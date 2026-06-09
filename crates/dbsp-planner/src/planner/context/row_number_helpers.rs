@@ -1,13 +1,57 @@
 use super::*;
 
-pub(super) fn extract_row_number_limit(
+pub(super) fn extract_row_number_limit_with_residual(
     predicate: &Expr,
-) -> Result<Option<(String, usize)>, PlannerError> {
+) -> Result<Option<(String, usize, Option<Expr>)>, PlannerError> {
     let normalized = normalize_expr(predicate.clone())?;
-    let Expr::BinaryExpr(binary) = normalized else {
+    extract_row_number_limit_with_residual_from_normalized(normalized)
+}
+
+fn extract_row_number_limit_with_residual_from_normalized(
+    expr: Expr,
+) -> Result<Option<(String, usize, Option<Expr>)>, PlannerError> {
+    if let Some((column, limit)) = extract_direct_row_number_limit(&expr)? {
+        return Ok(Some((column, limit, None)));
+    }
+
+    let Expr::BinaryExpr(binary) = expr else {
         return Ok(None);
     };
+    if binary.op != Operator::And {
+        return Ok(None);
+    }
 
+    let left = *binary.left;
+    let right = *binary.right;
+    let left_match = extract_row_number_limit_with_residual_from_normalized(left.clone())?;
+    let right_match = extract_row_number_limit_with_residual_from_normalized(right.clone())?;
+    match (left_match, right_match) {
+        (Some(_), Some(_)) => Err(PlannerError::UnsupportedPlan(
+            "only one ROW_NUMBER limit predicate is supported".to_string(),
+        )),
+        (Some((column, limit, residual)), None) => {
+            let mut residuals = Vec::new();
+            if let Some(residual) = residual {
+                residuals.push(residual);
+            }
+            residuals.push(right);
+            Ok(Some((column, limit, combine_filters(residuals))))
+        }
+        (None, Some((column, limit, residual))) => {
+            let mut residuals = vec![left];
+            if let Some(residual) = residual {
+                residuals.push(residual);
+            }
+            Ok(Some((column, limit, combine_filters(residuals))))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn extract_direct_row_number_limit(expr: &Expr) -> Result<Option<(String, usize)>, PlannerError> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return Ok(None);
+    };
     let (column, literal, exclusive) = match (&*binary.left, binary.op, &*binary.right) {
         (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => {
             (column.name.clone(), literal, false)

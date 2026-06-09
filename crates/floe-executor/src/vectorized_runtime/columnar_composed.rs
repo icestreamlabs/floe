@@ -531,6 +531,14 @@ fn row_number_limit_column(predicate: &Expr) -> Option<String> {
     let Expr::BinaryExpr(binary) = predicate else {
         return None;
     };
+    if binary.op == Operator::And {
+        let left = row_number_limit_column(binary.left.as_ref());
+        let right = row_number_limit_column(binary.right.as_ref());
+        return match (left, right) {
+            (Some(found), None) | (None, Some(found)) => Some(found),
+            _ => None,
+        };
+    }
     let (Expr::Column(column), op, literal) = (&*binary.left, binary.op, &*binary.right) else {
         return None;
     };

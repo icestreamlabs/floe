@@ -7,7 +7,9 @@ impl<'cfg> PlannerContext<'cfg> {
         &mut self,
         filter: &datafusion::logical_expr::logical_plan::Filter,
     ) -> Result<Option<PlannedNode>, PlannerError> {
-        let Some((rank_column, limit)) = extract_row_number_limit(&filter.predicate)? else {
+        let Some((rank_column, limit, residual_predicate)) =
+            extract_row_number_limit_with_residual(&filter.predicate)?
+        else {
             return Ok(None);
         };
 
@@ -90,11 +92,26 @@ impl<'cfg> PlannerContext<'cfg> {
             schema: output_schema,
         };
 
-        if let Some(exprs) = post_projection {
-            return self.build_projection_items(topn_node, &exprs).map(Some);
+        let mut output = if let Some(exprs) = post_projection {
+            self.build_projection_items(topn_node, &exprs)?
+        } else {
+            topn_node
+        };
+
+        if let Some(residual_predicate) = residual_predicate {
+            let select = DbspSelectNode::try_new(output.schema.clone(), residual_predicate)?;
+            let id = self.add_node(
+                vec![output.id],
+                DbspNodeKind::Select(select),
+                output.schema.clone(),
+            );
+            output = PlannedNode {
+                id,
+                schema: output.schema,
+            };
         }
 
-        Ok(Some(topn_node))
+        Ok(Some(output))
     }
 
     pub(super) fn plan_join(

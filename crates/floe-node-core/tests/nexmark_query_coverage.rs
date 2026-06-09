@@ -258,6 +258,14 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction FROM bid ORDER BY price * 2 DESC LIMIT 5",
     },
     ValidPlanRuntimeCase {
+        id: "filter_over_topn",
+        sql: "SELECT auction, price FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5) t WHERE price > 100",
+    },
+    ValidPlanRuntimeCase {
+        id: "filter_over_row_number_topn",
+        sql: "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked WHERE rn <= 2 AND price > 100",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_topn_hidden_sort_key",
         sql: "SELECT auction FROM bid GROUP BY auction ORDER BY SUM(price) DESC LIMIT 5",
     },

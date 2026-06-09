@@ -617,8 +617,11 @@ fn row_number_filter_for_plan(plan: &LogicalPlan) -> Option<(String, &Filter)> {
             row_number_filter_for_plan(projection.input.as_ref())
         }
         LogicalPlan::Filter(filter) => {
-            let (rank_column, _limit) = extract_row_number_limit(&filter.predicate)?;
-            Some((rank_column, filter))
+            if let Some((rank_column, _limit)) = extract_row_number_limit(&filter.predicate) {
+                Some((rank_column, filter))
+            } else {
+                row_number_filter_for_plan(filter.input.as_ref())
+            }
         }
         LogicalPlan::SubqueryAlias(alias) => row_number_filter_for_plan(alias.input.as_ref()),
         _ => None,
@@ -630,6 +633,7 @@ fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
         LogicalPlan::Projection(projection) => {
             global_sort_limit_for_plan(projection.input.as_ref())
         }
+        LogicalPlan::Filter(filter) => global_sort_limit_for_plan(filter.input.as_ref()),
         LogicalPlan::SubqueryAlias(alias) => global_sort_limit_for_plan(alias.input.as_ref()),
         LogicalPlan::Limit(limit) => {
             limit_has_nonnegative_skip_and_positive_fetch(limit)
@@ -667,6 +671,14 @@ fn extract_row_number_limit(predicate: &Expr) -> Option<(String, usize)> {
     let Expr::BinaryExpr(binary) = predicate else {
         return None;
     };
+    if binary.op == Operator::And {
+        let left = extract_row_number_limit(binary.left.as_ref());
+        let right = extract_row_number_limit(binary.right.as_ref());
+        return match (left, right) {
+            (Some(found), None) | (None, Some(found)) => Some(found),
+            _ => None,
+        };
+    }
     let (column, literal, exclusive) = match (&*binary.left, binary.op, &*binary.right) {
         (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => {
             (column.name.clone(), literal, false)
