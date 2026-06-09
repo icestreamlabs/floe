@@ -44,6 +44,7 @@ mod columnar_join_top_avg;
 mod columnar_join_topn;
 mod columnar_stateless;
 mod columnar_topn;
+mod columnar_union;
 mod source_state;
 
 use columnar_count::{
@@ -83,6 +84,10 @@ use columnar_stateless::{
 use columnar_topn::{
     ColumnarTopNMaterializedViewState, build_columnar_topn_materialized_view_state,
     columnar_topn_plan_for_plan, run_columnar_topn_materialized_view_tick,
+};
+use columnar_union::{
+    ColumnarUnionMaterializedViewState, build_columnar_union_materialized_view_state,
+    columnar_union_plan_for_plan, run_columnar_union_materialized_view_tick,
 };
 
 #[derive(Debug, Clone)]
@@ -178,6 +183,7 @@ struct VectorizedMaterializedViewState {
     columnar_join_top_avg: Option<ColumnarJoinTopAvgMaterializedViewState>,
     columnar_join_topn: Option<ColumnarJoinTopNMaterializedViewState>,
     columnar_topn: Option<ColumnarTopNMaterializedViewState>,
+    columnar_union: Option<ColumnarUnionMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
     execution_mode: MaterializedViewExecutionMode,
 }
@@ -202,6 +208,7 @@ enum MaterializedViewExecutionMode {
     ColumnarJoinTopAvg,
     ColumnarJoinTopN,
     ColumnarTopN,
+    ColumnarUnion,
     ColumnarCountByKey,
     IncrementalFilterProject,
     FullRefresh,
@@ -682,6 +689,49 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
+            let columnar_union_plan = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_grouped_max.is_none()
+                && columnar_grouped_stats.is_none()
+                && columnar_join.is_none()
+                && columnar_topn.is_none()
+                && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
+            {
+                columnar_union_plan_for_plan(df.logical_plan(), &source_states)?
+            } else {
+                None
+            };
+            let columnar_union = match (columnar_union_plan, options.operator_state_table.as_ref())
+            {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_union_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar union operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
             let columnar_stateless_plan = if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
@@ -690,6 +740,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
                 && columnar_join_top_avg.is_none()
+                && columnar_union.is_none()
             {
                 columnar_stateless_plan_for_plan(df.logical_plan(), &source_states)
             } else {
@@ -727,6 +778,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
                 && columnar_join_top_avg.is_none()
+                && columnar_union.is_none()
                 && columnar_stateless.is_none()
             {
                 incremental_source_for_plan(df.logical_plan(), &source_states)
@@ -759,6 +811,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
                 && columnar_join_top_avg.is_none()
+                && columnar_union.is_none()
                 && columnar_stateless.is_none()
                 && incremental.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
@@ -784,6 +837,8 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarJoinTopN
             } else if columnar_topn.is_some() {
                 MaterializedViewExecutionMode::ColumnarTopN
+            } else if columnar_union.is_some() {
+                MaterializedViewExecutionMode::ColumnarUnion
             } else if columnar_count.is_some() {
                 MaterializedViewExecutionMode::ColumnarCountByKey
             } else if incremental.is_some() {
@@ -838,6 +893,11 @@ impl VectorizedExecutionRuntime {
                             .as_ref()
                             .map(ColumnarTopNMaterializedViewState::initial_snapshot)
                     })
+                    .or_else(|| {
+                        columnar_union
+                            .as_ref()
+                            .map(ColumnarUnionMaterializedViewState::initial_snapshot)
+                    })
                     .unwrap_or_default(),
                 incremental,
                 columnar_stateless,
@@ -848,6 +908,7 @@ impl VectorizedExecutionRuntime {
                 columnar_join_top_avg,
                 columnar_join_topn,
                 columnar_topn,
+                columnar_union,
                 columnar_count,
                 execution_mode,
             });
@@ -1113,6 +1174,17 @@ impl VectorizedExecutionRuntime {
                 continue;
             }
             if run_columnar_topn_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            if run_columnar_union_materialized_view_tick(
                 registry,
                 insert_batches,
                 weighted_delta_batches,

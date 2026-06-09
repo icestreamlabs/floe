@@ -674,6 +674,164 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
 }
 
 #[tokio::test]
+async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("orders source definition");
+    let shipments = SourceDefinition::new(
+        "shipments",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("shipments source definition");
+    let schema = orders.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    )
+    .expect("initial orders");
+    let initial_shipments = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 4]))],
+    )
+    .expect("initial shipments");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(shipments);
+    let table = build_operator_state_table("vectorized-columnar-union").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_union_ids",
+            "SELECT id FROM orders WHERE id <= 2 UNION ALL SELECT id FROM shipments WHERE id >= 2",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnion
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "shipments",
+            vec![initial_shipments.clone()],
+            vec![initial_shipments],
+        )
+        .await
+        .expect("append initial shipments");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_union_ids").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 2, 2, 4]);
+
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let order_retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .expect("order retract");
+    let weighted = weighted_batch_from_diffs(&order_retract, &weighted_schema, &[-1])
+        .expect("weighted order retract");
+    runtime
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply order retract");
+    let shipment_insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![5]))],
+    )
+    .expect("shipment insert");
+    let weighted = weighted_batch_from_diffs(&shipment_insert, &weighted_schema, &[1])
+        .expect("weighted shipment insert");
+    runtime
+        .apply_weighted_source_delta("shipments", weighted)
+        .await
+        .expect("apply shipment insert");
+    runtime.run_tick(2).await.expect("weighted tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 2, 4, 5]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(2, -1), (5, 1)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_union_ids",
+            "SELECT id FROM orders WHERE id <= 2 UNION ALL SELECT id FROM shipments WHERE id >= 2",
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnion
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_union_ids")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(single_int_rows(&recovered_snapshot), vec![1, 2, 4, 5]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let shipment_retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .expect("shipment retract");
+    let weighted = weighted_batch_from_diffs(&shipment_retract, &weighted_schema, &[-1])
+        .expect("weighted shipment retract");
+    recovered
+        .apply_weighted_source_delta("shipments", weighted)
+        .await
+        .expect("apply shipment retract");
+    recovered.run_tick(4).await.expect("post-recovery tick");
+
+    let snapshot = recovered_handle.arrow_snapshot_for(4).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 4, 5]);
+    let delta = recovered_handle.arrow_delta_for(4).expect("mv delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(2, -1)]);
+}
+
+#[tokio::test]
 async fn count_group_by_uses_slate_backed_columnar_operator_incrementally() {
     let definition = SourceDefinition::new(
         "orders",
