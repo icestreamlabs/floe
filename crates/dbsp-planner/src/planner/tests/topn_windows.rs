@@ -86,6 +86,98 @@ fn lowers_sort_fetch_to_topn() {
     }
 }
 
+#[test]
+fn lowers_limit_zero_to_empty() {
+    let bid = nexmark_bid_table();
+    let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
+        .unwrap()
+        .limit(0, Some(0))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    assert!(
+        matches!(root.kind, DbspNodeKind::Empty(_)),
+        "expected LIMIT 0 to lower to Empty, found {:?}",
+        root.kind
+    );
+}
+
+#[test]
+fn lowers_bounded_sort_exhausted_by_offset_to_empty() {
+    let bid = nexmark_bid_table();
+    let input = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let sort = datafusion::logical_expr::LogicalPlan::Sort(LogicalSort {
+        expr: vec![col(qualified(bid, "price")).sort(false, true)],
+        input: Arc::new(input),
+        fetch: Some(3),
+    });
+    let plan = datafusion::logical_expr::LogicalPlan::Limit(LogicalLimit {
+        skip: Some(Box::new(lit(5_i64))),
+        fetch: Some(Box::new(lit(5_i64))),
+        input: Arc::new(sort),
+    });
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let root = circuit_plan.node(circuit_plan.root).unwrap();
+    assert!(
+        matches!(root.kind, DbspNodeKind::Empty(_)),
+        "expected exhausted bounded TopN to lower to Empty, found {:?}",
+        root.kind
+    );
+}
+
+#[tokio::test]
+async fn lowers_filter_over_offset_topn() {
+    let sql = "SELECT key, value \
+        FROM (SELECT auction AS key, price AS value FROM bid ORDER BY price DESC LIMIT 5 OFFSET 2) s \
+        WHERE value > 100";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let topn = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::TopN(topn) => Some(topn),
+            _ => None,
+        })
+        .expect("expected lowered TopN node");
+    assert_eq!(topn.limit(), 5);
+    assert_eq!(topn.offset(), 2);
+}
+
+#[tokio::test]
+async fn lowers_wrapped_join_top_avg_limit() {
+    let sql = "SELECT key, value \
+        FROM (SELECT auction AS key, CAST(avg_price AS BIGINT) AS value \
+            FROM (SELECT b.auction, AVG(b.price) AS avg_price \
+                FROM bid b JOIN auction a ON b.auction = a.id \
+                GROUP BY b.auction) j \
+            ORDER BY avg_price DESC LIMIT 5) s";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let topn = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::TopN(topn) => Some(topn),
+            _ => None,
+        })
+        .expect("expected lowered TopN node");
+    assert_eq!(topn.limit(), 5);
+}
+
 #[tokio::test]
 async fn lowers_row_number_filter_to_partitioned_topn() {
     let sql = "SELECT auction, bidder, price, channel, url, \"dateTime\", extra \

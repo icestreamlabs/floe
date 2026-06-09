@@ -12,8 +12,8 @@ use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, DataFusionError, ScalarValue};
 
 use dbsp_circuit::circuit::plan::{
-    DbspAggregateNode, DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspOneRowNode,
-    DbspProjectNode, DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
+    DbspAggregateNode, DbspDistinctNode, DbspEmptyNode, DbspJoinNode, DbspJoinType, DbspNodeKind,
+    DbspOneRowNode, DbspProjectNode, DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
     DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, OrderExpr, ProjectItem,
 };
 use dbsp_circuit::circuit::schema::{Field, RowSchema};

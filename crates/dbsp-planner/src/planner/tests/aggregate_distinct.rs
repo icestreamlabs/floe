@@ -114,6 +114,26 @@ fn plans_one_row_empty_relation_projection() {
 }
 
 #[test]
+fn plans_zero_row_empty_relation_projection() {
+    let plan = LogicalPlanBuilder::empty(false)
+        .project(vec![lit(0_i64).alias("key")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    assert!(
+        circuit_plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, DbspNodeKind::Empty(_))),
+        "expected optimizer-produced zero-row relation to be planned"
+    );
+}
+
+#[test]
 fn prunes_unused_aggregate_calls_under_projection() {
     let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
@@ -283,4 +303,32 @@ fn plans_union_distinct_as_union_plus_distinct() {
         DbspNodeKind::Union(_) => assert_eq!(union.inputs.len(), 2),
         other => panic!("expected Union under Distinct, found {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn plans_union_with_outer_join_nullable_columns() {
+    let sql = "SELECT key FROM (\
+        SELECT key FROM (\
+            SELECT b.auction AS key, a.seller AS value \
+            FROM bid b FULL OUTER JOIN auction a ON b.auction = a.id\
+        ) s \
+        UNION ALL \
+        SELECT id AS key FROM auction\
+    ) u";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+    let union = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Union(union) => Some(union),
+            _ => None,
+        })
+        .expect("expected Union node");
+    assert!(
+        union.output_schema().field(0).expect("union key").nullable,
+        "union output should be nullable when any input is nullable"
+    );
 }

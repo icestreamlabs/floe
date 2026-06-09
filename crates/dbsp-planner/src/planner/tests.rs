@@ -7,8 +7,8 @@ use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::functions_aggregate::expr_fn::{avg, count, sum};
 use datafusion::logical_expr::expr::WildcardOptions;
 use datafusion::logical_expr::expr_fn::SimpleScalarUDF;
-use datafusion::logical_expr::logical_plan::Sort as LogicalSort;
 use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
+use datafusion::logical_expr::logical_plan::{Limit as LogicalLimit, Sort as LogicalSort};
 use datafusion::logical_expr::{
     ColumnarValue, Expr, JoinType, LogicalPlanBuilder, ScalarFunctionImplementation, ScalarUDF,
     Signature, TableSource, TypeSignature, Volatility, col, lit,

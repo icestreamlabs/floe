@@ -215,12 +215,10 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::Repartition(repartition) => self.plan_node(&repartition.input),
             LogicalPlan::Distinct(distinct) => self.plan_distinct(distinct),
             LogicalPlan::EmptyRelation(relation) => {
-                if !relation.produce_one_row {
-                    return Err(PlannerError::UnsupportedPlan(
-                        "empty relation nodes with zero rows are not supported".to_string(),
-                    ));
-                }
                 let output_schema = row_schema_from_dfschema(relation.schema.as_ref())?;
+                if !relation.produce_one_row {
+                    return Ok(self.build_empty_node(output_schema));
+                }
                 let one_row = DbspOneRowNode::new(output_schema.clone());
                 let id =
                     self.add_node(vec![], DbspNodeKind::OneRow(one_row), output_schema.clone());
@@ -260,7 +258,7 @@ impl<'cfg> PlannerContext<'cfg> {
     }
 }
 
-fn row_schema_from_dfschema(schema: &DFSchema) -> Result<Arc<RowSchema>, PlannerError> {
+pub(super) fn row_schema_from_dfschema(schema: &DFSchema) -> Result<Arc<RowSchema>, PlannerError> {
     let fields = schema
         .iter()
         .map(|(_, field)| {

@@ -28,9 +28,9 @@ pub use dbsp_storage::storage;
 pub use algebra::AbelianGroup;
 pub use circuit::{
     CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
-    DbspAsofJoinSpec, DbspDistinctNode, DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind,
-    DbspOneRowNode, DbspPredicate, DbspProjectNode, DbspRangeJoinSpec, DbspScalarType,
-    DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
+    DbspAsofJoinSpec, DbspDistinctNode, DbspEmptyNode, DbspExpression, DbspJoinNode, DbspJoinType,
+    DbspNodeKind, DbspOneRowNode, DbspPredicate, DbspProjectNode, DbspRangeJoinSpec,
+    DbspScalarType, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
     DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, FieldRef, FloeAsofJoinNode,
     OptimizerDiagnostics, OptimizerRuleDiagnostics, OptimizerStageDiagnostics, OrderExpr,
     PlannerConfig, PlannerError, PrimaryKey, ProjectItem, RowSchema, TableDescriptor,

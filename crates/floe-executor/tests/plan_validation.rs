@@ -112,6 +112,20 @@ fn accepts_topn_operator() -> Result<()> {
 }
 
 #[test]
+fn accepts_empty_operator_without_sources() -> Result<()> {
+    let planner = planner();
+    let plan = empty_plan(&planner)?;
+    let sources = BTreeSet::new();
+
+    let validated = validate_dbsp_plan(&plan, &sources, "mv_empty")?;
+    assert_eq!(validated.root_node, plan.root);
+    assert!(validated.required_sources.is_empty());
+    let root = plan.node(plan.root).expect("root");
+    assert!(matches!(root.kind, DbspNodeKind::Empty(_)));
+    Ok(())
+}
+
+#[test]
 fn accepts_union_operator() -> Result<()> {
     let planner = planner();
     let plan = union_plan(&planner)?;
@@ -266,6 +280,14 @@ fn topn_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let logical_plan = table_scan(Some(bid.name()), &schema_for(bid), None)?
         .sort(vec![col("price").sort(true, true)])?
         .limit(0, Some(5))?
+        .build()?;
+    Ok(planner.build(&logical_plan)?)
+}
+
+fn empty_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
+    let bid = nexmark_bid_table();
+    let logical_plan = table_scan(Some(bid.name()), &schema_for(bid), None)?
+        .limit(0, Some(0))?
         .build()?;
     Ok(planner.build(&logical_plan)?)
 }

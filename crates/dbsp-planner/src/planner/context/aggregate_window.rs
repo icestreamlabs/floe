@@ -1,3 +1,4 @@
+use super::core::row_schema_from_dfschema;
 use super::row_number_helpers::*;
 use super::*;
 
@@ -83,12 +84,7 @@ impl<'cfg> PlannerContext<'cfg> {
             .get_fetch_type()
             .map_err(|err| PlannerError::UnsupportedPlan(err.to_string()))?
         {
-            FetchType::Literal(Some(value)) if value > 0 => value,
-            FetchType::Literal(Some(_)) => {
-                return Err(PlannerError::UnsupportedPlan(
-                    "LIMIT must be a positive literal".to_string(),
-                ));
-            }
+            FetchType::Literal(Some(value)) => value,
             FetchType::Literal(None) => {
                 return Err(PlannerError::UnsupportedPlan(
                     "LIMIT without FETCH is not supported".to_string(),
@@ -111,27 +107,70 @@ impl<'cfg> PlannerContext<'cfg> {
                 ));
             }
         };
+        if fetch == 0 {
+            let output_schema = row_schema_from_dfschema(limit.input.schema().as_ref())?;
+            return Ok(self.build_empty_node(output_schema));
+        }
 
-        if let LogicalPlan::Sort(sort) = limit.input.as_ref() {
-            let input = self.plan_node(&sort.input)?;
-            let order_by = self.map_sort_expressions(&sort.expr, input.schema.clone())?;
-            let topn =
-                DbspTopNNode::try_new(input.schema.clone(), Vec::new(), order_by, fetch, offset)?;
-            let output_schema = topn.output_schema().clone();
-            let id = self.add_node(
-                vec![input.id],
-                DbspNodeKind::TopN(topn),
-                output_schema.clone(),
-            );
-            return Ok(PlannedNode {
-                id,
-                schema: output_schema,
-            });
+        match limit.input.as_ref() {
+            LogicalPlan::Sort(sort) => {
+                return self.build_topn_from_sort(sort, fetch, offset);
+            }
+            LogicalPlan::Projection(projection) => {
+                if let LogicalPlan::Sort(sort) = projection.input.as_ref() {
+                    let topn = self.build_topn_from_sort(sort, fetch, offset)?;
+                    return self.build_projection_node(topn, projection);
+                }
+            }
+            _ => {}
         }
 
         Err(PlannerError::UnsupportedPlan(
             "LIMIT requires an ORDER BY to form a TopN operator".to_string(),
         ))
+    }
+
+    fn build_topn_from_sort(
+        &mut self,
+        sort: &datafusion::logical_expr::logical_plan::Sort,
+        fetch: usize,
+        offset: usize,
+    ) -> Result<PlannedNode, PlannerError> {
+        let input = self.plan_node(&sort.input)?;
+        let fetch = if let Some(sort_fetch) = sort.fetch {
+            match sort_fetch.checked_sub(offset) {
+                Some(remaining) => fetch.min(remaining),
+                None => 0,
+            }
+        } else {
+            fetch
+        };
+        if fetch == 0 {
+            return Ok(self.build_empty_node(input.schema));
+        }
+
+        let order_by = self.map_sort_expressions(&sort.expr, input.schema.clone())?;
+        let topn =
+            DbspTopNNode::try_new(input.schema.clone(), Vec::new(), order_by, fetch, offset)?;
+        let output_schema = topn.output_schema().clone();
+        let id = self.add_node(
+            vec![input.id],
+            DbspNodeKind::TopN(topn),
+            output_schema.clone(),
+        );
+        Ok(PlannedNode {
+            id,
+            schema: output_schema,
+        })
+    }
+
+    pub(super) fn build_empty_node(&mut self, output_schema: Arc<RowSchema>) -> PlannedNode {
+        let empty = DbspEmptyNode::new(output_schema.clone());
+        let id = self.add_node(vec![], DbspNodeKind::Empty(empty), output_schema.clone());
+        PlannedNode {
+            id,
+            schema: output_schema,
+        }
     }
 
     pub(super) fn parse_row_number_spec(
