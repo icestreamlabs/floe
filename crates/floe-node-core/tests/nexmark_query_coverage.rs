@@ -81,6 +81,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT DISTINCT auction, bidder FROM bid",
     },
     ValidPlanRuntimeCase {
+        id: "ordered_distinct",
+        sql: "SELECT DISTINCT auction FROM bid ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
         id: "left_outer_join",
         sql: "SELECT b.auction, a.seller FROM bid b LEFT JOIN auction a ON b.auction = a.id",
     },
@@ -195,6 +199,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "ordered_grouped_aggregate",
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "ordered_count_aggregate",
+        sql: "SELECT auction, COUNT(*) AS bid_count FROM bid GROUP BY auction ORDER BY auction",
     },
     ValidPlanRuntimeCase {
         id: "global_sort_limit_offset_topn",

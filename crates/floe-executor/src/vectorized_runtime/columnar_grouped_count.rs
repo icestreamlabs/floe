@@ -577,6 +577,9 @@ fn grouped_count_aggregate_for_plan(
             distinct_count_aggregate_for_input(input.as_ref())
                 .map(|aggregate| aggregate.map(|aggregate| (aggregate, None)))
         }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            grouped_count_aggregate_for_plan(sort.input.as_ref())
+        }
         _ => Ok(None),
     }
 }
