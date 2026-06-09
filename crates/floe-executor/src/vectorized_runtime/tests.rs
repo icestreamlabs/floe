@@ -1,6 +1,6 @@
 use super::*;
 use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
-use datafusion::arrow::array::{Array, Int64Array, StringArray};
+use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::storage::{KeyValueTable, SlateTable};
@@ -31,6 +31,15 @@ fn string_values(batch: &RecordBatch, column_idx: usize) -> Vec<String> {
         .collect()
 }
 
+fn float64_values(batch: &RecordBatch, column_idx: usize) -> Vec<f64> {
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("float64 column");
+    (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
 fn id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -59,6 +68,34 @@ fn single_int_rows(batches: &[RecordBatch]) -> Vec<i64> {
         rows.extend(int64_values(batch, 0));
     }
     rows.sort();
+    rows
+}
+
+fn grouped_stats_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64, f64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let auctions = int64_values(batch, 0);
+        let totals = int64_values(batch, 1);
+        let cheap = int64_values(batch, 2);
+        let mins = int64_values(batch, 3);
+        let maxes = int64_values(batch, 4);
+        let avgs = float64_values(batch, 5);
+        let sums = int64_values(batch, 6);
+        rows.extend(
+            auctions
+                .into_iter()
+                .zip(totals)
+                .zip(cheap)
+                .zip(mins)
+                .zip(maxes)
+                .zip(avgs)
+                .zip(sums)
+                .map(|((((((auction, total), cheap), min), max), avg), sum)| {
+                    (auction, total, cheap, min, max, avg, sum)
+                }),
+        );
+    }
+    rows.sort_by_key(|row| row.0);
     rows
 }
 
@@ -874,6 +911,154 @@ async fn grouped_max_with_hidden_key_uses_slate_backed_columnar_operator_increme
         .arrow_delta_for(5)
         .expect("post-retract delta");
     assert_eq!(weighted_single_int_rows(&delta), vec![(50, 1), (70, -1)]);
+}
+
+#[tokio::test]
+async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 30, 100])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-stats").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("cheap_bids", DataType::Int64, false),
+        Field::new("min_price", DataType::Int64, true),
+        Field::new("max_price", DataType::Int64, true),
+        Field::new("avg_price", DataType::Float64, true),
+        Field::new("sum_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT auction, \
+        COUNT(*) AS total_bids, \
+        COUNT(*) FILTER (WHERE price < 50) AS cheap_bids, \
+        MIN(price) AS min_price, \
+        MAX(price) AS max_price, \
+        AVG(price) AS avg_price, \
+        SUM(price) AS sum_price \
+        FROM bids GROUP BY auction";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_bid_stats").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        grouped_stats_rows(&snapshot),
+        vec![(1, 2, 2, 10, 30, 20.0, 40), (2, 1, 0, 100, 100, 100.0, 100),]
+    );
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        grouped_stats_rows(&snapshot),
+        vec![(1, 3, 2, 10, 50, 30.0, 90), (2, 1, 0, 100, 100, 100.0, 100),]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_bid_stats")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        grouped_stats_rows(&recovered_snapshot),
+        vec![(1, 3, 2, 10, 50, 30.0, 90), (2, 1, 0, 100, 100, 100.0, 100),]
+    );
+
+    let retract_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("retract source rows");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&retract_rows, &weighted_schema, &[-1])
+        .expect("weighted retract rows");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(
+        grouped_stats_rows(&snapshot),
+        vec![(1, 2, 2, 10, 30, 20.0, 40), (2, 1, 0, 100, 100, 100.0, 100),]
+    );
 }
 
 #[tokio::test]

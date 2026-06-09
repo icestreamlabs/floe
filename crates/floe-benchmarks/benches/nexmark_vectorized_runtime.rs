@@ -83,6 +83,14 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: q12_output_schema,
             batch: bid_batch,
         },
+        NexmarkRuntimeCase {
+            id: "q17",
+            source_name: "nexmark_bid",
+            view_name: "mv_nexmark_q17",
+            query: r#"SELECT auction, DATE_FORMAT("dateTime", 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, MIN(price) AS min_price, MAX(price) AS max_price, AVG(price) AS avg_price, SUM(price) AS sum_price FROM bid GROUP BY auction, DATE_FORMAT("dateTime", 'yyyy-MM-dd')"#,
+            output_schema: q17_output_schema,
+            batch: bid_batch,
+        },
     ];
 
     let mut group = c.benchmark_group("nexmark_vectorized_runtime_columnar");
@@ -325,6 +333,21 @@ fn q12_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("bidder", DataType::Int64, true),
         Field::new("bid_count", DataType::Int64, false),
+    ]))
+}
+
+fn q17_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("day", DataType::Utf8, true),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("rank1_bids", DataType::Int64, false),
+        Field::new("rank2_bids", DataType::Int64, false),
+        Field::new("rank3_bids", DataType::Int64, false),
+        Field::new("min_price", DataType::Int64, true),
+        Field::new("max_price", DataType::Int64, true),
+        Field::new("avg_price", DataType::Float64, true),
+        Field::new("sum_price", DataType::Int64, true),
     ]))
 }
 

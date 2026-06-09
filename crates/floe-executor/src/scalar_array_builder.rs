@@ -3,9 +3,9 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
-    Date32Builder, Decimal128Array, Decimal128Builder, Int64Array, Int64Builder, NullArray,
-    StringArray, StringBuilder, TimestampMillisecondArray, TimestampMillisecondBuilder,
-    UInt64Array, UInt64Builder,
+    Date32Builder, Decimal128Array, Decimal128Builder, Float64Array, Float64Builder, Int64Array,
+    Int64Builder, NullArray, StringArray, StringBuilder, TimestampMillisecondArray,
+    TimestampMillisecondBuilder, UInt64Array, UInt64Builder,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use floe_core::RowValue;
@@ -14,6 +14,7 @@ use crate::encoding::EncodedRowScalar;
 
 pub(crate) enum ScalarColumnBuilder {
     Int64(Int64Builder),
+    Float64(Float64Builder),
     Utf8(StringBuilder),
     TimestampMillis {
         builder: TimestampMillisecondBuilder,
@@ -33,6 +34,7 @@ impl ScalarColumnBuilder {
     pub(crate) fn new(data_type: &DataType, capacity: usize) -> Result<Self> {
         match data_type {
             DataType::Int64 => Ok(Self::Int64(Int64Builder::with_capacity(capacity))),
+            DataType::Float64 => Ok(Self::Float64(Float64Builder::with_capacity(capacity))),
             DataType::Utf8 => Ok(Self::Utf8(StringBuilder::with_capacity(
                 capacity,
                 capacity.saturating_mul(8),
@@ -81,6 +83,9 @@ impl ScalarColumnBuilder {
                     "row missing column index {column_idx} for Int64 column"
                 )),
             })?,
+            Self::Float64(_) => {
+                return Err(anyhow!("cannot append RowValue into Float64 column builder"));
+            }
             Self::Utf8(builder) => rows.iter().try_for_each(|row| match row.get(column_idx) {
                 Some(RowValue::Utf8(v)) => {
                     builder.append_value(v);
@@ -188,6 +193,18 @@ impl ScalarColumnBuilder {
         }
     }
 
+    pub(crate) fn append_f64_value(&mut self, value: f64) -> Result<()> {
+        match self {
+            Self::Float64(builder) => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "expected Float64 column builder when appending f64 value"
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn append_binary_value(&mut self, value: &[u8]) -> Result<()> {
         match self {
@@ -214,6 +231,13 @@ impl ScalarColumnBuilder {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| anyhow!("expected Int64 Arrow array"))?;
+                builder.append_value(values.value(row_idx));
+            }
+            Self::Float64(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| anyhow!("expected Float64 Arrow array"))?;
                 builder.append_value(values.value(row_idx));
             }
             Self::Utf8(builder) => {
@@ -283,6 +307,15 @@ impl ScalarColumnBuilder {
                     ));
                 }
             },
+            Self::Float64(builder) => {
+                if value.is_none() {
+                    builder.append_null();
+                } else {
+                    return Err(anyhow!(
+                        "cannot append encoded scalar to Float64 column builder"
+                    ));
+                }
+            }
             Self::Utf8(builder) => match value {
                 Some(EncodedRowScalar::Utf8(value)) => builder.append_value(value),
                 None => builder.append_null(),
@@ -385,6 +418,17 @@ impl ScalarColumnBuilder {
                     ));
                 }
             },
+            Self::Float64(builder) => {
+                if value.is_none() {
+                    for _ in 0..count {
+                        builder.append_null();
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "cannot append encoded scalar to Float64 column builder"
+                    ));
+                }
+            }
             Self::Utf8(builder) => match value {
                 Some(EncodedRowScalar::Utf8(value)) => {
                     for _ in 0..count {
@@ -508,6 +552,7 @@ impl ScalarColumnBuilder {
     pub(crate) fn finish_array(&mut self) -> ArrayRef {
         match self {
             Self::Int64(builder) => Arc::new(builder.finish()),
+            Self::Float64(builder) => Arc::new(builder.finish()),
             Self::Utf8(builder) => Arc::new(builder.finish()),
             Self::TimestampMillis { builder, data_type } => {
                 Arc::new(builder.finish().with_data_type(data_type.clone()))
