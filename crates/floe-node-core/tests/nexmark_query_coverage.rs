@@ -137,6 +137,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction",
     },
     ValidPlanRuntimeCase {
+        id: "ordered_three_way_join",
+        sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction ORDER BY p.name",
+    },
+    ValidPlanRuntimeCase {
         id: "self_join_aggregate",
         sql: "SELECT l.auction, COUNT(*) AS pair_count FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price GROUP BY l.auction",
     },

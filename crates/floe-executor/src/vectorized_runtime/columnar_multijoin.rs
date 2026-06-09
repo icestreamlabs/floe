@@ -491,6 +491,9 @@ fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
         LogicalPlan::Projection(projection) => collect_joins(projection.input.as_ref(), joins),
         LogicalPlan::Filter(filter) => collect_joins(filter.input.as_ref(), joins),
         LogicalPlan::SubqueryAlias(alias) => collect_joins(alias.input.as_ref(), joins),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            collect_joins(sort.input.as_ref(), joins)
+        }
         _ => {}
     }
 }
@@ -514,6 +517,9 @@ fn collect_table_scan_sources(
         }
         LogicalPlan::SubqueryAlias(alias) => {
             collect_table_scan_sources(alias.input.as_ref(), sources, out)
+        }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            collect_table_scan_sources(sort.input.as_ref(), sources, out)
         }
         LogicalPlan::Join(join) => {
             collect_table_scan_sources(join.left.as_ref(), sources, out);
@@ -562,6 +568,9 @@ fn collect_sources(
         }
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            collect_sources(sort.input.as_ref(), sources, out)
+        }
         LogicalPlan::Join(join) => {
             collect_sources(join.left.as_ref(), sources, out);
             collect_sources(join.right.as_ref(), sources, out);
@@ -587,6 +596,9 @@ fn contains_unsupported_multijoin_wrapper(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::SubqueryAlias(alias) => {
             contains_unsupported_multijoin_wrapper(alias.input.as_ref())
+        }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            contains_unsupported_multijoin_wrapper(sort.input.as_ref())
         }
         LogicalPlan::Join(join) => {
             contains_unsupported_multijoin_wrapper(join.left.as_ref())
