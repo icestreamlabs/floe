@@ -216,7 +216,9 @@ fn global_join_topn_plan_for_plan(
     let [join] = joins.as_slice() else {
         return Ok(None);
     };
-    if join.join_type != JoinType::Inner || (join.on.is_empty() && join.filter.is_none()) {
+    if !is_supported_global_join_topn_join_type(join.join_type)
+        || (join.on.is_empty() && join.filter.is_none())
+    {
         return Ok(None);
     }
     let Some(left_source) = single_source_for_plan(join.left.as_ref(), sources) else {
@@ -242,6 +244,22 @@ fn global_join_topn_plan_for_plan(
             logical_plan: plan.clone(),
         },
     }))
+}
+
+#[cold]
+#[inline(never)]
+fn is_supported_global_join_topn_join_type(join_type: JoinType) -> bool {
+    matches!(
+        join_type,
+        JoinType::Inner
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Full
+            | JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+    )
 }
 
 pub(super) async fn build_columnar_join_topn_materialized_view_state(
