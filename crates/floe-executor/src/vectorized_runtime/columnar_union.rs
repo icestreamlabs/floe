@@ -117,6 +117,12 @@ fn union_execution_plan(plan: &LogicalPlan) -> Option<(LogicalPlan, bool)> {
         LogicalPlan::Distinct(Distinct::All(input)) if contains_union(input.as_ref()) => {
             Some((input.as_ref().clone(), true))
         }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            let (input, distinct) = union_execution_plan(sort.input.as_ref())?;
+            let mut sort = sort.clone();
+            sort.input = Arc::new(input);
+            Some((LogicalPlan::Sort(sort), distinct))
+        }
         LogicalPlan::SubqueryAlias(alias) => union_execution_plan(alias.input.as_ref()),
         _ if contains_union(plan) => Some((plan.clone(), false)),
         _ => None,
@@ -653,6 +659,7 @@ fn contains_union(plan: &LogicalPlan) -> bool {
         LogicalPlan::Projection(projection) => contains_union(projection.input.as_ref()),
         LogicalPlan::Filter(filter) => contains_union(filter.input.as_ref()),
         LogicalPlan::SubqueryAlias(alias) => contains_union(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => contains_union(sort.input.as_ref()),
         _ => false,
     }
 }
@@ -665,6 +672,9 @@ fn contains_unsupported_union_wrapper(plan: &LogicalPlan) -> bool {
         LogicalPlan::Filter(filter) => contains_unsupported_union_wrapper(filter.input.as_ref()),
         LogicalPlan::SubqueryAlias(alias) => {
             contains_unsupported_union_wrapper(alias.input.as_ref())
+        }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            contains_unsupported_union_wrapper(sort.input.as_ref())
         }
         LogicalPlan::Union(union) => union
             .inputs
@@ -700,6 +710,9 @@ fn collect_sources(
         }
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            collect_sources(sort.input.as_ref(), sources, out)
+        }
         LogicalPlan::Union(union) => {
             for input in &union.inputs {
                 collect_sources(input.as_ref(), sources, out);

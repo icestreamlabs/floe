@@ -181,6 +181,14 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction FROM bid UNION SELECT auction FROM bid",
     },
     ValidPlanRuntimeCase {
+        id: "ordered_union_all",
+        sql: "SELECT auction FROM bid UNION ALL SELECT auction FROM bid ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "ordered_union_distinct",
+        sql: "SELECT auction FROM bid UNION SELECT auction FROM bid ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
         id: "distinct_over_union",
         sql: "SELECT DISTINCT auction FROM (SELECT auction FROM bid WHERE price > 100 UNION ALL SELECT auction FROM bid WHERE price <= 100) u",
     },
