@@ -9402,6 +9402,185 @@ async fn distinct_join_uses_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
+async fn intersect_except_use_slate_backed_columnar_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 3, 2])),
+            Arc::new(Int64Array::from(vec![90, 100, 110, 120, 130])),
+        ],
+    )
+    .expect("initial bids batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-intersect-except").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let intersect_query = "SELECT auction, price FROM bids WHERE price >= 100 \
+        INTERSECT SELECT auction, price FROM bids WHERE auction <= 2";
+    let except_query = "SELECT auction, price FROM bids WHERE price >= 100 \
+        EXCEPT SELECT auction, price FROM bids WHERE auction = 2";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_intersect_bids",
+                intersect_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_except_bids",
+                except_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctJoin
+    );
+    assert_eq!(
+        runtime.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctJoin
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let intersect_handle = registry
+        .get("mv_intersect_bids")
+        .expect("intersect materialized view");
+    let intersect_snapshot = intersect_handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        id_count_rows(&intersect_snapshot),
+        vec![(1, 100), (2, 110), (2, 130)]
+    );
+
+    let except_handle = registry
+        .get("mv_except_bids")
+        .expect("except materialized view");
+    let except_snapshot = except_handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(id_count_rows(&except_snapshot), vec![(1, 100), (3, 120)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_intersect_bids",
+                intersect_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_except_bids",
+                except_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctJoin
+    );
+    assert_eq!(
+        recovered.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctJoin
+    );
+    recovered.run_tick(2).await.expect("recovered tick");
+
+    let recovered_intersect = recovery_registry
+        .get("mv_intersect_bids")
+        .expect("recovered intersect materialized view");
+    let recovered_snapshot = recovered_intersect
+        .arrow_snapshot_for(2)
+        .expect("recovered intersect snapshot");
+    assert_eq!(
+        id_count_rows(&recovered_snapshot),
+        vec![(1, 100), (2, 110), (2, 130)]
+    );
+    let recovered_delta = recovered_intersect
+        .arrow_delta_for(2)
+        .expect("recovered empty intersect delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let recovered_except = recovery_registry
+        .get("mv_except_bids")
+        .expect("recovered except materialized view");
+    let recovered_snapshot = recovered_except
+        .arrow_snapshot_for(2)
+        .expect("recovered except snapshot");
+    assert_eq!(id_count_rows(&recovered_snapshot), vec![(1, 100), (3, 120)]);
+    let recovered_delta = recovered_except
+        .arrow_delta_for(2)
+        .expect("recovered empty except delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2, 3])),
+            Arc::new(Int64Array::from(vec![110, 120])),
+        ],
+    )
+    .expect("bid retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&bids_schema)
+        .expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&retract, &weighted_schema, &[-1, -1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(3).await.expect("retract tick");
+
+    let intersect_snapshot = recovered_intersect
+        .arrow_snapshot_for(3)
+        .expect("intersect snapshot after retract");
+    assert_eq!(id_count_rows(&intersect_snapshot), vec![(1, 100), (2, 130)]);
+    let intersect_delta = recovered_intersect
+        .arrow_delta_for(3)
+        .expect("intersect delta after retract");
+    assert_eq!(weighted_id_count_rows(&intersect_delta), vec![(2, 110, -1)]);
+
+    let except_snapshot = recovered_except
+        .arrow_snapshot_for(3)
+        .expect("except snapshot after retract");
+    assert_eq!(id_count_rows(&except_snapshot), vec![(1, 100)]);
+    let except_delta = recovered_except
+        .arrow_delta_for(3)
+        .expect("except delta after retract");
+    assert_eq!(weighted_id_count_rows(&except_delta), vec![(3, 120, -1)]);
+}
+
+#[tokio::test]
 async fn distinct_topn_uses_slate_backed_columnar_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",
