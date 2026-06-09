@@ -27,6 +27,11 @@ use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
+use super::columnar_grouped_max::{
+    ColumnarGroupedMaxMaterializedViewState, ColumnarGroupedMaxPlan,
+    build_columnar_grouped_max_materialized_view_state_in_namespace,
+    columnar_grouped_max_plan_for_plan, run_columnar_grouped_max_state_tick,
+};
 use super::columnar_join_topn::{
     ColumnarJoinTopNMaterializedViewState, ColumnarJoinTopNPlan,
     build_columnar_join_topn_materialized_view_state_in_namespaces,
@@ -98,6 +103,7 @@ struct ColumnarJoinSourceState {
     join: Option<ColumnarJoinJoinInputState>,
     multijoin: Option<ColumnarJoinMultiJoinInputState>,
     union: Option<ColumnarJoinUnionInputState>,
+    grouped_max: Option<ColumnarJoinGroupedMaxInputState>,
 }
 
 struct ColumnarJoinConstantState {
@@ -131,6 +137,10 @@ struct ColumnarJoinUnionInputState {
     state: ColumnarUnionMaterializedViewState,
 }
 
+struct ColumnarJoinGroupedMaxInputState {
+    state: ColumnarGroupedMaxMaterializedViewState,
+}
+
 struct ColumnarJoinInputPlan {
     input_name: String,
     schema: SchemaRef,
@@ -159,6 +169,9 @@ enum ColumnarJoinInputPlanKind {
     },
     Union {
         plan: ColumnarUnionPlan,
+    },
+    GroupedMax {
+        plan: ColumnarGroupedMaxPlan,
     },
 }
 
@@ -415,6 +428,9 @@ fn join_input_namespace(mv_namespace: &str, side: &str, input: &ColumnarJoinInpu
         ColumnarJoinInputPlanKind::Union { .. } => {
             format!("{mv_namespace}/columnar/join/{side}/union")
         }
+        ColumnarJoinInputPlanKind::GroupedMax { .. } => {
+            format!("{mv_namespace}/columnar/join/{side}/grouped_max")
+        }
     }
 }
 
@@ -472,6 +488,7 @@ async fn build_join_input_state(
                 join: None,
                 multijoin: None,
                 union: None,
+                grouped_max: None,
             })
         }
         ColumnarJoinInputPlanKind::Constant { logical_plan } => {
@@ -534,6 +551,7 @@ async fn build_join_input_state(
                 join: None,
                 multijoin: None,
                 union: None,
+                grouped_max: None,
             })
         }
         ColumnarJoinInputPlanKind::TopN {
@@ -604,6 +622,7 @@ async fn build_join_input_state(
                 join: None,
                 multijoin: None,
                 union: None,
+                grouped_max: None,
             })
         }
         ColumnarJoinInputPlanKind::JoinTopN { plan } => {
@@ -640,6 +659,7 @@ async fn build_join_input_state(
                 join: None,
                 multijoin: None,
                 union: None,
+                grouped_max: None,
             })
         }
         ColumnarJoinInputPlanKind::Join { plan } => {
@@ -674,6 +694,7 @@ async fn build_join_input_state(
                 }),
                 multijoin: None,
                 union: None,
+                grouped_max: None,
             })
         }
         ColumnarJoinInputPlanKind::MultiJoin { plan } => {
@@ -706,6 +727,7 @@ async fn build_join_input_state(
                 join: None,
                 multijoin: Some(ColumnarJoinMultiJoinInputState { state }),
                 union: None,
+                grouped_max: None,
             })
         }
         ColumnarJoinInputPlanKind::Union { plan } => {
@@ -738,6 +760,40 @@ async fn build_join_input_state(
                 join: None,
                 multijoin: None,
                 union: Some(ColumnarJoinUnionInputState { state }),
+                grouped_max: None,
+            })
+        }
+        ColumnarJoinInputPlanKind::GroupedMax { plan } => {
+            let grouped_max_namespace = format!("{namespace}/state");
+            let state = build_columnar_grouped_max_materialized_view_state_in_namespace(
+                table,
+                grouped_max_namespace,
+                &input.schema,
+                plan,
+                sources,
+                udfs,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed {side} nested grouped-max input for '{}'",
+                    input.input_name
+                )
+            })?;
+            let snapshot = state.initial_snapshot();
+            Ok(ColumnarJoinSourceState {
+                input_name: input.input_name,
+                source_name: None,
+                schema: input.schema,
+                input_zset: None,
+                snapshot,
+                constant: None,
+                topn: None,
+                join_topn: None,
+                join: None,
+                multijoin: None,
+                union: None,
+                grouped_max: Some(ColumnarJoinGroupedMaxInputState { state }),
             })
         }
     }
@@ -1127,6 +1183,14 @@ async fn prepare_join_input_tick(
         return prepare_nested_union_input_tick(source, insert_batches, weighted_delta_batches)
             .await;
     }
+    if source.grouped_max.is_some() {
+        return prepare_nested_grouped_max_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        )
+        .await;
+    }
     if source.join_topn.is_some() {
         return prepare_join_topn_join_input_tick(source, insert_batches, weighted_delta_batches)
             .await;
@@ -1173,6 +1237,50 @@ async fn prepare_nested_union_input_tick(
     )
     .await
     .with_context(|| format!("evaluate nested union input '{}'", source.input_name))?;
+    let changed = !tick.delta.batches().is_empty();
+    if !tick.input_changed {
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    if !changed {
+        source.snapshot = tick.next_snapshot;
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    Ok(JoinInputTick {
+        delta: tick.delta,
+        changed: true,
+        next_snapshot: Some(tick.next_snapshot),
+    })
+}
+
+async fn prepare_nested_grouped_max_input_tick(
+    source: &mut ColumnarJoinSourceState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<JoinInputTick> {
+    let Some(grouped_max) = source.grouped_max.as_mut() else {
+        return Ok(JoinInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&source.schema))?,
+            changed: false,
+            next_snapshot: None,
+        });
+    };
+    let tick = run_columnar_grouped_max_state_tick(
+        &mut grouped_max.state,
+        insert_batches,
+        weighted_delta_batches,
+        &source.schema,
+        &source.snapshot,
+    )
+    .await
+    .with_context(|| format!("evaluate nested grouped-max input '{}'", source.input_name))?;
     let changed = !tick.delta.batches().is_empty();
     if !tick.input_changed {
         return Ok(JoinInputTick {
@@ -1694,7 +1802,8 @@ impl JoinEvaluatorInput {
             | ColumnarJoinInputPlanKind::JoinTopN { .. }
             | ColumnarJoinInputPlanKind::Join { .. }
             | ColumnarJoinInputPlanKind::MultiJoin { .. }
-            | ColumnarJoinInputPlanKind::Union { .. } => (None, None),
+            | ColumnarJoinInputPlanKind::Union { .. }
+            | ColumnarJoinInputPlanKind::GroupedMax { .. } => (None, None),
         };
         Ok(Self {
             provider,
@@ -1827,6 +1936,7 @@ fn rebind_join_side_logical_plan(
             | ColumnarJoinInputPlanKind::Join { .. }
             | ColumnarJoinInputPlanKind::MultiJoin { .. }
             | ColumnarJoinInputPlanKind::Union { .. }
+            | ColumnarJoinInputPlanKind::GroupedMax { .. }
     ) {
         return input.scan_plan(&input_plan.input_name);
     }
@@ -1857,6 +1967,7 @@ impl ColumnarJoinInputPlan {
             ColumnarJoinInputPlanKind::Join { .. } => None,
             ColumnarJoinInputPlanKind::MultiJoin { .. } => None,
             ColumnarJoinInputPlanKind::Union { .. } => None,
+            ColumnarJoinInputPlanKind::GroupedMax { .. } => None,
         }
     }
 
@@ -1877,6 +1988,7 @@ impl ColumnarJoinInputPlan {
                 .collect(),
             ColumnarJoinInputPlanKind::MultiJoin { plan } => plan.source_names(),
             ColumnarJoinInputPlanKind::Union { plan } => plan.source_names(),
+            ColumnarJoinInputPlanKind::GroupedMax { plan } => plan.source_names(),
             ColumnarJoinInputPlanKind::Constant { .. } => BTreeSet::new(),
         }
     }
@@ -1964,6 +2076,17 @@ fn join_input_plan_for_side(
         }));
     }
 
+    if let Some(input_name) = derived_relation_name(plan) {
+        let schema = df_schema_to_arrow(plan.schema());
+        if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(plan, sources, &schema)? {
+            return Ok(Some(ColumnarJoinInputPlan {
+                input_name,
+                schema,
+                kind: ColumnarJoinInputPlanKind::GroupedMax { plan: grouped_max },
+            }));
+        }
+    }
+
     let Some(source_name) = single_source_for_plan(plan, sources) else {
         return Ok(None);
     };
@@ -2011,7 +2134,13 @@ fn collect_joins<'a>(
         && derived_relation_name(plan).is_some()
         && (columnar_join_plan_for_plan_with_options(plan, sources, false)?.is_some()
             || columnar_multijoin_plan_for_plan(plan, sources)?.is_some()
-            || columnar_union_plan_for_plan(plan, sources)?.is_some())
+            || columnar_union_plan_for_plan(plan, sources)?.is_some()
+            || columnar_grouped_max_plan_for_plan(
+                plan,
+                sources,
+                &df_schema_to_arrow(plan.schema()),
+            )?
+            .is_some())
     {
         return Ok(());
     }
@@ -2120,6 +2249,9 @@ fn collect_sources(
         LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
         LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
         LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
+        LogicalPlan::Aggregate(aggregate) => {
+            collect_sources(aggregate.input.as_ref(), sources, out)
+        }
         LogicalPlan::Union(union) => {
             for input in &union.inputs {
                 collect_sources(input.as_ref(), sources, out);
@@ -2193,6 +2325,12 @@ fn contains_unsupported_join_side_wrapper(
     }
     if derived_relation_name(plan).is_some()
         && columnar_union_plan_for_plan(plan, sources)?.is_some()
+    {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_grouped_max_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
+            .is_some()
     {
         return Ok(false);
     }

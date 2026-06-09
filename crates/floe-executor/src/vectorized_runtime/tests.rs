@@ -10696,8 +10696,9 @@ async fn aggregate_join_uses_slate_backed_columnar_operator_semantics() {
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarAggregateJoin
+        MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
 
     runtime
         .append_source_batches_for_execution_and_query(
@@ -10764,8 +10765,9 @@ async fn aggregate_join_uses_slate_backed_columnar_operator_semantics() {
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarAggregateJoin
+        MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&recovered, "snapshot_diff");
     recovered.run_tick(3).await.expect("recovered tick");
 
     let recovered_handle = recovery_registry

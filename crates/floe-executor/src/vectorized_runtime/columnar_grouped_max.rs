@@ -1,4 +1,4 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,6 +41,12 @@ pub(super) struct ColumnarGroupedMaxPlan {
     max_idx: usize,
 }
 
+impl ColumnarGroupedMaxPlan {
+    pub(super) fn source_names(&self) -> BTreeSet<String> {
+        [self.source_name.clone()].into_iter().collect()
+    }
+}
+
 pub(super) struct ColumnarGroupedMaxMaterializedViewState {
     source_name: String,
     source_schema: SchemaRef,
@@ -70,6 +76,12 @@ struct PendingMaxGroupDelta {
     value_deltas: HashMap<i64, i64>,
     batch: RecordBatch,
     row_idx: usize,
+}
+
+pub(super) struct ColumnarGroupedMaxTick {
+    pub(super) delta: ColumnarZSet,
+    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) input_changed: bool,
 }
 
 pub(super) fn columnar_grouped_max_plan_for_plan(
@@ -156,10 +168,29 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarGroupedMaxMaterializedViewState> {
+    let mv_namespace = namespaces::materialized_view(view_name)?;
+    build_columnar_grouped_max_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarGroupedMaxPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarGroupedMaxMaterializedViewState> {
     let source = sources
         .get(&plan.source_name)
         .ok_or_else(|| anyhow::anyhow!("unknown vectorized source '{}'", plan.source_name))?;
-    let mv_namespace = namespaces::materialized_view(view_name)?;
     let input_namespace = format!("{mv_namespace}/columnar/grouped_max/input");
     let output_namespace = format!("{mv_namespace}/columnar/grouped_max/output");
     let state_namespace = format!("{mv_namespace}/columnar/grouped_max/state");
@@ -218,6 +249,42 @@ pub(super) async fn run_columnar_grouped_max_materialized_view_tick(
     };
 
     let plan_start = Instant::now();
+    let tick = run_columnar_grouped_max_state_tick(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        &mv.output_schema,
+        &mv.previous_snapshot,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "evaluate Slate-backed grouped-max columnar snapshot delta for '{}'",
+            mv.view_name
+        )
+    })?;
+
+    let delta_batches = tick.delta.batches().to_vec();
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = tick.next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "columnar_grouped_max",
+        "SlateDB-backed grouped-max columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+pub(super) async fn run_columnar_grouped_max_state_tick(
+    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarGroupedMaxTick> {
     let input_delta =
         if let Some(weighted_batches) = weighted_delta_batches.get(columnar.source_name.as_str()) {
             ColumnarZSet::try_new_weighted(
@@ -255,6 +322,7 @@ pub(super) async fn run_columnar_grouped_max_materialized_view_tick(
     } else {
         input_delta
     };
+    let input_changed = !persisted_input_delta.batches().is_empty();
     let pending = grouped_max_pending_delta(columnar, persisted_input_delta.batches()).await?;
     let output_delta_batches = apply_grouped_max_delta(columnar, pending).await?;
     let output_delta =
@@ -277,30 +345,16 @@ pub(super) async fn run_columnar_grouped_max_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed grouped-max columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+            .await
+            .context("apply Slate-backed grouped-max columnar snapshot delta")?;
 
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_grouped_max",
-        "SlateDB-backed grouped-max columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarGroupedMaxTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    })
 }
 
 async fn grouped_max_pending_delta(
