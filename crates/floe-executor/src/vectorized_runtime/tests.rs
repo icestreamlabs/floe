@@ -4971,6 +4971,123 @@ async fn asof_join_uses_slate_backed_columnar_composed_operator_semantics() {
 }
 
 #[tokio::test]
+async fn asof_join_without_equi_keys_uses_slate_backed_columnar_composed_operator_semantics() {
+    let auctions = SourceDefinition::new(
+        "auction",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("auction source definition");
+    let bids = SourceDefinition::new(
+        "bid",
+        vec![
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("bid source definition");
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auction_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 500])),
+        ],
+    )
+    .expect("initial auctions batch");
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 20])),
+            Arc::new(TimestampMillisecondArray::from(vec![400, 800])),
+        ],
+    )
+    .expect("initial bids batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-asof-join-no-keys").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("price", DataType::Int64, true),
+    ]));
+    let query = "SELECT a.id, b.price \
+        FROM auction a ASOF JOIN bid b \
+        MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\")";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_asof_global_prices",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposed
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auction",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bid",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_asof_global_prices")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(asof_rows(&snapshot), vec![(1, Some(20)), (2, Some(10))]);
+
+    let bid_insert = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![30])),
+            Arc::new(TimestampMillisecondArray::from(vec![900])),
+        ],
+    )
+    .expect("bid insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bid",
+            vec![bid_insert.clone()],
+            vec![bid_insert],
+        )
+        .await
+        .expect("append bid insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(asof_rows(&snapshot), vec![(1, Some(30)), (2, Some(10))]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_asof_rows(&delta),
+        vec![(1, Some(20), -1), (1, Some(30), 1)]
+    );
+}
+
+#[tokio::test]
 async fn range_join_uses_slate_backed_columnar_operator_semantics() {
     let windows = SourceDefinition::new(
         "windows",

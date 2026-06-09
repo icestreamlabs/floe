@@ -121,12 +121,32 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction HAVING SUM(price) > 1000",
     },
     ValidPlanRuntimeCase {
+        id: "filtered_distinct_aggregate",
+        sql: "SELECT COUNT(*) FILTER (WHERE price > 100) AS filtered_rows, COUNT(DISTINCT bidder) FILTER (WHERE price > 100) AS filtered_distinct_bidders FROM bid",
+    },
+    ValidPlanRuntimeCase {
+        id: "hop_allowed_lateness_window",
+        sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000, 1500)",
+    },
+    ValidPlanRuntimeCase {
+        id: "tumble_allowed_lateness_window",
+        sql: "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, TUMBLE(\"dateTime\", 10000, 750)",
+    },
+    ValidPlanRuntimeCase {
         id: "session_window_aggregate",
         sql: "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000)",
     },
     ValidPlanRuntimeCase {
+        id: "session_allowed_lateness_window",
+        sql: "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000, 1200)",
+    },
+    ValidPlanRuntimeCase {
         id: "asof_join",
         sql: "SELECT a.id, b.price FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "asof_join_without_equi_keys",
+        sql: "SELECT a.id, b.price FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\")",
     },
 ];
 
