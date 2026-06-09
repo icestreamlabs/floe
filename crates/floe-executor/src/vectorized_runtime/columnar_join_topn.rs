@@ -39,6 +39,12 @@ pub(super) struct ColumnarJoinTopNPlan {
     kind: ColumnarJoinTopNPlanKind,
 }
 
+impl ColumnarJoinTopNPlan {
+    pub(super) fn source_names(&self) -> [String; 2] {
+        [self.left_source.clone(), self.right_source.clone()]
+    }
+}
+
 enum ColumnarJoinTopNPlanKind {
     PartitionedBestBid {
         left_key_column: String,
@@ -61,6 +67,12 @@ impl ColumnarJoinTopNMaterializedViewState {
     pub(super) fn initial_snapshot(&self) -> Vec<RecordBatch> {
         self.initial_snapshot.clone()
     }
+}
+
+pub(super) struct ColumnarJoinTopNTick {
+    pub(super) delta: ColumnarZSet,
+    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) input_changed: bool,
 }
 
 struct JoinTopNSourceState {
@@ -270,6 +282,54 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinTopNMaterializedViewState> {
+    let mv_namespace = namespaces::materialized_view(view_name)?;
+    let (left_namespace, right_namespace) = if plan.left_source == plan.right_source {
+        (
+            format!(
+                "{mv_namespace}/columnar/join_topn/left/{}/input",
+                plan.left_source
+            ),
+            format!(
+                "{mv_namespace}/columnar/join_topn/right/{}/input",
+                plan.right_source
+            ),
+        )
+    } else {
+        (
+            format!(
+                "{mv_namespace}/columnar/join_topn/{}/input",
+                plan.left_source
+            ),
+            format!(
+                "{mv_namespace}/columnar/join_topn/{}/input",
+                plan.right_source
+            ),
+        )
+    };
+    let output_namespace = format!("{mv_namespace}/columnar/join_topn/output");
+    build_columnar_join_topn_materialized_view_state_in_namespaces(
+        table,
+        left_namespace,
+        right_namespace,
+        output_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespaces(
+    table: Arc<dyn KeyValueTable>,
+    left_namespace: String,
+    right_namespace: String,
+    output_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarJoinTopNPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarJoinTopNMaterializedViewState> {
     let left_source = sources
         .get(&plan.left_source)
         .ok_or_else(|| anyhow::anyhow!("unknown join-topn source '{}'", plan.left_source))?;
@@ -296,32 +356,6 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
         ),
         ColumnarJoinTopNPlanKind::GlobalSnapshotDiff { .. } => (None, None),
     };
-
-    let mv_namespace = namespaces::materialized_view(view_name)?;
-    let (left_namespace, right_namespace) = if plan.left_source == plan.right_source {
-        (
-            format!(
-                "{mv_namespace}/columnar/join_topn/left/{}/input",
-                plan.left_source
-            ),
-            format!(
-                "{mv_namespace}/columnar/join_topn/right/{}/input",
-                plan.right_source
-            ),
-        )
-    } else {
-        (
-            format!(
-                "{mv_namespace}/columnar/join_topn/{}/input",
-                plan.left_source
-            ),
-            format!(
-                "{mv_namespace}/columnar/join_topn/{}/input",
-                plan.right_source
-            ),
-        )
-    };
-    let output_namespace = format!("{mv_namespace}/columnar/join_topn/output");
 
     let left_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
@@ -422,7 +456,36 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
         return Ok(false);
     };
     let plan_start = Instant::now();
+    let tick = run_columnar_join_topn_state_tick(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        &mv.output_schema,
+        &mv.previous_snapshot,
+    )
+    .await?;
 
+    let delta_batches = tick.delta.batches().to_vec();
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = tick.next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "columnar_join_topn",
+        "SlateDB-backed join-topn columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+pub(super) async fn run_columnar_join_topn_state_tick(
+    columnar: &mut ColumnarJoinTopNMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarJoinTopNTick> {
     let left_input_delta =
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
     let right_input_delta =
@@ -431,6 +494,7 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
         persisted_source_delta(&mut columnar.left.input_zset, left_input_delta).await?;
     let right_delta =
         persisted_source_delta(&mut columnar.right.input_zset, right_input_delta).await?;
+    let input_changed = !left_delta.batches().is_empty() || !right_delta.batches().is_empty();
 
     let next_left_snapshot =
         apply_source_snapshot_delta(&columnar.left.schema, &columnar.left.snapshot, &left_delta)
@@ -494,17 +558,13 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
                         .context("evaluate next join-topn partition outputs")?,
                 )
             };
-            diff_snapshot_batches(
-                Arc::clone(&mv.output_schema),
-                &previous_output,
-                &next_output,
-            )
-            .await
-            .context("diff join-topn partition outputs")?
-            .batches
+            diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
+                .await
+                .context("diff join-topn partition outputs")?
+                .batches
         }
         JoinTopNEvaluator::GlobalSnapshotDiff(evaluator) => {
-            if left_delta.batches().is_empty() && right_delta.batches().is_empty() {
+            if !input_changed {
                 Vec::new()
             } else {
                 let next_output = evaluator
@@ -516,14 +576,10 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
                     )
                     .await
                     .context("evaluate global join-topn output")?;
-                diff_snapshot_batches(
-                    Arc::clone(&mv.output_schema),
-                    &mv.previous_snapshot,
-                    &next_output,
-                )
-                .await
-                .context("diff global join-topn output")?
-                .batches
+                diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
+                    .await
+                    .context("diff global join-topn output")?
+                    .batches
             }
         }
     };
@@ -548,32 +604,18 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed join-topn columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+            .await
+            .context("apply Slate-backed join-topn columnar snapshot delta")?;
 
     columnar.left.snapshot = next_left_snapshot;
     columnar.right.snapshot = next_right_snapshot;
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = "columnar_join_topn",
-        "SlateDB-backed join-topn columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarJoinTopNTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    })
 }
 
 fn source_input_delta(
