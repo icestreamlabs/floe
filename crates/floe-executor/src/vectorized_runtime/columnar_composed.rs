@@ -479,6 +479,7 @@ fn collect_joins<'a>(plan: &'a LogicalPlan, joins: &mut Vec<&'a Join>) {
         LogicalPlan::Projection(projection) => collect_joins(projection.input.as_ref(), joins),
         LogicalPlan::Filter(filter) => collect_joins(filter.input.as_ref(), joins),
         LogicalPlan::SubqueryAlias(alias) => collect_joins(alias.input.as_ref(), joins),
+        LogicalPlan::Subquery(subquery) => collect_joins(subquery.subquery.as_ref(), joins),
         LogicalPlan::Aggregate(aggregate) => collect_joins(aggregate.input.as_ref(), joins),
         LogicalPlan::Sort(sort) => collect_joins(sort.input.as_ref(), joins),
         LogicalPlan::Limit(limit) => collect_joins(limit.input.as_ref(), joins),
@@ -533,6 +534,9 @@ fn collect_sources(
         }
         LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
+        LogicalPlan::Subquery(subquery) => {
+            collect_sources(subquery.subquery.as_ref(), sources, out)
+        }
         LogicalPlan::Aggregate(aggregate) => {
             collect_sources(aggregate.input.as_ref(), sources, out)
         }
