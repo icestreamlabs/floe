@@ -9878,6 +9878,161 @@ async fn union_topn_uses_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
+async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let auctions = SourceDefinition::new(
+        "auctions",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("auctions source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let auctions_schema = auctions.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 3])),
+            Arc::new(Int64Array::from(vec![100, 90, 200, 50])),
+        ],
+    )
+    .expect("initial bids batch");
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .expect("initial auctions batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    sources.register(auctions);
+    let table = build_operator_state_table("vectorized-columnar-reversed-composed").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let join_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("seller", DataType::Int64, false),
+    ]));
+    let key_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_distinct_over_join",
+                "SELECT DISTINCT b.auction, a.seller \
+                    FROM bids b JOIN auctions a ON b.auction = a.id",
+                Arc::clone(&join_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_join_over_topn",
+                "SELECT t.auction, a.seller \
+                    FROM (SELECT auction, price FROM bids ORDER BY price DESC LIMIT 2) t \
+                    JOIN auctions a ON t.auction = a.id",
+                Arc::clone(&join_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_union_over_topn",
+                "SELECT key \
+                    FROM (SELECT key FROM (SELECT auction AS key, price FROM bids ORDER BY price DESC LIMIT 2) t \
+                    UNION ALL SELECT id AS key FROM auctions) u",
+                Arc::clone(&key_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_union_over_aggregate",
+                "SELECT key \
+                    FROM (SELECT auction AS key FROM (SELECT auction, COUNT(*) AS c FROM bids GROUP BY auction) a \
+                    UNION ALL SELECT id AS key FROM auctions) u",
+                Arc::clone(&key_schema),
+            ),
+        ],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctJoin
+    );
+    assert_eq!(
+        runtime.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarComposedJoinTopN
+    );
+    assert_eq!(
+        runtime.materialized_views[2].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnionTopN
+    );
+    assert_eq!(
+        runtime.materialized_views[3].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnionAggregate
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let distinct_over_join = registry
+        .get("mv_distinct_over_join")
+        .expect("distinct-over-join materialized view");
+    assert_eq!(
+        id_count_rows(&distinct_over_join.arrow_snapshot_for(1).expect("snapshot")),
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
+
+    let join_over_topn = registry
+        .get("mv_join_over_topn")
+        .expect("join-over-topn materialized view");
+    assert_eq!(
+        id_count_rows(&join_over_topn.arrow_snapshot_for(1).expect("snapshot")),
+        vec![(1, 10), (2, 20)]
+    );
+
+    let union_over_topn = registry
+        .get("mv_union_over_topn")
+        .expect("union-over-topn materialized view");
+    assert_eq!(
+        single_int_rows(&union_over_topn.arrow_snapshot_for(1).expect("snapshot")),
+        vec![1, 1, 2, 2, 3]
+    );
+
+    let union_over_aggregate = registry
+        .get("mv_union_over_aggregate")
+        .expect("union-over-aggregate materialized view");
+    assert_eq!(
+        single_int_rows(
+            &union_over_aggregate
+                .arrow_snapshot_for(1)
+                .expect("snapshot")
+        ),
+        vec![1, 1, 2, 2, 3, 3]
+    );
+}
+
+#[tokio::test]
 async fn explicit_full_refresh_policy_allows_non_incremental_mv() {
     let definition = SourceDefinition::new(
         "orders",

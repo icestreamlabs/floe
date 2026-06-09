@@ -351,17 +351,7 @@ fn contains_join_aggregate(plan: &LogicalPlan) -> bool {
 }
 
 fn contains_distinct_aggregate(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Aggregate(aggregate) => contains_distinct(aggregate.input.as_ref()),
-        LogicalPlan::Projection(projection) => {
-            contains_distinct_aggregate(projection.input.as_ref())
-        }
-        LogicalPlan::Filter(filter) => contains_distinct_aggregate(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => contains_distinct_aggregate(alias.input.as_ref()),
-        LogicalPlan::Sort(sort) => contains_distinct_aggregate(sort.input.as_ref()),
-        LogicalPlan::Limit(limit) => contains_distinct_aggregate(limit.input.as_ref()),
-        _ => false,
-    }
+    contains_distinct(plan) && contains_aggregate(plan)
 }
 
 fn contains_distinct(plan: &LogicalPlan) -> bool {
@@ -388,59 +378,59 @@ fn contains_distinct(plan: &LogicalPlan) -> bool {
 }
 
 fn contains_distinct_join(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Join(join) => {
-            contains_distinct(join.left.as_ref())
-                || contains_distinct(join.right.as_ref())
-                || contains_distinct_join(join.left.as_ref())
-                || contains_distinct_join(join.right.as_ref())
-        }
-        LogicalPlan::Projection(projection) => contains_distinct_join(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => contains_distinct_join(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => contains_distinct_join(alias.input.as_ref()),
-        LogicalPlan::Sort(sort) => contains_distinct_join(sort.input.as_ref()),
-        LogicalPlan::Limit(limit) => contains_distinct_join(limit.input.as_ref()),
-        _ => false,
-    }
+    contains_distinct(plan) && contains_join(plan)
 }
 
 fn contains_distinct_topn(plan: &LogicalPlan) -> bool {
-    contains_topn_input(plan, contains_distinct)
+    contains_distinct(plan) && contains_topn(plan)
 }
 
 fn contains_join_topn(plan: &LogicalPlan) -> bool {
-    contains_topn_input(plan, contains_join)
+    contains_join(plan) && contains_topn(plan)
 }
 
 fn contains_union_topn(plan: &LogicalPlan) -> bool {
-    contains_topn_input(plan, contains_union)
+    contains_union(plan) && contains_topn(plan)
 }
 
-fn contains_topn_input(plan: &LogicalPlan, predicate: fn(&LogicalPlan) -> bool) -> bool {
-    contains_topn_input_with_limit(plan, predicate, false)
+fn contains_topn(plan: &LogicalPlan) -> bool {
+    contains_topn_with_limit(plan, false)
 }
 
-fn contains_topn_input_with_limit(
-    plan: &LogicalPlan,
-    predicate: fn(&LogicalPlan) -> bool,
-    seen_limit: bool,
-) -> bool {
+fn contains_topn_with_limit(plan: &LogicalPlan, seen_limit: bool) -> bool {
     match plan {
-        LogicalPlan::Sort(sort) if sort.fetch.is_some() || seen_limit => {
-            predicate(sort.input.as_ref())
+        LogicalPlan::Sort(sort) => {
+            sort.fetch.is_some()
+                || seen_limit
+                || contains_topn_with_limit(sort.input.as_ref(), false)
         }
-        LogicalPlan::Limit(limit) => {
-            contains_topn_input_with_limit(limit.input.as_ref(), predicate, true)
-        }
+        LogicalPlan::Limit(limit) => contains_topn_with_limit(limit.input.as_ref(), true),
         LogicalPlan::Projection(projection) => {
-            contains_topn_input_with_limit(projection.input.as_ref(), predicate, seen_limit)
+            contains_topn_with_limit(projection.input.as_ref(), seen_limit)
         }
-        LogicalPlan::Filter(filter) => {
-            contains_topn_input_with_limit(filter.input.as_ref(), predicate, seen_limit)
-        }
+        LogicalPlan::Filter(filter) => contains_topn_with_limit(filter.input.as_ref(), seen_limit),
         LogicalPlan::SubqueryAlias(alias) => {
-            contains_topn_input_with_limit(alias.input.as_ref(), predicate, seen_limit)
+            contains_topn_with_limit(alias.input.as_ref(), seen_limit)
         }
+        LogicalPlan::Subquery(subquery) => {
+            contains_topn_with_limit(subquery.subquery.as_ref(), seen_limit)
+        }
+        LogicalPlan::Aggregate(aggregate) => {
+            contains_topn_with_limit(aggregate.input.as_ref(), seen_limit)
+        }
+        LogicalPlan::Window(window) => contains_topn_with_limit(window.input.as_ref(), seen_limit),
+        LogicalPlan::Repartition(repartition) => {
+            contains_topn_with_limit(repartition.input.as_ref(), seen_limit)
+        }
+        LogicalPlan::Distinct(distinct) => contains_topn_with_limit(distinct.input(), seen_limit),
+        LogicalPlan::Join(join) => {
+            contains_topn_with_limit(join.left.as_ref(), seen_limit)
+                || contains_topn_with_limit(join.right.as_ref(), seen_limit)
+        }
+        LogicalPlan::Union(union) => union
+            .inputs
+            .iter()
+            .any(|input| contains_topn_with_limit(input.as_ref(), seen_limit)),
         _ => false,
     }
 }
@@ -452,20 +442,7 @@ fn contains_join(plan: &LogicalPlan) -> bool {
 }
 
 fn contains_aggregate_join(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Join(join) => {
-            contains_aggregate(join.left.as_ref())
-                || contains_aggregate(join.right.as_ref())
-                || contains_aggregate_join(join.left.as_ref())
-                || contains_aggregate_join(join.right.as_ref())
-        }
-        LogicalPlan::Projection(projection) => contains_aggregate_join(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => contains_aggregate_join(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => contains_aggregate_join(alias.input.as_ref()),
-        LogicalPlan::Sort(sort) => contains_aggregate_join(sort.input.as_ref()),
-        LogicalPlan::Limit(limit) => contains_aggregate_join(limit.input.as_ref()),
-        _ => false,
-    }
+    contains_aggregate(plan) && contains_join(plan)
 }
 
 fn contains_aggregate(plan: &LogicalPlan) -> bool {
@@ -492,32 +469,11 @@ fn contains_aggregate(plan: &LogicalPlan) -> bool {
 }
 
 fn contains_union_join(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Join(join) => {
-            contains_union(join.left.as_ref())
-                || contains_union(join.right.as_ref())
-                || contains_union_join(join.left.as_ref())
-                || contains_union_join(join.right.as_ref())
-        }
-        LogicalPlan::Projection(projection) => contains_union_join(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => contains_union_join(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => contains_union_join(alias.input.as_ref()),
-        LogicalPlan::Sort(sort) => contains_union_join(sort.input.as_ref()),
-        LogicalPlan::Limit(limit) => contains_union_join(limit.input.as_ref()),
-        _ => false,
-    }
+    contains_union(plan) && contains_join(plan)
 }
 
 fn contains_union_aggregate(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Aggregate(aggregate) => contains_union(aggregate.input.as_ref()),
-        LogicalPlan::Projection(projection) => contains_union_aggregate(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => contains_union_aggregate(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => contains_union_aggregate(alias.input.as_ref()),
-        LogicalPlan::Sort(sort) => contains_union_aggregate(sort.input.as_ref()),
-        LogicalPlan::Limit(limit) => contains_union_aggregate(limit.input.as_ref()),
-        _ => false,
-    }
+    contains_union(plan) && contains_aggregate(plan)
 }
 
 fn contains_union(plan: &LogicalPlan) -> bool {
