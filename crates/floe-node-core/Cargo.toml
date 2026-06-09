@@ -27,3 +27,7 @@ object_store = { workspace = true, features = ["aws"] }
 tokio-postgres = { workspace = true }
 url = { workspace = true }
 regex = "1.11"
+
+[dev-dependencies]
+dbsp = { path = "../dbsp" }
+slatedb = { workspace = true }
