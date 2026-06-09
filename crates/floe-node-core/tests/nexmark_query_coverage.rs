@@ -86,6 +86,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT DISTINCT auction FROM bid ORDER BY auction",
     },
     ValidPlanRuntimeCase {
+        id: "distinct_topn",
+        sql: "SELECT DISTINCT auction FROM bid ORDER BY auction LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "left_outer_join",
         sql: "SELECT b.auction, a.seller FROM bid b LEFT JOIN auction a ON b.auction = a.id",
     },
@@ -154,6 +158,14 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT a.auction, a.max_price, au.seller FROM (SELECT auction, MAX(price) AS max_price FROM bid GROUP BY auction) a JOIN auction au ON a.auction = au.id",
     },
     ValidPlanRuntimeCase {
+        id: "distinct_join",
+        sql: "SELECT d.auction, a.seller FROM (SELECT DISTINCT auction FROM bid) d JOIN auction a ON d.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "join_topn",
+        sql: "SELECT b.auction, a.seller FROM bid b JOIN auction a ON b.auction = a.id ORDER BY b.price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_topn",
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
     },
@@ -220,6 +232,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "union_join",
         sql: "SELECT u.key, p.name FROM (SELECT seller AS key FROM auction UNION ALL SELECT bidder AS key FROM bid) u JOIN person p ON u.key = p.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_topn",
+        sql: "SELECT key FROM (SELECT auction AS key FROM bid UNION ALL SELECT id AS key FROM auction) u ORDER BY key DESC LIMIT 5",
     },
     ValidPlanRuntimeCase {
         id: "having_aggregate",
