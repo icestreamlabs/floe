@@ -5,10 +5,11 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, Int64Builder, StringArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Int64Array, Int64Builder, StringArray,
+    TimestampMillisecondArray, UInt32Array,
 };
 use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
@@ -102,6 +103,8 @@ enum AggregateValueType {
     Any,
     Int64,
     Utf8,
+    TimestampMillis,
+    DateDays,
 }
 
 struct SlateGroupedStatsState {
@@ -152,6 +155,8 @@ enum AggregateValue {
     Int64(i64),
     Float64(f64),
     Utf8(String),
+    TimestampMillis(i64),
+    DateDays(i32),
     Null,
 }
 
@@ -242,27 +247,30 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let projection_schema = df_schema_to_arrow(&projection_plan.schema)?;
     for spec in &mut specs {
         if let (Some(value_idx), Some(value_type)) = (spec.value_idx, spec.value_type) {
-            let expected = match value_type {
+            let actual_type = projection_schema.field(value_idx).data_type();
+            let supported = match value_type {
                 AggregateValueType::Any if spec.kind == AggregateKind::DistinctCount => {
-                    match projection_schema.field(value_idx).data_type() {
+                    match actual_type {
                         DataType::Int64 => {
                             spec.value_type = Some(AggregateValueType::Int64);
-                            Some(&DataType::Int64)
+                            true
                         }
                         DataType::Utf8 => {
                             spec.value_type = Some(AggregateValueType::Utf8);
-                            Some(&DataType::Utf8)
+                            true
                         }
-                        _ => return Ok(None),
+                        _ => false,
                     }
                 }
-                AggregateValueType::Any => None,
-                AggregateValueType::Int64 => Some(&DataType::Int64),
-                AggregateValueType::Utf8 => Some(&DataType::Utf8),
+                AggregateValueType::Any => true,
+                AggregateValueType::Int64 => actual_type == &DataType::Int64,
+                AggregateValueType::Utf8 => actual_type == &DataType::Utf8,
+                AggregateValueType::TimestampMillis => {
+                    matches!(actual_type, DataType::Timestamp(TimeUnit::Millisecond, _))
+                }
+                AggregateValueType::DateDays => actual_type == &DataType::Date32,
             };
-            if let Some(expected) = expected
-                && projection_schema.field(value_idx).data_type() != expected
-            {
+            if !supported {
                 return Ok(None);
             }
         }
@@ -658,7 +666,8 @@ fn add_projected_stats_row_to_pending(
                 AggregateDelta::MinMaxI64 { value_deltas },
                 AggregateKind::Min | AggregateKind::Max,
             ) => {
-                let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                let Some(value) = projected_ordered_i64_value(&value_arrays[agg_idx], row_idx)
+                else {
                     continue;
                 };
                 update_i64_value_delta(value_deltas, value, sign)?;
@@ -792,6 +801,15 @@ async fn load_aggregate_values(
                     .await?
                     .map(AggregateValue::Int64)
                     .unwrap_or(AggregateValue::Null),
+                Some(AggregateValueType::TimestampMillis | AggregateValueType::DateDays) => {
+                    columnar
+                        .stats_state
+                        .load_minmax(group_key, idx)
+                        .await?
+                        .map(|value| aggregate_value_from_ordered_i64(spec.value_type, value))
+                        .transpose()?
+                        .unwrap_or(AggregateValue::Null)
+                }
                 Some(AggregateValueType::Utf8) => columnar
                     .stats_state
                     .load_string_minmax(group_key, idx)
@@ -964,7 +982,8 @@ async fn apply_aggregate_deltas(
                 columnar
                     .stats_state
                     .write_minmax(writes, group_key, idx, new)?;
-                new.map(AggregateValue::Int64)
+                new.map(|value| aggregate_value_from_ordered_i64(spec.value_type, value))
+                    .transpose()?
                     .unwrap_or(AggregateValue::Null)
             }
             (
@@ -1057,6 +1076,8 @@ enum ProjectedValueArray<'a> {
     Any(&'a dyn Array),
     Int64(&'a Int64Array),
     Utf8(&'a StringArray),
+    TimestampMillis(&'a TimestampMillisecondArray),
+    DateDays(&'a Date32Array),
 }
 
 fn projected_value_arrays<'a>(
@@ -1085,6 +1106,18 @@ fn projected_value_arrays<'a>(
                     .downcast_ref::<StringArray>()
                     .map(ProjectedValueArray::Utf8)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats value must be Utf8")),
+                Some(AggregateValueType::TimestampMillis) => batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .map(ProjectedValueArray::TimestampMillis)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats value must be TimestampMillis")),
+                Some(AggregateValueType::DateDays) => batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .map(ProjectedValueArray::DateDays)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats value must be Date32")),
                 None => Ok(ProjectedValueArray::None),
             }
         })
@@ -1118,12 +1151,31 @@ fn projected_i64_value(values: &ProjectedValueArray<'_>, row_idx: usize) -> Opti
     (!values.is_null(row_idx)).then(|| values.value(row_idx))
 }
 
+fn projected_ordered_i64_value(values: &ProjectedValueArray<'_>, row_idx: usize) -> Option<i64> {
+    match values {
+        ProjectedValueArray::Int64(values) => {
+            (!values.is_null(row_idx)).then(|| values.value(row_idx))
+        }
+        ProjectedValueArray::TimestampMillis(values) => {
+            (!values.is_null(row_idx)).then(|| values.value(row_idx))
+        }
+        ProjectedValueArray::DateDays(values) => {
+            (!values.is_null(row_idx)).then(|| i64::from(values.value(row_idx)))
+        }
+        ProjectedValueArray::None | ProjectedValueArray::Any(_) | ProjectedValueArray::Utf8(_) => {
+            None
+        }
+    }
+}
+
 fn projected_value_is_non_null(values: &ProjectedValueArray<'_>, row_idx: usize) -> bool {
     match values {
         ProjectedValueArray::None => true,
         ProjectedValueArray::Any(values) => !values.is_null(row_idx),
         ProjectedValueArray::Int64(values) => !values.is_null(row_idx),
         ProjectedValueArray::Utf8(values) => !values.is_null(row_idx),
+        ProjectedValueArray::TimestampMillis(values) => !values.is_null(row_idx),
+        ProjectedValueArray::DateDays(values) => !values.is_null(row_idx),
     }
 }
 
@@ -1870,6 +1922,12 @@ fn append_aggregate_value(builder: &mut ScalarColumnBuilder, value: &AggregateVa
         AggregateValue::Utf8(value) => {
             builder.append_encoded_scalar(Some(&EncodedRowScalar::Utf8(value.clone())))
         }
+        AggregateValue::TimestampMillis(value) => {
+            builder.append_encoded_scalar(Some(&EncodedRowScalar::TimestampMillis(*value)))
+        }
+        AggregateValue::DateDays(value) => {
+            builder.append_encoded_scalar(Some(&EncodedRowScalar::DateDays(*value)))
+        }
         AggregateValue::Null => builder.append_encoded_scalar(None),
     }
 }
@@ -2007,14 +2065,26 @@ fn aggregate_spec_for_expr(
     } else if name.eq_ignore_ascii_case("avg") && output_type == &DataType::Float64 {
         (AggregateKind::Avg, AggregateValueType::Int64)
     } else if name.eq_ignore_ascii_case("min")
-        && matches!(output_type, DataType::Int64 | DataType::Utf8)
+        && matches!(
+            output_type,
+            DataType::Int64
+                | DataType::Utf8
+                | DataType::Timestamp(TimeUnit::Millisecond, _)
+                | DataType::Date32
+        )
     {
         (
             AggregateKind::Min,
             aggregate_value_type_for_data_type(output_type)?,
         )
     } else if name.eq_ignore_ascii_case("max")
-        && matches!(output_type, DataType::Int64 | DataType::Utf8)
+        && matches!(
+            output_type,
+            DataType::Int64
+                | DataType::Utf8
+                | DataType::Timestamp(TimeUnit::Millisecond, _)
+                | DataType::Date32
+        )
     {
         (
             AggregateKind::Max,
@@ -2035,7 +2105,27 @@ fn aggregate_value_type_for_data_type(data_type: &DataType) -> Option<AggregateV
     match data_type {
         DataType::Int64 => Some(AggregateValueType::Int64),
         DataType::Utf8 => Some(AggregateValueType::Utf8),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(AggregateValueType::TimestampMillis),
+        DataType::Date32 => Some(AggregateValueType::DateDays),
         _ => None,
+    }
+}
+
+fn aggregate_value_from_ordered_i64(
+    value_type: Option<AggregateValueType>,
+    value: i64,
+) -> Result<AggregateValue> {
+    match value_type {
+        Some(AggregateValueType::TimestampMillis) => Ok(AggregateValue::TimestampMillis(value)),
+        Some(AggregateValueType::DateDays) => Ok(AggregateValue::DateDays(
+            i32::try_from(value).context("grouped-stats Date32 min/max value out of range")?,
+        )),
+        Some(AggregateValueType::Int64) | Some(AggregateValueType::Any) | None => {
+            Ok(AggregateValue::Int64(value))
+        }
+        Some(AggregateValueType::Utf8) => {
+            bail!("grouped-stats Utf8 min/max cannot be decoded from ordered i64 state")
+        }
     }
 }
 

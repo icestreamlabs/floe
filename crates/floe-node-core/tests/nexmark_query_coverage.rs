@@ -254,6 +254,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT COUNT(DISTINCT channel) AS distinct_channels FROM bid",
     },
     ValidPlanRuntimeCase {
+        id: "timestamp_min_max_aggregate",
+        sql: "SELECT MIN(\"dateTime\") AS first_bid_time, MAX(\"dateTime\") AS last_bid_time FROM bid",
+    },
+    ValidPlanRuntimeCase {
         id: "hop_window_aggregate",
         sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)",
     },

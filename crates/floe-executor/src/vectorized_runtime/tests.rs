@@ -1,7 +1,7 @@
 use super::*;
 use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
 use datafusion::arrow::array::{
-    Array, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+    Array, Date32Array, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
@@ -19,6 +19,24 @@ fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("int64 column");
+    (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
+fn timestamp_millis_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .expect("timestamp(ms) column");
+    (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
+fn date_days_values(batch: &RecordBatch, column_idx: usize) -> Vec<i32> {
+    let values = batch
+        .column(column_idx)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("Date32 column");
     (0..values.len()).map(|idx| values.value(idx)).collect()
 }
 
@@ -102,6 +120,28 @@ fn single_int_rows(batches: &[RecordBatch]) -> Vec<i64> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
         rows.extend(int64_values(batch, 0));
+    }
+    rows.sort();
+    rows
+}
+
+fn timestamp_pair_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let first = timestamp_millis_values(batch, 0);
+        let last = timestamp_millis_values(batch, 1);
+        rows.extend(first.into_iter().zip(last));
+    }
+    rows.sort();
+    rows
+}
+
+fn date_pair_rows(batches: &[RecordBatch]) -> Vec<(i32, i32)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let first = date_days_values(batch, 0);
+        let last = date_days_values(batch, 1);
+        rows.extend(first.into_iter().zip(last));
     }
     rows.sort();
     rows
@@ -486,6 +526,50 @@ fn weighted_single_int_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
         let values = int64_values(batch, 0);
         let weights = int64_values(batch, weight_idx);
         rows.extend(values.into_iter().zip(weights));
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_timestamp_pair_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let first = timestamp_millis_values(batch, 0);
+        let last = timestamp_millis_values(batch, 1);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            first
+                .into_iter()
+                .zip(last)
+                .zip(weights)
+                .map(|((first, last), weight)| (first, last, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_date_pair_rows(batches: &[RecordBatch]) -> Vec<(i32, i32, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let first = date_days_values(batch, 0);
+        let last = date_days_values(batch, 1);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            first
+                .into_iter()
+                .zip(last)
+                .zip(weights)
+                .map(|((first, last), weight)| (first, last, weight)),
+        );
     }
     rows.sort();
     rows
@@ -3756,6 +3840,224 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
         .arrow_delta_for(4)
         .expect("post-retract delta");
     assert_eq!(weighted_single_int_rows(&delta), vec![(2, 1), (3, -1)]);
+}
+
+#[tokio::test]
+async fn grouped_stats_supports_timestamp_min_max_incrementally() {
+    let definition = SourceDefinition::new(
+        "events",
+        vec![SourceColumn::new_nullable(
+            "event_time",
+            SourceDataType::TimestampMillis,
+            false,
+        )],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![
+            1000, 500, 750,
+        ]))],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table =
+        build_operator_state_table("vectorized-columnar-grouped-stats-timestamp-minmax").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let ts_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("first_ts", ts_type.clone(), false),
+        Field::new("last_ts", ts_type, false),
+    ]));
+    let query = "SELECT MIN(event_time) AS first_ts, MAX(event_time) AS last_ts FROM events";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_event_bounds",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "events",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_event_bounds").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(timestamp_pair_rows(&snapshot), vec![(500, 1000)]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![400, 1200]))],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("events", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(timestamp_pair_rows(&snapshot), vec![(400, 1200)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_timestamp_pair_rows(&delta),
+        vec![(400, 1200, 1), (500, 1000, -1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_event_bounds",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_event_bounds")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(timestamp_pair_rows(&recovered_snapshot), vec![(400, 1200)]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![400]))],
+    )
+    .expect("source retract rows");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&retract, &weighted_schema, &[-1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("events", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(timestamp_pair_rows(&snapshot), vec![(500, 1200)]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_timestamp_pair_rows(&delta),
+        vec![(400, 1200, -1), (500, 1200, 1)]
+    );
+}
+
+#[tokio::test]
+async fn grouped_stats_supports_date_min_max_incrementally() {
+    let definition = SourceDefinition::new(
+        "events",
+        vec![SourceColumn::new_nullable(
+            "event_day",
+            SourceDataType::DateDays,
+            false,
+        )],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Date32Array::from(vec![10, 5, 7]))],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-stats-date-minmax").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("first_day", DataType::Date32, false),
+        Field::new("last_day", DataType::Date32, false),
+    ]));
+    let query = "SELECT MIN(event_day) AS first_day, MAX(event_day) AS last_day FROM events";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_event_days",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "events",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_event_days").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(date_pair_rows(&snapshot), vec![(5, 10)]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Date32Array::from(vec![4, 12]))],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("events", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(date_pair_rows(&snapshot), vec![(4, 12)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_date_pair_rows(&delta),
+        vec![(4, 12, 1), (5, 10, -1)]
+    );
 }
 
 #[tokio::test]
