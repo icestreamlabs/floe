@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, Int64Builder, UInt32Array,
+    Array, ArrayRef, BooleanArray, Int64Array, Int64Builder, StringArray, UInt32Array,
 };
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -21,6 +21,7 @@ use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
 use crate::delta_consolidation::weighted_snapshot_schema;
+use crate::encoding::EncodedRowScalar;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
@@ -74,15 +75,23 @@ struct AggregateSpec {
     kind: AggregateKind,
     value_idx: Option<usize>,
     filter_idx: Option<usize>,
+    value_type: Option<AggregateValueType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregateKind {
     Count,
+    DistinctCount,
     Sum,
     Avg,
     Min,
     Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateValueType {
+    Int64,
+    Utf8,
 }
 
 struct SlateGroupedStatsState {
@@ -94,6 +103,8 @@ struct SlateGroupedStatsState {
     pairs: Mutex<HashMap<(Vec<u8>, usize), (i64, i64)>>,
     minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<i64>>>,
     value_counts: Mutex<HashMap<(Vec<u8>, usize, i64), i64>>,
+    string_minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<String>>>,
+    string_value_counts: Mutex<HashMap<(Vec<u8>, usize, String), i64>>,
 }
 
 struct PendingStatsGroupDelta {
@@ -106,15 +117,18 @@ struct PendingStatsGroupDelta {
 #[derive(Clone)]
 enum AggregateDelta {
     Count { count_delta: i64 },
+    DistinctCount { value_deltas: HashMap<i64, i64> },
     Sum { sum_delta: i64 },
     Avg { sum_delta: i64, count_delta: i64 },
-    MinMax { value_deltas: HashMap<i64, i64> },
+    MinMaxI64 { value_deltas: HashMap<i64, i64> },
+    MinMaxUtf8 { value_deltas: HashMap<String, i64> },
 }
 
 #[derive(Clone, PartialEq)]
 enum AggregateValue {
     Int64(i64),
     Float64(f64),
+    Utf8(String),
     Null,
 }
 
@@ -176,10 +190,14 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         .context("build grouped-stats value projection")?;
     let projection_schema = df_schema_to_arrow(&projection_plan.schema)?;
     for spec in &specs {
-        if let Some(value_idx) = spec.value_idx
-            && projection_schema.field(value_idx).data_type() != &DataType::Int64
-        {
-            return Ok(None);
+        if let (Some(value_idx), Some(value_type)) = (spec.value_idx, spec.value_type) {
+            let expected = match value_type {
+                AggregateValueType::Int64 => &DataType::Int64,
+                AggregateValueType::Utf8 => &DataType::Utf8,
+            };
+            if projection_schema.field(value_idx).data_type() != expected {
+                return Ok(None);
+            }
         }
         if let Some(filter_idx) = spec.filter_idx
             && projection_schema.field(filter_idx).data_type() != &DataType::Boolean
@@ -440,7 +458,7 @@ fn add_projected_stats_batches_to_pending(
                     agg_deltas: columnar
                         .specs
                         .iter()
-                        .map(|spec| AggregateDelta::for_kind(spec.kind))
+                        .map(AggregateDelta::for_spec)
                         .collect(),
                     batch: batch.clone(),
                     row_idx,
@@ -458,6 +476,16 @@ fn add_projected_stats_batches_to_pending(
                         *count_delta = count_delta
                             .checked_add(sign)
                             .ok_or_else(|| anyhow::anyhow!("grouped-stats count delta overflow"))?;
+                    }
+                    (
+                        AggregateDelta::DistinctCount { value_deltas },
+                        AggregateKind::DistinctCount,
+                    ) => {
+                        let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
+                        else {
+                            continue;
+                        };
+                        update_i64_value_delta(value_deltas, value, sign)?;
                     }
                     (AggregateDelta::Sum { sum_delta }, AggregateKind::Sum) => {
                         let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
@@ -493,28 +521,24 @@ fn add_projected_stats_batches_to_pending(
                         })?;
                     }
                     (
-                        AggregateDelta::MinMax { value_deltas },
+                        AggregateDelta::MinMaxI64 { value_deltas },
                         AggregateKind::Min | AggregateKind::Max,
                     ) => {
                         let Some(value) = projected_i64_value(&value_arrays[agg_idx], row_idx)
                         else {
                             continue;
                         };
-                        match value_deltas.entry(value) {
-                            Entry::Occupied(mut entry) => {
-                                let next = entry.get().checked_add(sign).ok_or_else(|| {
-                                    anyhow::anyhow!("grouped-stats min/max value delta overflow")
-                                })?;
-                                if next == 0 {
-                                    entry.remove();
-                                } else {
-                                    *entry.get_mut() = next;
-                                }
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(sign);
-                            }
-                        }
+                        update_i64_value_delta(value_deltas, value, sign)?;
+                    }
+                    (
+                        AggregateDelta::MinMaxUtf8 { value_deltas },
+                        AggregateKind::Min | AggregateKind::Max,
+                    ) => {
+                        let Some(value) = projected_utf8_value(&value_arrays[agg_idx], row_idx)
+                        else {
+                            continue;
+                        };
+                        update_string_value_delta(value_deltas, value.to_string(), sign)?;
                     }
                     _ => bail!("grouped-stats aggregate delta kind mismatch"),
                 }
@@ -590,6 +614,9 @@ async fn load_aggregate_values(
             AggregateKind::Count => {
                 AggregateValue::Int64(columnar.stats_state.load_i64(group_key, idx).await?)
             }
+            AggregateKind::DistinctCount => {
+                AggregateValue::Int64(columnar.stats_state.load_i64(group_key, idx).await?)
+            }
             AggregateKind::Sum => {
                 AggregateValue::Int64(columnar.stats_state.load_i64(group_key, idx).await?)
             }
@@ -601,12 +628,21 @@ async fn load_aggregate_values(
                     AggregateValue::Float64(sum as f64 / count as f64)
                 }
             }
-            AggregateKind::Min | AggregateKind::Max => columnar
-                .stats_state
-                .load_minmax(group_key, idx)
-                .await?
-                .map(AggregateValue::Int64)
-                .unwrap_or(AggregateValue::Null),
+            AggregateKind::Min | AggregateKind::Max => match spec.value_type {
+                Some(AggregateValueType::Int64) => columnar
+                    .stats_state
+                    .load_minmax(group_key, idx)
+                    .await?
+                    .map(AggregateValue::Int64)
+                    .unwrap_or(AggregateValue::Null),
+                Some(AggregateValueType::Utf8) => columnar
+                    .stats_state
+                    .load_string_minmax(group_key, idx)
+                    .await?
+                    .map(AggregateValue::Utf8)
+                    .unwrap_or(AggregateValue::Null),
+                None => AggregateValue::Null,
+            },
         });
     }
     Ok(values)
@@ -628,6 +664,41 @@ async fn apply_aggregate_deltas(
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats count overflow"))?;
                 if new < 0 {
                     bail!("grouped-stats count became negative");
+                }
+                columnar
+                    .stats_state
+                    .write_i64(writes, group_key, idx, new)?;
+                AggregateValue::Int64(new)
+            }
+            (AggregateKind::DistinctCount, AggregateDelta::DistinctCount { value_deltas }) => {
+                let old = columnar.stats_state.load_i64(group_key, idx).await?;
+                let mut new = old;
+                for (value, value_delta) in value_deltas {
+                    let old_count = columnar
+                        .stats_state
+                        .load_value_count(group_key, idx, *value)
+                        .await?;
+                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats distinct value count overflow")
+                    })?;
+                    if new_count < 0 {
+                        bail!("grouped-stats distinct removed more values than were present");
+                    }
+                    if old_count == 0 && new_count > 0 {
+                        new = new
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("grouped-stats distinct overflow"))?;
+                    } else if old_count > 0 && new_count == 0 {
+                        new = new
+                            .checked_sub(1)
+                            .ok_or_else(|| anyhow::anyhow!("grouped-stats distinct underflow"))?;
+                    }
+                    columnar
+                        .stats_state
+                        .write_value_count(writes, group_key, idx, *value, new_count)?;
+                }
+                if new < 0 {
+                    bail!("grouped-stats distinct count became negative");
                 }
                 columnar
                     .stats_state
@@ -670,7 +741,10 @@ async fn apply_aggregate_deltas(
                     AggregateValue::Float64(new_sum as f64 / new_count as f64)
                 }
             }
-            (AggregateKind::Min | AggregateKind::Max, AggregateDelta::MinMax { value_deltas }) => {
+            (
+                AggregateKind::Min | AggregateKind::Max,
+                AggregateDelta::MinMaxI64 { value_deltas },
+            ) => {
                 let old = columnar.stats_state.load_minmax(group_key, idx).await?;
                 let mut updated_counts = HashMap::new();
                 for (value, value_delta) in value_deltas {
@@ -699,6 +773,41 @@ async fn apply_aggregate_deltas(
                 new.map(AggregateValue::Int64)
                     .unwrap_or(AggregateValue::Null)
             }
+            (
+                AggregateKind::Min | AggregateKind::Max,
+                AggregateDelta::MinMaxUtf8 { value_deltas },
+            ) => {
+                let old = columnar
+                    .stats_state
+                    .load_string_minmax(group_key, idx)
+                    .await?;
+                let mut updated_counts = HashMap::new();
+                for (value, value_delta) in value_deltas {
+                    let old_count = columnar
+                        .stats_state
+                        .load_string_value_count(group_key, idx, value)
+                        .await?;
+                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats string min/max value count overflow")
+                    })?;
+                    if new_count < 0 {
+                        bail!("grouped-stats string min/max removed more values than were present");
+                    }
+                    updated_counts.insert(value.clone(), new_count);
+                    columnar
+                        .stats_state
+                        .write_string_value_count(writes, group_key, idx, value, new_count)?;
+                }
+                let new = columnar
+                    .stats_state
+                    .new_string_minmax_after_delta(group_key, idx, spec.kind, old, &updated_counts)
+                    .await?;
+                columnar
+                    .stats_state
+                    .write_string_minmax(writes, group_key, idx, new.as_deref())?;
+                new.map(AggregateValue::Utf8)
+                    .unwrap_or(AggregateValue::Null)
+            }
             _ => bail!("grouped-stats aggregate state kind mismatch"),
         });
     }
@@ -706,15 +815,23 @@ async fn apply_aggregate_deltas(
 }
 
 impl AggregateDelta {
-    fn for_kind(kind: AggregateKind) -> Self {
-        match kind {
-            AggregateKind::Count => Self::Count { count_delta: 0 },
-            AggregateKind::Sum => Self::Sum { sum_delta: 0 },
-            AggregateKind::Avg => Self::Avg {
+    fn for_spec(spec: &AggregateSpec) -> Self {
+        match (spec.kind, spec.value_type) {
+            (AggregateKind::Count, _) => Self::Count { count_delta: 0 },
+            (AggregateKind::DistinctCount, _) => Self::DistinctCount {
+                value_deltas: HashMap::new(),
+            },
+            (AggregateKind::Sum, _) => Self::Sum { sum_delta: 0 },
+            (AggregateKind::Avg, _) => Self::Avg {
                 sum_delta: 0,
                 count_delta: 0,
             },
-            AggregateKind::Min | AggregateKind::Max => Self::MinMax {
+            (AggregateKind::Min | AggregateKind::Max, Some(AggregateValueType::Utf8)) => {
+                Self::MinMaxUtf8 {
+                    value_deltas: HashMap::new(),
+                }
+            }
+            (AggregateKind::Min | AggregateKind::Max, _) => Self::MinMaxI64 {
                 value_deltas: HashMap::new(),
             },
         }
@@ -724,31 +841,48 @@ impl AggregateDelta {
 fn aggregate_deltas_empty(deltas: &[AggregateDelta]) -> bool {
     deltas.iter().all(|delta| match delta {
         AggregateDelta::Count { count_delta } => *count_delta == 0,
+        AggregateDelta::DistinctCount { value_deltas } => value_deltas.is_empty(),
         AggregateDelta::Sum { sum_delta } => *sum_delta == 0,
         AggregateDelta::Avg {
             sum_delta,
             count_delta,
         } => *sum_delta == 0 && *count_delta == 0,
-        AggregateDelta::MinMax { value_deltas } => value_deltas.is_empty(),
+        AggregateDelta::MinMaxI64 { value_deltas } => value_deltas.is_empty(),
+        AggregateDelta::MinMaxUtf8 { value_deltas } => value_deltas.is_empty(),
     })
+}
+
+enum ProjectedValueArray<'a> {
+    None,
+    Int64(&'a Int64Array),
+    Utf8(&'a StringArray),
 }
 
 fn projected_value_arrays<'a>(
     batch: &'a RecordBatch,
     specs: &[AggregateSpec],
-) -> Result<Vec<Option<&'a Int64Array>>> {
+) -> Result<Vec<ProjectedValueArray<'a>>> {
     specs
         .iter()
         .map(|spec| {
-            spec.value_idx
-                .map(|idx| {
-                    batch
-                        .column(idx)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| anyhow::anyhow!("grouped-stats value must be Int64"))
-                })
-                .transpose()
+            let Some(idx) = spec.value_idx else {
+                return Ok(ProjectedValueArray::None);
+            };
+            match spec.value_type {
+                Some(AggregateValueType::Int64) => batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .map(ProjectedValueArray::Int64)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats value must be Int64")),
+                Some(AggregateValueType::Utf8) => batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(ProjectedValueArray::Utf8)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats value must be Utf8")),
+                None => Ok(ProjectedValueArray::None),
+            }
         })
         .collect()
 }
@@ -773,9 +907,65 @@ fn projected_filter_arrays<'a>(
         .collect()
 }
 
-fn projected_i64_value(values: &Option<&Int64Array>, row_idx: usize) -> Option<i64> {
-    let values = values.as_ref()?;
+fn projected_i64_value(values: &ProjectedValueArray<'_>, row_idx: usize) -> Option<i64> {
+    let ProjectedValueArray::Int64(values) = values else {
+        return None;
+    };
     (!values.is_null(row_idx)).then(|| values.value(row_idx))
+}
+
+fn projected_utf8_value<'a>(
+    values: &'a ProjectedValueArray<'a>,
+    row_idx: usize,
+) -> Option<&'a str> {
+    let ProjectedValueArray::Utf8(values) = values else {
+        return None;
+    };
+    (!values.is_null(row_idx)).then(|| values.value(row_idx))
+}
+
+fn update_i64_value_delta(deltas: &mut HashMap<i64, i64>, value: i64, sign: i64) -> Result<()> {
+    match deltas.entry(value) {
+        Entry::Occupied(mut entry) => {
+            let next = entry
+                .get()
+                .checked_add(sign)
+                .ok_or_else(|| anyhow::anyhow!("grouped-stats i64 value delta overflow"))?;
+            if next == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = next;
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(sign);
+        }
+    }
+    Ok(())
+}
+
+fn update_string_value_delta(
+    deltas: &mut HashMap<String, i64>,
+    value: String,
+    sign: i64,
+) -> Result<()> {
+    match deltas.entry(value) {
+        Entry::Occupied(mut entry) => {
+            let next = entry
+                .get()
+                .checked_add(sign)
+                .ok_or_else(|| anyhow::anyhow!("grouped-stats string value delta overflow"))?;
+            if next == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = next;
+            }
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(sign);
+        }
+    }
+    Ok(())
 }
 
 fn filter_allows(filter: &Option<&BooleanArray>, row_idx: usize) -> bool {
@@ -796,6 +986,8 @@ impl SlateGroupedStatsState {
             pairs: Mutex::new(HashMap::new()),
             minmax_values: Mutex::new(HashMap::new()),
             value_counts: Mutex::new(HashMap::new()),
+            string_minmax_values: Mutex::new(HashMap::new()),
+            string_value_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -984,6 +1176,59 @@ impl SlateGroupedStatsState {
         Ok(())
     }
 
+    async fn load_string_minmax(&self, group_key: &[u8], agg_idx: usize) -> Result<Option<String>> {
+        let cache_key = (group_key.to_vec(), agg_idx);
+        if let Some(value) = self
+            .string_minmax_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats string min/max cache poisoned"))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(value);
+        }
+        if self.assume_empty {
+            return Ok(None);
+        }
+        let Some(bytes) = self
+            .table
+            .get_bytes(&self.aggregate_key(MINMAX_TAG, group_key, agg_idx)?)
+            .await
+            .context("read grouped-stats string min/max state")?
+        else {
+            return Ok(None);
+        };
+        let value = Some(String::from_utf8(bytes.to_vec()).context("decode string min/max")?);
+        self.string_minmax_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats string min/max cache poisoned"))?
+            .insert(cache_key, value.clone());
+        Ok(value)
+    }
+
+    fn write_string_minmax(
+        &self,
+        batch: &mut WriteBatch,
+        group_key: &[u8],
+        agg_idx: usize,
+        value: Option<&str>,
+    ) -> Result<()> {
+        let key = self.aggregate_key(MINMAX_TAG, group_key, agg_idx)?;
+        if let Some(value) = value {
+            batch.put(key, value.as_bytes());
+        } else {
+            batch.delete(key);
+        }
+        self.string_minmax_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats string min/max cache poisoned"))?
+            .insert(
+                (group_key.to_vec(), agg_idx),
+                value.map(ToString::to_string),
+            );
+        Ok(())
+    }
+
     async fn load_value_count(&self, group_key: &[u8], agg_idx: usize, value: i64) -> Result<i64> {
         let cache_key = (group_key.to_vec(), agg_idx, value);
         if let Some(count) = self
@@ -1021,6 +1266,55 @@ impl SlateGroupedStatsState {
             .lock()
             .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?
             .insert((group_key.to_vec(), agg_idx, value), count);
+        Ok(())
+    }
+
+    async fn load_string_value_count(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+        value: &str,
+    ) -> Result<i64> {
+        let cache_key = (group_key.to_vec(), agg_idx, value.to_string());
+        if let Some(count) = self
+            .string_value_counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
+            .get(&cache_key)
+            .copied()
+        {
+            return Ok(count);
+        }
+        if self.assume_empty {
+            return Ok(0);
+        }
+        let count = self
+            .load_key_i64(&self.string_value_key(group_key, agg_idx, value)?)
+            .await?;
+        self.string_value_counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
+            .insert(cache_key, count);
+        Ok(count)
+    }
+
+    fn write_string_value_count(
+        &self,
+        batch: &mut WriteBatch,
+        group_key: &[u8],
+        agg_idx: usize,
+        value: &str,
+        count: i64,
+    ) -> Result<()> {
+        self.write_key_i64(
+            batch,
+            self.string_value_key(group_key, agg_idx, value)?,
+            count,
+        );
+        self.string_value_counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
+            .insert((group_key.to_vec(), agg_idx, value.to_string()), count);
         Ok(())
     }
 
@@ -1099,6 +1393,83 @@ impl SlateGroupedStatsState {
         Ok(out)
     }
 
+    async fn new_string_minmax_after_delta(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+        kind: AggregateKind,
+        old: Option<String>,
+        updated_counts: &HashMap<String, i64>,
+    ) -> Result<Option<String>> {
+        let mut added: Option<String> = None;
+        for (value, count) in updated_counts {
+            if *count > 0 {
+                added = Some(match added {
+                    Some(current) => minmax_string(kind, current, value.clone()),
+                    None => value.clone(),
+                });
+            }
+        }
+        match old {
+            None => Ok(added),
+            Some(old) => {
+                let old_still_present = match updated_counts.get(&old) {
+                    Some(count) => *count > 0,
+                    None => true,
+                };
+                if old_still_present {
+                    return Ok(Some(match added {
+                        Some(value) => minmax_string(kind, old, value),
+                        None => old,
+                    }));
+                }
+                self.scan_string_minmax_with_overlay(group_key, agg_idx, kind, updated_counts)
+                    .await
+            }
+        }
+    }
+
+    async fn scan_string_minmax_with_overlay(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+        kind: AggregateKind,
+        updated_counts: &HashMap<String, i64>,
+    ) -> Result<Option<String>> {
+        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
+        let mut out = None;
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&value_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats string min/max value state")?
+        {
+            let value = String::from_utf8(
+                key.get(value_prefix.len()..)
+                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats string value key"))?
+                    .to_vec(),
+            )
+            .context("decode grouped-stats string value key")?;
+            let old_count = decode_i64(&value_bytes)?;
+            let count = updated_counts.get(&value).copied().unwrap_or(old_count);
+            if count > 0 {
+                out = Some(match out {
+                    Some(current) => minmax_string(kind, current, value),
+                    None => value,
+                });
+            }
+        }
+        for (value, count) in updated_counts {
+            if *count > 0 {
+                out = Some(match out {
+                    Some(current) => minmax_string(kind, current, value.clone()),
+                    None => value.clone(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn load_key_i64(&self, key: &[u8]) -> Result<i64> {
         let Some(bytes) = self
             .table
@@ -1122,6 +1493,12 @@ impl SlateGroupedStatsState {
     fn value_key(&self, group_key: &[u8], agg_idx: usize, value: i64) -> Result<Vec<u8>> {
         let mut key = self.value_key_prefix(group_key, agg_idx)?;
         key.extend_from_slice(&encode_i64_sortable(value));
+        Ok(key)
+    }
+
+    fn string_value_key(&self, group_key: &[u8], agg_idx: usize, value: &str) -> Result<Vec<u8>> {
+        let mut key = self.value_key_prefix(group_key, agg_idx)?;
+        key.extend_from_slice(value.as_bytes());
         Ok(key)
     }
 
@@ -1197,6 +1574,10 @@ impl WeightedStatsOutputBuilder {
                     AggregateValue::Float64(value) => {
                         self.builders[output_idx].append_f64_value(*value)?;
                     }
+                    AggregateValue::Utf8(value) => {
+                        self.builders[output_idx]
+                            .append_encoded_scalar(Some(&EncodedRowScalar::Utf8(value.clone())))?;
+                    }
                     AggregateValue::Null => {
                         self.builders[output_idx].append_encoded_scalar(None)?;
                     }
@@ -1231,7 +1612,7 @@ fn aggregate_spec_for_expr(
         return None;
     };
     let params = &aggregate.params;
-    if params.distinct || !params.order_by.is_empty() || params.null_treatment.is_some() {
+    if !params.order_by.is_empty() || params.null_treatment.is_some() {
         return None;
     }
     let filter_idx = params.filter.as_ref().map(|filter| {
@@ -1246,14 +1627,38 @@ fn aggregate_spec_for_expr(
     });
     let name = aggregate.func.name();
     if name.eq_ignore_ascii_case("count") {
-        if !is_count_star_args(&params.args) || output_type != &DataType::Int64 {
+        if output_type != &DataType::Int64 {
+            return None;
+        }
+        if params.distinct {
+            let [value_expr] = params.args.as_slice() else {
+                return None;
+            };
+            let value_idx = projection_expr.len();
+            projection_expr.push(
+                value_expr
+                    .clone()
+                    .alias(format!("__floe_grouped_stats_value_{value_idx}")),
+            );
+            return Some(AggregateSpec {
+                kind: AggregateKind::DistinctCount,
+                value_idx: Some(value_idx),
+                filter_idx,
+                value_type: Some(AggregateValueType::Int64),
+            });
+        }
+        if !is_count_star_args(&params.args) {
             return None;
         }
         return Some(AggregateSpec {
             kind: AggregateKind::Count,
             value_idx: None,
             filter_idx,
+            value_type: None,
         });
+    }
+    if params.distinct {
+        return None;
     }
     let [value_expr] = params.args.as_slice() else {
         return None;
@@ -1264,14 +1669,25 @@ fn aggregate_spec_for_expr(
             .clone()
             .alias(format!("__floe_grouped_stats_value_{value_idx}")),
     );
-    let kind = if name.eq_ignore_ascii_case("sum") && output_type == &DataType::Int64 {
-        AggregateKind::Sum
+    let (kind, value_type) = if name.eq_ignore_ascii_case("sum") && output_type == &DataType::Int64
+    {
+        (AggregateKind::Sum, AggregateValueType::Int64)
     } else if name.eq_ignore_ascii_case("avg") && output_type == &DataType::Float64 {
-        AggregateKind::Avg
-    } else if name.eq_ignore_ascii_case("min") && output_type == &DataType::Int64 {
-        AggregateKind::Min
-    } else if name.eq_ignore_ascii_case("max") && output_type == &DataType::Int64 {
-        AggregateKind::Max
+        (AggregateKind::Avg, AggregateValueType::Int64)
+    } else if name.eq_ignore_ascii_case("min")
+        && matches!(output_type, DataType::Int64 | DataType::Utf8)
+    {
+        (
+            AggregateKind::Min,
+            aggregate_value_type_for_data_type(output_type)?,
+        )
+    } else if name.eq_ignore_ascii_case("max")
+        && matches!(output_type, DataType::Int64 | DataType::Utf8)
+    {
+        (
+            AggregateKind::Max,
+            aggregate_value_type_for_data_type(output_type)?,
+        )
     } else {
         return None;
     };
@@ -1279,7 +1695,16 @@ fn aggregate_spec_for_expr(
         kind,
         value_idx: Some(value_idx),
         filter_idx,
+        value_type: Some(value_type),
     })
+}
+
+fn aggregate_value_type_for_data_type(data_type: &DataType) -> Option<AggregateValueType> {
+    match data_type {
+        DataType::Int64 => Some(AggregateValueType::Int64),
+        DataType::Utf8 => Some(AggregateValueType::Utf8),
+        _ => None,
+    }
 }
 
 fn grouped_stats_aggregate_for_plan(
@@ -1416,6 +1841,14 @@ fn minmax_value(kind: AggregateKind, left: i64, right: i64) -> i64 {
         AggregateKind::Min => left.min(right),
         AggregateKind::Max => left.max(right),
         _ => unreachable!("minmax_value called for non-min/max aggregate"),
+    }
+}
+
+fn minmax_string(kind: AggregateKind, left: String, right: String) -> String {
+    match kind {
+        AggregateKind::Min => left.min(right),
+        AggregateKind::Max => left.max(right),
+        _ => unreachable!("minmax_string called for non-min/max aggregate"),
     }
 }
 

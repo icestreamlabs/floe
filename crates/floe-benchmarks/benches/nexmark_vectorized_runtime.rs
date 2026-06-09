@@ -138,6 +138,26 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: q13_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "q15",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
+            view_name: "mv_nexmark_q15",
+            query: r#"SELECT DATE_FORMAT("dateTime", 'yyyy-MM-dd') AS day, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM bid GROUP BY DATE_FORMAT("dateTime", 'yyyy-MM-dd')"#,
+            output_schema: q15_output_schema,
+        },
+        NexmarkRuntimeCase {
+            id: "q16",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
+            view_name: "mv_nexmark_q16",
+            query: r#"SELECT channel, DATE_FORMAT("dateTime", 'yyyy-MM-dd') AS day, MAX(DATE_FORMAT("dateTime", 'HH:mm')) AS minute, COUNT(*) AS total_bids, COUNT(*) FILTER (WHERE price < 10000) AS rank1_bids, COUNT(*) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bids, COUNT(*) FILTER (WHERE price >= 1000000) AS rank3_bids, COUNT(DISTINCT bidder) AS total_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price < 10000) AS rank1_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_bidders, COUNT(DISTINCT bidder) FILTER (WHERE price >= 1000000) AS rank3_bidders, COUNT(DISTINCT auction) AS total_auctions, COUNT(DISTINCT auction) FILTER (WHERE price < 10000) AS rank1_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 10000 AND price < 1000000) AS rank2_auctions, COUNT(DISTINCT auction) FILTER (WHERE price >= 1000000) AS rank3_auctions FROM bid GROUP BY channel, DATE_FORMAT("dateTime", 'yyyy-MM-dd')"#,
+            output_schema: q16_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "q17",
             sources: &[NexmarkRuntimeSource {
                 source_name: "nexmark_bid",
@@ -598,6 +618,44 @@ fn q13_output_schema() -> SchemaRef {
             true,
         ),
         Field::new("value", DataType::Int64, true),
+    ]))
+}
+
+fn q15_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("day", DataType::Utf8, true),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("rank1_bids", DataType::Int64, false),
+        Field::new("rank2_bids", DataType::Int64, false),
+        Field::new("rank3_bids", DataType::Int64, false),
+        Field::new("total_bidders", DataType::Int64, false),
+        Field::new("rank1_bidders", DataType::Int64, false),
+        Field::new("rank2_bidders", DataType::Int64, false),
+        Field::new("rank3_bidders", DataType::Int64, false),
+        Field::new("total_auctions", DataType::Int64, false),
+        Field::new("rank1_auctions", DataType::Int64, false),
+        Field::new("rank2_auctions", DataType::Int64, false),
+        Field::new("rank3_auctions", DataType::Int64, false),
+    ]))
+}
+
+fn q16_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("channel", DataType::Utf8, true),
+        Field::new("day", DataType::Utf8, true),
+        Field::new("minute", DataType::Utf8, true),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("rank1_bids", DataType::Int64, false),
+        Field::new("rank2_bids", DataType::Int64, false),
+        Field::new("rank3_bids", DataType::Int64, false),
+        Field::new("total_bidders", DataType::Int64, false),
+        Field::new("rank1_bidders", DataType::Int64, false),
+        Field::new("rank2_bidders", DataType::Int64, false),
+        Field::new("rank3_bidders", DataType::Int64, false),
+        Field::new("total_auctions", DataType::Int64, false),
+        Field::new("rank1_auctions", DataType::Int64, false),
+        Field::new("rank2_auctions", DataType::Int64, false),
+        Field::new("rank3_auctions", DataType::Int64, false),
     ]))
 }
 

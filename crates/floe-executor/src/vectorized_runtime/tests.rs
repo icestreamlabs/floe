@@ -117,6 +117,55 @@ fn grouped_stats_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64, 
     rows
 }
 
+fn distinct_stats_rows(
+    batches: &[RecordBatch],
+) -> Vec<(String, String, String, i64, i64, i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let channels = string_values(batch, 0);
+        let days = string_values(batch, 1);
+        let minutes = string_values(batch, 2);
+        let total_bids = int64_values(batch, 3);
+        let cheap_bids = int64_values(batch, 4);
+        let total_bidders = int64_values(batch, 5);
+        let cheap_bidders = int64_values(batch, 6);
+        let total_auctions = int64_values(batch, 7);
+        rows.extend(
+            channels
+                .into_iter()
+                .zip(days)
+                .zip(minutes)
+                .zip(total_bids)
+                .zip(cheap_bids)
+                .zip(total_bidders)
+                .zip(cheap_bidders)
+                .zip(total_auctions)
+                .map(
+                    |(
+                        (
+                            (((((channel, day), minute), total_bid), cheap_bid), total_bidder),
+                            cheap_bidder,
+                        ),
+                        total_auction,
+                    )| {
+                        (
+                            channel,
+                            day,
+                            minute,
+                            total_bid,
+                            cheap_bid,
+                            total_bidder,
+                            cheap_bidder,
+                            total_auction,
+                        )
+                    },
+                ),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn join_rows(batches: &[RecordBatch]) -> Vec<(i64, String, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -1142,6 +1191,211 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
     assert_eq!(
         grouped_stats_rows(&snapshot),
         vec![(1, 2, 2, 10, 30, 20.0, 40), (2, 1, 0, 100, 100, 100.0, 100),]
+    );
+}
+
+#[tokio::test]
+async fn grouped_stats_supports_distinct_counts_and_string_max_incrementally() {
+    let definition = SourceDefinition::new(
+        "events",
+        vec![
+            SourceColumn::new_nullable("channel", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("day", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("minute", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["apple", "apple", "apple"])),
+            Arc::new(StringArray::from(vec![
+                "2026-06-08",
+                "2026-06-08",
+                "2026-06-08",
+            ])),
+            Arc::new(StringArray::from(vec!["10:00", "10:05", "09:55"])),
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![100, 101, 100])),
+            Arc::new(Int64Array::from(vec![50, 150, 75])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-stats-distinct").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("channel", DataType::Utf8, false),
+        Field::new("day", DataType::Utf8, false),
+        Field::new("minute", DataType::Utf8, true),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("cheap_bids", DataType::Int64, false),
+        Field::new("total_bidders", DataType::Int64, false),
+        Field::new("cheap_bidders", DataType::Int64, false),
+        Field::new("total_auctions", DataType::Int64, false),
+    ]));
+    let query = "SELECT channel, day, \
+        MAX(minute) AS minute, \
+        COUNT(*) AS total_bids, \
+        COUNT(*) FILTER (WHERE price < 100) AS cheap_bids, \
+        COUNT(DISTINCT bidder) AS total_bidders, \
+        COUNT(DISTINCT bidder) FILTER (WHERE price < 100) AS cheap_bidders, \
+        COUNT(DISTINCT auction) AS total_auctions \
+        FROM events GROUP BY channel, day";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_event_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "events",
+            vec![initial.clone()],
+            vec![initial],
+        )
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_event_stats").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        distinct_stats_rows(&snapshot),
+        vec![(
+            "apple".to_string(),
+            "2026-06-08".to_string(),
+            "10:05".to_string(),
+            3,
+            2,
+            2,
+            2,
+            2,
+        )]
+    );
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["apple"])),
+            Arc::new(StringArray::from(vec!["2026-06-08"])),
+            Arc::new(StringArray::from(vec!["10:10"])),
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(Int64Array::from(vec![102])),
+            Arc::new(Int64Array::from(vec![80])),
+        ],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("events", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        distinct_stats_rows(&snapshot),
+        vec![(
+            "apple".to_string(),
+            "2026-06-08".to_string(),
+            "10:10".to_string(),
+            4,
+            3,
+            3,
+            3,
+            3,
+        )]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_event_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_event_stats")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        distinct_stats_rows(&recovered_snapshot),
+        vec![(
+            "apple".to_string(),
+            "2026-06-08".to_string(),
+            "10:10".to_string(),
+            4,
+            3,
+            3,
+            3,
+            3,
+        )]
+    );
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["apple"])),
+            Arc::new(StringArray::from(vec!["2026-06-08"])),
+            Arc::new(StringArray::from(vec!["10:00"])),
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("source retract rows");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&retract, &weighted_schema, &[-1])
+        .expect("weighted retract rows");
+    recovered
+        .apply_weighted_source_delta("events", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(
+        distinct_stats_rows(&snapshot),
+        vec![(
+            "apple".to_string(),
+            "2026-06-08".to_string(),
+            "10:10".to_string(),
+            3,
+            2,
+            3,
+            2,
+            3,
+        )]
     );
 }
 
