@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::DFSchemaRef;
 use dbsp::storage::{KeyValueTable, SlateTable};
@@ -48,6 +48,67 @@ struct ActiveRuntimeCoverageResult {
     coverage: ActiveRuntimeCoverage,
     error: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct ValidPlanRuntimeCase {
+    id: &'static str,
+    sql: &'static str,
+}
+
+const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
+    ValidPlanRuntimeCase {
+        id: "left_outer_join",
+        sql: "SELECT b.auction, a.seller FROM bid b LEFT JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "right_outer_join",
+        sql: "SELECT b.auction, a.seller FROM bid b RIGHT JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "full_outer_join",
+        sql: "SELECT b.auction, a.seller FROM bid b FULL OUTER JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "left_semi_join",
+        sql: "SELECT b.auction, b.bidder FROM bid b LEFT SEMI JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "left_anti_join",
+        sql: "SELECT b.auction, b.bidder FROM bid b LEFT ANTI JOIN auction a ON b.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "three_way_join",
+        sql: "SELECT p.name, b.price FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "self_join_aggregate",
+        sql: "SELECT l.auction, COUNT(*) AS pair_count FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price GROUP BY l.auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_topn",
+        sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_over_distinct_subquery",
+        sql: "SELECT COUNT(auction) AS c FROM (SELECT DISTINCT auction, bidder FROM bid) d",
+    },
+    ValidPlanRuntimeCase {
+        id: "subquery_alias_projection",
+        sql: "SELECT auction FROM (SELECT auction, price FROM bid WHERE price > 100) q WHERE auction > 0",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_duplicate_source",
+        sql: "SELECT auction FROM (SELECT auction, price FROM bid WHERE price > 100 UNION ALL SELECT auction, price FROM bid WHERE price <= 100) u",
+    },
+    ValidPlanRuntimeCase {
+        id: "having_aggregate",
+        sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction HAVING SUM(price) > 1000",
+    },
+    ValidPlanRuntimeCase {
+        id: "session_window_aggregate",
+        sql: "SELECT bidder, COUNT(*) AS bid_count FROM bid GROUP BY bidder, SESSION(\"dateTime\", 5000)",
+    },
+];
 
 #[tokio::test]
 async fn guards_nexmark_query_coverage_regressions() {
@@ -138,21 +199,36 @@ async fn guards_active_vectorized_runtime_nexmark_columnar_subset() {
     }
 }
 
+#[tokio::test]
+async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
+    let mut registry = SourceRegistry::new();
+    registry.extend(generator::definitions().expect("load nexmark source definitions"));
+    let planner = DbspPlanBuilder::new(nexmark_config().expect("load nexmark planner config"));
+    let available_sources = available_nexmark_sources();
+
+    let mut failures = Vec::new();
+    for case in VALID_DBSP_RUNTIME_PLAN_CASES {
+        if let Err(err) =
+            validate_active_vectorized_runtime_case(&registry, &planner, &available_sources, *case)
+                .await
+        {
+            failures.push(format!("{}: {err:#}", case.id));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "active vectorized runtime rejected DBSP-valid plan shape(s):\n{}",
+            failures.join("\n")
+        );
+    }
+}
+
 async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     let mut registry = SourceRegistry::new();
     registry.extend(generator::definitions()?);
 
-    let available_sources = [
-        "nexmark_person",
-        "person",
-        "nexmark_auction",
-        "auction",
-        "nexmark_bid",
-        "bid",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<BTreeSet<_>>();
+    let available_sources = available_nexmark_sources();
 
     let planner = DbspPlanBuilder::new(nexmark_config()?);
 
@@ -247,6 +323,50 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     }
 
     Ok(out)
+}
+
+async fn validate_active_vectorized_runtime_case(
+    registry: &SourceRegistry,
+    planner: &DbspPlanBuilder,
+    available_sources: &BTreeSet<String>,
+    case: ValidPlanRuntimeCase,
+) -> Result<()> {
+    let definition = parse_materialized_view(&format!(
+        "CREATE MATERIALIZED VIEW {} AS {}",
+        case.id, case.sql
+    ))
+    .with_context(|| format!("SQL parse failed for {}", case.id))?;
+    let logical = plan_materialized_views(registry, &[definition])
+        .await
+        .with_context(|| format!("logical planning failed for {}", case.id))?;
+    let planned = logical
+        .first()
+        .with_context(|| format!("logical planner produced no MV plan for {}", case.id))?;
+    let circuit = planner
+        .build(planned.logical_plan())
+        .with_context(|| format!("DBSP circuit planning failed for {}", case.id))?;
+    validate_dbsp_plan(&circuit, available_sources, case.id)
+        .with_context(|| format!("DBSP circuit validation failed for {}", case.id))?;
+
+    let output_schema = df_schema_to_arrow(planned.logical_plan().schema())
+        .with_context(|| format!("Arrow schema conversion failed for {}", case.id))?;
+    let state_table = build_operator_state_table(case.id).await?;
+    let mv_plan = VectorizedMaterializedViewPlan::new(
+        planned.definition().name().to_string(),
+        planned.definition().query().to_string(),
+        output_schema,
+    );
+    VectorizedExecutionRuntime::new_with_udfs_and_options(
+        registry,
+        vec![mv_plan],
+        Arc::new(MaterializedViewRegistry::new()),
+        planner_udfs(),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(state_table),
+    )
+    .await
+    .with_context(|| format!("active vectorized runtime rejected {}", case.id))?;
+
+    Ok(())
 }
 
 async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRuntimeCoverageResult>>
@@ -348,6 +468,20 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
     }
 
     Ok(out)
+}
+
+fn available_nexmark_sources() -> BTreeSet<String> {
+    [
+        "nexmark_person",
+        "person",
+        "nexmark_auction",
+        "auction",
+        "nexmark_bid",
+        "bid",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 async fn build_operator_state_table(name: &str) -> Result<Arc<dyn KeyValueTable>> {
