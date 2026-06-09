@@ -679,23 +679,54 @@ fn extract_row_number_limit(predicate: &Expr) -> Option<(String, usize)> {
             _ => None,
         };
     }
-    let (column, literal, exclusive) = match (&*binary.left, binary.op, &*binary.right) {
-        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => {
-            (column.name.clone(), literal, false)
-        }
-        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => {
-            (column.name.clone(), literal, true)
-        }
+    let (column, literal, kind) = match (&*binary.left, binary.op, &*binary.right) {
+        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::InclusiveUpper,
+        ),
+        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::ExclusiveUpper,
+        ),
+        (literal @ Expr::Literal(_, _), Operator::GtEq, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::InclusiveUpper,
+        ),
+        (literal @ Expr::Literal(_, _), Operator::Gt, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::ExclusiveUpper,
+        ),
+        (Expr::Column(column), Operator::Eq, literal @ Expr::Literal(_, _))
+        | (literal @ Expr::Literal(_, _), Operator::Eq, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::Equality,
+        ),
         _ => return None,
     };
-    let mut limit = literal_to_positive_usize(literal)?;
-    if exclusive {
-        if limit == 0 {
-            return None;
+    let value = literal_to_positive_usize(literal)?;
+    let limit = match kind {
+        RowNumberPredicateKind::InclusiveUpper => value,
+        RowNumberPredicateKind::ExclusiveUpper => {
+            if value <= 1 {
+                return None;
+            }
+            value - 1
         }
-        limit -= 1;
-    }
+        RowNumberPredicateKind::Equality => 1,
+    };
     (limit > 0).then_some((column, limit))
+}
+
+#[derive(Clone, Copy)]
+enum RowNumberPredicateKind {
+    InclusiveUpper,
+    ExclusiveUpper,
+    Equality,
 }
 
 fn literal_to_nonnegative_usize(expr: &Expr) -> Option<usize> {

@@ -141,6 +141,52 @@ async fn lowers_row_number_filter_with_residual_predicate_to_topn_select() {
 }
 
 #[tokio::test]
+async fn lowers_reversed_row_number_filter_to_partitioned_topn() {
+    let sql = "SELECT auction, price \
+        FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked \
+        WHERE 2 >= rn";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let topn = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::TopN(topn) => Some(topn),
+            _ => None,
+        })
+        .expect("expected lowered TopN node");
+    assert_eq!(topn.limit(), 2);
+    assert_eq!(topn.offset(), 0);
+    assert_eq!(topn.partition_by().len(), 1);
+}
+
+#[tokio::test]
+async fn lowers_row_number_equality_to_partitioned_topn_offset() {
+    let sql = "SELECT auction, price \
+        FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked \
+        WHERE rn = 2";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let topn = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::TopN(topn) => Some(topn),
+            _ => None,
+        })
+        .expect("expected lowered TopN node");
+    assert_eq!(topn.limit(), 1);
+    assert_eq!(topn.offset(), 1);
+    assert_eq!(topn.partition_by().len(), 1);
+}
+
+#[tokio::test]
 async fn preserves_subquery_projection_aliases_after_row_number_lowering() {
     let sql = "SELECT auction, bidder, price, \"bidTime\" \
         FROM (SELECT b.auction, b.bidder, b.price, b.\"dateTime\" AS \"bidTime\", \

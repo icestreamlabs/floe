@@ -7671,6 +7671,130 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
 }
 
 #[tokio::test]
+async fn row_number_predicate_variants_use_slate_backed_columnar_operator_incrementally() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 1, 2, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 15, 5])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table =
+        build_operator_state_table("vectorized-columnar-row-number-predicate-variants").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let reversed_query = "SELECT auction, bidder, price \
+        FROM (SELECT auction, bidder, price, \
+            ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rank_number \
+            FROM bids) ranked \
+        WHERE 2 >= rank_number";
+    let equality_query = "SELECT auction, bidder, price \
+        FROM (SELECT auction, bidder, price, \
+            ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rank_number \
+            FROM bids) ranked \
+        WHERE rank_number = 2";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_reversed_ranked_bids",
+                reversed_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_second_ranked_bids",
+                equality_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert!(
+        runtime
+            .materialized_views
+            .iter()
+            .all(|mv| mv.execution_mode == MaterializedViewExecutionMode::ColumnarTopN)
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let reversed = registry
+        .get("mv_reversed_ranked_bids")
+        .expect("reversed materialized view");
+    let equality = registry
+        .get("mv_second_ranked_bids")
+        .expect("equality materialized view");
+    assert_eq!(
+        bid_topn_rows(&reversed.arrow_snapshot_for(1).expect("reversed snapshot")),
+        vec![(1, 20, 20), (1, 30, 30), (2, 40, 15), (2, 50, 5)]
+    );
+    assert_eq!(
+        bid_topn_rows(&equality.arrow_snapshot_for(1).expect("equality snapshot")),
+        vec![(1, 20, 20), (2, 50, 5)]
+    );
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![99])),
+            Arc::new(Int64Array::from(vec![25])),
+        ],
+    )
+    .expect("source insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let expected_snapshot = vec![(1, 30, 30), (1, 99, 25), (2, 40, 15), (2, 50, 5)];
+    assert_eq!(
+        bid_topn_rows(&reversed.arrow_snapshot_for(2).expect("reversed snapshot")),
+        expected_snapshot
+    );
+    assert_eq!(
+        bid_topn_rows(&equality.arrow_snapshot_for(2).expect("equality snapshot")),
+        vec![(1, 99, 25), (2, 50, 5)]
+    );
+    let expected_delta = vec![(1, 20, 20, -1), (1, 99, 25, 1)];
+    assert_eq!(
+        weighted_bid_topn_rows(&reversed.arrow_delta_for(2).expect("reversed delta")),
+        expected_delta
+    );
+    assert_eq!(
+        weighted_bid_topn_rows(&equality.arrow_delta_for(2).expect("equality delta")),
+        expected_delta
+    );
+}
+
+#[tokio::test]
 async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() {
     let definition = SourceDefinition::new(
         "bids",

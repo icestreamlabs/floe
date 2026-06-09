@@ -7,7 +7,7 @@ impl<'cfg> PlannerContext<'cfg> {
         &mut self,
         filter: &datafusion::logical_expr::logical_plan::Filter,
     ) -> Result<Option<PlannedNode>, PlannerError> {
-        let Some((rank_column, limit, residual_predicate)) =
+        let Some((rank_column, limit, offset, residual_predicate)) =
             extract_row_number_limit_with_residual(&filter.predicate)?
         else {
             return Ok(None);
@@ -80,7 +80,8 @@ impl<'cfg> PlannerContext<'cfg> {
             (partition_by, order_by, post_projection)
         };
         let order_by = self.map_sort_expressions(&order_by, input.schema.clone())?;
-        let topn = DbspTopNNode::try_new(input.schema.clone(), partition_by, order_by, limit, 0)?;
+        let topn =
+            DbspTopNNode::try_new(input.schema.clone(), partition_by, order_by, limit, offset)?;
         let output_schema = topn.output_schema().clone();
         let id = self.add_node(
             vec![input.id],

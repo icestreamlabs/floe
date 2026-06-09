@@ -539,14 +539,37 @@ fn row_number_limit_column(predicate: &Expr) -> Option<String> {
             _ => None,
         };
     }
-    let (Expr::Column(column), op, literal) = (&*binary.left, binary.op, &*binary.right) else {
-        return None;
+    let (column, literal, kind) = match (&*binary.left, binary.op, &*binary.right) {
+        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => {
+            (column, literal, RowNumberPredicateKind::InclusiveUpper)
+        }
+        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => {
+            (column, literal, RowNumberPredicateKind::ExclusiveUpper)
+        }
+        (literal @ Expr::Literal(_, _), Operator::GtEq, Expr::Column(column)) => {
+            (column, literal, RowNumberPredicateKind::InclusiveUpper)
+        }
+        (literal @ Expr::Literal(_, _), Operator::Gt, Expr::Column(column)) => {
+            (column, literal, RowNumberPredicateKind::ExclusiveUpper)
+        }
+        (Expr::Column(column), Operator::Eq, literal @ Expr::Literal(_, _))
+        | (literal @ Expr::Literal(_, _), Operator::Eq, Expr::Column(column)) => {
+            (column, literal, RowNumberPredicateKind::Equality)
+        }
+        _ => return None,
     };
-    if !matches!(op, Operator::Lt | Operator::LtEq) || literal_to_positive_usize(literal).is_none()
-    {
+    let value = literal_to_positive_usize(literal)?;
+    if matches!(kind, RowNumberPredicateKind::ExclusiveUpper) && value <= 1 {
         return None;
     }
     Some(column.name.clone())
+}
+
+#[derive(Clone, Copy)]
+enum RowNumberPredicateKind {
+    InclusiveUpper,
+    ExclusiveUpper,
+    Equality,
 }
 
 fn literal_to_positive_usize(expr: &Expr) -> Option<usize> {

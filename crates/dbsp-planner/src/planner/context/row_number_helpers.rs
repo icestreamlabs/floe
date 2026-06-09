@@ -2,16 +2,16 @@ use super::*;
 
 pub(super) fn extract_row_number_limit_with_residual(
     predicate: &Expr,
-) -> Result<Option<(String, usize, Option<Expr>)>, PlannerError> {
+) -> Result<Option<(String, usize, usize, Option<Expr>)>, PlannerError> {
     let normalized = normalize_expr(predicate.clone())?;
     extract_row_number_limit_with_residual_from_normalized(normalized)
 }
 
 fn extract_row_number_limit_with_residual_from_normalized(
     expr: Expr,
-) -> Result<Option<(String, usize, Option<Expr>)>, PlannerError> {
-    if let Some((column, limit)) = extract_direct_row_number_limit(&expr)? {
-        return Ok(Some((column, limit, None)));
+) -> Result<Option<(String, usize, usize, Option<Expr>)>, PlannerError> {
+    if let Some((column, limit, offset)) = extract_direct_row_number_limit(&expr)? {
+        return Ok(Some((column, limit, offset, None)));
     }
 
     let Expr::BinaryExpr(binary) = expr else {
@@ -29,50 +29,83 @@ fn extract_row_number_limit_with_residual_from_normalized(
         (Some(_), Some(_)) => Err(PlannerError::UnsupportedPlan(
             "only one ROW_NUMBER limit predicate is supported".to_string(),
         )),
-        (Some((column, limit, residual)), None) => {
+        (Some((column, limit, offset, residual)), None) => {
             let mut residuals = Vec::new();
             if let Some(residual) = residual {
                 residuals.push(residual);
             }
             residuals.push(right);
-            Ok(Some((column, limit, combine_filters(residuals))))
+            Ok(Some((column, limit, offset, combine_filters(residuals))))
         }
-        (None, Some((column, limit, residual))) => {
+        (None, Some((column, limit, offset, residual))) => {
             let mut residuals = vec![left];
             if let Some(residual) = residual {
                 residuals.push(residual);
             }
-            Ok(Some((column, limit, combine_filters(residuals))))
+            Ok(Some((column, limit, offset, combine_filters(residuals))))
         }
         (None, None) => Ok(None),
     }
 }
 
-fn extract_direct_row_number_limit(expr: &Expr) -> Result<Option<(String, usize)>, PlannerError> {
+#[derive(Clone, Copy)]
+enum RowNumberPredicateKind {
+    InclusiveUpper,
+    ExclusiveUpper,
+    Equality,
+}
+
+fn extract_direct_row_number_limit(
+    expr: &Expr,
+) -> Result<Option<(String, usize, usize)>, PlannerError> {
     let Expr::BinaryExpr(binary) = expr else {
         return Ok(None);
     };
-    let (column, literal, exclusive) = match (&*binary.left, binary.op, &*binary.right) {
-        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => {
-            (column.name.clone(), literal, false)
-        }
-        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => {
-            (column.name.clone(), literal, true)
-        }
+    let (column, literal, kind) = match (&*binary.left, binary.op, &*binary.right) {
+        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::InclusiveUpper,
+        ),
+        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::ExclusiveUpper,
+        ),
+        (literal @ Expr::Literal(_, _), Operator::GtEq, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::InclusiveUpper,
+        ),
+        (literal @ Expr::Literal(_, _), Operator::Gt, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::ExclusiveUpper,
+        ),
+        (Expr::Column(column), Operator::Eq, literal @ Expr::Literal(_, _))
+        | (literal @ Expr::Literal(_, _), Operator::Eq, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::Equality,
+        ),
         _ => return Ok(None),
     };
 
-    let mut limit = literal_to_positive_usize(literal)?;
-    if exclusive {
-        if limit == 0 {
-            return Ok(None);
+    let value = literal_to_positive_usize(literal)?;
+    let (limit, offset) = match kind {
+        RowNumberPredicateKind::InclusiveUpper => (value, 0),
+        RowNumberPredicateKind::ExclusiveUpper => {
+            if value <= 1 {
+                return Ok(None);
+            }
+            (value - 1, 0)
         }
-        limit -= 1;
-    }
+        RowNumberPredicateKind::Equality => (1, value - 1),
+    };
     if limit == 0 {
         return Ok(None);
     }
-    Ok(Some((column, limit)))
+    Ok(Some((column, limit, offset)))
 }
 
 pub(super) fn projection_expr_matches_rank(expr: &Expr, rank_column: &str) -> bool {

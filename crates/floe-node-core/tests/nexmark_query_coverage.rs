@@ -278,6 +278,18 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, bidder, price FROM (SELECT auction, bidder, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rank_number FROM bid) ranked WHERE rank_number <= 5",
     },
     ValidPlanRuntimeCase {
+        id: "reversed_row_number_topn",
+        sql: "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked WHERE 2 >= rn",
+    },
+    ValidPlanRuntimeCase {
+        id: "row_number_equal_top1",
+        sql: "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked WHERE rn = 1",
+    },
+    ValidPlanRuntimeCase {
+        id: "row_number_equal_second",
+        sql: "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked WHERE rn = 2",
+    },
+    ValidPlanRuntimeCase {
         id: "row_number_alias_projection",
         sql: "SELECT auction, bidder, price, \"bidTime\" FROM (SELECT b.auction, b.bidder, b.price, b.\"dateTime\" AS \"bidTime\", ROW_NUMBER() OVER (PARTITION BY b.auction ORDER BY b.price DESC, b.\"dateTime\" ASC) AS rownum FROM bid b) ranked WHERE rownum <= 1",
     },
