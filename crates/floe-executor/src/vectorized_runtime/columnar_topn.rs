@@ -653,6 +653,7 @@ fn limit_has_nonnegative_skip_and_positive_fetch(limit: &Limit) -> bool {
 fn sort_input_for_limit(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::SubqueryAlias(alias) => sort_input_for_limit(alias.input.as_ref()),
+        LogicalPlan::Projection(projection) => sort_input_for_limit(projection.input.as_ref()),
         LogicalPlan::Sort(sort) => !sort.expr.is_empty(),
         _ => false,
     }

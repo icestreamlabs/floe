@@ -7153,6 +7153,147 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
 }
 
 #[tokio::test]
+async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            Arc::new(Int64Array::from(vec![10, 20, 15, 5])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-hidden-sort-key-topn").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![Field::new(
+        "auction",
+        DataType::Int64,
+        false,
+    )]));
+    let query = "SELECT auction FROM bids ORDER BY price DESC LIMIT 2";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_hidden_sort_top_bids",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_hidden_sort_top_bids")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![2, 3]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![5, 6])),
+            Arc::new(Int64Array::from(vec![50, 60])),
+            Arc::new(Int64Array::from(vec![25, 7])),
+        ],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![2, 5]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(3, -1), (5, 1)]);
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_hidden_sort_top_bids",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_hidden_sort_top_bids")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(single_int_rows(&recovered_snapshot), vec![2, 5]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let retract = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![5])),
+            Arc::new(Int64Array::from(vec![50])),
+            Arc::new(Int64Array::from(vec![25])),
+        ],
+    )
+    .expect("source retract rows");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&retract, &weighted_schema, &[-1])
+        .expect("weighted retract rows");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![2, 3]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(3, 1), (5, -1)]);
+}
+
+#[tokio::test]
 async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementally() {
     let definition = SourceDefinition::new(
         "bids",

@@ -246,6 +246,22 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5",
     },
     ValidPlanRuntimeCase {
+        id: "topn_hidden_sort_key",
+        sql: "SELECT auction FROM bid ORDER BY price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "topn_expression_sort_key",
+        sql: "SELECT auction, price FROM bid ORDER BY price * 2 DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "topn_hidden_expression_sort_key",
+        sql: "SELECT auction FROM bid ORDER BY price * 2 DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_topn_hidden_sort_key",
+        sql: "SELECT auction FROM bid GROUP BY auction ORDER BY SUM(price) DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
         id: "partitioned_row_number_topn",
         sql: "SELECT auction, bidder, price, channel, url, \"dateTime\", extra FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY bidder, auction ORDER BY \"dateTime\" DESC) AS rank_number FROM bid) ranked WHERE rank_number <= 1",
     },
@@ -754,6 +770,48 @@ fn generated_dbsp_runtime_plan_cases() -> Vec<GeneratedPlanRuntimeCase> {
             sql: format!("SELECT s.key, p.name FROM person p JOIN ({input_sql}) s ON p.id = s.key"),
         });
         cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_left_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT p.id AS key, s.value AS value FROM person p LEFT JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_right_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT p.id AS key, s.value AS value FROM person p RIGHT JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_full_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT p.id AS key, s.value AS value FROM person p FULL OUTER JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_left_semi_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT p.id AS key FROM person p LEFT SEMI JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_left_anti_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT p.id AS key FROM person p LEFT ANTI JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_right_semi_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key FROM person p RIGHT SEMI JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_right_anti_join_as_right_over_{input_id}"),
+            sql: format!(
+                "SELECT s.key FROM person p RIGHT ANTI JOIN ({input_sql}) s ON p.id = s.key"
+            ),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
             id: format!("generated_left_join_over_{input_id}"),
             sql: format!(
                 "SELECT s.key, a.seller FROM ({input_sql}) s LEFT JOIN auction a ON s.key = a.id"
@@ -1005,7 +1063,7 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
         skipped.len()
     );
     assert!(
-        execution_modes.len() >= 800,
+        execution_modes.len() >= 1100,
         "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
         execution_modes.len(),
         skipped.len()
