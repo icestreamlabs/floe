@@ -67,6 +67,7 @@ use columnar_composed::{
     build_columnar_join_aggregate_materialized_view_state,
     build_columnar_join_join_materialized_view_state,
     build_columnar_self_join_aggregate_materialized_view_state,
+    build_columnar_subquery_materialized_view_state,
     build_columnar_topn_composed_materialized_view_state,
     build_columnar_union_aggregate_materialized_view_state,
     build_columnar_union_join_materialized_view_state,
@@ -77,10 +78,10 @@ use columnar_composed::{
     columnar_distinct_join_plan_for_plan, columnar_distinct_plan_for_plan,
     columnar_distinct_topn_plan_for_plan, columnar_distinct_union_plan_for_plan,
     columnar_join_aggregate_plan_for_plan, columnar_join_join_plan_for_plan,
-    columnar_self_join_aggregate_plan_for_plan, columnar_topn_composed_plan_for_plan,
-    columnar_union_aggregate_plan_for_plan, columnar_union_join_plan_for_plan,
-    columnar_union_topn_plan_for_plan, plan_contains_asof_extension,
-    run_columnar_aggregate_aggregate_materialized_view_tick,
+    columnar_self_join_aggregate_plan_for_plan, columnar_subquery_plan_for_plan,
+    columnar_topn_composed_plan_for_plan, columnar_union_aggregate_plan_for_plan,
+    columnar_union_join_plan_for_plan, columnar_union_topn_plan_for_plan,
+    plan_contains_asof_extension, run_columnar_aggregate_aggregate_materialized_view_tick,
     run_columnar_aggregate_join_materialized_view_tick,
     run_columnar_aggregate_topn_materialized_view_tick,
     run_columnar_asof_join_materialized_view_tick,
@@ -94,6 +95,7 @@ use columnar_composed::{
     run_columnar_join_aggregate_materialized_view_tick,
     run_columnar_join_join_materialized_view_tick,
     run_columnar_self_join_aggregate_materialized_view_tick,
+    run_columnar_subquery_materialized_view_tick,
     run_columnar_topn_composed_materialized_view_tick,
     run_columnar_union_aggregate_materialized_view_tick,
     run_columnar_union_join_materialized_view_tick, run_columnar_union_topn_materialized_view_tick,
@@ -258,6 +260,7 @@ struct VectorizedMaterializedViewState {
     columnar_topn: Option<ColumnarTopNMaterializedViewState>,
     columnar_union: Option<ColumnarUnionMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
+    columnar_subquery: Option<ColumnarComposedMaterializedViewState>,
     columnar_composed: Option<ColumnarComposedMaterializedViewState>,
     execution_mode: MaterializedViewExecutionMode,
 }
@@ -302,6 +305,7 @@ enum MaterializedViewExecutionMode {
     ColumnarTopN,
     ColumnarUnion,
     ColumnarCountByKey,
+    ColumnarSubquery,
     ColumnarComposed,
     IncrementalFilterProject,
     FullRefresh,
@@ -338,6 +342,7 @@ impl MaterializedViewExecutionMode {
             Self::ColumnarTopN => "columnar_topn",
             Self::ColumnarUnion => "columnar_union",
             Self::ColumnarCountByKey => "columnar_count_by_key",
+            Self::ColumnarSubquery => "columnar_subquery",
             Self::ColumnarComposed => "columnar_composed",
             Self::IncrementalFilterProject => "incremental_filter_project",
             Self::FullRefresh => "full_refresh",
@@ -1964,6 +1969,72 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
+            let columnar_subquery_plan = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_grouped_max.is_none()
+                && columnar_grouped_stats.is_none()
+                && columnar_join.is_none()
+                && columnar_topn.is_none()
+                && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
+                && columnar_multijoin.is_none()
+                && columnar_union.is_none()
+                && columnar_stateless.is_none()
+                && incremental.is_none()
+                && columnar_asof_join.is_none()
+                && columnar_self_join_aggregate.is_none()
+                && columnar_join_aggregate.is_none()
+                && columnar_distinct_aggregate.is_none()
+                && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
+                && columnar_union_join.is_none()
+                && columnar_aggregate_join.is_none()
+                && columnar_distinct_join.is_none()
+                && columnar_distinct_topn.is_none()
+                && columnar_aggregate_topn.is_none()
+                && columnar_composed_join_topn.is_none()
+                && columnar_union_topn.is_none()
+                && columnar_distinct_union.is_none()
+                && columnar_join_join.is_none()
+                && columnar_distinct.is_none()
+                && columnar_topn_composed.is_none()
+            {
+                columnar_subquery_plan_for_plan(df.logical_plan(), &source_states)?
+            } else {
+                None
+            };
+            let columnar_subquery = match (
+                columnar_subquery_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_subquery_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar subquery operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
             let columnar_composed_plan = if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
@@ -1993,6 +2064,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_join.is_none()
                 && columnar_distinct.is_none()
                 && columnar_topn_composed.is_none()
+                && columnar_subquery.is_none()
             {
                 columnar_composed_plan_for_plan(df.logical_plan(), &source_states)?
             } else {
@@ -2059,6 +2131,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_join.is_none()
                 && columnar_distinct.is_none()
                 && columnar_topn_composed.is_none()
+                && columnar_subquery.is_none()
                 && columnar_composed.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
             {
@@ -2123,6 +2196,8 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarUnion
             } else if columnar_count.is_some() {
                 MaterializedViewExecutionMode::ColumnarCountByKey
+            } else if columnar_subquery.is_some() {
+                MaterializedViewExecutionMode::ColumnarSubquery
             } else if columnar_composed.is_some() {
                 MaterializedViewExecutionMode::ColumnarComposed
             } else if incremental.is_some() {
@@ -2284,6 +2359,11 @@ impl VectorizedExecutionRuntime {
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
                     })
                     .or_else(|| {
+                        columnar_subquery
+                            .as_ref()
+                            .map(ColumnarComposedMaterializedViewState::initial_snapshot)
+                    })
+                    .or_else(|| {
                         columnar_composed
                             .as_ref()
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
@@ -2318,6 +2398,7 @@ impl VectorizedExecutionRuntime {
                 columnar_topn,
                 columnar_union,
                 columnar_count,
+                columnar_subquery,
                 columnar_composed,
                 execution_mode,
             });
@@ -2799,6 +2880,17 @@ impl VectorizedExecutionRuntime {
                 continue;
             }
             if run_columnar_topn_composed_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            if run_columnar_subquery_materialized_view_tick(
                 registry,
                 insert_batches,
                 weighted_delta_batches,

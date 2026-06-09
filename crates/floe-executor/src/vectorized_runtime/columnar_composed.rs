@@ -11,7 +11,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchemaRef, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -32,7 +32,9 @@ use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
-use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
+use crate::vectorized_runtime::source_state::{
+    plan_contains_expression_subquery, rename_batches, resolve_source_table,
+};
 
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
@@ -143,6 +145,16 @@ pub(super) fn columnar_asof_join_plan_for_plan(
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarComposedPlan>> {
     if !plan_contains_asof_extension(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
+pub(super) fn columnar_subquery_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !plan_contains_expression_subquery(plan) {
         return Ok(None);
     }
     columnar_composed_plan_for_plan(plan, sources)
@@ -691,6 +703,28 @@ pub(super) async fn build_columnar_composed_materialized_view_state(
     .await
 }
 
+pub(super) async fn build_columnar_subquery_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "subquery",
+        "subquery",
+        "columnar_subquery_snapshot_diff",
+    )
+    .await
+}
+
 pub(super) async fn build_columnar_asof_join_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
@@ -1160,6 +1194,24 @@ pub(super) async fn run_columnar_composed_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_subquery_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::Subquery,
+    )
+    .await
+}
+
 pub(super) async fn run_columnar_asof_join_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -1469,6 +1521,7 @@ pub(super) async fn run_columnar_distinct_aggregate_materialized_view_tick(
 #[derive(Clone, Copy)]
 enum ColumnarSnapshotDiffSlot {
     Composed,
+    Subquery,
     AsofJoin,
     SelfJoinAggregate,
     JoinAggregate,
@@ -1498,6 +1551,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
 ) -> Result<bool> {
     let Some(columnar) = (match slot {
         ColumnarSnapshotDiffSlot::Composed => mv.columnar_composed.as_mut(),
+        ColumnarSnapshotDiffSlot::Subquery => mv.columnar_subquery.as_mut(),
         ColumnarSnapshotDiffSlot::AsofJoin => mv.columnar_asof_join.as_mut(),
         ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::JoinAggregate => mv.columnar_join_aggregate.as_mut(),
@@ -1894,7 +1948,7 @@ fn rebind_composed_logical_plan(
     asof_specs: &mut Vec<ComposedAsofJoinSpec>,
 ) -> Result<LogicalPlan> {
     let mut asof_rewrites = Vec::new();
-    let transformed = logical_plan.transform_up(|plan| match plan {
+    let transformed = logical_plan.transform_up_with_subqueries(|plan| match plan {
         LogicalPlan::TableScan(mut scan) => {
             let table_name = scan.table_name.table();
             let Some(source_name) = table_scan_source(&scan, sources) else {
@@ -2449,6 +2503,9 @@ fn collect_sources(
     sources: &HashMap<String, VectorizedSourceState>,
     out: &mut BTreeSet<String>,
 ) {
+    for expr in plan.expressions() {
+        collect_expr_subquery_sources(&expr, sources, out);
+    }
     match plan {
         LogicalPlan::TableScan(scan) => {
             if let Some(source_name) = table_scan_source(scan, sources) {
@@ -2490,6 +2547,29 @@ fn collect_sources(
         }
         _ => {}
     }
+}
+
+fn collect_expr_subquery_sources(
+    expr: &Expr,
+    sources: &HashMap<String, VectorizedSourceState>,
+    out: &mut BTreeSet<String>,
+) {
+    let _ = expr.apply(|expr| match expr {
+        Expr::Exists(exists) => {
+            collect_sources(exists.subquery.subquery.as_ref(), sources, out);
+            Ok(TreeNodeRecursion::Jump)
+        }
+        Expr::InSubquery(in_subquery) => {
+            collect_expr_subquery_sources(in_subquery.expr.as_ref(), sources, out);
+            collect_sources(in_subquery.subquery.subquery.as_ref(), sources, out);
+            Ok(TreeNodeRecursion::Jump)
+        }
+        Expr::ScalarSubquery(subquery) => {
+            collect_sources(subquery.subquery.as_ref(), sources, out);
+            Ok(TreeNodeRecursion::Jump)
+        }
+        _ => Ok(TreeNodeRecursion::Continue),
+    });
 }
 
 fn table_scan_source(

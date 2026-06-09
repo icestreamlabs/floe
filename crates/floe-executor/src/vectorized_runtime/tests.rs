@@ -9581,6 +9581,252 @@ async fn intersect_except_use_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
+async fn subquery_predicates_use_slate_backed_columnar_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+        ],
+    )
+    .expect("initial bids batch");
+    let auctions = SourceDefinition::new(
+        "auctions",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("auctions source definition");
+    let auctions_schema = auctions.to_arrow_schema();
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![Arc::new(Int64Array::from(vec![1, 3]))],
+    )
+    .expect("initial auctions batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    sources.register(auctions);
+    let table = build_operator_state_table("vectorized-columnar-subquery").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let in_query = "SELECT auction, price FROM bids WHERE auction IN (SELECT id FROM auctions)";
+    let not_exists_query = "SELECT b.auction, b.price FROM bids b \
+        WHERE NOT EXISTS (SELECT 1 FROM auctions a WHERE a.id = b.auction)";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new("mv_in_bids", in_query, Arc::clone(&output_schema)),
+            VectorizedMaterializedViewPlan::new(
+                "mv_not_exists_bids",
+                not_exists_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+    assert_eq!(
+        runtime.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let in_handle = registry.get("mv_in_bids").expect("IN materialized view");
+    assert_eq!(
+        id_count_rows(&in_handle.arrow_snapshot_for(1).expect("IN snapshot")),
+        vec![(1, 100), (3, 300)]
+    );
+    let not_exists_handle = registry
+        .get("mv_not_exists_bids")
+        .expect("NOT EXISTS materialized view");
+    assert_eq!(
+        id_count_rows(
+            &not_exists_handle
+                .arrow_snapshot_for(1)
+                .expect("NOT EXISTS snapshot")
+        ),
+        vec![(2, 200)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new("mv_in_bids", in_query, Arc::clone(&output_schema)),
+            VectorizedMaterializedViewPlan::new(
+                "mv_not_exists_bids",
+                not_exists_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+    assert_eq!(
+        recovered.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+    recovered.run_tick(2).await.expect("recovered tick");
+
+    let recovered_in = recovery_registry
+        .get("mv_in_bids")
+        .expect("recovered IN materialized view");
+    assert_eq!(
+        id_count_rows(&recovered_in.arrow_snapshot_for(2).expect("IN snapshot")),
+        vec![(1, 100), (3, 300)]
+    );
+    let recovered_not_exists = recovery_registry
+        .get("mv_not_exists_bids")
+        .expect("recovered NOT EXISTS materialized view");
+    assert_eq!(
+        id_count_rows(
+            &recovered_not_exists
+                .arrow_snapshot_for(2)
+                .expect("NOT EXISTS snapshot")
+        ),
+        vec![(2, 200)]
+    );
+    assert!(
+        recovered_in
+            .arrow_delta_for(2)
+            .expect("recovered empty IN delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+    assert!(
+        recovered_not_exists
+            .arrow_delta_for(2)
+            .expect("recovered empty NOT EXISTS delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+
+    let auction_retract = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![Arc::new(Int64Array::from(vec![3]))],
+    )
+    .expect("auction retract batch");
+    let auctions_weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&auctions_schema)
+            .expect("weighted auctions schema");
+    let weighted = weighted_batch_from_diffs(&auction_retract, &auctions_weighted_schema, &[-1])
+        .expect("weighted auction retract");
+    recovered
+        .apply_weighted_source_delta("auctions", weighted)
+        .await
+        .expect("apply weighted auction retract");
+    recovered.run_tick(3).await.expect("auction retract tick");
+
+    assert_eq!(
+        id_count_rows(&recovered_in.arrow_snapshot_for(3).expect("IN snapshot")),
+        vec![(1, 100)]
+    );
+    assert_eq!(
+        weighted_id_count_rows(&recovered_in.arrow_delta_for(3).expect("IN delta")),
+        vec![(3, 300, -1)]
+    );
+    assert_eq!(
+        id_count_rows(
+            &recovered_not_exists
+                .arrow_snapshot_for(3)
+                .expect("NOT EXISTS snapshot")
+        ),
+        vec![(2, 200), (3, 300)]
+    );
+    assert_eq!(
+        weighted_id_count_rows(
+            &recovered_not_exists
+                .arrow_delta_for(3)
+                .expect("NOT EXISTS delta")
+        ),
+        vec![(3, 300, 1)]
+    );
+
+    let bid_retract = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .expect("bid retract batch");
+    let bids_weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&bids_schema)
+        .expect("weighted bids schema");
+    let weighted = weighted_batch_from_diffs(&bid_retract, &bids_weighted_schema, &[-1])
+        .expect("weighted bid retract");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted bid retract");
+    recovered.run_tick(4).await.expect("bid retract tick");
+
+    assert!(id_count_rows(&recovered_in.arrow_snapshot_for(4).expect("IN snapshot")).is_empty());
+    assert_eq!(
+        weighted_id_count_rows(&recovered_in.arrow_delta_for(4).expect("IN delta")),
+        vec![(1, 100, -1)]
+    );
+    assert_eq!(
+        id_count_rows(
+            &recovered_not_exists
+                .arrow_snapshot_for(4)
+                .expect("NOT EXISTS snapshot")
+        ),
+        vec![(2, 200), (3, 300)]
+    );
+    assert!(
+        recovered_not_exists
+            .arrow_delta_for(4)
+            .expect("NOT EXISTS empty delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+}
+
+#[tokio::test]
 async fn distinct_topn_uses_slate_backed_columnar_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",

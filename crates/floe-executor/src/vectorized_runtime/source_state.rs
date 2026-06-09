@@ -1,4 +1,6 @@
 use super::*;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::Expr;
 
 pub(super) fn rename_batches(
     batches: &[RecordBatch],
@@ -52,18 +54,54 @@ pub(super) fn incremental_source_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Option<String> {
+    if plan_contains_expression_subquery(plan) {
+        return None;
+    }
+    incremental_source_for_plan_inner(plan, sources)
+}
+
+fn incremental_source_for_plan_inner(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Option<String> {
     match plan {
         LogicalPlan::Projection(projection) => {
-            incremental_source_for_plan(projection.input.as_ref(), sources)
+            incremental_source_for_plan_inner(projection.input.as_ref(), sources)
         }
-        LogicalPlan::Filter(filter) => incremental_source_for_plan(filter.input.as_ref(), sources),
-        LogicalPlan::Sort(sort) => incremental_source_for_plan(sort.input.as_ref(), sources),
+        LogicalPlan::Filter(filter) => {
+            incremental_source_for_plan_inner(filter.input.as_ref(), sources)
+        }
+        LogicalPlan::Sort(sort) => incremental_source_for_plan_inner(sort.input.as_ref(), sources),
         LogicalPlan::SubqueryAlias(alias) => {
-            incremental_source_for_plan(alias.input.as_ref(), sources)
+            incremental_source_for_plan_inner(alias.input.as_ref(), sources)
         }
         LogicalPlan::TableScan(scan) => resolve_source_table(scan.table_name.to_string(), sources),
         _ => None,
     }
+}
+
+pub(super) fn plan_contains_expression_subquery(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        for expr in node.expressions() {
+            if expr_contains_subquery(&expr) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    expr.exists(|expr| {
+        Ok(matches!(
+            expr,
+            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+        ))
+    })
+    .unwrap_or(true)
 }
 
 pub(super) fn resolve_source_table(

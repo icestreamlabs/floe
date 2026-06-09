@@ -521,6 +521,34 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "SELECT auction AS key, COUNT_CHAR(extra, 'c') AS value FROM bid",
     ),
     (
+        "cte_filter_projection",
+        "WITH high_bids AS (SELECT auction AS key, price AS value FROM bid WHERE price > 100) SELECT key, value FROM high_bids",
+    ),
+    (
+        "cte_aggregate",
+        "WITH totals AS (SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction) SELECT key, value FROM totals",
+    ),
+    (
+        "in_subquery",
+        "SELECT auction AS key, price AS value FROM bid WHERE auction IN (SELECT id FROM auction)",
+    ),
+    (
+        "not_in_subquery",
+        "SELECT auction AS key, price AS value FROM bid WHERE auction NOT IN (SELECT id FROM auction)",
+    ),
+    (
+        "exists_subquery",
+        "SELECT b.auction AS key, b.price AS value FROM bid b WHERE EXISTS (SELECT 1 FROM auction a WHERE a.id = b.auction)",
+    ),
+    (
+        "not_exists_subquery",
+        "SELECT b.auction AS key, b.price AS value FROM bid b WHERE NOT EXISTS (SELECT 1 FROM auction a WHERE a.id = b.auction)",
+    ),
+    (
+        "scalar_subquery_filter",
+        "SELECT auction AS key, price AS value FROM bid WHERE price > (SELECT MIN(\"initialBid\") FROM auction)",
+    ),
+    (
         "distinct",
         "SELECT DISTINCT auction AS key, bidder AS value FROM bid",
     ),
