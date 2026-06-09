@@ -60,6 +60,14 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             batch: bid_batch,
         },
         NexmarkRuntimeCase {
+            id: "q7",
+            source_name: "nexmark_bid",
+            view_name: "mv_nexmark_q7",
+            query: r#"SELECT MAX(price) AS maxprice FROM bid GROUP BY TUMBLE("dateTime", 10000)"#,
+            output_schema: q7_output_schema,
+            batch: bid_batch,
+        },
+        NexmarkRuntimeCase {
             id: "q8",
             source_name: "nexmark_person",
             view_name: "mv_nexmark_q8",
@@ -295,6 +303,14 @@ fn q5_output_schema() -> SchemaRef {
         Field::new("auction", DataType::Int64, true),
         Field::new("num", DataType::Int64, false),
     ]))
+}
+
+fn q7_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "maxprice",
+        DataType::Int64,
+        true,
+    )]))
 }
 
 fn q8_output_schema() -> SchemaRef {
