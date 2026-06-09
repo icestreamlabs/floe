@@ -9929,6 +9929,11 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
         DataType::Int64,
         true,
     )]));
+    let grand_total_schema = Arc::new(Schema::new(vec![Field::new(
+        "grand_total",
+        DataType::Int64,
+        true,
+    )]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
@@ -9972,6 +9977,12 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
                     UNION ALL SELECT id AS key FROM auctions) u",
                 Arc::clone(&key_schema),
             ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_aggregate_over_aggregate",
+                "SELECT SUM(total) AS grand_total \
+                    FROM (SELECT auction, SUM(price) AS total FROM bids GROUP BY auction) a",
+                Arc::clone(&grand_total_schema),
+            ),
         ],
         Arc::clone(&registry),
         VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
@@ -10001,6 +10012,10 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     assert_eq!(
         runtime.materialized_views[5].execution_mode,
         MaterializedViewExecutionMode::ColumnarUnionAggregate
+    );
+    assert_eq!(
+        runtime.materialized_views[6].execution_mode,
+        MaterializedViewExecutionMode::ColumnarAggregateAggregate
     );
 
     runtime
@@ -10071,6 +10086,18 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     assert_eq!(
         single_int_rows(&union_over_distinct.arrow_snapshot_for(1).expect("snapshot")),
         vec![1, 1, 2, 2, 3, 3]
+    );
+
+    let aggregate_over_aggregate = registry
+        .get("mv_aggregate_over_aggregate")
+        .expect("aggregate-over-aggregate materialized view");
+    assert_eq!(
+        single_int_rows(
+            &aggregate_over_aggregate
+                .arrow_snapshot_for(1)
+                .expect("snapshot")
+        ),
+        vec![440]
     );
 }
 

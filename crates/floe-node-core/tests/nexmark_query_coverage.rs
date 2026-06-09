@@ -210,6 +210,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT COUNT(auction) AS c FROM (SELECT DISTINCT auction, bidder FROM bid) d",
     },
     ValidPlanRuntimeCase {
+        id: "aggregate_over_aggregate",
+        sql: "SELECT SUM(total) AS grand_total FROM (SELECT auction, SUM(price) AS total FROM bid GROUP BY auction) a",
+    },
+    ValidPlanRuntimeCase {
         id: "distinct_over_aggregate",
         sql: "SELECT DISTINCT auction, total FROM (SELECT auction, SUM(price) AS total FROM bid GROUP BY auction) a",
     },
@@ -346,6 +350,26 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)",
     },
     ValidPlanRuntimeCase {
+        id: "window_aggregate_topn",
+        sql: "SELECT auction, COUNT(*) FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000) ORDER BY \"count(*)\" DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_over_window_aggregate",
+        sql: "SELECT SUM(\"count(*)\") AS total_num FROM (SELECT auction, COUNT(*) FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)) w",
+    },
+    ValidPlanRuntimeCase {
+        id: "distinct_over_window_aggregate",
+        sql: "SELECT DISTINCT auction FROM (SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)) w",
+    },
+    ValidPlanRuntimeCase {
+        id: "join_over_window_aggregate",
+        sql: "SELECT w.auction, a.seller FROM (SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)) w JOIN auction a ON w.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_over_window_aggregate",
+        sql: "SELECT key FROM (SELECT auction AS key FROM (SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000)) w UNION ALL SELECT id AS key FROM auction) u",
+    },
+    ValidPlanRuntimeCase {
         id: "hop_allowed_lateness_window",
         sql: "SELECT auction, COUNT(*) AS num FROM bid GROUP BY auction, HOP(\"dateTime\", 2000, 10000, 1500)",
     },
@@ -368,6 +392,22 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "asof_join",
         sql: "SELECT a.id, b.price FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "asof_topn",
+        sql: "SELECT a.id, b.price FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction ORDER BY b.price DESC LIMIT 5",
+    },
+    ValidPlanRuntimeCase {
+        id: "aggregate_over_asof",
+        sql: "SELECT COUNT(price) AS c FROM (SELECT a.id, b.price FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction) q",
+    },
+    ValidPlanRuntimeCase {
+        id: "distinct_over_asof",
+        sql: "SELECT DISTINCT id FROM (SELECT a.id, b.price FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction) q",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_over_asof",
+        sql: "SELECT key FROM (SELECT a.id AS key FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction UNION ALL SELECT id AS key FROM auction) u",
     },
     ValidPlanRuntimeCase {
         id: "asof_join_without_equi_keys",

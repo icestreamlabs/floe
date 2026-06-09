@@ -188,6 +188,16 @@ pub(super) fn columnar_union_aggregate_plan_for_plan(
     columnar_composed_plan_for_plan(plan, sources)
 }
 
+pub(super) fn columnar_aggregate_aggregate_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_aggregate_aggregate(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn columnar_union_join_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -558,6 +568,20 @@ fn contains_aggregate_join(plan: &LogicalPlan) -> bool {
     contains_aggregate(plan) && contains_join(plan)
 }
 
+fn contains_aggregate_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => contains_aggregate(aggregate.input.as_ref()),
+        LogicalPlan::Projection(projection) => {
+            contains_aggregate_aggregate(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => contains_aggregate_aggregate(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_aggregate_aggregate(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_aggregate_aggregate(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_aggregate_aggregate(limit.input.as_ref()),
+        _ => false,
+    }
+}
+
 fn contains_aggregate(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Aggregate(_) => true,
@@ -715,6 +739,28 @@ pub(super) async fn build_columnar_union_aggregate_materialized_view_state(
         "union_aggregate",
         "union aggregate",
         "columnar_union_aggregate_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_aggregate_aggregate_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "aggregate_aggregate",
+        "aggregate aggregate",
+        "columnar_aggregate_aggregate_snapshot_diff",
     )
     .await
 }
@@ -1084,6 +1130,24 @@ pub(super) async fn run_columnar_union_aggregate_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_aggregate_aggregate_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::AggregateAggregate,
+    )
+    .await
+}
+
 pub(super) async fn run_columnar_union_join_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -1253,6 +1317,7 @@ enum ColumnarSnapshotDiffSlot {
     SelfJoinAggregate,
     JoinAggregate,
     UnionAggregate,
+    AggregateAggregate,
     UnionJoin,
     AggregateJoin,
     DistinctJoin,
@@ -1278,6 +1343,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::JoinAggregate => mv.columnar_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::UnionAggregate => mv.columnar_union_aggregate.as_mut(),
+        ColumnarSnapshotDiffSlot::AggregateAggregate => mv.columnar_aggregate_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::UnionJoin => mv.columnar_union_join.as_mut(),
         ColumnarSnapshotDiffSlot::AggregateJoin => mv.columnar_aggregate_join.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctJoin => mv.columnar_distinct_join.as_mut(),

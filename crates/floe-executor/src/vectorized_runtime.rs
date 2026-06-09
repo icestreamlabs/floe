@@ -52,7 +52,9 @@ mod columnar_union;
 mod source_state;
 
 use columnar_composed::{
-    ColumnarComposedMaterializedViewState, build_columnar_aggregate_join_materialized_view_state,
+    ColumnarComposedMaterializedViewState,
+    build_columnar_aggregate_aggregate_materialized_view_state,
+    build_columnar_aggregate_join_materialized_view_state,
     build_columnar_aggregate_topn_materialized_view_state,
     build_columnar_asof_join_materialized_view_state,
     build_columnar_composed_join_topn_materialized_view_state,
@@ -65,14 +67,15 @@ use columnar_composed::{
     build_columnar_self_join_aggregate_materialized_view_state,
     build_columnar_union_aggregate_materialized_view_state,
     build_columnar_union_join_materialized_view_state,
-    build_columnar_union_topn_materialized_view_state, columnar_aggregate_join_plan_for_plan,
-    columnar_aggregate_topn_plan_for_plan, columnar_asof_join_plan_for_plan,
-    columnar_composed_join_topn_plan_for_plan, columnar_composed_plan_for_plan,
-    columnar_distinct_aggregate_plan_for_plan, columnar_distinct_join_plan_for_plan,
-    columnar_distinct_topn_plan_for_plan, columnar_distinct_union_plan_for_plan,
-    columnar_join_aggregate_plan_for_plan, columnar_self_join_aggregate_plan_for_plan,
-    columnar_union_aggregate_plan_for_plan, columnar_union_join_plan_for_plan,
-    columnar_union_topn_plan_for_plan, plan_contains_asof_extension,
+    build_columnar_union_topn_materialized_view_state, columnar_aggregate_aggregate_plan_for_plan,
+    columnar_aggregate_join_plan_for_plan, columnar_aggregate_topn_plan_for_plan,
+    columnar_asof_join_plan_for_plan, columnar_composed_join_topn_plan_for_plan,
+    columnar_composed_plan_for_plan, columnar_distinct_aggregate_plan_for_plan,
+    columnar_distinct_join_plan_for_plan, columnar_distinct_topn_plan_for_plan,
+    columnar_distinct_union_plan_for_plan, columnar_join_aggregate_plan_for_plan,
+    columnar_self_join_aggregate_plan_for_plan, columnar_union_aggregate_plan_for_plan,
+    columnar_union_join_plan_for_plan, columnar_union_topn_plan_for_plan,
+    plan_contains_asof_extension, run_columnar_aggregate_aggregate_materialized_view_tick,
     run_columnar_aggregate_join_materialized_view_tick,
     run_columnar_aggregate_topn_materialized_view_tick,
     run_columnar_asof_join_materialized_view_tick,
@@ -232,6 +235,7 @@ struct VectorizedMaterializedViewState {
     columnar_join_aggregate: Option<ColumnarComposedMaterializedViewState>,
     columnar_distinct_aggregate: Option<ColumnarComposedMaterializedViewState>,
     columnar_union_aggregate: Option<ColumnarComposedMaterializedViewState>,
+    columnar_aggregate_aggregate: Option<ColumnarComposedMaterializedViewState>,
     columnar_union_join: Option<ColumnarComposedMaterializedViewState>,
     columnar_aggregate_join: Option<ColumnarComposedMaterializedViewState>,
     columnar_distinct_join: Option<ColumnarComposedMaterializedViewState>,
@@ -272,6 +276,7 @@ enum MaterializedViewExecutionMode {
     ColumnarJoinAggregate,
     ColumnarDistinctAggregate,
     ColumnarUnionAggregate,
+    ColumnarAggregateAggregate,
     ColumnarUnionJoin,
     ColumnarAggregateJoin,
     ColumnarDistinctJoin,
@@ -304,6 +309,7 @@ impl MaterializedViewExecutionMode {
             Self::ColumnarJoinAggregate => "columnar_join_aggregate",
             Self::ColumnarDistinctAggregate => "columnar_distinct_aggregate",
             Self::ColumnarUnionAggregate => "columnar_union_aggregate",
+            Self::ColumnarAggregateAggregate => "columnar_aggregate_aggregate",
             Self::ColumnarUnionJoin => "columnar_union_join",
             Self::ColumnarAggregateJoin => "columnar_aggregate_join",
             Self::ColumnarDistinctJoin => "columnar_distinct_join",
@@ -1227,6 +1233,60 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
+            let columnar_aggregate_aggregate_plan = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_grouped_max.is_none()
+                && columnar_grouped_stats.is_none()
+                && columnar_join.is_none()
+                && columnar_topn.is_none()
+                && columnar_join_topn.is_none()
+                && columnar_join_top_avg.is_none()
+                && columnar_multijoin.is_none()
+                && columnar_union.is_none()
+                && columnar_stateless.is_none()
+                && incremental.is_none()
+                && columnar_asof_join.is_none()
+                && columnar_self_join_aggregate.is_none()
+                && columnar_join_aggregate.is_none()
+                && columnar_distinct_aggregate.is_none()
+                && columnar_union_aggregate.is_none()
+            {
+                columnar_aggregate_aggregate_plan_for_plan(df.logical_plan(), &source_states)?
+            } else {
+                None
+            };
+            let columnar_aggregate_aggregate = match (
+                columnar_aggregate_aggregate_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_aggregate_aggregate_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar aggregate aggregate operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
+                _ => None,
+            };
             let columnar_union_join_plan = if columnar_count.is_none()
                 && columnar_grouped_count.is_none()
                 && columnar_grouped_max.is_none()
@@ -1244,6 +1304,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
             {
                 columnar_union_join_plan_for_plan(df.logical_plan(), &source_states)?
             } else {
@@ -1298,6 +1359,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
             {
                 columnar_aggregate_join_plan_for_plan(df.logical_plan(), &source_states)?
@@ -1353,6 +1415,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
             {
@@ -1409,6 +1472,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1466,6 +1530,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1524,6 +1589,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1583,6 +1649,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1643,6 +1710,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1704,6 +1772,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1766,6 +1835,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_aggregate.is_none()
                 && columnar_distinct_aggregate.is_none()
                 && columnar_union_aggregate.is_none()
+                && columnar_aggregate_aggregate.is_none()
                 && columnar_union_join.is_none()
                 && columnar_aggregate_join.is_none()
                 && columnar_distinct_join.is_none()
@@ -1808,6 +1878,8 @@ impl VectorizedExecutionRuntime {
                 MaterializedViewExecutionMode::ColumnarDistinctAggregate
             } else if columnar_union_aggregate.is_some() {
                 MaterializedViewExecutionMode::ColumnarUnionAggregate
+            } else if columnar_aggregate_aggregate.is_some() {
+                MaterializedViewExecutionMode::ColumnarAggregateAggregate
             } else if columnar_union_join.is_some() {
                 MaterializedViewExecutionMode::ColumnarUnionJoin
             } else if columnar_aggregate_join.is_some() {
@@ -1931,6 +2003,11 @@ impl VectorizedExecutionRuntime {
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
                     })
                     .or_else(|| {
+                        columnar_aggregate_aggregate
+                            .as_ref()
+                            .map(ColumnarComposedMaterializedViewState::initial_snapshot)
+                    })
+                    .or_else(|| {
                         columnar_union_join
                             .as_ref()
                             .map(ColumnarComposedMaterializedViewState::initial_snapshot)
@@ -1990,6 +2067,7 @@ impl VectorizedExecutionRuntime {
                 columnar_join_aggregate,
                 columnar_distinct_aggregate,
                 columnar_union_aggregate,
+                columnar_aggregate_aggregate,
                 columnar_union_join,
                 columnar_aggregate_join,
                 columnar_distinct_join,
@@ -2350,6 +2428,17 @@ impl VectorizedExecutionRuntime {
                 continue;
             }
             if run_columnar_union_aggregate_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
+            if run_columnar_aggregate_aggregate_materialized_view_tick(
                 registry,
                 insert_batches,
                 weighted_delta_batches,
