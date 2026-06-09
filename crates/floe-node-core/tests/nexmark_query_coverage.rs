@@ -178,6 +178,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
     },
     ValidPlanRuntimeCase {
+        id: "aggregate_over_topn",
+        sql: "SELECT SUM(price) AS total FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5) t",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_stats_topn",
         sql: "SELECT bidder, SUM(price) AS total_price, COUNT(price) AS bid_count, AVG(price) AS avg_price FROM bid GROUP BY bidder ORDER BY total_price DESC LIMIT 5",
     },
@@ -240,6 +244,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "distinct_over_union",
         sql: "SELECT DISTINCT auction FROM (SELECT auction FROM bid WHERE price > 100 UNION ALL SELECT auction FROM bid WHERE price <= 100) u",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_over_distinct",
+        sql: "SELECT key FROM (SELECT DISTINCT auction AS key FROM bid UNION ALL SELECT id AS key FROM auction) u",
     },
     ValidPlanRuntimeCase {
         id: "union_aggregate",

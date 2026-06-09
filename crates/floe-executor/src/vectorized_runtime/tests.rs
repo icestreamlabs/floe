@@ -9924,6 +9924,11 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
         Field::new("seller", DataType::Int64, false),
     ]));
     let key_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+    let sum_schema = Arc::new(Schema::new(vec![Field::new(
+        "total",
+        DataType::Int64,
+        true,
+    )]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
@@ -9941,9 +9946,22 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
                 Arc::clone(&join_schema),
             ),
             VectorizedMaterializedViewPlan::new(
+                "mv_aggregate_over_topn",
+                "SELECT SUM(price) AS total \
+                    FROM (SELECT auction, price FROM bids ORDER BY price DESC LIMIT 2) t",
+                Arc::clone(&sum_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
                 "mv_union_over_topn",
                 "SELECT key \
                     FROM (SELECT key FROM (SELECT auction AS key, price FROM bids ORDER BY price DESC LIMIT 2) t \
+                    UNION ALL SELECT id AS key FROM auctions) u",
+                Arc::clone(&key_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_union_over_distinct",
+                "SELECT key \
+                    FROM (SELECT DISTINCT auction AS key FROM bids \
                     UNION ALL SELECT id AS key FROM auctions) u",
                 Arc::clone(&key_schema),
             ),
@@ -9970,10 +9988,18 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     );
     assert_eq!(
         runtime.materialized_views[2].execution_mode,
-        MaterializedViewExecutionMode::ColumnarUnionTopN
+        MaterializedViewExecutionMode::ColumnarAggregateTopN
     );
     assert_eq!(
         runtime.materialized_views[3].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnionTopN
+    );
+    assert_eq!(
+        runtime.materialized_views[4].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinctUnion
+    );
+    assert_eq!(
+        runtime.materialized_views[5].execution_mode,
         MaterializedViewExecutionMode::ColumnarUnionAggregate
     );
 
@@ -10011,6 +10037,14 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
         vec![(1, 10), (2, 20)]
     );
 
+    let aggregate_over_topn = registry
+        .get("mv_aggregate_over_topn")
+        .expect("aggregate-over-topn materialized view");
+    assert_eq!(
+        single_int_rows(&aggregate_over_topn.arrow_snapshot_for(1).expect("snapshot")),
+        vec![300]
+    );
+
     let union_over_topn = registry
         .get("mv_union_over_topn")
         .expect("union-over-topn materialized view");
@@ -10028,6 +10062,14 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
                 .arrow_snapshot_for(1)
                 .expect("snapshot")
         ),
+        vec![1, 1, 2, 2, 3, 3]
+    );
+
+    let union_over_distinct = registry
+        .get("mv_union_over_distinct")
+        .expect("union-over-distinct materialized view");
+    assert_eq!(
+        single_int_rows(&union_over_distinct.arrow_snapshot_for(1).expect("snapshot")),
         vec![1, 1, 2, 2, 3, 3]
     );
 }

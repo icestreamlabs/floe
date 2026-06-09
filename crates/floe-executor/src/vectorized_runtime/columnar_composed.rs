@@ -198,6 +198,16 @@ pub(super) fn columnar_union_join_plan_for_plan(
     columnar_composed_plan_for_plan(plan, sources)
 }
 
+pub(super) fn columnar_distinct_union_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_distinct_union(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn columnar_aggregate_join_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -223,6 +233,16 @@ pub(super) fn columnar_distinct_topn_plan_for_plan(
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarComposedPlan>> {
     if !contains_distinct_topn(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
+pub(super) fn columnar_aggregate_topn_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_aggregate_topn(plan) {
         return Ok(None);
     }
     columnar_composed_plan_for_plan(plan, sources)
@@ -381,8 +401,16 @@ fn contains_distinct_join(plan: &LogicalPlan) -> bool {
     contains_distinct(plan) && contains_join(plan)
 }
 
+fn contains_distinct_union(plan: &LogicalPlan) -> bool {
+    contains_distinct(plan) && contains_union(plan)
+}
+
 fn contains_distinct_topn(plan: &LogicalPlan) -> bool {
     contains_distinct(plan) && contains_topn(plan)
+}
+
+fn contains_aggregate_topn(plan: &LogicalPlan) -> bool {
+    contains_aggregate(plan) && contains_topn(plan)
 }
 
 fn contains_join_topn(plan: &LogicalPlan) -> bool {
@@ -716,6 +744,28 @@ pub(super) async fn build_columnar_composed_join_topn_materialized_view_state(
     .await
 }
 
+pub(super) async fn build_columnar_aggregate_topn_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "aggregate_topn",
+        "aggregate topn",
+        "columnar_aggregate_topn_snapshot_diff",
+    )
+    .await
+}
+
 pub(super) async fn build_columnar_union_topn_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
@@ -734,6 +784,28 @@ pub(super) async fn build_columnar_union_topn_materialized_view_state(
         "union_topn",
         "union topn",
         "columnar_union_topn_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_distinct_union_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "distinct_union",
+        "distinct union",
+        "columnar_distinct_union_snapshot_diff",
     )
     .await
 }
@@ -1017,6 +1089,24 @@ pub(super) async fn run_columnar_composed_join_topn_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_aggregate_topn_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::AggregateTopN,
+    )
+    .await
+}
+
 pub(super) async fn run_columnar_union_topn_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -1031,6 +1121,24 @@ pub(super) async fn run_columnar_union_topn_materialized_view_tick(
         mv,
         version,
         ColumnarSnapshotDiffSlot::UnionTopN,
+    )
+    .await
+}
+
+pub(super) async fn run_columnar_distinct_union_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::DistinctUnion,
     )
     .await
 }
@@ -1064,8 +1172,10 @@ enum ColumnarSnapshotDiffSlot {
     AggregateJoin,
     DistinctJoin,
     DistinctTopN,
+    AggregateTopN,
     JoinTopN,
     UnionTopN,
+    DistinctUnion,
     DistinctAggregate,
 }
 
@@ -1087,8 +1197,10 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         ColumnarSnapshotDiffSlot::AggregateJoin => mv.columnar_aggregate_join.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctJoin => mv.columnar_distinct_join.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctTopN => mv.columnar_distinct_topn.as_mut(),
+        ColumnarSnapshotDiffSlot::AggregateTopN => mv.columnar_aggregate_topn.as_mut(),
         ColumnarSnapshotDiffSlot::JoinTopN => mv.columnar_composed_join_topn.as_mut(),
         ColumnarSnapshotDiffSlot::UnionTopN => mv.columnar_union_topn.as_mut(),
+        ColumnarSnapshotDiffSlot::DistinctUnion => mv.columnar_distinct_union.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctAggregate => mv.columnar_distinct_aggregate.as_mut(),
     }) else {
         return Ok(false);
