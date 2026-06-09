@@ -182,6 +182,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT SUM(price) AS total FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5) t",
     },
     ValidPlanRuntimeCase {
+        id: "aggregate_over_row_number_topn",
+        sql: "SELECT SUM(price) AS total FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) t WHERE rn <= 5",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_stats_topn",
         sql: "SELECT bidder, SUM(price) AS total_price, COUNT(price) AS bid_count, AVG(price) AS avg_price FROM bid GROUP BY bidder ORDER BY total_price DESC LIMIT 5",
     },
@@ -212,6 +216,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "distinct_over_topn",
         sql: "SELECT DISTINCT auction FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5) t",
+    },
+    ValidPlanRuntimeCase {
+        id: "distinct_over_row_number_topn",
+        sql: "SELECT DISTINCT auction FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) t WHERE rn <= 5",
     },
     ValidPlanRuntimeCase {
         id: "subquery_alias_projection",
@@ -268,6 +276,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "union_over_topn",
         sql: "SELECT key FROM (SELECT key FROM (SELECT auction AS key, price FROM bid ORDER BY price DESC LIMIT 5) t UNION ALL SELECT id AS key FROM auction) u",
+    },
+    ValidPlanRuntimeCase {
+        id: "union_over_row_number_topn",
+        sql: "SELECT key FROM (SELECT auction AS key FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) t WHERE rn <= 5 UNION ALL SELECT id AS key FROM auction) u",
     },
     ValidPlanRuntimeCase {
         id: "union_over_aggregate",

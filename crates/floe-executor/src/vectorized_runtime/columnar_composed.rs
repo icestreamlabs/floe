@@ -12,13 +12,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchemaRef};
+use datafusion::common::{Column, DFSchemaRef, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Join, TableScan};
 use datafusion::logical_expr::{
     BinaryExpr, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, ScalarUDF,
-    UserDefinedLogicalNodeCore,
+    UserDefinedLogicalNodeCore, WindowFunctionDefinition,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::collect;
@@ -436,7 +436,10 @@ fn contains_topn_with_limit(plan: &LogicalPlan, seen_limit: bool) -> bool {
         LogicalPlan::Projection(projection) => {
             contains_topn_with_limit(projection.input.as_ref(), seen_limit)
         }
-        LogicalPlan::Filter(filter) => contains_topn_with_limit(filter.input.as_ref(), seen_limit),
+        LogicalPlan::Filter(filter) => {
+            contains_row_number_topn_filter(filter)
+                || contains_topn_with_limit(filter.input.as_ref(), seen_limit)
+        }
         LogicalPlan::SubqueryAlias(alias) => {
             contains_topn_with_limit(alias.input.as_ref(), seen_limit)
         }
@@ -461,6 +464,88 @@ fn contains_topn_with_limit(plan: &LogicalPlan, seen_limit: bool) -> bool {
             .any(|input| contains_topn_with_limit(input.as_ref(), seen_limit)),
         _ => false,
     }
+}
+
+fn contains_row_number_topn_filter(
+    filter: &datafusion::logical_expr::logical_plan::Filter,
+) -> bool {
+    if row_number_limit_column(&filter.predicate).is_none() {
+        return false;
+    }
+    contains_row_number_window(filter.input.as_ref())
+}
+
+fn row_number_limit_column(predicate: &Expr) -> Option<String> {
+    let Expr::BinaryExpr(binary) = predicate else {
+        return None;
+    };
+    let (Expr::Column(column), op, literal) = (&*binary.left, binary.op, &*binary.right) else {
+        return None;
+    };
+    if !matches!(op, Operator::Lt | Operator::LtEq) || literal_to_positive_usize(literal).is_none()
+    {
+        return None;
+    }
+    Some(column.name.clone())
+}
+
+fn literal_to_positive_usize(expr: &Expr) -> Option<usize> {
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    match value {
+        ScalarValue::Int8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int64(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt64(Some(value)) => Some(i128::from(*value)),
+        _ => None,
+    }
+    .filter(|value| *value > 0)
+    .and_then(|value| usize::try_from(value).ok())
+}
+
+fn contains_row_number_window(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Window(window) => window
+            .window_expr
+            .iter()
+            .any(|expr| row_number_window_alias(expr).is_some()),
+        LogicalPlan::Projection(projection) => {
+            contains_row_number_window(projection.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => contains_row_number_window(alias.input.as_ref()),
+        LogicalPlan::Repartition(repartition) => {
+            contains_row_number_window(repartition.input.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn row_number_window_alias(expr: &Expr) -> Option<String> {
+    let (alias, window) = match expr {
+        Expr::Alias(alias) => {
+            let Expr::WindowFunction(window) = alias.expr.as_ref() else {
+                return None;
+            };
+            (alias.name.clone(), window.as_ref())
+        }
+        Expr::WindowFunction(window) => (expr.schema_name().to_string(), window.as_ref()),
+        _ => return None,
+    };
+    let is_row_number = matches!(
+        &window.fun,
+        WindowFunctionDefinition::WindowUDF(udf)
+            if udf.name().eq_ignore_ascii_case("row_number")
+    );
+    (is_row_number
+        && window.params.filter.is_none()
+        && window.params.null_treatment.is_none()
+        && !window.params.distinct)
+        .then_some(alias)
 }
 
 fn contains_join(plan: &LogicalPlan) -> bool {
