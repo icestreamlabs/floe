@@ -148,6 +148,26 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: q17_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "q18",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
+            view_name: "mv_nexmark_q18",
+            query: r#"SELECT auction, bidder, price, channel, url, "dateTime", extra FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY bidder, auction ORDER BY "dateTime" DESC) AS rank_number FROM bid) dedup WHERE rank_number <= 1"#,
+            output_schema: q18_output_schema,
+        },
+        NexmarkRuntimeCase {
+            id: "q19",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
+            view_name: "mv_nexmark_q19",
+            query: r#"SELECT auction, bidder, price, channel, url, "dateTime", extra FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rank_number FROM bid) ranked WHERE rank_number <= 10"#,
+            output_schema: q19_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "q20",
             sources: &[
                 NexmarkRuntimeSource {
@@ -593,6 +613,30 @@ fn q17_output_schema() -> SchemaRef {
         Field::new("max_price", DataType::Int64, true),
         Field::new("avg_price", DataType::Float64, true),
         Field::new("sum_price", DataType::Int64, true),
+    ]))
+}
+
+fn q18_output_schema() -> SchemaRef {
+    bid_full_output_schema()
+}
+
+fn q19_output_schema() -> SchemaRef {
+    bid_full_output_schema()
+}
+
+fn bid_full_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, true),
+        Field::new("bidder", DataType::Int64, true),
+        Field::new("price", DataType::Int64, true),
+        Field::new("channel", DataType::Utf8, true),
+        Field::new("url", DataType::Utf8, true),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("extra", DataType::Utf8, true),
     ]))
 }
 
