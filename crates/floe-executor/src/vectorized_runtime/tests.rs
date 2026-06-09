@@ -9924,6 +9924,10 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
         Field::new("seller", DataType::Int64, false),
     ]));
     let key_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+    let bid_pair_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
     let sum_schema = Arc::new(Schema::new(vec![Field::new(
         "total",
         DataType::Int64,
@@ -9983,6 +9987,26 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
                     FROM (SELECT auction, SUM(price) AS total FROM bids GROUP BY auction) a",
                 Arc::clone(&grand_total_schema),
             ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_distinct_over_distinct",
+                "SELECT DISTINCT key \
+                    FROM (SELECT DISTINCT auction AS key, price AS value FROM bids) d",
+                Arc::clone(&key_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_filter_over_topn",
+                "SELECT auction, price \
+                    FROM (SELECT auction, price FROM bids ORDER BY price DESC LIMIT 3) t \
+                    WHERE price > 100",
+                Arc::clone(&bid_pair_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_join_over_self_join",
+                "SELECT j.auction, a.seller \
+                    FROM (SELECT l.auction, r.price FROM bids l JOIN bids r ON l.auction = r.auction WHERE l.price < r.price) j \
+                    JOIN auctions a ON j.auction = a.id",
+                Arc::clone(&join_schema),
+            ),
         ],
         Arc::clone(&registry),
         VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
@@ -10016,6 +10040,18 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
     assert_eq!(
         runtime.materialized_views[6].execution_mode,
         MaterializedViewExecutionMode::ColumnarAggregateAggregate
+    );
+    assert_eq!(
+        runtime.materialized_views[7].execution_mode,
+        MaterializedViewExecutionMode::ColumnarDistinct
+    );
+    assert_eq!(
+        runtime.materialized_views[8].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopNComposed
+    );
+    assert_eq!(
+        runtime.materialized_views[9].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoinJoin
     );
 
     runtime
@@ -10098,6 +10134,34 @@ async fn reversed_composed_shapes_use_slate_backed_columnar_operator_semantics()
                 .expect("snapshot")
         ),
         vec![440]
+    );
+
+    let distinct_over_distinct = registry
+        .get("mv_distinct_over_distinct")
+        .expect("distinct-over-distinct materialized view");
+    assert_eq!(
+        single_int_rows(
+            &distinct_over_distinct
+                .arrow_snapshot_for(1)
+                .expect("snapshot")
+        ),
+        vec![1, 2, 3]
+    );
+
+    let filter_over_topn = registry
+        .get("mv_filter_over_topn")
+        .expect("filter-over-topn materialized view");
+    assert_eq!(
+        id_count_rows(&filter_over_topn.arrow_snapshot_for(1).expect("snapshot")),
+        vec![(2, 200)]
+    );
+
+    let join_over_self_join = registry
+        .get("mv_join_over_self_join")
+        .expect("join-over-self-join materialized view");
+    assert_eq!(
+        id_count_rows(&join_over_self_join.arrow_snapshot_for(1).expect("snapshot")),
+        vec![(1, 10)]
     );
 }
 

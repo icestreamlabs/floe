@@ -56,6 +56,18 @@ struct ValidPlanRuntimeCase {
     sql: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct GeneratedPlanRuntimeCase {
+    id: String,
+    sql: String,
+}
+
+#[derive(Debug, Clone)]
+enum GeneratedRuntimeCaseResult {
+    RuntimeMode(String),
+    DbspUnsupported(String),
+}
+
 const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     ValidPlanRuntimeCase {
         id: "projection_over_scan",
@@ -491,6 +503,98 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
     },
 ];
 
+const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
+    (
+        "scan_filter",
+        "SELECT auction AS key, price AS value FROM bid WHERE price > 100",
+    ),
+    (
+        "distinct",
+        "SELECT DISTINCT auction AS key, bidder AS value FROM bid",
+    ),
+    (
+        "aggregate",
+        "SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction",
+    ),
+    (
+        "global_aggregate",
+        "SELECT 0 AS key, SUM(price) AS value FROM bid",
+    ),
+    (
+        "topn",
+        "SELECT auction AS key, price AS value FROM bid ORDER BY price DESC LIMIT 5",
+    ),
+    (
+        "row_number_topn",
+        "SELECT auction AS key, price AS value FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) t WHERE rn <= 5",
+    ),
+    (
+        "join",
+        "SELECT b.auction AS key, b.price AS value FROM bid b JOIN auction a ON b.auction = a.id",
+    ),
+    (
+        "range_join",
+        "SELECT a.id AS key, b.price AS value FROM auction a JOIN bid b ON b.price >= a.\"initialBid\" AND b.price < a.reserve",
+    ),
+    (
+        "self_join",
+        "SELECT l.auction AS key, r.price AS value FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price",
+    ),
+    (
+        "three_way_join",
+        "SELECT a.seller AS key, b.price AS value FROM auction a JOIN person p ON a.seller = p.id JOIN bid b ON a.id = b.auction",
+    ),
+    (
+        "union",
+        "SELECT auction AS key, price AS value FROM bid UNION ALL SELECT id AS key, \"initialBid\" AS value FROM auction",
+    ),
+    (
+        "asof_join",
+        "SELECT a.id AS key, b.price AS value FROM auction a ASOF JOIN bid b MATCH_CONDITION (b.\"dateTime\" <= a.\"dateTime\") ON a.id = b.auction",
+    ),
+];
+
+fn generated_dbsp_runtime_plan_cases() -> Vec<GeneratedPlanRuntimeCase> {
+    let mut cases = Vec::new();
+    for (input_id, input_sql) in GENERATED_PLAN_INPUTS {
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_identity_over_{input_id}"),
+            sql: format!("SELECT key, value FROM ({input_sql}) s"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_filter_over_{input_id}"),
+            sql: format!("SELECT key, value FROM ({input_sql}) s WHERE value > 100"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_distinct_over_{input_id}"),
+            sql: format!("SELECT DISTINCT key FROM ({input_sql}) s"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_grouped_aggregate_over_{input_id}"),
+            sql: format!("SELECT key, SUM(value) AS total FROM ({input_sql}) s GROUP BY key"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_global_aggregate_over_{input_id}"),
+            sql: format!("SELECT SUM(value) AS total FROM ({input_sql}) s"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_topn_over_{input_id}"),
+            sql: format!("SELECT key, value FROM ({input_sql}) s ORDER BY value DESC LIMIT 3"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_join_over_{input_id}"),
+            sql: format!("SELECT s.key, p.name FROM ({input_sql}) s JOIN person p ON s.key = p.id"),
+        });
+        cases.push(GeneratedPlanRuntimeCase {
+            id: format!("generated_union_over_{input_id}"),
+            sql: format!(
+                "SELECT key FROM (SELECT key FROM ({input_sql}) s UNION ALL SELECT id AS key FROM auction) u"
+            ),
+        });
+    }
+    cases
+}
+
 #[tokio::test]
 async fn guards_nexmark_query_coverage_regressions() {
     let actual = collect_coverage().await.expect("collect coverage");
@@ -641,6 +745,73 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
     }
 }
 
+#[tokio::test]
+async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
+    let mut registry = SourceRegistry::new();
+    registry.extend(generator::definitions().expect("load nexmark source definitions"));
+    let planner = DbspPlanBuilder::new(nexmark_config().expect("load nexmark planner config"));
+    let available_sources = available_nexmark_sources();
+
+    let mut failures = Vec::new();
+    let mut skipped = BTreeMap::new();
+    let mut execution_modes = BTreeMap::new();
+    for case in generated_dbsp_runtime_plan_cases() {
+        match validate_generated_active_vectorized_runtime_case(
+            &registry,
+            &planner,
+            &available_sources,
+            &case,
+        )
+        .await
+        {
+            Ok(GeneratedRuntimeCaseResult::RuntimeMode(execution_mode)) => {
+                execution_modes.insert(case.id, execution_mode);
+            }
+            Ok(GeneratedRuntimeCaseResult::DbspUnsupported(reason)) => {
+                skipped.insert(case.id, reason);
+            }
+            Err(err) => {
+                failures.push(format!("{}: {err:#}", case.id));
+            }
+        }
+    }
+
+    eprintln!(
+        "generated active vectorized runtime DBSP-valid shape modes:\n{}",
+        serde_json::to_string_pretty(&execution_modes).expect("serialize execution modes")
+    );
+    eprintln!(
+        "generated active vectorized runtime DBSP-unsupported shape count: {}",
+        skipped.len()
+    );
+    assert!(
+        execution_modes.len() >= 90,
+        "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
+        execution_modes.len(),
+        skipped.len()
+    );
+
+    for (case_id, execution_mode) in &execution_modes {
+        if execution_mode == "columnar_composed" {
+            failures.push(format!(
+                "{case_id}: active vectorized runtime used generic columnar composed fallback"
+            ));
+        }
+        if execution_mode == "full_refresh" {
+            failures.push(format!(
+                "{case_id}: active vectorized runtime used full-refresh fallback"
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "active vectorized runtime rejected generated DBSP-valid plan shape(s):\n{}",
+            failures.join("\n")
+        );
+    }
+}
+
 async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     let mut registry = SourceRegistry::new();
     registry.extend(generator::definitions()?);
@@ -740,6 +911,63 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     }
 
     Ok(out)
+}
+
+async fn validate_generated_active_vectorized_runtime_case(
+    registry: &SourceRegistry,
+    planner: &DbspPlanBuilder,
+    available_sources: &BTreeSet<String>,
+    case: &GeneratedPlanRuntimeCase,
+) -> Result<GeneratedRuntimeCaseResult> {
+    let definition = parse_materialized_view(&format!(
+        "CREATE MATERIALIZED VIEW {} AS {}",
+        case.id, case.sql
+    ))
+    .with_context(|| format!("SQL parse failed for {}", case.id))?;
+    let logical = plan_materialized_views(registry, &[definition])
+        .await
+        .with_context(|| format!("logical planning failed for {}", case.id))?;
+    let planned = logical
+        .first()
+        .with_context(|| format!("logical planner produced no MV plan for {}", case.id))?;
+    let circuit = match planner.build(planned.logical_plan()) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Ok(GeneratedRuntimeCaseResult::DbspUnsupported(format!(
+                "DBSP circuit planning failed: {err:#}"
+            )));
+        }
+    };
+    if let Err(err) = validate_dbsp_plan(&circuit, available_sources, &case.id) {
+        return Ok(GeneratedRuntimeCaseResult::DbspUnsupported(format!(
+            "DBSP circuit validation failed: {err:#}"
+        )));
+    }
+
+    let output_schema = df_schema_to_arrow(planned.logical_plan().schema())
+        .with_context(|| format!("Arrow schema conversion failed for {}", case.id))?;
+    let state_table = build_operator_state_table(&case.id).await?;
+    let mv_plan = VectorizedMaterializedViewPlan::new(
+        planned.definition().name().to_string(),
+        planned.definition().query().to_string(),
+        output_schema,
+    );
+    let runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
+        registry,
+        vec![mv_plan],
+        Arc::new(MaterializedViewRegistry::new()),
+        planner_udfs(),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(state_table),
+    )
+    .await
+    .with_context(|| format!("active vectorized runtime rejected {}", case.id))?;
+
+    runtime
+        .materialized_view_execution_modes()
+        .into_iter()
+        .find(|(view_name, _)| *view_name == case.id)
+        .map(|(_, mode)| GeneratedRuntimeCaseResult::RuntimeMode(mode.to_string()))
+        .with_context(|| format!("runtime did not expose execution mode for {}", case.id))
 }
 
 async fn validate_active_vectorized_runtime_case(
