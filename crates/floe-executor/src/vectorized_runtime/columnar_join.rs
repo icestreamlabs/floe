@@ -18,7 +18,9 @@ use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
-use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
+use crate::delta_consolidation::{
+    add_weight_column_to_batches, diff_snapshot_batches, weighted_snapshot_schema,
+};
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
 use crate::table_provider::DynamicStateTableProvider;
@@ -62,7 +64,8 @@ struct ColumnarJoinSourceState {
 struct JoinDeltaEvaluator {
     ctx: SessionContext,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
-    inputs: HashMap<String, JoinEvaluatorInput>,
+    left_input: JoinEvaluatorInput,
+    right_input: JoinEvaluatorInput,
     output_schema: SchemaRef,
 }
 
@@ -95,11 +98,9 @@ pub(super) fn columnar_join_plan_for_plan(
     let Some(right_source) = single_source_for_plan(join.right.as_ref(), sources) else {
         return Ok(None);
     };
-    if left_source == right_source {
-        return Ok(None);
-    }
     let all_sources = source_set_for_plan(plan, sources);
-    if all_sources.len() != 2
+    let expected_source_count = if left_source == right_source { 1 } else { 2 };
+    if all_sources.len() != expected_source_count
         || !all_sources.contains(&left_source)
         || !all_sources.contains(&right_source)
     {
@@ -131,8 +132,23 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         .get(&plan.right_source)
         .ok_or_else(|| anyhow::anyhow!("unknown join source '{}'", plan.right_source))?;
     let mv_namespace = namespaces::materialized_view(view_name)?;
-    let left_namespace = format!("{mv_namespace}/columnar/join/{}/input", plan.left_source);
-    let right_namespace = format!("{mv_namespace}/columnar/join/{}/input", plan.right_source);
+    let (left_namespace, right_namespace) = if plan.left_source == plan.right_source {
+        (
+            format!(
+                "{mv_namespace}/columnar/join/left/{}/input",
+                plan.left_source
+            ),
+            format!(
+                "{mv_namespace}/columnar/join/right/{}/input",
+                plan.right_source
+            ),
+        )
+    } else {
+        (
+            format!("{mv_namespace}/columnar/join/{}/input", plan.left_source),
+            format!("{mv_namespace}/columnar/join/{}/input", plan.right_source),
+        )
+    };
     let output_namespace = format!("{mv_namespace}/columnar/join/output");
 
     let left_zset = SlateBackedColumnarZSet::new(
@@ -171,7 +187,8 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         sources,
         udfs,
         output_schema,
-        [&left_name, &right_name],
+        &left_name,
+        &right_name,
     )
     .await
     .context("build left-delta/right-state join evaluator")?;
@@ -180,7 +197,8 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         sources,
         udfs,
         output_schema,
-        [&left_name, &right_name],
+        &left_name,
+        &right_name,
     )
     .await
     .context("build left-state/right-delta join evaluator")?;
@@ -189,7 +207,8 @@ pub(super) async fn build_columnar_join_materialized_view_state(
         sources,
         udfs,
         output_schema,
-        [&left_name, &right_name],
+        &left_name,
+        &right_name,
     )
     .await
     .context("build left-delta/right-delta join evaluator")?;
@@ -232,6 +251,23 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
 ) -> Result<bool> {
+    let Some(is_self_join) = mv
+        .columnar_join
+        .as_ref()
+        .map(|columnar| columnar.left.source_name == columnar.right.source_name)
+    else {
+        return Ok(false);
+    };
+    if is_self_join {
+        return run_columnar_self_join_materialized_view_tick(
+            registry,
+            insert_batches,
+            weighted_delta_batches,
+            mv,
+            version,
+        )
+        .await;
+    }
     let Some(columnar) = mv.columnar_join.as_mut() else {
         return Ok(false);
     };
@@ -344,6 +380,107 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
         total_ms = plan_start.elapsed().as_millis() as u64,
         mode = "columnar_join",
         "SlateDB-backed join columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+async fn run_columnar_self_join_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    let Some(columnar) = mv.columnar_join.as_mut() else {
+        return Ok(false);
+    };
+    let plan_start = Instant::now();
+
+    let left_input_delta =
+        source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
+    let right_input_delta =
+        source_input_delta(&columnar.right, insert_batches, weighted_delta_batches)?;
+    let left_delta =
+        persisted_source_delta(&mut columnar.left.input_zset, left_input_delta).await?;
+    let right_delta =
+        persisted_source_delta(&mut columnar.right.input_zset, right_input_delta).await?;
+    let next_source_snapshot = snapshot_batches_from_zset(
+        &columnar
+            .left
+            .input_zset
+            .materialize_columnar()
+            .await
+            .context("materialize self-join input zset")?,
+    )?;
+
+    let output_delta_batches =
+        if left_delta.batches().is_empty() && right_delta.batches().is_empty() {
+            Vec::new()
+        } else {
+            let next_output = columnar
+                .left_delta_right_delta
+                .evaluate(
+                    &columnar.left.source_name,
+                    &next_source_snapshot,
+                    &columnar.right.source_name,
+                    &next_source_snapshot,
+                )
+                .await
+                .context("evaluate next self-join output")?;
+            diff_snapshot_batches(
+                Arc::clone(&mv.output_schema),
+                &mv.previous_snapshot,
+                &next_output,
+            )
+            .await
+            .context("diff self-join output")?
+            .batches
+        };
+
+    let output_delta =
+        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
+            .context("build self-join output zset delta")?;
+    let persisted_output_delta = if let Some(handle) = columnar
+        .output_zset
+        .create_version(
+            &output_delta,
+            columnar
+                .output_zset
+                .current_handle()
+                .map(|handle| handle.version),
+        )
+        .await?
+    {
+        columnar.output_zset.read_delta(&handle).await?
+    } else {
+        output_delta
+    };
+
+    let delta_batches = persisted_output_delta.batches().to_vec();
+    let next_snapshot = apply_weighted_snapshot_delta(
+        &mv.output_schema,
+        &mv.previous_snapshot,
+        delta_batches.clone(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "apply Slate-backed self-join columnar snapshot delta for '{}'",
+            mv.view_name
+        )
+    })?;
+
+    columnar.left.snapshot = next_source_snapshot.clone();
+    columnar.right.snapshot = next_source_snapshot;
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = "columnar_self_join",
+        "SlateDB-backed self-join columnar DBSP materialized view tick completed"
     );
     Ok(true)
 }
@@ -498,51 +635,28 @@ impl JoinDeltaEvaluator {
         sources: &HashMap<String, VectorizedSourceState>,
         udfs: &[ScalarUDF],
         output_schema: &SchemaRef,
-        source_names: [&str; 2],
+        left_source_name: &str,
+        right_source_name: &str,
     ) -> Result<Self> {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         for udf in udfs.iter().cloned() {
             ctx.register_udf(udf);
         }
-        let mut inputs = HashMap::new();
-        let mut provider_by_table = HashMap::new();
-        for source_name in source_names {
-            let source = sources
-                .get(source_name)
-                .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
-            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&source.schema)));
-            provider_by_table.insert(
-                source_name.to_string(),
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-            );
-            let (alias_schema, alias_provider) = if let (Some(alias), Some(alias_schema)) = (
-                source_name.strip_prefix("nexmark_"),
-                source.alias_schema.as_ref(),
-            ) {
-                let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
-                provider_by_table.insert(
-                    alias.to_string(),
-                    Arc::clone(&provider) as Arc<dyn TableProvider>,
-                );
-                (Some(Arc::clone(alias_schema)), Some(provider))
-            } else {
-                (None, None)
-            };
-            inputs.insert(
-                source_name.to_string(),
-                JoinEvaluatorInput {
-                    provider,
-                    alias_schema,
-                    alias_provider,
-                },
-            );
-        }
-        let logical_plan = rebind_join_logical_plan(logical_plan, &provider_by_table)?;
+        let left_input = JoinEvaluatorInput::new(left_source_name, sources)?;
+        let right_input = JoinEvaluatorInput::new(right_source_name, sources)?;
+        let logical_plan = rebind_join_logical_plan(
+            logical_plan,
+            left_source_name,
+            &left_input,
+            right_source_name,
+            &right_input,
+        )?;
         let plan = ctx.state().create_physical_plan(&logical_plan).await?;
         Ok(Self {
             ctx,
             plan,
-            inputs,
+            left_input,
+            right_input,
             output_schema: Arc::clone(output_schema),
         })
     }
@@ -554,8 +668,12 @@ impl JoinDeltaEvaluator {
         right_source: &str,
         right_batches: &[RecordBatch],
     ) -> Result<Vec<RecordBatch>> {
-        self.set_input_batches(left_source, left_batches)?;
-        self.set_input_batches(right_source, right_batches)?;
+        self.left_input
+            .set_batches(left_source, left_batches)
+            .with_context(|| format!("set left join evaluator input for '{left_source}'"))?;
+        self.right_input
+            .set_batches(right_source, right_batches)
+            .with_context(|| format!("set right join evaluator input for '{right_source}'"))?;
         let collected = collect(Arc::clone(&self.plan), self.ctx.task_ctx()).await;
         self.clear_inputs()?;
         normalize_batches(
@@ -564,26 +682,68 @@ impl JoinDeltaEvaluator {
         )
     }
 
-    fn set_input_batches(&self, source_name: &str, batches: &[RecordBatch]) -> Result<()> {
-        let input = self
-            .inputs
+    fn clear_inputs(&self) -> Result<()> {
+        self.left_input.clear()?;
+        self.right_input.clear()?;
+        Ok(())
+    }
+}
+
+impl JoinEvaluatorInput {
+    fn new(source_name: &str, sources: &HashMap<String, VectorizedSourceState>) -> Result<Self> {
+        let source = sources
             .get(source_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown join evaluator source '{source_name}'"))?;
-        input.provider.set_batches(batches.to_vec())?;
+            .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
+        let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&source.schema)));
+        let (alias_schema, alias_provider) = if let (Some(_alias), Some(alias_schema)) = (
+            source_name.strip_prefix("nexmark_"),
+            source.alias_schema.as_ref(),
+        ) {
+            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
+            (Some(Arc::clone(alias_schema)), Some(provider))
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            provider,
+            alias_schema,
+            alias_provider,
+        })
+    }
+
+    fn provider_for_table(
+        &self,
+        source_name: &str,
+        table_name: &str,
+    ) -> Option<Arc<dyn TableProvider>> {
+        if table_name == source_name {
+            return Some(Arc::clone(&self.provider) as Arc<dyn TableProvider>);
+        }
+        if source_name.strip_prefix("nexmark_") == Some(table_name)
+            && let Some(alias_provider) = self.alias_provider.as_ref()
+        {
+            return Some(Arc::clone(alias_provider) as Arc<dyn TableProvider>);
+        }
+        None
+    }
+
+    fn set_batches(&self, source_name: &str, batches: &[RecordBatch]) -> Result<()> {
+        self.provider.set_batches(batches.to_vec())?;
         if let (Some(alias_schema), Some(alias_provider)) =
-            (input.alias_schema.as_ref(), input.alias_provider.as_ref())
+            (self.alias_schema.as_ref(), self.alias_provider.as_ref())
         {
             alias_provider.set_batches(rename_batches(batches, alias_schema)?)?;
+        }
+        if self.provider_for_table(source_name, source_name).is_none() {
+            bail!("unknown join evaluator source '{source_name}'");
         }
         Ok(())
     }
 
-    fn clear_inputs(&self) -> Result<()> {
-        for input in self.inputs.values() {
-            input.provider.set_batches(Vec::new())?;
-            if let Some(alias_provider) = input.alias_provider.as_ref() {
-                alias_provider.set_batches(Vec::new())?;
-            }
+    fn clear(&self) -> Result<()> {
+        self.provider.set_batches(Vec::new())?;
+        if let Some(alias_provider) = self.alias_provider.as_ref() {
+            alias_provider.set_batches(Vec::new())?;
         }
         Ok(())
     }
@@ -591,15 +751,50 @@ impl JoinDeltaEvaluator {
 
 fn rebind_join_logical_plan(
     logical_plan: LogicalPlan,
-    provider_by_table: &HashMap<String, Arc<dyn TableProvider>>,
+    left_source_name: &str,
+    left_input: &JoinEvaluatorInput,
+    right_source_name: &str,
+    right_input: &JoinEvaluatorInput,
+) -> Result<LogicalPlan> {
+    let transformed = logical_plan.transform_up(|plan| match plan {
+        LogicalPlan::Join(mut join) => {
+            join.left = Arc::new(
+                rebind_join_side_logical_plan(
+                    join.left.as_ref().clone(),
+                    left_source_name,
+                    left_input,
+                )
+                .map_err(|err| datafusion::error::DataFusionError::Plan(err.to_string()))?,
+            );
+            join.right = Arc::new(
+                rebind_join_side_logical_plan(
+                    join.right.as_ref().clone(),
+                    right_source_name,
+                    right_input,
+                )
+                .map_err(|err| datafusion::error::DataFusionError::Plan(err.to_string()))?,
+            );
+            Ok(Transformed::yes(LogicalPlan::Join(join)))
+        }
+        other => Ok(Transformed::no(other)),
+    })?;
+    Ok(transformed.data)
+}
+
+fn rebind_join_side_logical_plan(
+    logical_plan: LogicalPlan,
+    source_name: &str,
+    input: &JoinEvaluatorInput,
 ) -> Result<LogicalPlan> {
     let transformed = logical_plan.transform_up(|plan| match plan {
         LogicalPlan::TableScan(mut scan) => {
             let table_name = scan.table_name.table();
-            let Some(provider) = provider_by_table.get(table_name) else {
-                return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+            let Some(provider) = input.provider_for_table(source_name, table_name) else {
+                return Err(datafusion::error::DataFusionError::Plan(format!(
+                    "join side expected source '{source_name}' but found table scan '{table_name}'"
+                )));
             };
-            scan.source = provider_as_source(Arc::clone(provider));
+            scan.source = provider_as_source(provider);
             Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
         }
         other => Ok(Transformed::no(other)),
