@@ -120,7 +120,7 @@ async fn guards_active_vectorized_runtime_nexmark_columnar_subset() {
         }
     }
 
-    let expected_supported = ["q0", "q1", "q2", "q14", "q21", "q22"]
+    let expected_supported = ["q0", "q1", "q2", "q5", "q8", "q12", "q14", "q21", "q22"]
         .into_iter()
         .collect::<BTreeSet<_>>();
     for query in expected_supported {

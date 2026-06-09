@@ -8,7 +8,9 @@ use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
-use datafusion::execution::context::SessionContext;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::datasource::provider_as_source;
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
 use dbsp::storage::KeyValueTable;
@@ -34,12 +36,18 @@ const INCREMENTAL_SNAPSHOT_MAX_BATCHES: usize = 256;
 const INCREMENTAL_SNAPSHOT_COMPACT_TARGET_ROWS: usize = 65_536;
 
 mod columnar_count;
+mod columnar_grouped_count;
 mod columnar_stateless;
 mod source_state;
 
 use columnar_count::{
     ColumnarCountMaterializedViewState, build_columnar_count_materialized_view_state,
     columnar_count_plan_for_plan, run_columnar_count_materialized_view_tick,
+};
+use columnar_grouped_count::{
+    ColumnarGroupedCountMaterializedViewState,
+    build_columnar_grouped_count_materialized_view_state, columnar_grouped_count_plan_for_plan,
+    run_columnar_grouped_count_materialized_view_tick,
 };
 use columnar_stateless::{
     ColumnarStatelessMaterializedViewState, build_columnar_stateless_materialized_view_state,
@@ -132,6 +140,7 @@ struct VectorizedMaterializedViewState {
     previous_snapshot: Vec<RecordBatch>,
     incremental: Option<IncrementalMaterializedViewState>,
     columnar_stateless: Option<ColumnarStatelessMaterializedViewState>,
+    columnar_grouped_count: Option<ColumnarGroupedCountMaterializedViewState>,
     columnar_count: Option<ColumnarCountMaterializedViewState>,
     execution_mode: MaterializedViewExecutionMode,
 }
@@ -149,6 +158,7 @@ struct IncrementalMaterializedViewState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializedViewExecutionMode {
     ColumnarStateless,
+    ColumnarGroupedCount,
     ColumnarCountByKey,
     IncrementalFilterProject,
     FullRefresh,
@@ -338,11 +348,44 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
-            let columnar_stateless_plan = if columnar_count.is_none() {
-                columnar_stateless_plan_for_plan(df.logical_plan(), &source_states)
+            let columnar_grouped_count_plan = if columnar_count.is_none() {
+                columnar_grouped_count_plan_for_plan(
+                    df.logical_plan(),
+                    &source_states,
+                    &mv.output_schema,
+                )?
             } else {
                 None
             };
+            let columnar_grouped_count = match (
+                columnar_grouped_count_plan,
+                options.operator_state_table.as_ref(),
+            ) {
+                (Some(plan), Some(table)) => Some(
+                    build_columnar_grouped_count_materialized_view_state(
+                        Arc::clone(table),
+                        &mv.view_name,
+                        &mv.output_schema,
+                        plan,
+                        &source_states,
+                        &udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build SlateDB-backed columnar grouped count operator for {}",
+                            mv.view_name
+                        )
+                    })?,
+                ),
+                _ => None,
+            };
+            let columnar_stateless_plan =
+                if columnar_count.is_none() && columnar_grouped_count.is_none() {
+                    columnar_stateless_plan_for_plan(df.logical_plan(), &source_states)
+                } else {
+                    None
+                };
             let columnar_stateless = match (
                 columnar_stateless_plan,
                 options.operator_state_table.as_ref(),
@@ -367,7 +410,10 @@ impl VectorizedExecutionRuntime {
                 ),
                 _ => None,
             };
-            let incremental_source = if columnar_count.is_none() && columnar_stateless.is_none() {
+            let incremental_source = if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
+                && columnar_stateless.is_none()
+            {
                 incremental_source_for_plan(df.logical_plan(), &source_states)
             } else {
                 None
@@ -391,6 +437,7 @@ impl VectorizedExecutionRuntime {
                 None => None,
             };
             if columnar_count.is_none()
+                && columnar_grouped_count.is_none()
                 && columnar_stateless.is_none()
                 && incremental.is_none()
                 && mv.execution_policy == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly
@@ -402,6 +449,8 @@ impl VectorizedExecutionRuntime {
             }
             let execution_mode = if columnar_stateless.is_some() {
                 MaterializedViewExecutionMode::ColumnarStateless
+            } else if columnar_grouped_count.is_some() {
+                MaterializedViewExecutionMode::ColumnarGroupedCount
             } else if columnar_count.is_some() {
                 MaterializedViewExecutionMode::ColumnarCountByKey
             } else if incremental.is_some() {
@@ -421,9 +470,15 @@ impl VectorizedExecutionRuntime {
                 previous_snapshot: columnar_stateless
                     .as_ref()
                     .map(ColumnarStatelessMaterializedViewState::initial_snapshot)
+                    .or_else(|| {
+                        columnar_grouped_count
+                            .as_ref()
+                            .map(ColumnarGroupedCountMaterializedViewState::initial_snapshot)
+                    })
                     .unwrap_or_default(),
                 incremental,
                 columnar_stateless,
+                columnar_grouped_count,
                 columnar_count,
                 execution_mode,
             });
@@ -622,6 +677,17 @@ impl VectorizedExecutionRuntime {
             {
                 continue;
             }
+            if run_columnar_grouped_count_materialized_view_tick(
+                registry,
+                insert_batches,
+                weighted_delta_batches,
+                mv,
+                version,
+            )
+            .await?
+            {
+                continue;
+            }
             if run_incremental_materialized_view_tick(
                 registry,
                 insert_batches,
@@ -692,14 +758,75 @@ async fn build_incremental_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<IncrementalMaterializedViewState> {
+    let ctx = incremental_context_with_udfs(udfs);
+    let (source_provider, alias_schema, alias_provider) =
+        incremental_context_providers(&ctx, source_name, sources)?;
+    let df = ctx.sql(query).await?;
+    let plan = df.create_physical_plan().await?;
     let source = sources
         .get(source_name)
         .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;
-    let ctx = SessionContext::new();
+    Ok(IncrementalMaterializedViewState {
+        source_name: source_name.to_string(),
+        source_schema: Arc::clone(&source.schema),
+        ctx,
+        source_provider,
+        alias_schema,
+        alias_provider,
+        plan,
+    })
+}
+
+async fn build_incremental_materialized_view_state_from_logical_plan(
+    source_name: &str,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+    logical_plan: &LogicalPlan,
+) -> Result<IncrementalMaterializedViewState> {
+    let ctx = incremental_context_with_udfs(udfs);
+    let (source_provider, alias_schema, alias_provider) =
+        incremental_context_providers(&ctx, source_name, sources)?;
+    let logical_plan = rebind_incremental_logical_plan(
+        logical_plan.clone(),
+        source_name,
+        &source_provider,
+        alias_provider.as_ref(),
+    )?;
+    let plan = ctx.state().create_physical_plan(&logical_plan).await?;
+    let source = sources
+        .get(source_name)
+        .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;
+    Ok(IncrementalMaterializedViewState {
+        source_name: source_name.to_string(),
+        source_schema: Arc::clone(&source.schema),
+        ctx,
+        source_provider,
+        alias_schema,
+        alias_provider,
+        plan,
+    })
+}
+
+fn incremental_context_with_udfs(udfs: &[ScalarUDF]) -> SessionContext {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     for udf in udfs.iter().cloned() {
         ctx.register_udf(udf);
     }
+    ctx
+}
 
+fn incremental_context_providers(
+    ctx: &SessionContext,
+    source_name: &str,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<(
+    Arc<DynamicStateTableProvider>,
+    Option<SchemaRef>,
+    Option<Arc<DynamicStateTableProvider>>,
+)> {
+    let source = sources
+        .get(source_name)
+        .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;
     let source_provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&source.schema)));
     ctx.register_table(
         source_name,
@@ -720,18 +847,31 @@ async fn build_incremental_materialized_view_state(
     } else {
         (None, None)
     };
+    Ok((source_provider, alias_schema, alias_provider))
+}
 
-    let df = ctx.sql(query).await?;
-    let plan = df.create_physical_plan().await?;
-    Ok(IncrementalMaterializedViewState {
-        source_name: source_name.to_string(),
-        source_schema: Arc::clone(&source.schema),
-        ctx,
-        source_provider,
-        alias_schema,
-        alias_provider,
-        plan,
-    })
+fn rebind_incremental_logical_plan(
+    logical_plan: LogicalPlan,
+    source_name: &str,
+    source_provider: &Arc<DynamicStateTableProvider>,
+    alias_provider: Option<&Arc<DynamicStateTableProvider>>,
+) -> Result<LogicalPlan> {
+    let source_alias = source_name.strip_prefix("nexmark_");
+    let transformed = logical_plan.transform_up(|plan| match plan {
+        LogicalPlan::TableScan(mut scan) if scan.table_name.table() == source_name => {
+            scan.source = provider_as_source(Arc::clone(source_provider) as Arc<dyn TableProvider>);
+            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        }
+        LogicalPlan::TableScan(mut scan) if Some(scan.table_name.table()) == source_alias => {
+            let Some(alias_provider) = alias_provider else {
+                return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+            };
+            scan.source = provider_as_source(Arc::clone(alias_provider) as Arc<dyn TableProvider>);
+            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+        }
+        other => Ok(Transformed::no(other)),
+    })?;
+    Ok(transformed.data)
 }
 
 async fn run_full_refresh_materialized_view_tick(
