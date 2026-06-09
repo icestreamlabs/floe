@@ -5,15 +5,15 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
 use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Distinct, TableScan};
-use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
@@ -35,7 +35,7 @@ use super::{
 
 pub(super) struct ColumnarUnionPlan {
     logical_plan: LogicalPlan,
-    source_names: Vec<String>,
+    inputs: Vec<ColumnarUnionInputPlan>,
     distinct: bool,
 }
 
@@ -54,9 +54,29 @@ impl ColumnarUnionMaterializedViewState {
 }
 
 struct ColumnarUnionSourceState {
-    source_name: String,
+    input_name: String,
+    source_name: Option<String>,
     schema: SchemaRef,
     input_zset: SlateBackedColumnarZSet,
+    constant: Option<ColumnarUnionConstantState>,
+}
+
+struct ColumnarUnionConstantState {
+    state_table: Arc<dyn KeyValueTable>,
+    initialized_key: Vec<u8>,
+    initialized: bool,
+    pending_snapshot: Vec<RecordBatch>,
+}
+
+struct ColumnarUnionInputPlan {
+    input_name: String,
+    schema: SchemaRef,
+    kind: ColumnarUnionInputPlanKind,
+}
+
+enum ColumnarUnionInputPlanKind {
+    Source { source_name: String },
+    Constant { logical_plan: LogicalPlan },
 }
 
 struct UnionDeltaEvaluator {
@@ -70,6 +90,11 @@ struct UnionEvaluatorInput {
     provider: Arc<DynamicStateTableProvider>,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
+}
+
+struct UnionConstantEvaluatorInput {
+    input_name: String,
+    provider: Arc<DynamicStateTableProvider>,
 }
 
 struct UnionSignedDelta {
@@ -98,16 +123,14 @@ pub(super) fn columnar_union_plan_for_plan(
     if contains_unsupported_union_wrapper(&logical_plan) {
         return Ok(None);
     }
-    let source_names = source_set_for_plan(&logical_plan, sources)
-        .into_iter()
-        .collect::<Vec<_>>();
-    if source_names.is_empty() {
+    let inputs = union_input_plans(&logical_plan, sources)?;
+    if inputs.is_empty() {
         return Ok(None);
     }
 
     Ok(Some(ColumnarUnionPlan {
         logical_plan,
-        source_names,
+        inputs,
         distinct,
     }))
 }
@@ -137,6 +160,11 @@ pub(super) async fn build_columnar_union_materialized_view_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarUnionMaterializedViewState> {
+    let ColumnarUnionPlan {
+        logical_plan,
+        inputs,
+        distinct,
+    } = plan;
     let mv_namespace = namespaces::materialized_view(view_name)?;
     let output_namespace = format!("{mv_namespace}/columnar/union/output");
     let distinct_state_namespace = format!("{mv_namespace}/columnar/union/distinct_state");
@@ -153,47 +181,153 @@ pub(super) async fn build_columnar_union_materialized_view_state(
             .await
             .context("load union output snapshot")?,
     )?;
+    let output_initialized = output_zset.current_handle().is_some();
 
-    let mut source_states = Vec::with_capacity(plan.source_names.len());
-    for source_name in &plan.source_names {
-        let source = sources
-            .get(source_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown union source '{source_name}'"))?;
-        let input_namespace = format!("{mv_namespace}/columnar/union/{source_name}/input");
-        source_states.push(ColumnarUnionSourceState {
-            source_name: source_name.clone(),
-            schema: Arc::clone(&source.schema),
-            input_zset: SlateBackedColumnarZSet::new(
+    let evaluator = UnionDeltaEvaluator::build(logical_plan, sources, udfs, output_schema, &inputs)
+        .await
+        .context("build union delta evaluator")?;
+
+    let mut source_states = Vec::with_capacity(inputs.len());
+    for (idx, input) in inputs.into_iter().enumerate() {
+        let namespace = union_input_namespace(&mv_namespace, idx, &input);
+        source_states.push(
+            build_union_input_state(
                 Arc::clone(&table),
-                input_namespace,
-                Arc::clone(&source.schema),
+                &mv_namespace,
+                idx,
+                namespace,
+                input,
+                sources,
+                udfs,
+                output_initialized,
             )
             .await
-            .with_context(|| {
-                format!("initialize SlateDB-backed union input zset for '{source_name}'")
-            })?,
-        });
+            .context("build SlateDB-backed union input state")?,
+        );
     }
-
-    let evaluator = UnionDeltaEvaluator::build(
-        plan.logical_plan,
-        sources,
-        udfs,
-        output_schema,
-        &plan.source_names,
-    )
-    .await
-    .context("build union delta evaluator")?;
 
     Ok(ColumnarUnionMaterializedViewState {
         sources: source_states,
         output_zset,
         evaluator,
-        distinct_state: plan
-            .distinct
+        distinct_state: distinct
             .then(|| SlateUnionDistinctState::new(table, &distinct_state_namespace)),
         initial_snapshot,
     })
+}
+
+fn union_input_namespace(mv_namespace: &str, idx: usize, input: &ColumnarUnionInputPlan) -> String {
+    match &input.kind {
+        ColumnarUnionInputPlanKind::Source { .. } => {
+            format!("{mv_namespace}/columnar/union/{}/input", input.input_name)
+        }
+        ColumnarUnionInputPlanKind::Constant { .. } => {
+            format!("{mv_namespace}/columnar/union/constant_{idx}/input")
+        }
+    }
+}
+
+async fn build_union_input_state(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: &str,
+    idx: usize,
+    namespace: String,
+    input: ColumnarUnionInputPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+    output_initialized: bool,
+) -> Result<ColumnarUnionSourceState> {
+    let input_zset =
+        SlateBackedColumnarZSet::new(Arc::clone(&table), namespace, Arc::clone(&input.schema))
+            .await
+            .with_context(|| {
+                format!(
+                    "initialize SlateDB-backed union input zset for '{}'",
+                    input.input_name
+                )
+            })?;
+
+    match input.kind {
+        ColumnarUnionInputPlanKind::Source { source_name } => {
+            let source = sources
+                .get(&source_name)
+                .ok_or_else(|| anyhow::anyhow!("unknown union source '{source_name}'"))?;
+            Ok(ColumnarUnionSourceState {
+                input_name: input.input_name,
+                source_name: Some(source_name),
+                schema: Arc::clone(&source.schema),
+                input_zset,
+                constant: None,
+            })
+        }
+        ColumnarUnionInputPlanKind::Constant { logical_plan } => {
+            let initialized_key =
+                format!("{mv_namespace}/columnar/union/constant_{idx}/state/initialized")
+                    .into_bytes();
+            let initialized = table
+                .get_bytes(&initialized_key)
+                .await
+                .with_context(|| format!("read union constant {idx} initialized marker"))?
+                .is_some()
+                || output_initialized;
+            let has_persisted_input = input_zset.current_handle().is_some();
+            let persisted_snapshot = if has_persisted_input {
+                snapshot_batches_from_zset(
+                    &input_zset
+                        .materialize_columnar()
+                        .await
+                        .with_context(|| format!("load union constant {idx} input snapshot"))?,
+                )?
+            } else {
+                vec![RecordBatch::new_empty(Arc::clone(&input.schema))]
+            };
+            let pending_snapshot = if initialized {
+                Vec::new()
+            } else if has_persisted_input {
+                persisted_snapshot
+            } else {
+                evaluate_constant_union_input(logical_plan, &input.schema, udfs)
+                    .await
+                    .with_context(|| format!("evaluate union constant {idx} input"))?
+            };
+            Ok(ColumnarUnionSourceState {
+                input_name: input.input_name,
+                source_name: None,
+                schema: input.schema,
+                input_zset,
+                constant: Some(ColumnarUnionConstantState {
+                    state_table: table,
+                    initialized_key,
+                    initialized,
+                    pending_snapshot,
+                }),
+            })
+        }
+    }
+}
+
+async fn evaluate_constant_union_input(
+    logical_plan: LogicalPlan,
+    schema: &SchemaRef,
+    udfs: &[ScalarUDF],
+) -> Result<Vec<RecordBatch>> {
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    for udf in udfs.iter().cloned() {
+        ctx.register_udf(udf);
+    }
+    let physical_plan = ctx
+        .state()
+        .create_physical_plan(&logical_plan)
+        .await
+        .context("create constant union input physical plan")?;
+    let mut batches = collect(physical_plan, ctx.task_ctx())
+        .await
+        .context("execute constant union input")?;
+    batches = normalize_batches(batches, schema)?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(batches)
 }
 
 pub(super) async fn run_columnar_union_materialized_view_tick(
@@ -211,12 +345,11 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
     let mut positive_by_source = HashMap::new();
     let mut negative_by_source = HashMap::new();
     for source in &mut columnar.sources {
-        let input_delta = source_input_delta(source, insert_batches, weighted_delta_batches)?;
-        let persisted_delta = persisted_source_delta(&mut source.input_zset, input_delta).await?;
-        let signed = signed_source_delta(&source.schema, persisted_delta.batches())
-            .with_context(|| format!("split union source delta for '{}'", source.source_name))?;
-        positive_by_source.insert(source.source_name.clone(), signed.positive);
-        negative_by_source.insert(source.source_name.clone(), signed.negative);
+        let signed = prepare_union_input_tick(source, insert_batches, weighted_delta_batches)
+            .await
+            .with_context(|| format!("prepare union input tick for '{}'", source.input_name))?;
+        positive_by_source.insert(source.input_name.clone(), signed.positive);
+        negative_by_source.insert(source.input_name.clone(), signed.negative);
     }
 
     let mut output_delta_batches = Vec::new();
@@ -260,6 +393,9 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
     let handle = registry.register(mv.view_name.clone());
     handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
     mv.previous_snapshot = next_snapshot;
+    for source in &mut columnar.sources {
+        mark_union_constant_initialized(source).await?;
+    }
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -409,22 +545,20 @@ fn source_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    if let Some(weighted_batches) = weighted_delta_batches.get(source.source_name.as_str()) {
+    let Some(source_name) = source.source_name.as_deref() else {
+        return ColumnarZSet::empty(Arc::clone(&source.schema));
+    };
+    if let Some(weighted_batches) = weighted_delta_batches.get(source_name) {
         ColumnarZSet::try_new_weighted(Arc::clone(&source.schema), weighted_batches.clone())
             .with_context(|| {
                 format!(
                     "build weighted union input delta for '{}'",
-                    source.source_name
+                    source.input_name
                 )
             })
-    } else if let Some(source_batches) = insert_batches.get(source.source_name.as_str()) {
+    } else if let Some(source_batches) = insert_batches.get(source_name) {
         ColumnarZSet::from_value_batches(Arc::clone(&source.schema), source_batches.clone(), 1)
-            .with_context(|| {
-                format!(
-                    "build insert union input delta for '{}'",
-                    source.source_name
-                )
-            })
+            .with_context(|| format!("build insert union input delta for '{}'", source.input_name))
     } else {
         ColumnarZSet::empty(Arc::clone(&source.schema))
     }
@@ -538,13 +672,87 @@ impl SlateUnionDistinctState {
     }
 }
 
+async fn prepare_union_input_tick(
+    source: &mut ColumnarUnionSourceState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<UnionSignedDelta> {
+    if source.constant.is_some() {
+        return prepare_constant_union_input_tick(source).await;
+    }
+    let input_delta = source_input_delta(source, insert_batches, weighted_delta_batches)?;
+    let persisted_delta = persisted_source_delta(&mut source.input_zset, input_delta).await?;
+    signed_source_delta(&source.schema, persisted_delta.batches())
+}
+
+async fn prepare_constant_union_input_tick(
+    source: &mut ColumnarUnionSourceState,
+) -> Result<UnionSignedDelta> {
+    let Some((initialized, pending_snapshot)) = source
+        .constant
+        .as_ref()
+        .map(|constant| (constant.initialized, constant.pending_snapshot.clone()))
+    else {
+        return Ok(UnionSignedDelta {
+            positive: Vec::new(),
+            negative: Vec::new(),
+        });
+    };
+    if initialized {
+        return Ok(UnionSignedDelta {
+            positive: Vec::new(),
+            negative: Vec::new(),
+        });
+    }
+
+    if source.input_zset.current_handle().is_some() {
+        return Ok(UnionSignedDelta {
+            positive: pending_snapshot,
+            negative: Vec::new(),
+        });
+    }
+
+    let input_delta =
+        ColumnarZSet::from_value_batches(Arc::clone(&source.schema), pending_snapshot, 1)
+            .with_context(|| {
+                format!(
+                    "build constant union input delta for '{}'",
+                    source.input_name
+                )
+            })?;
+    let persisted_delta = persisted_source_delta(&mut source.input_zset, input_delta).await?;
+    signed_source_delta(&source.schema, persisted_delta.batches())
+}
+
+async fn mark_union_constant_initialized(source: &mut ColumnarUnionSourceState) -> Result<()> {
+    let Some(constant) = source.constant.as_mut() else {
+        return Ok(());
+    };
+    if constant.initialized {
+        return Ok(());
+    }
+    constant
+        .state_table
+        .put(&constant.initialized_key, b"1")
+        .await
+        .with_context(|| {
+            format!(
+                "persist SlateDB-backed union constant initialized marker for '{}'",
+                source.input_name
+            )
+        })?;
+    constant.initialized = true;
+    constant.pending_snapshot.clear();
+    Ok(())
+}
+
 impl UnionDeltaEvaluator {
     async fn build(
         logical_plan: LogicalPlan,
         sources: &HashMap<String, VectorizedSourceState>,
         udfs: &[ScalarUDF],
         output_schema: &SchemaRef,
-        source_names: &[String],
+        input_plans: &[ColumnarUnionInputPlan],
     ) -> Result<Self> {
         let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
         for udf in udfs.iter().cloned() {
@@ -553,30 +761,45 @@ impl UnionDeltaEvaluator {
 
         let mut inputs = HashMap::new();
         let mut provider_by_table = HashMap::new();
-        for source_name in source_names {
-            let source = sources
-                .get(source_name)
-                .ok_or_else(|| anyhow::anyhow!("unknown union source '{source_name}'"))?;
-            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(&source.schema)));
-            provider_by_table.insert(
-                source_name.clone(),
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-            );
-            let (alias_schema, alias_provider) = if let (Some(alias), Some(alias_schema)) = (
-                source_name.strip_prefix("nexmark_"),
-                source.alias_schema.as_ref(),
-            ) {
-                let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
-                provider_by_table.insert(
-                    alias.to_string(),
-                    Arc::clone(&provider) as Arc<dyn TableProvider>,
-                );
-                (Some(Arc::clone(alias_schema)), Some(provider))
-            } else {
-                (None, None)
+        let mut constant_inputs = Vec::new();
+        for input_plan in input_plans {
+            let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(
+                &input_plan.schema,
+            )));
+            let (alias_schema, alias_provider) = match &input_plan.kind {
+                ColumnarUnionInputPlanKind::Source { source_name } => {
+                    let source = sources
+                        .get(source_name)
+                        .ok_or_else(|| anyhow::anyhow!("unknown union source '{source_name}'"))?;
+                    provider_by_table.insert(
+                        source_name.clone(),
+                        Arc::clone(&provider) as Arc<dyn TableProvider>,
+                    );
+                    if let (Some(alias), Some(alias_schema)) = (
+                        source_name.strip_prefix("nexmark_"),
+                        source.alias_schema.as_ref(),
+                    ) {
+                        let provider =
+                            Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
+                        provider_by_table.insert(
+                            alias.to_string(),
+                            Arc::clone(&provider) as Arc<dyn TableProvider>,
+                        );
+                        (Some(Arc::clone(alias_schema)), Some(provider))
+                    } else {
+                        (None, None)
+                    }
+                }
+                ColumnarUnionInputPlanKind::Constant { .. } => {
+                    constant_inputs.push(UnionConstantEvaluatorInput {
+                        input_name: input_plan.input_name.clone(),
+                        provider: Arc::clone(&provider),
+                    });
+                    (None, None)
+                }
             };
             inputs.insert(
-                source_name.clone(),
+                input_plan.input_name.clone(),
                 UnionEvaluatorInput {
                     provider,
                     alias_schema,
@@ -585,7 +808,8 @@ impl UnionDeltaEvaluator {
             );
         }
 
-        let logical_plan = rebind_union_logical_plan(logical_plan, &provider_by_table)?;
+        let logical_plan =
+            rebind_union_logical_plan(logical_plan, &provider_by_table, &constant_inputs)?;
         let plan = ctx.state().create_physical_plan(&logical_plan).await?;
         Ok(Self {
             ctx,
@@ -638,19 +862,104 @@ impl UnionDeltaEvaluator {
 fn rebind_union_logical_plan(
     logical_plan: LogicalPlan,
     provider_by_table: &HashMap<String, Arc<dyn TableProvider>>,
+    constant_inputs: &[UnionConstantEvaluatorInput],
 ) -> Result<LogicalPlan> {
-    let transformed = logical_plan.transform_up(|plan| match plan {
+    let mut constant_idx = 0;
+    rebind_union_logical_plan_inner(
+        logical_plan,
+        provider_by_table,
+        constant_inputs,
+        &mut constant_idx,
+    )
+}
+
+fn rebind_union_logical_plan_inner(
+    logical_plan: LogicalPlan,
+    provider_by_table: &HashMap<String, Arc<dyn TableProvider>>,
+    constant_inputs: &[UnionConstantEvaluatorInput],
+    constant_idx: &mut usize,
+) -> Result<LogicalPlan> {
+    match logical_plan {
+        LogicalPlan::Projection(mut projection) => {
+            projection.input = Arc::new(rebind_union_logical_plan_inner(
+                projection.input.as_ref().clone(),
+                provider_by_table,
+                constant_inputs,
+                constant_idx,
+            )?);
+            Ok(LogicalPlan::Projection(projection))
+        }
+        LogicalPlan::Filter(mut filter) => {
+            filter.input = Arc::new(rebind_union_logical_plan_inner(
+                filter.input.as_ref().clone(),
+                provider_by_table,
+                constant_inputs,
+                constant_idx,
+            )?);
+            Ok(LogicalPlan::Filter(filter))
+        }
+        LogicalPlan::SubqueryAlias(mut alias) => {
+            alias.input = Arc::new(rebind_union_logical_plan_inner(
+                alias.input.as_ref().clone(),
+                provider_by_table,
+                constant_inputs,
+                constant_idx,
+            )?);
+            Ok(LogicalPlan::SubqueryAlias(alias))
+        }
+        LogicalPlan::Sort(mut sort) if sort.fetch.is_none() => {
+            sort.input = Arc::new(rebind_union_logical_plan_inner(
+                sort.input.as_ref().clone(),
+                provider_by_table,
+                constant_inputs,
+                constant_idx,
+            )?);
+            Ok(LogicalPlan::Sort(sort))
+        }
+        LogicalPlan::Union(mut union) => {
+            let mut inputs = Vec::with_capacity(union.inputs.len());
+            for input in union.inputs {
+                let rebound = if !plan_contains_table_scan(input.as_ref()) {
+                    let constant = constant_inputs.get(*constant_idx).ok_or_else(|| {
+                        anyhow::anyhow!("union constant input binding {constant_idx} is missing")
+                    })?;
+                    *constant_idx += 1;
+                    constant.scan_plan()?
+                } else {
+                    rebind_union_logical_plan_inner(
+                        input.as_ref().clone(),
+                        provider_by_table,
+                        constant_inputs,
+                        constant_idx,
+                    )?
+                };
+                inputs.push(Arc::new(rebound));
+            }
+            union.inputs = inputs;
+            Ok(LogicalPlan::Union(union))
+        }
         LogicalPlan::TableScan(mut scan) => {
             let table_name = scan.table_name.table();
             let Some(provider) = provider_by_table.get(table_name) else {
-                return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                return Ok(LogicalPlan::TableScan(scan));
             };
             scan.source = provider_as_source(Arc::clone(provider));
-            Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+            Ok(LogicalPlan::TableScan(scan))
         }
-        other => Ok(Transformed::no(other)),
-    })?;
-    Ok(transformed.data)
+        other => Ok(other),
+    }
+}
+
+impl UnionConstantEvaluatorInput {
+    fn scan_plan(&self) -> Result<LogicalPlan> {
+        LogicalPlanBuilder::scan(
+            self.input_name.as_str(),
+            provider_as_source(Arc::clone(&self.provider) as Arc<dyn TableProvider>),
+            None,
+        )?
+        .build()
+        .map_err(Into::into)
+    }
 }
 
 fn contains_union(plan: &LogicalPlan) -> bool {
@@ -679,10 +988,170 @@ fn contains_unsupported_union_wrapper(plan: &LogicalPlan) -> bool {
         LogicalPlan::Union(union) => union
             .inputs
             .iter()
-            .any(|input| contains_unsupported_union_wrapper(input.as_ref())),
+            .any(|input| contains_unsupported_union_input_wrapper(input.as_ref())),
         LogicalPlan::TableScan(_) => false,
         _ => true,
     }
+}
+
+fn contains_unsupported_union_input_wrapper(plan: &LogicalPlan) -> bool {
+    if !plan_contains_table_scan(plan) {
+        return false;
+    }
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            contains_unsupported_union_input_wrapper(projection.input.as_ref())
+        }
+        LogicalPlan::Filter(filter) => {
+            contains_unsupported_union_input_wrapper(filter.input.as_ref())
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            contains_unsupported_union_input_wrapper(alias.input.as_ref())
+        }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            contains_unsupported_union_input_wrapper(sort.input.as_ref())
+        }
+        LogicalPlan::Union(union) => union
+            .inputs
+            .iter()
+            .any(|input| contains_unsupported_union_input_wrapper(input.as_ref())),
+        LogicalPlan::TableScan(_) => false,
+        _ => true,
+    }
+}
+
+fn union_input_plans(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Vec<ColumnarUnionInputPlan>> {
+    let mut inputs = Vec::new();
+    let mut seen_sources = BTreeSet::new();
+    let mut constant_idx = 0;
+    collect_union_input_plans(
+        plan,
+        sources,
+        &mut seen_sources,
+        &mut inputs,
+        &mut constant_idx,
+    )?;
+    Ok(inputs)
+}
+
+fn collect_union_input_plans(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    seen_sources: &mut BTreeSet<String>,
+    inputs: &mut Vec<ColumnarUnionInputPlan>,
+    constant_idx: &mut usize,
+) -> Result<()> {
+    match plan {
+        LogicalPlan::Projection(projection) => collect_union_input_plans(
+            projection.input.as_ref(),
+            sources,
+            seen_sources,
+            inputs,
+            constant_idx,
+        ),
+        LogicalPlan::Filter(filter) => collect_union_input_plans(
+            filter.input.as_ref(),
+            sources,
+            seen_sources,
+            inputs,
+            constant_idx,
+        ),
+        LogicalPlan::SubqueryAlias(alias) => collect_union_input_plans(
+            alias.input.as_ref(),
+            sources,
+            seen_sources,
+            inputs,
+            constant_idx,
+        ),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => collect_union_input_plans(
+            sort.input.as_ref(),
+            sources,
+            seen_sources,
+            inputs,
+            constant_idx,
+        ),
+        LogicalPlan::Union(union) => {
+            for input in &union.inputs {
+                push_union_input_plan(input.as_ref(), sources, seen_sources, inputs, constant_idx)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn push_union_input_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    seen_sources: &mut BTreeSet<String>,
+    inputs: &mut Vec<ColumnarUnionInputPlan>,
+    constant_idx: &mut usize,
+) -> Result<()> {
+    if !plan_contains_table_scan(plan) {
+        let input_name = constant_relation_name(plan)
+            .unwrap_or_else(|| format!("__floe_union_constant_{constant_idx}"));
+        *constant_idx += 1;
+        inputs.push(ColumnarUnionInputPlan {
+            input_name,
+            schema: df_schema_to_arrow(plan.schema()),
+            kind: ColumnarUnionInputPlanKind::Constant {
+                logical_plan: plan.clone(),
+            },
+        });
+        return Ok(());
+    }
+    if contains_union(plan) {
+        return collect_union_input_plans(plan, sources, seen_sources, inputs, constant_idx);
+    }
+    let mut input_sources = source_set_for_plan(plan, sources).into_iter();
+    let Some(source_name) = input_sources.next() else {
+        bail!("columnar union input must reference exactly one source");
+    };
+    if input_sources.next().is_some() {
+        bail!("columnar union input must reference exactly one source");
+    }
+    if seen_sources.insert(source_name.clone()) {
+        let source = sources
+            .get(&source_name)
+            .ok_or_else(|| anyhow::anyhow!("unknown union source '{source_name}'"))?;
+        inputs.push(ColumnarUnionInputPlan {
+            input_name: source_name.clone(),
+            schema: Arc::clone(&source.schema),
+            kind: ColumnarUnionInputPlanKind::Source { source_name },
+        });
+    }
+    Ok(())
+}
+
+fn constant_relation_name(plan: &LogicalPlan) -> Option<String> {
+    plan.schema()
+        .iter()
+        .find_map(|(relation, _)| relation.map(ToString::to_string))
+}
+
+fn plan_contains_table_scan(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
+}
+
+fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> SchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(fields))
 }
 
 fn source_set_for_plan(

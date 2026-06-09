@@ -569,6 +569,10 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
         "WITH totals AS (SELECT auction AS key, SUM(price) AS value FROM bid GROUP BY auction) SELECT key, value FROM totals",
     ),
     (
+        "values",
+        "SELECT key, value FROM (VALUES (1, 100), (2, 200), (3, 300)) AS t(key, value)",
+    ),
+    (
         "in_subquery",
         "SELECT auction AS key, price AS value FROM bid WHERE auction IN (SELECT id FROM auction)",
     ),

@@ -1206,7 +1206,7 @@ async fn empty_values_relation_persists_columnar_constant_state() {
 }
 
 #[tokio::test]
-async fn source_join_values_relation_uses_slate_backed_columnar_composed_operator() {
+async fn source_join_values_relation_uses_slate_backed_columnar_join_operator() {
     let definition = SourceDefinition::new(
         "orders",
         vec![
@@ -1249,8 +1249,9 @@ async fn source_join_values_relation_uses_slate_backed_columnar_composed_operato
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
 
     runtime
         .append_source_batches_for_execution_and_query(
@@ -1312,8 +1313,9 @@ async fn source_join_values_relation_uses_slate_backed_columnar_composed_operato
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarJoin
     );
+    assert_columnar_join_strategy(&recovered, "snapshot_diff");
     recovered.run_tick(3).await.expect("recovered tick");
 
     let recovered_handle = recovery_registry
@@ -1594,6 +1596,124 @@ async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
     assert_eq!(single_int_rows(&snapshot), vec![1, 4, 5]);
     let delta = recovered_handle.arrow_delta_for(4).expect("mv delta");
     assert_eq!(weighted_single_int_rows(&delta), vec![(2, -1)]);
+}
+
+#[tokio::test]
+async fn source_union_values_relation_uses_slate_backed_columnar_union_operator() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new_nullable(
+            "id",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("orders source definition");
+    let schema = orders.to_arrow_schema();
+    let initial_orders = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .expect("initial orders");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    let table = build_operator_state_table("vectorized-columnar-union-values").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let query = "SELECT id FROM orders UNION ALL \
+                 SELECT id FROM (VALUES (2), (4)) AS v(id)";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_union_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnion
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "orders",
+            vec![initial_orders.clone()],
+            vec![initial_orders],
+        )
+        .await
+        .expect("append initial orders");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_union_values").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("initial snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 2, 2, 4]);
+    let delta = handle.arrow_delta_for(1).expect("initial delta");
+    assert_eq!(
+        weighted_single_int_rows(&delta),
+        vec![(1, 1), (2, 1), (2, 1), (4, 1)]
+    );
+
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let source_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 5]))],
+    )
+    .expect("source delta rows");
+    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, 1])
+        .expect("weighted source rows");
+    runtime
+        .apply_weighted_source_delta("orders", weighted)
+        .await
+        .expect("apply weighted source delta");
+    runtime.run_tick(2).await.expect("weighted tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("updated snapshot");
+    assert_eq!(single_int_rows(&snapshot), vec![1, 2, 4, 5]);
+    let delta = handle.arrow_delta_for(2).expect("updated delta");
+    assert_eq!(weighted_single_int_rows(&delta), vec![(2, -1), (5, 1)]);
+
+    table
+        .delete(b"mv/mv_union_values/columnar/union/constant_1/state/initialized")
+        .await
+        .expect("delete initialized marker");
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_union_values",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarUnion
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_union_values")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(single_int_rows(&recovered_snapshot), vec![1, 2, 4, 5]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
 }
 
 #[tokio::test]
