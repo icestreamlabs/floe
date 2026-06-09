@@ -158,6 +158,16 @@ pub(super) fn columnar_self_join_aggregate_plan_for_plan(
     columnar_composed_plan_for_plan(plan, sources)
 }
 
+pub(super) fn columnar_join_aggregate_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_join_aggregate(plan) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn columnar_distinct_aggregate_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -250,6 +260,22 @@ fn contains_self_join(
             .inputs
             .iter()
             .any(|input| contains_self_join(input.as_ref(), sources)),
+        _ => false,
+    }
+}
+
+fn contains_join_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => {
+            let mut joins = Vec::new();
+            collect_joins(aggregate.input.as_ref(), &mut joins);
+            !joins.is_empty()
+        }
+        LogicalPlan::Projection(projection) => contains_join_aggregate(projection.input.as_ref()),
+        LogicalPlan::Filter(filter) => contains_join_aggregate(filter.input.as_ref()),
+        LogicalPlan::SubqueryAlias(alias) => contains_join_aggregate(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) => contains_join_aggregate(sort.input.as_ref()),
+        LogicalPlan::Limit(limit) => contains_join_aggregate(limit.input.as_ref()),
         _ => false,
     }
 }
@@ -353,6 +379,28 @@ pub(super) async fn build_columnar_self_join_aggregate_materialized_view_state(
         "self_join_aggregate",
         "self-join aggregate",
         "columnar_self_join_aggregate_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_join_aggregate_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "join_aggregate",
+        "join aggregate",
+        "columnar_join_aggregate_snapshot_diff",
     )
     .await
 }
@@ -510,6 +558,24 @@ pub(super) async fn run_columnar_self_join_aggregate_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_join_aggregate_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::JoinAggregate,
+    )
+    .await
+}
+
 pub(super) async fn run_columnar_distinct_aggregate_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -533,6 +599,7 @@ enum ColumnarSnapshotDiffSlot {
     Composed,
     AsofJoin,
     SelfJoinAggregate,
+    JoinAggregate,
     DistinctAggregate,
 }
 
@@ -548,6 +615,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         ColumnarSnapshotDiffSlot::Composed => mv.columnar_composed.as_mut(),
         ColumnarSnapshotDiffSlot::AsofJoin => mv.columnar_asof_join.as_mut(),
         ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
+        ColumnarSnapshotDiffSlot::JoinAggregate => mv.columnar_join_aggregate.as_mut(),
         ColumnarSnapshotDiffSlot::DistinctAggregate => mv.columnar_distinct_aggregate.as_mut(),
     }) else {
         return Ok(false);

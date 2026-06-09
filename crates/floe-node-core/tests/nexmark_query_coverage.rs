@@ -146,6 +146,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT l.auction, COUNT(*) AS pair_count FROM bid l JOIN bid r ON l.auction = r.auction WHERE l.price < r.price GROUP BY l.auction",
     },
     ValidPlanRuntimeCase {
+        id: "join_aggregate",
+        sql: "SELECT a.category, COUNT(*) AS bid_count FROM auction a JOIN bid b ON a.id = b.auction GROUP BY a.category",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_topn",
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
     },

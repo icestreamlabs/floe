@@ -8429,6 +8429,184 @@ async fn aggregate_over_self_join_uses_slate_backed_columnar_operator_semantics(
 }
 
 #[tokio::test]
+async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
+    let auctions = SourceDefinition::new(
+        "auctions",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("category", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("auctions source definition");
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let auctions_schema = auctions.to_arrow_schema();
+    let bids_schema = bids.to_arrow_schema();
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![10, 10])),
+        ],
+    )
+    .expect("initial auctions batch");
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![100, 110, 120])),
+        ],
+    )
+    .expect("initial bids batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-join-aggregate").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Int64, false),
+        Field::new("bid_count", DataType::Int64, false),
+    ]));
+    let query = "SELECT a.category, COUNT(*) AS bid_count \
+        FROM auctions a JOIN bids b ON a.id = b.auction \
+        GROUP BY a.category";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_category_bid_counts",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoinAggregate
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_category_bid_counts")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(10, 3)]);
+
+    let bid_insert = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(Int64Array::from(vec![130])),
+        ],
+    )
+    .expect("bid insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![bid_insert.clone()],
+            vec![bid_insert],
+        )
+        .await
+        .expect("append bid insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(10, 4)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_id_count_rows(&delta),
+        vec![(10, 3, -1), (10, 4, 1)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_category_bid_counts",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoinAggregate
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_category_bid_counts")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(id_count_rows(&recovered_snapshot), vec![(10, 4)]);
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let bid_retract = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .expect("bid retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&bids_schema)
+        .expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&bid_retract, &weighted_schema, &[-1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(10, 3)]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_id_count_rows(&delta),
+        vec![(10, 3, 1), (10, 4, -1)]
+    );
+}
+
+#[tokio::test]
 async fn explicit_full_refresh_policy_allows_non_incremental_mv() {
     let definition = SourceDefinition::new(
         "orders",
