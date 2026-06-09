@@ -2067,6 +2067,9 @@ fn grouped_stats_aggregate_for_plan(plan: &LogicalPlan) -> Option<GroupedStatsPl
             }),
             _ => None,
         },
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            grouped_stats_aggregate_for_plan(sort.input.as_ref())
+        }
         LogicalPlan::SubqueryAlias(alias) => grouped_stats_aggregate_for_plan(alias.input.as_ref()),
         _ => None,
     }
