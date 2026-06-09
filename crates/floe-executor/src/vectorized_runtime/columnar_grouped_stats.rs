@@ -194,14 +194,18 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         specs.push(spec);
     }
 
-    let output_mapping = match output_mapping_for_projection(
-        plan_match.projection,
-        aggregate,
-        output_schema,
-        plan_match.post_aggregate_plan.is_some(),
-    ) {
-        Some(mapping) => mapping,
-        None => return Ok(None),
+    let mut post_aggregate_plan = plan_match.post_aggregate_plan.clone();
+    let output_mapping = if post_aggregate_plan.is_some() {
+        Vec::new()
+    } else if let Some(mapping) =
+        output_mapping_for_projection(plan_match.projection, aggregate, output_schema)
+    {
+        mapping
+    } else if plan_match.projection.is_some() {
+        post_aggregate_plan = Some(plan.clone());
+        Vec::new()
+    } else {
+        return Ok(None);
     };
     if output_mapping
         .iter()
@@ -214,7 +218,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
             return Ok(None);
         }
     }
-    if let Some(post_plan) = plan_match.post_aggregate_plan.as_ref() {
+    if let Some(post_plan) = post_aggregate_plan.as_ref() {
         let post_schema = df_schema_to_arrow(post_plan.schema())?;
         if post_schema.fields().len() != output_schema.fields().len() {
             return Ok(None);
@@ -267,7 +271,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         specs,
         output_mapping,
         group_count,
-        post_aggregate_plan: plan_match.post_aggregate_plan,
+        post_aggregate_plan,
     }))
 }
 
@@ -2072,11 +2076,7 @@ fn output_mapping_for_projection(
     projection: Option<&Projection>,
     aggregate: &Aggregate,
     output_schema: &SchemaRef,
-    has_post_aggregate_plan: bool,
 ) -> Option<Vec<usize>> {
-    if has_post_aggregate_plan {
-        return Some(Vec::new());
-    }
     let aggregate_schema = &aggregate.schema;
     match projection {
         Some(projection) => {
