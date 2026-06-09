@@ -214,10 +214,21 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::Subquery(subquery) => self.plan_node(&subquery.subquery),
             LogicalPlan::Repartition(repartition) => self.plan_node(&repartition.input),
             LogicalPlan::Distinct(distinct) => self.plan_distinct(distinct),
-            LogicalPlan::EmptyRelation(relation) => Err(PlannerError::UnsupportedPlan(format!(
-                "empty relation nodes are not supported (produce_one_row = {})",
-                relation.produce_one_row
-            ))),
+            LogicalPlan::EmptyRelation(relation) => {
+                if !relation.produce_one_row {
+                    return Err(PlannerError::UnsupportedPlan(
+                        "empty relation nodes with zero rows are not supported".to_string(),
+                    ));
+                }
+                let output_schema = row_schema_from_dfschema(relation.schema.as_ref())?;
+                let one_row = DbspOneRowNode::new(output_schema.clone());
+                let id =
+                    self.add_node(vec![], DbspNodeKind::OneRow(one_row), output_schema.clone());
+                Ok(PlannedNode {
+                    id,
+                    schema: output_schema,
+                })
+            }
             LogicalPlan::Values(_) => Err(PlannerError::UnsupportedPlan(
                 "VALUES lists are not supported".to_string(),
             )),
@@ -247,4 +258,18 @@ impl<'cfg> PlannerContext<'cfg> {
             ),
         }
     }
+}
+
+fn row_schema_from_dfschema(schema: &DFSchema) -> Result<Arc<RowSchema>, PlannerError> {
+    let fields = schema
+        .iter()
+        .map(|(_, field)| {
+            Ok(Field::new(
+                field.name().to_string(),
+                DbspScalarType::try_from_arrow(field.data_type())?,
+                field.is_nullable(),
+            ))
+        })
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+    RowSchema::try_new(fields).map_err(PlannerError::from)
 }

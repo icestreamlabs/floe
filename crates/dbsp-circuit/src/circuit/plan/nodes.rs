@@ -44,6 +44,21 @@ impl DbspSourceNode {
 }
 
 #[derive(Clone, Debug)]
+pub struct DbspOneRowNode {
+    output_schema: Arc<RowSchema>,
+}
+
+impl DbspOneRowNode {
+    pub fn new(output_schema: Arc<RowSchema>) -> Self {
+        Self { output_schema }
+    }
+
+    pub fn output_schema(&self) -> &Arc<RowSchema> {
+        &self.output_schema
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ProjectItem {
     pub expr: Expr,
     pub alias: Option<String>,

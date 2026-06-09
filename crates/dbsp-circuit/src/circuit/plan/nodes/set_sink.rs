@@ -58,6 +58,7 @@ impl DbspSinkNode {
 #[derive(Clone, Debug)]
 pub enum DbspNodeKind {
     Source(DbspSourceNode),
+    OneRow(DbspOneRowNode),
     Select(DbspSelectNode),
     Project(DbspProjectNode),
     Join(Box<DbspJoinNode>),

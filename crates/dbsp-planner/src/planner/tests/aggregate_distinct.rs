@@ -94,6 +94,26 @@ fn plans_global_count_star_without_empty_scan_projection() {
 }
 
 #[test]
+fn plans_one_row_empty_relation_projection() {
+    let plan = LogicalPlanBuilder::empty(true)
+        .project(vec![lit(0_i64).alias("key")])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    assert!(
+        circuit_plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, DbspNodeKind::OneRow(_))),
+        "expected optimizer-produced one-row relation to be planned"
+    );
+}
+
+#[test]
 fn prunes_unused_aggregate_calls_under_projection() {
     let bid = nexmark_bid_table();
     let plan = LogicalPlanBuilder::scan(bid.name(), table_source(bid), None)
