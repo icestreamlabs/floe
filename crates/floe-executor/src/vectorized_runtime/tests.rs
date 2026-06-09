@@ -7142,7 +7142,7 @@ async fn range_join_uses_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
-async fn aggregate_over_self_join_uses_slate_backed_columnar_composed_operator_semantics() {
+async fn aggregate_over_self_join_uses_slate_backed_columnar_operator_semantics() {
     let orders = SourceDefinition::new(
         "orders",
         vec![
@@ -7187,7 +7187,7 @@ async fn aggregate_over_self_join_uses_slate_backed_columnar_composed_operator_s
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarSelfJoinAggregate
     );
 
     runtime
@@ -7240,7 +7240,7 @@ async fn aggregate_over_self_join_uses_slate_backed_columnar_composed_operator_s
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarComposed
+        MaterializedViewExecutionMode::ColumnarSelfJoinAggregate
     );
     recovered.run_tick(3).await.expect("recovered tick");
 

@@ -148,6 +148,16 @@ pub(super) fn columnar_asof_join_plan_for_plan(
     columnar_composed_plan_for_plan(plan, sources)
 }
 
+pub(super) fn columnar_self_join_aggregate_plan_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<ColumnarComposedPlan>> {
+    if !contains_self_join_aggregate(plan, sources) {
+        return Ok(None);
+    }
+    columnar_composed_plan_for_plan(plan, sources)
+}
+
 pub(super) fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Extension(extension) => extension
@@ -177,6 +187,59 @@ pub(super) fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
             .inputs
             .iter()
             .any(|input| plan_contains_asof_extension(input.as_ref())),
+        _ => false,
+    }
+}
+
+fn contains_self_join_aggregate(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => contains_self_join(aggregate.input.as_ref(), sources),
+        LogicalPlan::Projection(projection) => {
+            contains_self_join_aggregate(projection.input.as_ref(), sources)
+        }
+        LogicalPlan::Filter(filter) => contains_self_join_aggregate(filter.input.as_ref(), sources),
+        LogicalPlan::SubqueryAlias(alias) => {
+            contains_self_join_aggregate(alias.input.as_ref(), sources)
+        }
+        LogicalPlan::Sort(sort) => contains_self_join_aggregate(sort.input.as_ref(), sources),
+        LogicalPlan::Limit(limit) => contains_self_join_aggregate(limit.input.as_ref(), sources),
+        _ => false,
+    }
+}
+
+fn contains_self_join(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> bool {
+    match plan {
+        LogicalPlan::Join(join) => {
+            let left_sources = source_set_for_plan(join.left.as_ref(), sources);
+            let right_sources = source_set_for_plan(join.right.as_ref(), sources);
+            (!left_sources.is_empty() && left_sources.len() == 1 && left_sources == right_sources)
+                || contains_self_join(join.left.as_ref(), sources)
+                || contains_self_join(join.right.as_ref(), sources)
+        }
+        LogicalPlan::Projection(projection) => {
+            contains_self_join(projection.input.as_ref(), sources)
+        }
+        LogicalPlan::Filter(filter) => contains_self_join(filter.input.as_ref(), sources),
+        LogicalPlan::SubqueryAlias(alias) => contains_self_join(alias.input.as_ref(), sources),
+        LogicalPlan::Subquery(subquery) => contains_self_join(subquery.subquery.as_ref(), sources),
+        LogicalPlan::Aggregate(aggregate) => contains_self_join(aggregate.input.as_ref(), sources),
+        LogicalPlan::Sort(sort) => contains_self_join(sort.input.as_ref(), sources),
+        LogicalPlan::Limit(limit) => contains_self_join(limit.input.as_ref(), sources),
+        LogicalPlan::Window(window) => contains_self_join(window.input.as_ref(), sources),
+        LogicalPlan::Repartition(repartition) => {
+            contains_self_join(repartition.input.as_ref(), sources)
+        }
+        LogicalPlan::Distinct(distinct) => contains_self_join(distinct.input(), sources),
+        LogicalPlan::Union(union) => union
+            .inputs
+            .iter()
+            .any(|input| contains_self_join(input.as_ref(), sources)),
         _ => false,
     }
 }
@@ -221,6 +284,28 @@ pub(super) async fn build_columnar_asof_join_materialized_view_state(
         "asof_join",
         "ASOF join",
         "columnar_asof_join_snapshot_diff",
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_self_join_aggregate_materialized_view_state(
+    table: Arc<dyn KeyValueTable>,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state(
+        table,
+        view_name,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "self_join_aggregate",
+        "self-join aggregate",
+        "columnar_self_join_aggregate_snapshot_diff",
     )
     .await
 }
@@ -338,10 +423,29 @@ pub(super) async fn run_columnar_asof_join_materialized_view_tick(
     .await
 }
 
+pub(super) async fn run_columnar_self_join_aggregate_materialized_view_tick(
+    registry: &MaterializedViewRegistry,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    mv: &mut VectorizedMaterializedViewState,
+    version: i64,
+) -> Result<bool> {
+    run_columnar_snapshot_diff_materialized_view_tick(
+        registry,
+        insert_batches,
+        weighted_delta_batches,
+        mv,
+        version,
+        ColumnarSnapshotDiffSlot::SelfJoinAggregate,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum ColumnarSnapshotDiffSlot {
     Composed,
     AsofJoin,
+    SelfJoinAggregate,
 }
 
 async fn run_columnar_snapshot_diff_materialized_view_tick(
@@ -355,6 +459,7 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
     let Some(columnar) = (match slot {
         ColumnarSnapshotDiffSlot::Composed => mv.columnar_composed.as_mut(),
         ColumnarSnapshotDiffSlot::AsofJoin => mv.columnar_asof_join.as_mut(),
+        ColumnarSnapshotDiffSlot::SelfJoinAggregate => mv.columnar_self_join_aggregate.as_mut(),
     }) else {
         return Ok(false);
     };
