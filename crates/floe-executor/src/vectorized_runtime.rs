@@ -421,6 +421,15 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
                 _ => None,
             };
             let columnar_grouped_max_plan =
@@ -454,6 +463,15 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
                 _ => None,
             };
             let columnar_grouped_stats_plan = if columnar_count.is_none()
@@ -489,6 +507,15 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
+                (Some(_), None)
+                    if mv.execution_policy
+                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
+                {
+                    bail!(
+                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
+                        mv.view_name
+                    );
+                }
                 _ => None,
             };
             let columnar_join_plan = if columnar_count.is_none()
