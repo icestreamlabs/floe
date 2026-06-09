@@ -298,6 +298,14 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) ranked WHERE rn <= 2 AND price > 100",
     },
     ValidPlanRuntimeCase {
+        id: "ordered_over_topn",
+        sql: "SELECT auction, price FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5) t ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
+        id: "ordered_over_row_number_topn",
+        sql: "SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) ranked WHERE rn <= 5 ORDER BY auction",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_topn_hidden_sort_key",
         sql: "SELECT auction FROM bid GROUP BY auction ORDER BY SUM(price) DESC LIMIT 5",
     },
@@ -1075,6 +1083,8 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("join_over_topn", "columnar_join"),
         ("join_over_row_number_topn", "columnar_join"),
         ("join_over_partitioned_row_number_topn", "columnar_join"),
+        ("ordered_over_topn", "columnar_topn"),
+        ("ordered_over_row_number_topn", "columnar_topn"),
         ("topn_over_self_join", "columnar_join_topn"),
         ("topn_over_three_way_join", "columnar_multijoin"),
     ];

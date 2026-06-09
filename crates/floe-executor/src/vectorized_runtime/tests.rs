@@ -8216,6 +8216,188 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
 }
 
 #[tokio::test]
+async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![10, 30, 20, 5])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-ordered-topn-wrappers").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let global_query = "SELECT auction, price \
+        FROM (SELECT auction, price FROM bids ORDER BY price DESC LIMIT 3) t \
+        ORDER BY auction";
+    let row_number_query = "SELECT auction, price \
+        FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bids) ranked \
+        WHERE rn <= 3 \
+        ORDER BY auction";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_ordered_global_topn",
+                global_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_ordered_row_number_topn",
+                row_number_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+    assert_eq!(
+        runtime.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let global_handle = registry
+        .get("mv_ordered_global_topn")
+        .expect("global materialized view");
+    let row_number_handle = registry
+        .get("mv_ordered_row_number_topn")
+        .expect("row-number materialized view");
+    let expected_initial = vec![(1, 10), (2, 30), (3, 20)];
+    assert_eq!(
+        id_count_rows(&global_handle.arrow_snapshot_for(1).expect("snapshot")),
+        expected_initial
+    );
+    assert_eq!(
+        id_count_rows(&row_number_handle.arrow_snapshot_for(1).expect("snapshot")),
+        expected_initial
+    );
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![4, 5])),
+            Arc::new(Int64Array::from(vec![40, 25])),
+        ],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let expected_after_insert = vec![(2, 30), (4, 40), (5, 25)];
+    assert_eq!(
+        id_count_rows(&global_handle.arrow_snapshot_for(2).expect("snapshot")),
+        expected_after_insert
+    );
+    assert_eq!(
+        id_count_rows(&row_number_handle.arrow_snapshot_for(2).expect("snapshot")),
+        expected_after_insert
+    );
+    let expected_insert_delta = vec![(1, 10, -1), (3, 20, -1), (4, 40, 1), (5, 25, 1)];
+    assert_eq!(
+        weighted_id_count_rows(&global_handle.arrow_delta_for(2).expect("delta")),
+        expected_insert_delta
+    );
+    assert_eq!(
+        weighted_id_count_rows(&row_number_handle.arrow_delta_for(2).expect("delta")),
+        expected_insert_delta
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![
+            VectorizedMaterializedViewPlan::new(
+                "mv_ordered_global_topn",
+                global_query,
+                Arc::clone(&output_schema),
+            ),
+            VectorizedMaterializedViewPlan::new(
+                "mv_ordered_row_number_topn",
+                row_number_query,
+                Arc::clone(&output_schema),
+            ),
+        ],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+    assert_eq!(
+        recovered.materialized_views[1].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_global = recovery_registry
+        .get("mv_ordered_global_topn")
+        .expect("recovered global materialized view");
+    let recovered_row_number = recovery_registry
+        .get("mv_ordered_row_number_topn")
+        .expect("recovered row-number materialized view");
+    assert_eq!(
+        id_count_rows(&recovered_global.arrow_snapshot_for(3).expect("snapshot")),
+        expected_after_insert
+    );
+    assert_eq!(
+        id_count_rows(
+            &recovered_row_number
+                .arrow_snapshot_for(3)
+                .expect("snapshot")
+        ),
+        expected_after_insert
+    );
+    assert!(
+        recovered_global
+            .arrow_delta_for(3)
+            .expect("delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+    assert!(
+        recovered_row_number
+            .arrow_delta_for(3)
+            .expect("delta")
+            .iter()
+            .all(|batch| batch.num_rows() == 0)
+    );
+}
+
+#[tokio::test]
 async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementally() {
     let definition = SourceDefinition::new(
         "bids",

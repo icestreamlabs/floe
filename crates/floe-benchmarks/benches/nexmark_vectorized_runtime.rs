@@ -160,6 +160,16 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: q9_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "ordered_topn",
+            sources: &[NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            }],
+            view_name: "mv_nexmark_ordered_topn",
+            query: r#"SELECT auction, price FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 256) t ORDER BY auction"#,
+            output_schema: q2_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "three_way_topn",
             sources: &[
                 NexmarkRuntimeSource {

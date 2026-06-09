@@ -616,6 +616,9 @@ fn row_number_filter_for_plan(plan: &LogicalPlan) -> Option<(String, &Filter)> {
         LogicalPlan::Projection(projection) => {
             row_number_filter_for_plan(projection.input.as_ref())
         }
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            row_number_filter_for_plan(sort.input.as_ref())
+        }
         LogicalPlan::Filter(filter) => {
             if let Some((rank_column, _limit)) = extract_row_number_limit(&filter.predicate) {
                 Some((rank_column, filter))
@@ -635,6 +638,9 @@ fn global_sort_limit_for_plan(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::Filter(filter) => global_sort_limit_for_plan(filter.input.as_ref()),
         LogicalPlan::SubqueryAlias(alias) => global_sort_limit_for_plan(alias.input.as_ref()),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            global_sort_limit_for_plan(sort.input.as_ref())
+        }
         LogicalPlan::Limit(limit) => {
             limit_has_nonnegative_skip_and_positive_fetch(limit)
                 && sort_input_for_limit(limit.input.as_ref())
