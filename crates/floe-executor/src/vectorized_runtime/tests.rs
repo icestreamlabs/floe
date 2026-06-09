@@ -10350,6 +10350,120 @@ async fn subquery_predicates_use_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
+async fn scalar_subquery_predicate_uses_slate_backed_columnar_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+        ],
+    )
+    .expect("initial bids batch");
+    let auctions = SourceDefinition::new(
+        "auctions",
+        vec![SourceColumn::new_nullable(
+            "initial_bid",
+            SourceDataType::Int64,
+            false,
+        )],
+    )
+    .expect("auctions source definition");
+    let auctions_schema = auctions.to_arrow_schema();
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![Arc::new(Int64Array::from(vec![150, 250]))],
+    )
+    .expect("initial auctions batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    sources.register(auctions);
+    let table = build_operator_state_table("vectorized-columnar-scalar-subquery").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let query = "SELECT auction, price FROM bids \
+        WHERE price > (SELECT MIN(initial_bid) FROM auctions)";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_scalar_subquery_bids",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarSubquery
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_scalar_subquery_bids")
+        .expect("scalar subquery materialized view");
+    assert_eq!(
+        id_count_rows(&handle.arrow_snapshot_for(1).expect("initial snapshot")),
+        vec![(2, 200), (3, 300)]
+    );
+
+    let lower_floor = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![Arc::new(Int64Array::from(vec![50]))],
+    )
+    .expect("lower scalar floor batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![lower_floor.clone()],
+            vec![lower_floor],
+        )
+        .await
+        .expect("append auction row");
+    runtime.run_tick(2).await.expect("scalar update tick");
+
+    assert_eq!(
+        id_count_rows(&handle.arrow_snapshot_for(2).expect("updated snapshot")),
+        vec![(1, 100), (2, 200), (3, 300)]
+    );
+    assert_eq!(
+        weighted_id_count_rows(&handle.arrow_delta_for(2).expect("updated delta")),
+        vec![(1, 100, 1)]
+    );
+}
+
+#[tokio::test]
 async fn distinct_and_aggregate_in_subqueries_use_slate_backed_columnar_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",

@@ -369,6 +369,39 @@ impl DbspJoinNode {
         })
     }
 
+    pub fn try_new_cross(
+        join_type: DbspJoinType,
+        left_schema: Arc<RowSchema>,
+        right_schema: Arc<RowSchema>,
+        residual: Option<Expr>,
+    ) -> Result<Self> {
+        if !matches!(join_type, DbspJoinType::Inner | DbspJoinType::LeftOuter) {
+            bail!("cross joins currently support INNER or LEFT OUTER semantics");
+        }
+        if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
+            bail!("cross joins with residual predicates currently require INNER semantics");
+        }
+        let residual = if let Some(expr) = residual {
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
+            Some(DbspExpression::analyze(expr, combined_schema)?)
+        } else {
+            None
+        };
+        let output_schema =
+            Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
+
+        Ok(Self {
+            join_type,
+            left_schema,
+            right_schema,
+            output_schema,
+            keys: Vec::new(),
+            residual,
+            range: None,
+            asof: None,
+        })
+    }
+
     pub fn try_new_range(
         left_schema: Arc<RowSchema>,
         right_schema: Arc<RowSchema>,

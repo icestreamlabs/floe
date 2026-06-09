@@ -86,6 +86,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT p AS price_alias FROM (SELECT price AS p, auction AS a FROM bid) q",
     },
     ValidPlanRuntimeCase {
+        id: "scalar_subquery_filter",
+        sql: "SELECT auction, price FROM bid WHERE price > (SELECT MIN(\"initialBid\") FROM auction)",
+    },
+    ValidPlanRuntimeCase {
         id: "plain_distinct",
         sql: "SELECT DISTINCT auction FROM bid",
     },

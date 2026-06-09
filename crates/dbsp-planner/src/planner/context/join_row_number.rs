@@ -215,9 +215,37 @@ impl<'cfg> PlannerContext<'cfg> {
                     });
                 }
             }
-            return Err(PlannerError::UnsupportedJoin(
-                "joins must have at least one equi-key, a half-open range predicate, or an ASOF predicate".to_string(),
-            ));
+            if matches!(join_type, DbspJoinType::Inner | DbspJoinType::LeftOuter) {
+                let residual = if residuals.iter().all(is_true_literal) {
+                    None
+                } else if matches!(join_type, DbspJoinType::Inner) {
+                    combine_filters(residuals.clone())
+                } else {
+                    None
+                };
+                if residual.is_some() || residuals.iter().all(is_true_literal) {
+                    let join_node = DbspJoinNode::try_new_cross(
+                        join_type,
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        residual,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+                    let output_schema = join_node.output_schema.clone();
+                    let id = self.add_node(
+                        vec![left.id, right.id],
+                        DbspNodeKind::Join(Box::new(join_node)),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
+            }
+            return Err(PlannerError::UnsupportedJoin(format!(
+                "joins must have at least one equi-key, a half-open range predicate, or an ASOF predicate (join_type={join_type:?}, residuals={residuals:?})"
+            )));
         }
         let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;
 
@@ -328,4 +356,8 @@ impl<'cfg> PlannerContext<'cfg> {
             schema: output_schema,
         })
     }
+}
+
+fn is_true_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(ScalarValue::Boolean(Some(true)), _))
 }

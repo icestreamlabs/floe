@@ -665,3 +665,34 @@ async fn plans_three_way_join_as_binary_join_composition() {
         .count();
     assert_eq!(join_count, 2);
 }
+
+#[tokio::test]
+async fn plans_scalar_subquery_filter_as_cross_join() {
+    let sql = "SELECT auction, price \
+        FROM bid \
+        WHERE price > (SELECT MIN(\"initialBid\") FROM auction)";
+    let plan = sql_plan(sql).await;
+
+    let planner = CircuitPlanner::new(planner_config());
+    let circuit_plan = planner.plan(&plan).expect("plan");
+
+    let join = circuit_plan
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            DbspNodeKind::Join(join) => Some(join),
+            _ => None,
+        })
+        .expect("expected scalar subquery rewrite to produce a join");
+    assert!(matches!(join.join_type, DbspJoinType::LeftOuter));
+    assert!(join.keys.is_empty());
+    assert!(join.range.is_none());
+    assert!(join.asof.is_none());
+    assert!(
+        circuit_plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, DbspNodeKind::Select(_))),
+        "expected rewritten scalar predicate to be planned as a select"
+    );
+}

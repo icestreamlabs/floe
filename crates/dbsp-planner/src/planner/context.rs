@@ -9,7 +9,7 @@ use datafusion::logical_expr::expr::Sort as ExprSort;
 use datafusion::logical_expr::logical_plan::{FetchType, SkipType};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, WindowFunctionDefinition};
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{Column, DataFusionError};
+use datafusion_common::{Column, DataFusionError, ScalarValue};
 
 use dbsp_circuit::circuit::plan::{
     DbspAggregateNode, DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode,
