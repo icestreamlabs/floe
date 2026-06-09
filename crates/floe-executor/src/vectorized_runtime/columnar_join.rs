@@ -1465,6 +1465,7 @@ fn collect_sources(
         LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
         LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
         LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
+        LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
         LogicalPlan::Join(join) => {
             collect_sources(join.left.as_ref(), sources, out);
             collect_sources(join.right.as_ref(), sources, out);

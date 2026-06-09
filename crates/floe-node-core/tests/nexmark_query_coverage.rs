@@ -246,6 +246,14 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT t.auction, a.seller FROM (SELECT auction, price FROM bid ORDER BY price DESC LIMIT 5) t JOIN auction a ON t.auction = a.id",
     },
     ValidPlanRuntimeCase {
+        id: "join_over_row_number_topn",
+        sql: "SELECT t.auction, a.seller FROM (SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) r WHERE rn <= 5) t JOIN auction a ON t.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
+        id: "join_over_partitioned_row_number_topn",
+        sql: "SELECT t.auction, a.seller FROM (SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC) AS rn FROM bid) r WHERE rn <= 2) t JOIN auction a ON t.auction = a.id",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_topn",
         sql: "SELECT auction, SUM(price) AS total FROM bid GROUP BY auction ORDER BY total DESC LIMIT 5",
     },
@@ -1060,6 +1068,8 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("ordered_over_join_topn", "columnar_join_topn"),
         ("topn_over_left_join", "columnar_join_topn"),
         ("join_over_topn", "columnar_join"),
+        ("join_over_row_number_topn", "columnar_join"),
+        ("join_over_partitioned_row_number_topn", "columnar_join"),
         ("topn_over_self_join", "columnar_join_topn"),
         ("topn_over_three_way_join", "columnar_multijoin"),
     ];

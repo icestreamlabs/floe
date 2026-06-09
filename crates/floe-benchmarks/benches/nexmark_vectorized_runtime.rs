@@ -196,6 +196,22 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: filtered_join_topn_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "join_row_number_topn",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+            ],
+            view_name: "mv_nexmark_join_row_number_topn",
+            query: r#"SELECT t.auction, a.seller FROM (SELECT auction, price FROM (SELECT auction, price, ROW_NUMBER() OVER (ORDER BY price DESC) AS rn FROM bid) ranked WHERE rn <= 256) t JOIN auction a ON t.auction = a.id"#,
+            output_schema: filtered_join_topn_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "q12",
             sources: &[NexmarkRuntimeSource {
                 source_name: "nexmark_bid",
