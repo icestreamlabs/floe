@@ -218,6 +218,10 @@ const VALID_DBSP_RUNTIME_PLAN_CASES: &[ValidPlanRuntimeCase] = &[
         sql: "SELECT a.category, COUNT(*) AS bid_count FROM auction a JOIN bid b ON a.id = b.auction GROUP BY a.category",
     },
     ValidPlanRuntimeCase {
+        id: "join_over_join_aggregate",
+        sql: "SELECT j.auction, j.total_price, p.name FROM (SELECT b.auction, SUM(b.price) AS total_price FROM bid b JOIN auction a ON b.auction = a.id GROUP BY b.auction) j JOIN person p ON j.auction = p.id",
+    },
+    ValidPlanRuntimeCase {
         id: "aggregate_join",
         sql: "SELECT a.auction, a.max_price, au.seller FROM (SELECT auction, MAX(price) AS max_price FROM bid GROUP BY auction) a JOIN auction au ON a.auction = au.id",
     },
@@ -1099,6 +1103,7 @@ async fn guards_active_vectorized_runtime_valid_dbsp_plan_shapes() {
         ("join_over_three_way_join", "columnar_join"),
         ("union_join", "columnar_join"),
         ("aggregate_join", "columnar_join"),
+        ("join_over_join_aggregate", "columnar_join"),
         ("join_over_global_aggregate", "columnar_join"),
         ("join_over_window_aggregate", "columnar_join"),
     ];

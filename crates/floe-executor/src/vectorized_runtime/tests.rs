@@ -11001,6 +11001,234 @@ async fn grouped_count_join_uses_slate_backed_columnar_join_operator_semantics()
 }
 
 #[tokio::test]
+async fn join_over_join_aggregate_uses_slate_backed_columnar_join_operator_semantics() {
+    let bids = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("bids source definition");
+    let auctions = SourceDefinition::new(
+        "auctions",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("auctions source definition");
+    let people = SourceDefinition::new(
+        "people",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("name", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("people source definition");
+    let bids_schema = bids.to_arrow_schema();
+    let auctions_schema = auctions.to_arrow_schema();
+    let people_schema = people.to_arrow_schema();
+    let initial_bids = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ],
+    )
+    .expect("initial bids batch");
+    let initial_auctions = RecordBatch::try_new(
+        Arc::clone(&auctions_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .expect("initial auctions batch");
+    let initial_people = RecordBatch::try_new(
+        Arc::clone(&people_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![300, 350])),
+            Arc::new(StringArray::from(vec!["total-300", "total-350"])),
+        ],
+    )
+    .expect("initial people batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(bids);
+    sources.register(auctions);
+    sources.register(people);
+    let table = build_operator_state_table("vectorized-columnar-join-aggregate-join").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("total_price", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let query = "SELECT j.total_price, p.name \
+        FROM ( \
+            SELECT b.auction, SUM(b.price) AS total_price \
+            FROM bids b JOIN auctions a ON b.auction = a.id \
+            GROUP BY b.auction \
+        ) j \
+        JOIN people p ON j.total_price = p.id";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_join_aggregate_people",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&runtime, "snapshot_diff");
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auctions",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "people",
+            vec![initial_people.clone()],
+            vec![initial_people],
+        )
+        .await
+        .expect("append initial people");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_join_aggregate_people")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(300, "total-300".to_string())]
+    );
+
+    let bid_insert = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("bid insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![bid_insert.clone()],
+            vec![bid_insert],
+        )
+        .await
+        .expect("append bid insert");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(350, "total-350".to_string())]
+    );
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![
+            (300, "total-300".to_string(), -1),
+            (350, "total-350".to_string(), 1)
+        ]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_join_aggregate_people",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("recovered runtime");
+    assert_eq!(
+        recovered.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoin
+    );
+    assert_columnar_join_strategy(&recovered, "snapshot_diff");
+    recovered.run_tick(3).await.expect("recovered tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_join_aggregate_people")
+        .expect("recovered materialized view");
+    let recovered_snapshot = recovered_handle
+        .arrow_snapshot_for(3)
+        .expect("recovered snapshot");
+    assert_eq!(
+        id_note_rows(&recovered_snapshot),
+        vec![(350, "total-350".to_string())]
+    );
+    let recovered_delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("recovered empty delta");
+    assert!(recovered_delta.iter().all(|batch| batch.num_rows() == 0));
+
+    let bid_retract = RecordBatch::try_new(
+        Arc::clone(&bids_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("bid retract batch");
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(&bids_schema)
+        .expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&bid_retract, &weighted_schema, &[-1]).expect("weighted retract");
+    recovered
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    recovered.run_tick(4).await.expect("retract tick");
+
+    let snapshot = recovered_handle
+        .arrow_snapshot_for(4)
+        .expect("post-retract snapshot");
+    assert_eq!(
+        id_note_rows(&snapshot),
+        vec![(300, "total-300".to_string())]
+    );
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_id_note_rows(&delta),
+        vec![
+            (300, "total-300".to_string(), 1),
+            (350, "total-350".to_string(), -1)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn global_stats_join_uses_slate_backed_columnar_join_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",

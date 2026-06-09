@@ -278,6 +278,26 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
             output_schema: grouped_sum_join_output_schema,
         },
         NexmarkRuntimeCase {
+            id: "join_aggregate_join",
+            sources: &[
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_bid",
+                    batch: bid_join_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_auction",
+                    batch: auction_batch,
+                },
+                NexmarkRuntimeSource {
+                    source_name: "nexmark_person",
+                    batch: person_join_batch,
+                },
+            ],
+            view_name: "mv_nexmark_join_aggregate_join",
+            query: r#"SELECT j.auction, j.total_price, p.id AS person_id FROM (SELECT b.auction, SUM(b.price) AS total_price FROM bid b JOIN auction a ON b.auction = a.id GROUP BY b.auction) j JOIN person p ON j.auction = p.id"#,
+            output_schema: join_aggregate_join_output_schema,
+        },
+        NexmarkRuntimeCase {
             id: "filtered_join_topn",
             sources: &[
                 NexmarkRuntimeSource {
@@ -926,6 +946,14 @@ fn grouped_sum_join_output_schema() -> SchemaRef {
         Field::new("auction", DataType::Int64, false),
         Field::new("total_price", DataType::Int64, true),
         Field::new("seller", DataType::Int64, false),
+    ]))
+}
+
+fn join_aggregate_join_output_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("total_price", DataType::Int64, true),
+        Field::new("person_id", DataType::Int64, false),
     ]))
 }
 

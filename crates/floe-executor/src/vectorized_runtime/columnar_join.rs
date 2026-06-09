@@ -27,6 +27,11 @@ use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
+use super::columnar_composed::{
+    ColumnarComposedMaterializedViewState, ColumnarComposedPlan,
+    build_columnar_join_aggregate_materialized_view_state_in_namespace,
+    columnar_join_aggregate_plan_for_plan, run_columnar_composed_state_tick,
+};
 use super::columnar_grouped_count::{
     ColumnarGroupedCountMaterializedViewState, ColumnarGroupedCountPlan,
     build_columnar_grouped_count_materialized_view_state_in_namespace,
@@ -116,6 +121,7 @@ struct ColumnarJoinSourceState {
     grouped_max: Option<ColumnarJoinGroupedMaxInputState>,
     grouped_count: Option<ColumnarJoinGroupedCountInputState>,
     grouped_stats: Option<ColumnarJoinGroupedStatsInputState>,
+    join_aggregate: Option<ColumnarJoinJoinAggregateInputState>,
 }
 
 struct ColumnarJoinConstantState {
@@ -161,6 +167,10 @@ struct ColumnarJoinGroupedStatsInputState {
     state: Box<ColumnarGroupedStatsMaterializedViewState>,
 }
 
+struct ColumnarJoinJoinAggregateInputState {
+    state: Box<ColumnarComposedMaterializedViewState>,
+}
+
 struct ColumnarJoinInputPlan {
     input_name: String,
     schema: SchemaRef,
@@ -198,6 +208,9 @@ enum ColumnarJoinInputPlanKind {
     },
     GroupedStats {
         plan: Box<ColumnarGroupedStatsPlan>,
+    },
+    JoinAggregate {
+        plan: Box<ColumnarComposedPlan>,
     },
 }
 
@@ -463,6 +476,9 @@ fn join_input_namespace(mv_namespace: &str, side: &str, input: &ColumnarJoinInpu
         ColumnarJoinInputPlanKind::GroupedStats { .. } => {
             format!("{mv_namespace}/columnar/join/{side}/grouped_stats")
         }
+        ColumnarJoinInputPlanKind::JoinAggregate { .. } => {
+            format!("{mv_namespace}/columnar/join/{side}/join_aggregate")
+        }
     }
 }
 
@@ -523,6 +539,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::Constant { logical_plan } => {
@@ -588,6 +605,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::TopN {
@@ -661,6 +679,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::JoinTopN { plan } => {
@@ -700,6 +719,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::Join { plan } => {
@@ -737,6 +757,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::MultiJoin { plan } => {
@@ -772,6 +793,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::Union { plan } => {
@@ -807,6 +829,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::GroupedMax { plan } => {
@@ -842,6 +865,7 @@ async fn build_join_input_state(
                 grouped_max: Some(ColumnarJoinGroupedMaxInputState { state }),
                 grouped_count: None,
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::GroupedCount { plan } => {
@@ -877,6 +901,7 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: Some(ColumnarJoinGroupedCountInputState { state }),
                 grouped_stats: None,
+                join_aggregate: None,
             })
         }
         ColumnarJoinInputPlanKind::GroupedStats { plan } => {
@@ -912,6 +937,43 @@ async fn build_join_input_state(
                 grouped_max: None,
                 grouped_count: None,
                 grouped_stats: Some(ColumnarJoinGroupedStatsInputState { state }),
+                join_aggregate: None,
+            })
+        }
+        ColumnarJoinInputPlanKind::JoinAggregate { plan } => {
+            let join_aggregate_namespace = format!("{namespace}/state");
+            let state = Box::pin(build_boxed_join_aggregate_join_input_state(
+                table,
+                join_aggregate_namespace,
+                &input.schema,
+                *plan,
+                sources,
+                udfs,
+            ))
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed {side} nested join-aggregate input for '{}'",
+                    input.input_name
+                )
+            })?;
+            let snapshot = state.initial_snapshot();
+            Ok(ColumnarJoinSourceState {
+                input_name: input.input_name,
+                source_name: None,
+                schema: input.schema,
+                input_zset: None,
+                snapshot,
+                constant: None,
+                topn: None,
+                join_topn: None,
+                join: None,
+                multijoin: None,
+                union: None,
+                grouped_max: None,
+                grouped_count: None,
+                grouped_stats: None,
+                join_aggregate: Some(ColumnarJoinJoinAggregateInputState { state }),
             })
         }
     }
@@ -969,6 +1031,27 @@ async fn build_boxed_grouped_stats_join_input_state(
 ) -> Result<Box<ColumnarGroupedStatsMaterializedViewState>> {
     Ok(Box::new(
         build_columnar_grouped_stats_materialized_view_state_in_namespace(
+            table,
+            namespace,
+            output_schema,
+            plan,
+            sources,
+            udfs,
+        )
+        .await?,
+    ))
+}
+
+async fn build_boxed_join_aggregate_join_input_state(
+    table: Arc<dyn KeyValueTable>,
+    namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<Box<ColumnarComposedMaterializedViewState>> {
+    Ok(Box::new(
+        build_columnar_join_aggregate_materialized_view_state_in_namespace(
             table,
             namespace,
             output_schema,
@@ -1388,6 +1471,14 @@ async fn prepare_join_input_tick(
         )
         .await;
     }
+    if source.join_aggregate.is_some() {
+        return prepare_nested_join_aggregate_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        )
+        .await;
+    }
     if source.join_topn.is_some() {
         return prepare_join_topn_join_input_tick(source, insert_batches, weighted_delta_batches)
             .await;
@@ -1573,6 +1664,55 @@ async fn prepare_nested_grouped_stats_input_tick(
     .with_context(|| {
         format!(
             "evaluate nested grouped-stats input '{}'",
+            source.input_name
+        )
+    })?;
+    let changed = !tick.delta.batches().is_empty();
+    if !tick.input_changed {
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    if !changed {
+        source.snapshot = tick.next_snapshot;
+        return Ok(JoinInputTick {
+            delta: tick.delta,
+            changed: false,
+            next_snapshot: None,
+        });
+    }
+    Ok(JoinInputTick {
+        delta: tick.delta,
+        changed: true,
+        next_snapshot: Some(tick.next_snapshot),
+    })
+}
+
+async fn prepare_nested_join_aggregate_input_tick(
+    source: &mut ColumnarJoinSourceState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<JoinInputTick> {
+    let Some(join_aggregate) = source.join_aggregate.as_mut() else {
+        return Ok(JoinInputTick {
+            delta: ColumnarZSet::empty(Arc::clone(&source.schema))?,
+            changed: false,
+            next_snapshot: None,
+        });
+    };
+    let tick = run_columnar_composed_state_tick(
+        join_aggregate.state.as_mut(),
+        insert_batches,
+        weighted_delta_batches,
+        &source.schema,
+        &source.snapshot,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "evaluate nested join-aggregate input '{}'",
             source.input_name
         )
     })?;
@@ -2100,7 +2240,8 @@ impl JoinEvaluatorInput {
             | ColumnarJoinInputPlanKind::Union { .. }
             | ColumnarJoinInputPlanKind::GroupedMax { .. }
             | ColumnarJoinInputPlanKind::GroupedCount { .. }
-            | ColumnarJoinInputPlanKind::GroupedStats { .. } => (None, None),
+            | ColumnarJoinInputPlanKind::GroupedStats { .. }
+            | ColumnarJoinInputPlanKind::JoinAggregate { .. } => (None, None),
         };
         Ok(Self {
             provider,
@@ -2236,6 +2377,7 @@ fn rebind_join_side_logical_plan(
             | ColumnarJoinInputPlanKind::GroupedMax { .. }
             | ColumnarJoinInputPlanKind::GroupedCount { .. }
             | ColumnarJoinInputPlanKind::GroupedStats { .. }
+            | ColumnarJoinInputPlanKind::JoinAggregate { .. }
     ) {
         return input.scan_plan(&input_plan.input_name);
     }
@@ -2269,6 +2411,7 @@ impl ColumnarJoinInputPlan {
             ColumnarJoinInputPlanKind::GroupedMax { .. } => None,
             ColumnarJoinInputPlanKind::GroupedCount { .. } => None,
             ColumnarJoinInputPlanKind::GroupedStats { .. } => None,
+            ColumnarJoinInputPlanKind::JoinAggregate { .. } => None,
         }
     }
 
@@ -2292,6 +2435,7 @@ impl ColumnarJoinInputPlan {
             ColumnarJoinInputPlanKind::GroupedMax { plan } => plan.source_names(),
             ColumnarJoinInputPlanKind::GroupedCount { plan } => plan.source_names(),
             ColumnarJoinInputPlanKind::GroupedStats { plan } => plan.source_names(),
+            ColumnarJoinInputPlanKind::JoinAggregate { plan } => plan.source_names(),
             ColumnarJoinInputPlanKind::Constant { .. } => BTreeSet::new(),
         }
     }
@@ -2406,6 +2550,15 @@ fn join_input_plan_for_side(
                 },
             }));
         }
+        if let Some(join_aggregate) = columnar_join_aggregate_plan_for_plan(plan, sources)? {
+            return Ok(Some(ColumnarJoinInputPlan {
+                input_name,
+                schema,
+                kind: ColumnarJoinInputPlanKind::JoinAggregate {
+                    plan: Box::new(join_aggregate),
+                },
+            }));
+        }
     }
 
     let Some(source_name) = single_source_for_plan(plan, sources) else {
@@ -2473,7 +2626,8 @@ fn collect_joins<'a>(
                 sources,
                 &df_schema_to_arrow(plan.schema()),
             )?
-            .is_some())
+            .is_some()
+            || columnar_join_aggregate_plan_for_plan(plan, sources)?.is_some())
     {
         return Ok(());
     }
@@ -2676,6 +2830,11 @@ fn contains_unsupported_join_side_wrapper(
     if derived_relation_name(plan).is_some()
         && columnar_grouped_stats_plan_for_plan(plan, sources, &df_schema_to_arrow(plan.schema()))?
             .is_some()
+    {
+        return Ok(false);
+    }
+    if derived_relation_name(plan).is_some()
+        && columnar_join_aggregate_plan_for_plan(plan, sources)?.is_some()
     {
         return Ok(false);
     }

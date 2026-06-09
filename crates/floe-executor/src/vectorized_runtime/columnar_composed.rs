@@ -46,6 +46,12 @@ pub(super) struct ColumnarComposedPlan {
     source_names: Vec<String>,
 }
 
+impl ColumnarComposedPlan {
+    pub(super) fn source_names(&self) -> BTreeSet<String> {
+        self.source_names.iter().cloned().collect()
+    }
+}
+
 pub(super) struct ColumnarComposedMaterializedViewState {
     sources: Vec<ColumnarComposedSourceState>,
     output_zset: SlateBackedColumnarZSet,
@@ -59,6 +65,12 @@ impl ColumnarComposedMaterializedViewState {
     pub(super) fn initial_snapshot(&self) -> Vec<RecordBatch> {
         self.initial_snapshot.clone()
     }
+}
+
+pub(super) struct ColumnarComposedTick {
+    pub(super) delta: ColumnarZSet,
+    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) input_changed: bool,
 }
 
 struct ColumnarComposedSourceState {
@@ -1108,6 +1120,28 @@ pub(super) async fn build_columnar_join_join_materialized_view_state(
     .await
 }
 
+pub(super) async fn build_columnar_join_aggregate_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarComposedMaterializedViewState> {
+    build_columnar_snapshot_diff_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        "join_aggregate",
+        "join aggregate",
+        "columnar_join_aggregate_snapshot_diff",
+    )
+    .await
+}
+
 pub(super) async fn build_columnar_distinct_aggregate_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
@@ -1142,6 +1176,31 @@ async fn build_columnar_snapshot_diff_materialized_view_state(
     log_mode: &'static str,
 ) -> Result<ColumnarComposedMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
+    build_columnar_snapshot_diff_materialized_view_state_in_namespace(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        namespace_segment,
+        operator_label,
+        log_mode,
+    )
+    .await
+}
+
+async fn build_columnar_snapshot_diff_materialized_view_state_in_namespace(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarComposedPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+    namespace_segment: &'static str,
+    operator_label: &'static str,
+    log_mode: &'static str,
+) -> Result<ColumnarComposedMaterializedViewState> {
     let output_namespace = format!("{mv_namespace}/columnar/{namespace_segment}/output");
     let output_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
@@ -1604,7 +1663,43 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
         return Ok(false);
     };
     let plan_start = Instant::now();
+    let tick = run_columnar_composed_state_tick(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        &mv.output_schema,
+        &mv.previous_snapshot,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "evaluate Slate-backed snapshot-diff {} columnar snapshot delta for '{}'",
+            columnar.operator_label, mv.view_name
+        )
+    })?;
 
+    let delta_batches = tick.delta.batches().to_vec();
+    let handle = registry.register(mv.view_name.clone());
+    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+    mv.previous_snapshot = tick.next_snapshot;
+    tracing::debug!(
+        view = %mv.view_name,
+        version,
+        total_ms = plan_start.elapsed().as_millis() as u64,
+        mode = columnar.log_mode,
+        operator = columnar.operator_label,
+        "SlateDB-backed snapshot-diff columnar DBSP materialized view tick completed"
+    );
+    Ok(true)
+}
+
+pub(super) async fn run_columnar_composed_state_tick(
+    columnar: &mut ColumnarComposedMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarComposedTick> {
     let mut persisted_deltas = HashMap::new();
     let mut has_input_change = false;
     for source in &mut columnar.sources {
@@ -1633,14 +1728,10 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
             .evaluate(&next_source_snapshots)
             .await
             .context("evaluate next snapshot-diff composed output")?;
-        diff_snapshot_batches(
-            Arc::clone(&mv.output_schema),
-            &mv.previous_snapshot,
-            &next_output,
-        )
-        .await
-        .context("diff snapshot-diff composed output")?
-        .batches
+        diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
+            .await
+            .context("diff snapshot-diff composed output")?
+            .batches
     } else {
         Vec::new()
     };
@@ -1665,36 +1756,26 @@ async fn run_columnar_snapshot_diff_materialized_view_tick(
     };
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot = apply_weighted_snapshot_delta(
-        &mv.output_schema,
-        &mv.previous_snapshot,
-        delta_batches.clone(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "apply Slate-backed snapshot-diff {} columnar snapshot delta for '{}'",
-            columnar.operator_label, mv.view_name
-        )
-    })?;
+    let next_snapshot =
+        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "apply Slate-backed snapshot-diff {} columnar snapshot delta",
+                    columnar.operator_label
+                )
+            })?;
     for source in &mut columnar.sources {
         source.snapshot = next_source_snapshots
             .remove(&source.source_name)
             .ok_or_else(|| anyhow::anyhow!("missing next snapshot for '{}'", source.source_name))?;
     }
 
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = next_snapshot;
-    tracing::debug!(
-        view = %mv.view_name,
-        version,
-        total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = columnar.log_mode,
-        operator = columnar.operator_label,
-        "SlateDB-backed snapshot-diff columnar DBSP materialized view tick completed"
-    );
-    Ok(true)
+    Ok(ColumnarComposedTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed: has_input_change,
+    })
 }
 
 fn source_input_delta(
