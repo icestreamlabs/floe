@@ -4,7 +4,8 @@ use datafusion::arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
     TimestampMillisecondArray,
 };
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::execution::context::SessionContext;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use floe_core::source::{
@@ -13,6 +14,8 @@ use floe_core::source::{
 use object_store::memory::InMemory;
 use serde_json::json;
 use slatedb::Db;
+
+use crate::table_provider::MaterializedViewTableProvider;
 
 fn int64_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
     let values = batch
@@ -113,6 +116,30 @@ fn id_note_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
     }
     rows.sort();
     rows
+}
+
+async fn scan_materialized_view_table(
+    registry: Arc<MaterializedViewRegistry>,
+    view_name: &str,
+    schema: SchemaRef,
+    sql: &str,
+) -> Vec<RecordBatch> {
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        view_name,
+        Arc::new(MaterializedViewTableProvider::new(
+            registry,
+            view_name.to_string(),
+            schema,
+        )),
+    )
+    .expect("register materialized view table provider");
+    ctx.sql(sql)
+        .await
+        .expect("plan materialized view query")
+        .collect()
+        .await
+        .expect("collect materialized view query")
 }
 
 fn id_count_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
@@ -976,7 +1003,14 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     runtime.run_tick(1).await.expect("initial tick");
 
     let handle = registry.get("mv_orders").expect("materialized view");
-    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert!(handle.arrow_snapshot_for(1).is_none());
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&registry),
+        "mv_orders",
+        Arc::clone(&output_schema),
+        "SELECT id, note FROM mv_orders",
+    )
+    .await;
     assert_eq!(
         id_note_rows(&snapshot),
         vec![(2, "b".to_string()), (4, "d".to_string())]
@@ -1000,7 +1034,14 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
         .expect("apply weighted delta");
     runtime.run_tick(2).await.expect("weighted tick");
 
-    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert!(handle.arrow_snapshot_for(2).is_none());
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&registry),
+        "mv_orders",
+        Arc::clone(&output_schema),
+        "SELECT id, note FROM mv_orders",
+    )
+    .await;
     assert_eq!(
         id_note_rows(&snapshot),
         vec![(3, "c".to_string()), (4, "d".to_string())]
@@ -1033,9 +1074,14 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     let recovered_handle = recovery_registry
         .get("mv_orders")
         .expect("recovered materialized view");
-    let recovered_snapshot = recovered_handle
-        .arrow_snapshot_for(3)
-        .expect("recovered snapshot");
+    assert!(recovered_handle.arrow_snapshot_for(3).is_none());
+    let recovered_snapshot = scan_materialized_view_table(
+        Arc::clone(&recovery_registry),
+        "mv_orders",
+        Arc::clone(&output_schema),
+        "SELECT id, note FROM mv_orders",
+    )
+    .await;
     assert_eq!(
         id_note_rows(&recovered_snapshot),
         vec![(3, "c".to_string()), (4, "d".to_string())]
@@ -1385,7 +1431,14 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
     runtime.run_tick(1).await.expect("initial tick");
 
     let handle = registry.get("mv_orders").expect("materialized view");
-    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert!(handle.arrow_snapshot_for(1).is_none());
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&registry),
+        "mv_orders",
+        Arc::clone(&output_schema),
+        "SELECT id FROM mv_orders",
+    )
+    .await;
     assert_eq!(single_int_rows(&snapshot), vec![1, 2, 3]);
 
     let weighted_schema =
@@ -1403,7 +1456,14 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
         .expect("apply weighted delta");
     runtime.run_tick(2).await.expect("weighted tick");
 
-    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert!(handle.arrow_snapshot_for(2).is_none());
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&registry),
+        "mv_orders",
+        Arc::clone(&output_schema),
+        "SELECT id FROM mv_orders",
+    )
+    .await;
     assert_eq!(single_int_rows(&snapshot), vec![1, 3, 4]);
     let delta = handle.arrow_delta_for(2).expect("mv delta");
     assert_eq!(weighted_single_int_rows(&delta), vec![(2, -1), (4, 1)]);
@@ -1430,9 +1490,14 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
     let recovered_handle = recovery_registry
         .get("mv_orders")
         .expect("recovered materialized view");
-    let recovered_snapshot = recovered_handle
-        .arrow_snapshot_for(3)
-        .expect("recovered snapshot");
+    assert!(recovered_handle.arrow_snapshot_for(3).is_none());
+    let recovered_snapshot = scan_materialized_view_table(
+        Arc::clone(&recovery_registry),
+        "mv_orders",
+        Arc::clone(&output_schema),
+        "SELECT id FROM mv_orders",
+    )
+    .await;
     assert_eq!(single_int_rows(&recovered_snapshot), vec![1, 3, 4]);
     let recovered_delta = recovered_handle
         .arrow_delta_for(3)

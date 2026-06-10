@@ -9,6 +9,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::LogicalWorkSnapshot;
 use dbsp::handles::ZSetHandle;
+use dbsp::storage::KeyValueTable;
 use tokio::sync::watch;
 use tracing::field;
 
@@ -110,11 +111,40 @@ pub struct MaterializedViewHandle {
     arrow_snapshots: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
     arrow_deltas: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
     dbsp_state: RwLock<Option<DbspPersistedState>>,
+    columnar_storage: RwLock<Option<ColumnarMaterializedViewStorage>>,
     published_versions: PublishedVersionIndex,
     versions: RwLock<HashMap<i64, ZSetHandle>>,
     logical_work: RwLock<BTreeMap<i64, LogicalWorkSnapshot>>,
     commit_visibility_barrier: RwLock<bool>,
     retention_keep_last: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct ColumnarMaterializedViewStorage {
+    table: Arc<dyn KeyValueTable>,
+    schema: SchemaRef,
+}
+
+impl fmt::Debug for ColumnarMaterializedViewStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnarMaterializedViewStorage")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ColumnarMaterializedViewStorage {
+    pub fn new(table: Arc<dyn KeyValueTable>, schema: SchemaRef) -> Self {
+        Self { table, schema }
+    }
+
+    pub fn table(&self) -> Arc<dyn KeyValueTable> {
+        Arc::clone(&self.table)
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 #[derive(Debug)]
@@ -203,6 +233,7 @@ impl MaterializedViewHandle {
             arrow_snapshots: RwLock::new(BTreeMap::new()),
             arrow_deltas: RwLock::new(BTreeMap::new()),
             dbsp_state: RwLock::new(None),
+            columnar_storage: RwLock::new(None),
             published_versions: PublishedVersionIndex::new(tx),
             versions: RwLock::new(HashMap::new()),
             logical_work: RwLock::new(BTreeMap::new()),
@@ -342,6 +373,14 @@ impl MaterializedViewHandle {
             .map(|batches| batches.iter().map(RecordBatch::num_rows).sum())
     }
 
+    pub fn set_columnar_storage(&self, storage: ColumnarMaterializedViewStorage) {
+        *write_lock(&self.columnar_storage, "materialized view columnar storage") = Some(storage);
+    }
+
+    pub fn columnar_storage(&self) -> Option<ColumnarMaterializedViewStorage> {
+        read_lock(&self.columnar_storage, "materialized view columnar storage").clone()
+    }
+
     pub fn set_dbsp_state(&self, state: DbspPersistedState) {
         let span = tracing::debug_span!(
             "materialize",
@@ -372,6 +411,48 @@ impl MaterializedViewHandle {
             version,
             namespace = %namespace,
             "materialized view version recorded"
+        );
+    }
+
+    pub fn publish_columnar_version(
+        &self,
+        version: i64,
+        handle: ZSetHandle,
+        storage: ColumnarMaterializedViewStorage,
+        row_count: usize,
+        delta: Vec<RecordBatch>,
+    ) {
+        self.set_columnar_storage(storage);
+        {
+            let mut guard = write_lock(&self.versions, "materialized view versions");
+            guard.insert(version, handle.clone());
+        }
+        {
+            let mut deltas = write_lock(&self.arrow_deltas, "materialized view arrow deltas");
+            deltas.insert(version, Arc::new(delta));
+        }
+        let row_count = i64::try_from(row_count).unwrap_or(i64::MAX);
+        *write_lock(&self.state_row_count, "materialized view row count") = row_count;
+        *write_lock(
+            &self.published_row_count,
+            "materialized view published row count",
+        ) = row_count;
+        *write_lock(
+            &self.state_row_count_version,
+            "materialized view state row count version",
+        ) = Some(version);
+        *write_lock(
+            &self.state_authoritative,
+            "materialized view authoritative state flag",
+        ) = true;
+        self.record_latest_version(version);
+        self.prune_retained_versions();
+        tracing::debug!(
+            view = %self.name,
+            version,
+            namespace = %handle.ns,
+            rows = row_count,
+            "materialized view columnar version recorded"
         );
     }
 
