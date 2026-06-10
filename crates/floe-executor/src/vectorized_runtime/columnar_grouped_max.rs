@@ -117,6 +117,7 @@ struct SlateGroupedMaxState {
     key_prefix: Vec<u8>,
     bounds_key: Vec<u8>,
     group_bounds: Mutex<GroupKeyBoundsState>,
+    max_summaries: Mutex<HashMap<Vec<u8>, i64>>,
 }
 
 #[derive(Clone)]
@@ -542,16 +543,18 @@ async fn run_columnar_grouped_max_state_tick_inner(
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-max output zset delta")?;
-    columnar
-        .output_zset
-        .create_version(
-            &output_delta,
-            columnar
-                .output_zset
-                .current_handle()
-                .map(|handle| handle.version),
-        )
-        .await?;
+    if maintain_output_snapshot {
+        columnar
+            .output_zset
+            .create_version(
+                &output_delta,
+                columnar
+                    .output_zset
+                    .current_handle()
+                    .map(|handle| handle.version),
+            )
+            .await?;
+    }
     let persisted_output_delta = output_delta;
 
     let next_snapshot = if maintain_output_snapshot {
@@ -792,8 +795,9 @@ async fn apply_grouped_max_delta(
 
     let mut writes = WriteBatch::new();
     let mut bounds_update = None;
+    let mut max_updates = Vec::new();
     for (group_key, delta) in pending {
-        let old_max = columnar.max_state.load_max(&group_key).await?;
+        let old_max = columnar.max_state.load_max(&group_key)?;
         let mut updated_counts = HashMap::new();
         for (value, value_delta) in &delta.value_deltas {
             let old_count =
@@ -833,6 +837,7 @@ async fn apply_grouped_max_delta(
             columnar
                 .max_state
                 .write_max(&mut writes, &group_key, new_max)?;
+            max_updates.push((group_key.clone(), new_max));
         }
         if new_max.is_some() {
             merge_group_key_bounds_update(&mut bounds_update, &group_key);
@@ -847,6 +852,7 @@ async fn apply_grouped_max_delta(
         .write_batch(writes)
         .await
         .context("persist grouped-max state updates")?;
+    columnar.max_state.apply_max_updates(max_updates)?;
     builder.finish()
 }
 
@@ -868,27 +874,48 @@ impl SlateGroupedMaxState {
             None if assume_empty => GroupKeyBoundsState::Empty,
             None => GroupKeyBoundsState::Unknown,
         };
-        Ok(Self {
+        let state = Self {
             table,
             key_prefix,
             bounds_key,
             group_bounds: Mutex::new(group_bounds),
-        })
+            max_summaries: Mutex::new(HashMap::new()),
+        };
+        let max_summaries = state
+            .load_all_max_summaries()
+            .await
+            .context("load grouped-max summary head")?;
+        *state
+            .max_summaries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max max summary head poisoned"))? = max_summaries;
+        Ok(state)
     }
 
-    async fn load_max(&self, group_key: &[u8]) -> Result<Option<i64>> {
+    fn load_max(&self, group_key: &[u8]) -> Result<Option<i64>> {
         if !self.group_key_may_exist(group_key)? {
             return Ok(None);
         }
-        let Some(bytes) = self
+        let max_summaries = self
+            .max_summaries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max max summary head poisoned"))?;
+        Ok(max_summaries.get(group_key).copied())
+    }
+
+    async fn load_all_max_summaries(&self) -> Result<HashMap<Vec<u8>, i64>> {
+        let summary_prefix = self.tag_prefix(SUMMARY_TAG);
+        let mut values = HashMap::new();
+        for (key, value_bytes) in self
             .table
-            .get_bytes(&self.group_key(SUMMARY_TAG, group_key)?)
+            .scan_prefix(&summary_prefix, &ScanOptions::default())
             .await
-            .context("read grouped-max summary state")?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_i64(bytes.as_ref())?))
+            .context("scan grouped-max summary state")?
+        {
+            let group_key = self.group_key_from_tagged_state_key(SUMMARY_TAG, &key)?;
+            values.insert(group_key.to_vec(), decode_i64(&value_bytes)?);
+        }
+        Ok(values)
     }
 
     async fn load_value_count(&self, group_key: &[u8], value: i64) -> Result<i64> {
@@ -1000,6 +1027,24 @@ impl SlateGroupedMaxState {
         Ok(())
     }
 
+    fn apply_max_updates(&self, updates: Vec<(Vec<u8>, Option<i64>)>) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut max_summaries = self
+            .max_summaries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max max summary head poisoned"))?;
+        for (group_key, max) in updates {
+            if let Some(max) = max {
+                max_summaries.insert(group_key, max);
+            } else {
+                max_summaries.remove(group_key.as_slice());
+            }
+        }
+        Ok(())
+    }
+
     fn group_key_may_exist(&self, group_key: &[u8]) -> Result<bool> {
         let bounds = self
             .group_bounds
@@ -1059,6 +1104,12 @@ impl SlateGroupedMaxState {
         Ok(key)
     }
 
+    fn tag_prefix(&self, tag: u8) -> Vec<u8> {
+        let mut prefix = self.key_prefix.clone();
+        prefix.push(tag);
+        prefix
+    }
+
     fn group_key(&self, tag: u8, group_key: &[u8]) -> Result<Vec<u8>> {
         let len =
             u32::try_from(group_key.len()).context("grouped-max group key exceeds u32 bytes")?;
@@ -1067,6 +1118,20 @@ impl SlateGroupedMaxState {
         key.extend_from_slice(&len.to_be_bytes());
         key.extend_from_slice(group_key);
         Ok(key)
+    }
+
+    fn group_key_from_tagged_state_key<'a>(&self, tag: u8, key: &'a [u8]) -> Result<&'a [u8]> {
+        let tag_index = self.key_prefix.len();
+        if !key.starts_with(&self.key_prefix) || key.get(tag_index) != Some(&tag) {
+            bail!("grouped-max state key prefix mismatch");
+        }
+        let mut cursor = tag_index + 1;
+        let group_key_len = read_u32_at(key, &mut cursor)? as usize;
+        let group_key = read_bytes_at(key, &mut cursor, group_key_len, "grouped-max group key")?;
+        if cursor != key.len() {
+            bail!("grouped-max summary state key has trailing bytes");
+        }
+        Ok(group_key)
     }
 }
 
@@ -1530,17 +1595,19 @@ mod tests {
             .expect("state");
 
         counting.reset_get_bytes_calls();
-        assert_eq!(state.load_max(&[1]).await.expect("fresh empty load"), None);
+        assert_eq!(state.load_max(&[1]).expect("fresh empty load"), None);
         assert_eq!(counting.get_bytes_calls(), 0);
 
         let mut batch = WriteBatch::new();
         let mut bounds_update = None;
+        let mut max_updates = Vec::new();
         state
             .write_value_count(&mut batch, &[10], 100, 1)
             .expect("write count 10");
         state
             .write_max(&mut batch, &[10], Some(100))
             .expect("write max 10");
+        max_updates.push((vec![10], Some(100)));
         merge_group_key_bounds_update(&mut bounds_update, &[10]);
         state
             .write_value_count(&mut batch, &[20], 200, 1)
@@ -1548,36 +1615,34 @@ mod tests {
         state
             .write_max(&mut batch, &[20], Some(200))
             .expect("write max 20");
+        max_updates.push((vec![20], Some(200)));
         merge_group_key_bounds_update(&mut bounds_update, &[20]);
         state
             .write_group_bounds(&mut batch, bounds_update.as_ref())
             .expect("write bounds");
         table.write_batch(batch).await.expect("persist state");
+        state
+            .apply_max_updates(max_updates)
+            .expect("apply max summary head updates");
 
         counting.reset_get_bytes_calls();
-        assert_eq!(state.load_max(&[1]).await.expect("below bounds"), None);
+        assert_eq!(state.load_max(&[1]).expect("below bounds"), None);
         assert_eq!(counting.get_bytes_calls(), 0);
 
         counting.reset_get_bytes_calls();
-        assert_eq!(state.load_max(&[30]).await.expect("above bounds"), None);
+        assert_eq!(state.load_max(&[30]).expect("above bounds"), None);
         assert_eq!(counting.get_bytes_calls(), 0);
 
         counting.reset_get_bytes_calls();
-        assert_eq!(
-            state.load_max(&[10]).await.expect("inside bounds"),
-            Some(100)
-        );
-        assert_eq!(counting.get_bytes_calls(), 1);
+        assert_eq!(state.load_max(&[10]).expect("inside bounds"), Some(100));
+        assert_eq!(counting.get_bytes_calls(), 0);
 
         let reopened = SlateGroupedMaxState::new(Arc::clone(&table), "grouped_max", false)
             .await
             .expect("reopened state");
         counting.reset_get_bytes_calls();
         assert_eq!(
-            reopened
-                .load_max(&[30])
-                .await
-                .expect("reopened above bounds"),
+            reopened.load_max(&[30]).expect("reopened above bounds"),
             None
         );
         assert_eq!(counting.get_bytes_calls(), 0);
@@ -1593,17 +1658,22 @@ mod tests {
             .expect("state");
         let mut batch = WriteBatch::new();
         let mut bounds_update = None;
+        let mut max_updates = Vec::new();
         state
             .write_value_count(&mut batch, &[10], 100, 1)
             .expect("write count");
         state
             .write_max(&mut batch, &[10], Some(100))
             .expect("write max");
+        max_updates.push((vec![10], Some(100)));
         merge_group_key_bounds_update(&mut bounds_update, &[10]);
         state
             .write_group_bounds(&mut batch, bounds_update.as_ref())
             .expect("write bounds");
         table.write_batch(batch).await.expect("persist state");
+        state
+            .apply_max_updates(max_updates)
+            .expect("apply max summary head updates");
         table
             .delete(&state.bounds_key)
             .await
@@ -1613,10 +1683,7 @@ mod tests {
             .await
             .expect("reopened state");
         counting.reset_get_bytes_calls();
-        assert_eq!(
-            reopened.load_max(&[30]).await.expect("unknown bounds load"),
-            None
-        );
-        assert_eq!(counting.get_bytes_calls(), 1);
+        assert_eq!(reopened.load_max(&[30]).expect("unknown bounds load"), None);
+        assert_eq!(counting.get_bytes_calls(), 0);
     }
 }

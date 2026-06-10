@@ -1538,16 +1538,18 @@ async fn run_columnar_join_state_tick_inner(
         mode = "columnar_join_incremental",
         "SlateDB-backed join columnar DBSP state tick completed"
     );
-    columnar
-        .output_zset
-        .create_version(
-            &output_delta,
-            columnar
-                .output_zset
-                .current_handle()
-                .map(|handle| handle.version),
-        )
-        .await?;
+    if maintain_output_snapshot {
+        columnar
+            .output_zset
+            .create_version(
+                &output_delta,
+                columnar
+                    .output_zset
+                    .current_handle()
+                    .map(|handle| handle.version),
+            )
+            .await?;
+    }
     let persisted_output_delta = output_delta;
 
     let next_snapshot = if maintain_output_snapshot {
