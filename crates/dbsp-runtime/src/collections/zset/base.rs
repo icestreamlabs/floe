@@ -14,7 +14,7 @@ use crate::storage::dictionary::{Dictionary, KeyIntern};
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::{KeyValueTable, SlateTable};
 
-use super::{ZSET_PREFIX, prefix_bounds};
+use super::ZSET_PREFIX;
 
 pub struct ZSet<K>
 where
@@ -207,7 +207,7 @@ where
 
         let entries = self
             .table
-            .scan_range(prefix_bounds(&self.data_prefix), &ScanOptions::default())
+            .scan_prefix(&self.data_prefix, &ScanOptions::default())
             .await?;
 
         for (key_bytes, _) in entries {
@@ -246,7 +246,7 @@ where
     async fn load_all(&self) -> Result<HashMap<K, i64>> {
         let entries = self
             .table
-            .scan_range(prefix_bounds(&self.data_prefix), &ScanOptions::default())
+            .scan_prefix(&self.data_prefix, &ScanOptions::default())
             .await?;
 
         let mut map = HashMap::new();

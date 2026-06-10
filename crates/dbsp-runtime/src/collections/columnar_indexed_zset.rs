@@ -220,10 +220,7 @@ impl SlateBackedColumnarIndexedZSet {
         for key in key_bytes {
             let entries = self
                 .table
-                .scan_range_bytes(
-                    prefix_bounds(&self.index_prefix_for_key(key)?),
-                    &ScanOptions::default(),
-                )
+                .scan_prefix_bytes(&self.index_prefix_for_key(key)?, &ScanOptions::default())
                 .await
                 .context("scan columnar index key postings")?;
             self.collect_posting_entries(entries, None, refs_by_segment)?;
@@ -304,7 +301,7 @@ impl SlateBackedColumnarIndexedZSet {
         let mut write_batch = WriteBatch::new();
         for (key, _) in self
             .table
-            .scan_range_bytes(prefix_bounds(&self.index_prefix), &ScanOptions::default())
+            .scan_prefix_bytes(&self.index_prefix, &ScanOptions::default())
             .await
             .context("scan columnar index postings for rebuild")?
         {

@@ -6,12 +6,14 @@ use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
+use bytes::Bytes;
 use rkyv::{Archive, Deserialize, Serialize};
+use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
+use crate::storage::KeyValueTable;
 use crate::storage::encoding;
 use crate::storage::keyspace;
-use crate::storage::{KeyValueTable, prefix_bounds};
 
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub struct SegmentMetadata {
@@ -135,8 +137,13 @@ impl ArrowSegmentStore {
         stats: SegmentWriteStats,
     ) -> Result<SegmentMetadata> {
         let (encoded, metadata) = encode_segment_envelope(schema, batches, stats)?;
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(
+            Bytes::from(self.segment_key(segment_id)),
+            Bytes::from(encoded),
+        );
         self.table
-            .put(&self.segment_key(segment_id), &encoded)
+            .write_batch(batch)
             .await
             .with_context(|| format!("persist Arrow segment {segment_id}"))?;
         Ok(metadata)
@@ -189,8 +196,8 @@ impl ArrowSegmentStore {
             Ok(())
         };
         self.table
-            .scan_range_bytes_for_each(
-                prefix_bounds(&self.segment_prefix),
+            .scan_prefix_bytes_for_each(
+                &self.segment_prefix,
                 &ScanOptions::default(),
                 &mut visit_entry,
             )
