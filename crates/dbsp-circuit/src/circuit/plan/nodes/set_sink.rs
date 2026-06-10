@@ -5,15 +5,21 @@ impl DbspUnionNode {
         if input_schemas.is_empty() {
             bail!("union requires at least one input");
         }
-        let first = input_schemas[0].clone();
+        let mut fields = input_schemas[0].fields().to_vec();
         for schema in &input_schemas[1..] {
-            if schema.fields() != first.fields() {
-                bail!("all union inputs must share the same schema");
+            if schema.len() != fields.len() {
+                bail!("all union inputs must have the same column count");
+            }
+            for (idx, field) in schema.fields().iter().enumerate() {
+                let output_field = &mut fields[idx];
+                if field.name != output_field.name || field.data_type != output_field.data_type {
+                    bail!("all union inputs must share column names and types");
+                }
+                output_field.nullable |= field.nullable;
             }
         }
-        Ok(Self {
-            output_schema: first,
-        })
+        let output_schema = RowSchema::try_new(fields)?;
+        Ok(Self { output_schema })
     }
 
     pub fn output_schema(&self) -> &Arc<RowSchema> {
@@ -58,6 +64,9 @@ impl DbspSinkNode {
 #[derive(Clone, Debug)]
 pub enum DbspNodeKind {
     Source(DbspSourceNode),
+    Empty(DbspEmptyNode),
+    OneRow(DbspOneRowNode),
+    Values(DbspValuesNode),
     Select(DbspSelectNode),
     Project(DbspProjectNode),
     Join(Box<DbspJoinNode>),

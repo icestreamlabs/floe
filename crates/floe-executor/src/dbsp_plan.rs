@@ -10,11 +10,12 @@ use datafusion::logical_expr::{Expr, LogicalPlan};
 
 pub use dbsp::circuit::{
     CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
-    DbspDistinctNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspProjectNode, DbspScalarType,
-    DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode, DbspWindowAggregateNode,
-    DbspWindowPolicy, DbspWindowSpec, Field, OrderExpr, PlannerConfig, PlannerError, ProjectItem,
-    RowSchema, TableDescriptor, nexmark_auction_alias_table, nexmark_auction_table,
-    nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
+    DbspDistinctNode, DbspEmptyNode, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspOneRowNode,
+    DbspProjectNode, DbspScalarType, DbspSelectNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
+    DbspValuesNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, OrderExpr,
+    PlannerConfig, PlannerError, ProjectItem, RowSchema, TableDescriptor,
+    nexmark_auction_alias_table, nexmark_auction_table, nexmark_bid_alias_table, nexmark_bid_table,
+    nexmark_person_alias_table, nexmark_person_table,
 };
 
 use crate::namespaces;
@@ -600,9 +601,15 @@ pub fn validate_dbsp_plan(
             fan_in_nodes.push(node_id);
         }
         match &circuit_node.kind {
-            DbspNodeKind::Source(_) => {
+            DbspNodeKind::Source(_)
+            | DbspNodeKind::Empty(_)
+            | DbspNodeKind::OneRow(_)
+            | DbspNodeKind::Values(_) => {
                 if input_count != 0 {
-                    bail!("node {node_id} → Source expects 0 inputs (found {input_count})");
+                    bail!(
+                        "node {node_id} → {} expects 0 inputs (found {input_count})",
+                        kind_name(&circuit_node.kind)
+                    );
                 }
             }
             DbspNodeKind::Project(_)
@@ -743,6 +750,9 @@ fn format_set(values: &BTreeSet<String>) -> String {
 fn kind_name(kind: &DbspNodeKind) -> &'static str {
     match kind {
         DbspNodeKind::Source(_) => "Source",
+        DbspNodeKind::Empty(_) => "Empty",
+        DbspNodeKind::OneRow(_) => "OneRow",
+        DbspNodeKind::Values(_) => "Values",
         DbspNodeKind::Select(_) => "Select",
         DbspNodeKind::Project(_) => "Project",
         DbspNodeKind::Join(_) => "Join",

@@ -46,6 +46,10 @@ impl DynamicStateTableProvider {
         Self::new_with_optional_key_indices(schema, None)
     }
 
+    pub(crate) fn new_with_scan_partitions(schema: SchemaRef, partition_count: usize) -> Self {
+        Self::new_with_optional_key_indices_and_partitions(schema, None, partition_count.max(1))
+    }
+
     pub(crate) fn new_with_key_indices(schema: SchemaRef, key_indices: Vec<usize>) -> Result<Self> {
         for idx in &key_indices {
             if *idx >= schema.fields().len() {
@@ -63,6 +67,18 @@ impl DynamicStateTableProvider {
     }
 
     fn new_with_optional_key_indices(schema: SchemaRef, key_indices: Option<Vec<usize>>) -> Self {
+        Self::new_with_optional_key_indices_and_partitions(
+            schema,
+            key_indices,
+            DYNAMIC_STATE_SCAN_PARTITIONS,
+        )
+    }
+
+    fn new_with_optional_key_indices_and_partitions(
+        schema: SchemaRef,
+        key_indices: Option<Vec<usize>>,
+        partition_count: usize,
+    ) -> Self {
         let state = Arc::new(ArcSwap::from_pointee(DynamicStateSnapshot::default()));
         let key_indices = key_indices.map(Arc::<[usize]>::from);
         let keyed_state = key_indices
@@ -73,6 +89,7 @@ impl DynamicStateTableProvider {
             Arc::clone(&state),
             key_indices.clone(),
             keyed_state.clone(),
+            partition_count.max(1),
         ));
         Self {
             schema,
@@ -269,6 +286,7 @@ impl TableProvider for DynamicStateTableProvider {
                 self.key_indices.clone(),
                 self.keyed_state.clone(),
                 limit,
+                1,
             ))
         } else {
             self.exec()
@@ -381,8 +399,16 @@ impl DynamicStateExec {
         state: Arc<ArcSwap<DynamicStateSnapshot>>,
         key_indices: Option<Arc<[usize]>>,
         keyed_state: Option<Arc<RwLock<DynamicKeyedState>>>,
+        partition_count: usize,
     ) -> Self {
-        Self::new_with_limit(schema, state, key_indices, keyed_state, None)
+        Self::new_with_limit(
+            schema,
+            state,
+            key_indices,
+            keyed_state,
+            None,
+            partition_count,
+        )
     }
 
     fn new_with_limit(
@@ -391,11 +417,12 @@ impl DynamicStateExec {
         key_indices: Option<Arc<[usize]>>,
         keyed_state: Option<Arc<RwLock<DynamicKeyedState>>>,
         limit: Option<usize>,
+        partition_count: usize,
     ) -> Self {
         let partition_count = if limit.is_some() {
             1
         } else {
-            DYNAMIC_STATE_SCAN_PARTITIONS
+            partition_count.max(1)
         };
         let cache = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),

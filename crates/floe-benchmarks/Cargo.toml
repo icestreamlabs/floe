@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "update_model_storage"
 harness = false
+
+[[bench]]
+name = "nexmark_vectorized_runtime"
+harness = false

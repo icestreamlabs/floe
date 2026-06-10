@@ -69,6 +69,55 @@ fn build_batch_limits_per_source() {
 }
 
 #[test]
+fn build_batch_splits_raw_kafka_batches_by_limits() {
+    let pending_events = core_source::PendingAppendIngestEventCounter::default();
+    pending_events.record_enqueue(3);
+    let raw_batch = core_source::KafkaRawIngestBatch {
+        source: "s1".to_string(),
+        records: (0..3)
+            .map(|offset| core_source::KafkaRawIngestRecord {
+                payload: br#"{"id":1}"#.to_vec(),
+                topic: Arc::<str>::from("topic"),
+                partition: 0,
+                offset,
+                event_time_ms: None,
+            })
+            .collect(),
+    };
+    let mut queues = vec![ConnectorQueue {
+        id: 0,
+        name: "kafka".to_string(),
+        pending: VecDeque::from([QueuedAppendIngestItem::KafkaRaw(
+            QueuedKafkaRawIngestBatch {
+                batch: raw_batch,
+                commit_ack: None,
+            },
+        )]),
+    }];
+
+    let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);
+    let selection = build_batch(BuildBatchRequest {
+        queues: &mut queues,
+        source_id_by_name: &source_id_by_name,
+        source_count: 1,
+        start_index: 0,
+        max_batch: 10,
+        max_per_source: 2,
+        max_per_connector: 10,
+        pending_events: &pending_events,
+    });
+
+    assert_eq!(selection.batch.len(), 0);
+    assert_eq!(selection.kafka_raw_batches.len(), 1);
+    assert_eq!(selection.kafka_raw_batches[0].source_id, Some(0));
+    assert_eq!(selection.kafka_raw_batches[0].batch.len(), 2);
+    assert_eq!(selection.selected_rows, 2);
+    assert_eq!(selection.per_connector_counts, vec![2]);
+    assert_eq!(queues[0].pending_rows(), 1);
+    assert_eq!(pending_events.pending(), 1);
+}
+
+#[test]
 fn merge_sql_sinks_validates_mv_reference() {
     let mut sink_specs = Vec::new();
     let sql_sink_specs = vec![SinkSpec {

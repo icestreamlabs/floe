@@ -11,9 +11,35 @@ pub type AppendIngestEventReceiver = mpsc::Receiver<AppendIngestEventBatch>;
 pub type RoutedAppendIngestEventReceiver = mpsc::Receiver<RoutedAppendIngestEventBatch>;
 
 #[derive(Debug)]
+pub struct KafkaRawIngestRecord {
+    pub payload: Vec<u8>,
+    pub topic: Arc<str>,
+    pub partition: i32,
+    pub offset: i64,
+    pub event_time_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct KafkaRawIngestBatch {
+    pub source: String,
+    pub records: Vec<KafkaRawIngestRecord>,
+}
+
+impl KafkaRawIngestBatch {
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+#[derive(Debug)]
 pub struct RoutedAppendIngestEventBatch {
     pub connector_id: usize,
     pub events: AppendIngestEventBatch,
+    pub kafka_raw: Option<KafkaRawIngestBatch>,
     pub commit_ack: Option<CommitAck>,
 }
 
@@ -138,6 +164,10 @@ impl AppendIngestEventSender {
             | AppendIngestEventSender::Routed { pending, .. } => pending.pending(),
         }
     }
+
+    pub fn supports_kafka_raw_batches(&self) -> bool {
+        matches!(self, AppendIngestEventSender::Routed { .. })
+    }
 }
 
 pub async fn send_event(
@@ -175,6 +205,7 @@ pub async fn send_batch(
                 .send(RoutedAppendIngestEventBatch {
                     connector_id: *connector_id,
                     events,
+                    kafka_raw: None,
                     commit_ack: None,
                 })
                 .await
@@ -220,6 +251,7 @@ pub async fn send_batch_with_commit_ack(
                 .send(RoutedAppendIngestEventBatch {
                     connector_id: *connector_id,
                     events,
+                    kafka_raw: None,
                     commit_ack: Some(CommitAck::new(count, ack_tx)),
                 })
                 .await
@@ -228,6 +260,43 @@ pub async fn send_batch_with_commit_ack(
                 return Err(SendError(err.0.events));
             }
             Ok(ack_rx)
+        }
+    }
+}
+
+pub async fn send_kafka_raw_batch(
+    sender: &AppendIngestEventSender,
+    batch: KafkaRawIngestBatch,
+) -> Result<(), SendError<KafkaRawIngestBatch>> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    match sender {
+        AppendIngestEventSender::Direct { .. } => Err(SendError(batch)),
+        AppendIngestEventSender::Routed {
+            connector_id,
+            sender,
+            pending,
+        } => {
+            let count = batch.len();
+            pending.record_enqueue(count);
+            if let Err(err) = sender
+                .send(RoutedAppendIngestEventBatch {
+                    connector_id: *connector_id,
+                    events: Vec::new(),
+                    kafka_raw: Some(batch),
+                    commit_ack: None,
+                })
+                .await
+            {
+                pending.record_dequeue(count);
+                return Err(SendError(
+                    err.0
+                        .kafka_raw
+                        .expect("routed raw Kafka batch missing after send failure"),
+                ));
+            }
+            Ok(())
         }
     }
 }

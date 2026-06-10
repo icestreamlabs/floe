@@ -7,6 +7,8 @@ use datafusion::logical_expr::logical_plan::{
     Aggregate, FetchType, Filter, Projection, SkipType, Sort, SubqueryAlias, Union,
 };
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
+use datafusion::optimizer::optimizer::{Optimizer, OptimizerContext};
+use datafusion::optimizer::scalar_subquery_to_join::ScalarSubqueryToJoin;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, Result as DataFusionResult, plan_err};
 
@@ -187,7 +189,8 @@ pub(super) fn optimize_logical_plan(
     plan: &LogicalPlan,
     config: &PlannerConfig,
 ) -> Result<OptimizedLogicalPlan, PlannerError> {
-    let mut current = plan.clone();
+    let mut current = optimize_scalar_subqueries(plan.clone())
+        .map_err(|err| PlannerError::AnalysisError(err.into()))?;
     let mut diagnostics = OptimizerDiagnostics::default();
 
     for stage in optimizer_stages() {
@@ -207,6 +210,11 @@ pub(super) fn optimize_logical_plan(
         plan: current,
         diagnostics,
     })
+}
+
+fn optimize_scalar_subqueries(plan: LogicalPlan) -> DataFusionResult<LogicalPlan> {
+    let optimizer = Optimizer::with_rules(vec![Arc::new(ScalarSubqueryToJoin::new())]);
+    optimizer.optimize(plan, &OptimizerContext::new(), |_, _| {})
 }
 
 #[derive(Debug, Clone, Copy)]

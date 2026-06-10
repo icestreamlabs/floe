@@ -57,6 +57,35 @@ fn source_journal_auto_skips_replayable_connector_sources() {
 }
 
 #[test]
+fn source_journal_auto_row_journals_durable_table_sources() {
+    let mut source_journal_sources = BTreeSet::new();
+    let mut kafka_metadata_sources = BTreeSet::from([
+        "kafka_events".to_string(),
+        "orders".to_string(),
+        "unused_table".to_string(),
+    ]);
+    let durable_tables = BTreeSet::from(["orders".to_string(), "unused_table".to_string()]);
+    let required_sources = BTreeSet::from(["kafka_events".to_string(), "orders".to_string()]);
+
+    apply_durable_table_source_journal_policy(
+        &mut source_journal_sources,
+        &mut kafka_metadata_sources,
+        &durable_tables,
+        &required_sources,
+        SourceJournalConfig::Auto,
+    );
+
+    assert_eq!(
+        source_journal_sources,
+        BTreeSet::from(["orders".to_string()])
+    );
+    assert_eq!(
+        kafka_metadata_sources,
+        BTreeSet::from(["kafka_events".to_string(), "unused_table".to_string()])
+    );
+}
+
+#[test]
 fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
     let mut args = default_run_args();
     args.events_per_second = 77.0;

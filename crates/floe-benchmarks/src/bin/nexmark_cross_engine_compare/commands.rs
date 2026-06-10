@@ -207,6 +207,6 @@ pub(super) fn print_tail(path: PathBuf, lines: usize) {
 
 pub(super) fn print_usage() {
     println!(
-        "Usage: nexmark_cross_engine_compare [floe|materialize|risingwave|feldera|all] [all|nexmark_all|q0..q22]"
+        "Usage: nexmark_cross_engine_compare [floe|materialize|risingwave|feldera|floe,risingwave|all] [all|nexmark_all|q0..q22]"
     );
 }

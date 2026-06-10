@@ -18,10 +18,7 @@ impl Harness {
         self.write_summary_header()?;
         self.ensure_redpanda()?;
         self.build_producer()?;
-        if matches!(
-            self.config.engine_selector,
-            EngineSelector::One(Engine::Floe) | EngineSelector::All
-        ) {
+        if self.config.engine_selector.contains(Engine::Floe) {
             self.build_floe_node()?;
         }
         self.capture_run_context()?;

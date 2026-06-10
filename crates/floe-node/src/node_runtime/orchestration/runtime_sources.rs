@@ -17,7 +17,7 @@ pub(super) fn build_runtime_source_indexes(
     definitions: &[SourceDefinition],
     all_required_sources: &BTreeSet<String>,
     required_columns_by_source_id: Vec<Option<Arc<[bool]>>>,
-    maintain_source_query_tables: bool,
+    source_query_table_names: &BTreeSet<String>,
     kafka_metadata_journal_required_sources: &BTreeSet<String>,
     source_journal_required_sources: &BTreeSet<String>,
     postgres_cdc_runtime_plans_by_connector: &HashMap<String, PostgresCdcRuntimePlan>,
@@ -44,7 +44,8 @@ pub(super) fn build_runtime_source_indexes(
             definitions
                 .iter()
                 .map(|definition| {
-                    maintain_source_query_tables && all_required_sources.contains(definition.name())
+                    source_query_table_names.contains(definition.name())
+                        && all_required_sources.contains(definition.name())
                 })
                 .collect(),
         ),

@@ -116,6 +116,12 @@ impl<'cfg> PlannerContext<'cfg> {
 
         let join_relation_sides =
             infer_join_relation_sides(projection_exprs, current_top_filter.as_ref(), join);
+        let rewritten_top_filter = current_top_filter
+            .as_ref()
+            .map(|filter| {
+                rewrite_join_output_projection_expr(filter.clone(), join, &join_relation_sides)
+            })
+            .transpose()?;
         let rewritten_projection_exprs = projection_exprs
             .map(|expressions| {
                 expressions
@@ -143,7 +149,7 @@ impl<'cfg> PlannerContext<'cfg> {
             remaining,
             required_columns,
         } = split_join_filter(
-            current_top_filter.as_ref(),
+            rewritten_top_filter.as_ref(),
             join.output_schema.as_ref(),
             join.left_schema.len(),
             join,
@@ -223,7 +229,7 @@ impl<'cfg> PlannerContext<'cfg> {
         let right_full = (0..join.right_schema.len()).collect::<BTreeSet<_>>();
         let changed = left_pushdown.is_some()
             || right_pushdown.is_some()
-            || remaining != current_top_filter
+            || remaining != rewritten_top_filter
             || left_required != left_full
             || right_required != right_full;
         if !changed {

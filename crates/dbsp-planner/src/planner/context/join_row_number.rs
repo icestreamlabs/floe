@@ -7,7 +7,9 @@ impl<'cfg> PlannerContext<'cfg> {
         &mut self,
         filter: &datafusion::logical_expr::logical_plan::Filter,
     ) -> Result<Option<PlannedNode>, PlannerError> {
-        let Some((rank_column, limit)) = extract_row_number_limit(&filter.predicate)? else {
+        let Some((rank_column, limit, offset, residual_predicate)) =
+            extract_row_number_limit_with_residual(&filter.predicate)?
+        else {
             return Ok(None);
         };
 
@@ -78,7 +80,8 @@ impl<'cfg> PlannerContext<'cfg> {
             (partition_by, order_by, post_projection)
         };
         let order_by = self.map_sort_expressions(&order_by, input.schema.clone())?;
-        let topn = DbspTopNNode::try_new(input.schema.clone(), partition_by, order_by, limit, 0)?;
+        let topn =
+            DbspTopNNode::try_new(input.schema.clone(), partition_by, order_by, limit, offset)?;
         let output_schema = topn.output_schema().clone();
         let id = self.add_node(
             vec![input.id],
@@ -90,11 +93,26 @@ impl<'cfg> PlannerContext<'cfg> {
             schema: output_schema,
         };
 
-        if let Some(exprs) = post_projection {
-            return self.build_projection_items(topn_node, &exprs).map(Some);
+        let mut output = if let Some(exprs) = post_projection {
+            self.build_projection_items(topn_node, &exprs)?
+        } else {
+            topn_node
+        };
+
+        if let Some(residual_predicate) = residual_predicate {
+            let select = DbspSelectNode::try_new(output.schema.clone(), residual_predicate)?;
+            let id = self.add_node(
+                vec![output.id],
+                DbspNodeKind::Select(select),
+                output.schema.clone(),
+            );
+            output = PlannedNode {
+                id,
+                schema: output.schema,
+            };
         }
 
-        Ok(Some(topn_node))
+        Ok(Some(output))
     }
 
     pub(super) fn plan_join(
@@ -197,9 +215,37 @@ impl<'cfg> PlannerContext<'cfg> {
                     });
                 }
             }
-            return Err(PlannerError::UnsupportedJoin(
-                "joins must have at least one equi-key, a half-open range predicate, or an ASOF predicate".to_string(),
-            ));
+            if matches!(join_type, DbspJoinType::Inner | DbspJoinType::LeftOuter) {
+                let residual = if residuals.iter().all(is_true_literal) {
+                    None
+                } else if matches!(join_type, DbspJoinType::Inner) {
+                    combine_filters(residuals.clone())
+                } else {
+                    None
+                };
+                if residual.is_some() || residuals.iter().all(is_true_literal) {
+                    let join_node = DbspJoinNode::try_new_cross(
+                        join_type,
+                        left.schema.clone(),
+                        right.schema.clone(),
+                        residual,
+                    )
+                    .map_err(|err| PlannerError::UnsupportedJoin(err.to_string()))?;
+                    let output_schema = join_node.output_schema.clone();
+                    let id = self.add_node(
+                        vec![left.id, right.id],
+                        DbspNodeKind::Join(Box::new(join_node)),
+                        output_schema.clone(),
+                    );
+                    return Ok(PlannedNode {
+                        id,
+                        schema: output_schema,
+                    });
+                }
+            }
+            return Err(PlannerError::UnsupportedJoin(format!(
+                "joins must have at least one equi-key, a half-open range predicate, or an ASOF predicate (join_type={join_type:?}, residuals={residuals:?})"
+            )));
         }
         let key_pairs = prune_redundant_join_key_pairs(key_pairs)?;
 
@@ -310,4 +356,8 @@ impl<'cfg> PlannerContext<'cfg> {
             schema: output_schema,
         })
     }
+}
+
+fn is_true_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(ScalarValue::Boolean(Some(true)), _))
 }

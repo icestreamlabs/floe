@@ -44,6 +44,85 @@ impl DbspSourceNode {
 }
 
 #[derive(Clone, Debug)]
+pub struct DbspOneRowNode {
+    output_schema: Arc<RowSchema>,
+}
+
+impl DbspOneRowNode {
+    pub fn new(output_schema: Arc<RowSchema>) -> Self {
+        Self { output_schema }
+    }
+
+    pub fn output_schema(&self) -> &Arc<RowSchema> {
+        &self.output_schema
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DbspValuesNode {
+    output_schema: Arc<RowSchema>,
+    rows: Vec<Vec<DbspExpression>>,
+}
+
+impl DbspValuesNode {
+    pub fn try_new(output_schema: Arc<RowSchema>, rows: Vec<Vec<Expr>>) -> Result<Self> {
+        let empty_schema = RowSchema::try_new(Vec::new())?;
+        let mut typed_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != output_schema.len() {
+                bail!(
+                    "VALUES row has {} columns but schema has {}",
+                    row.len(),
+                    output_schema.len()
+                );
+            }
+            let mut typed_row = Vec::with_capacity(row.len());
+            for (idx, expr) in row.into_iter().enumerate() {
+                let expression = DbspExpression::analyze(expr, empty_schema.clone())?;
+                let field = output_schema.field(idx).expect("schema index checked");
+                if expression.data_type() != &field.data_type {
+                    bail!(
+                        "VALUES column {} type mismatch: expected {}, found {}",
+                        field.name,
+                        field.data_type.name(),
+                        expression.data_type().name()
+                    );
+                }
+                typed_row.push(expression);
+            }
+            typed_rows.push(typed_row);
+        }
+        Ok(Self {
+            output_schema,
+            rows: typed_rows,
+        })
+    }
+
+    pub fn output_schema(&self) -> &Arc<RowSchema> {
+        &self.output_schema
+    }
+
+    pub fn rows(&self) -> &[Vec<DbspExpression>] {
+        &self.rows
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DbspEmptyNode {
+    output_schema: Arc<RowSchema>,
+}
+
+impl DbspEmptyNode {
+    pub fn new(output_schema: Arc<RowSchema>) -> Self {
+        Self { output_schema }
+    }
+
+    pub fn output_schema(&self) -> &Arc<RowSchema> {
+        &self.output_schema
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ProjectItem {
     pub expr: Expr,
     pub alias: Option<String>,
@@ -185,9 +264,6 @@ impl DbspJoinKey {
                 left.data_type().name(),
                 right.data_type().name()
             );
-        }
-        if left.data_type() == &DbspScalarType::Bool {
-            bail!("boolean join keys are not supported");
         }
         Ok(Self { left, right })
     }
@@ -363,6 +439,39 @@ impl DbspJoinNode {
             right_schema,
             output_schema,
             keys,
+            residual,
+            range: None,
+            asof: None,
+        })
+    }
+
+    pub fn try_new_cross(
+        join_type: DbspJoinType,
+        left_schema: Arc<RowSchema>,
+        right_schema: Arc<RowSchema>,
+        residual: Option<Expr>,
+    ) -> Result<Self> {
+        if !matches!(join_type, DbspJoinType::Inner | DbspJoinType::LeftOuter) {
+            bail!("cross joins currently support INNER or LEFT OUTER semantics");
+        }
+        if !matches!(join_type, DbspJoinType::Inner) && residual.is_some() {
+            bail!("cross joins with residual predicates currently require INNER semantics");
+        }
+        let residual = if let Some(expr) = residual {
+            let combined_schema = Self::matched_schema(left_schema.clone(), right_schema.clone())?;
+            Some(DbspExpression::analyze(expr, combined_schema)?)
+        } else {
+            None
+        };
+        let output_schema =
+            Self::combined_schema(left_schema.clone(), right_schema.clone(), &join_type)?;
+
+        Ok(Self {
+            join_type,
+            left_schema,
+            right_schema,
+            output_schema,
+            keys: Vec::new(),
             residual,
             range: None,
             asof: None,
@@ -708,9 +817,6 @@ impl GroupKeyExpr {
     fn try_new(expr: Expr, input_schema: Arc<RowSchema>, alias: Option<String>) -> Result<Self> {
         let expression = DbspExpression::analyze(expr, input_schema)?;
         let alias = alias.unwrap_or_else(|| expression.expr().schema_name().to_string());
-        if expression.data_type() == &DbspScalarType::Bool {
-            bail!("boolean values are not supported as group keys");
-        }
         Ok(Self { expression, alias })
     }
 
@@ -885,9 +991,6 @@ impl OrderExpr {
         nulls_first: bool,
     ) -> Result<Self> {
         let expression = DbspExpression::analyze(expr, input_schema)?;
-        if expression.data_type() == &DbspScalarType::Bool {
-            bail!("boolean ordering is not supported");
-        }
         Ok(Self {
             expression,
             ascending,
@@ -934,9 +1037,6 @@ impl DbspTopNNode {
         let mut partition_exprs = Vec::with_capacity(partition_by.len());
         for expr in partition_by {
             let analyzed = DbspExpression::analyze(expr, input_schema.clone())?;
-            if analyzed.data_type() == &DbspScalarType::Bool {
-                bail!("boolean partition keys are not supported");
-            }
             partition_exprs.push(analyzed);
         }
         Ok(Self {

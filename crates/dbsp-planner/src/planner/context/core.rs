@@ -78,7 +78,9 @@ impl<'cfg> PlannerContext<'cfg> {
                     current.id = id;
                 }
 
-                if let Some(projection) = &scan.projection {
+                if let Some(projection) = &scan.projection
+                    && !projection.is_empty()
+                {
                     let mut items = Vec::with_capacity(projection.len());
                     for idx in projection {
                         let Some(field) = source_schema.field(*idx) else {
@@ -138,11 +140,9 @@ impl<'cfg> PlannerContext<'cfg> {
                 }
 
                 let input = self.plan_node(&filter.input)?;
-                if let Some(optimized) = self.optimize_join_subtree(
-                    input.clone(),
-                    Some(normalized_predicate.clone()),
-                    None,
-                )? {
+                if let Some(optimized) =
+                    self.optimize_join_subtree(input.clone(), Some(filter.predicate.clone()), None)?
+                {
                     return Ok(optimized);
                 }
                 let mut predicate_schema = input.schema.clone();
@@ -212,13 +212,33 @@ impl<'cfg> PlannerContext<'cfg> {
             LogicalPlan::Subquery(subquery) => self.plan_node(&subquery.subquery),
             LogicalPlan::Repartition(repartition) => self.plan_node(&repartition.input),
             LogicalPlan::Distinct(distinct) => self.plan_distinct(distinct),
-            LogicalPlan::EmptyRelation(relation) => Err(PlannerError::UnsupportedPlan(format!(
-                "empty relation nodes are not supported (produce_one_row = {})",
-                relation.produce_one_row
-            ))),
-            LogicalPlan::Values(_) => Err(PlannerError::UnsupportedPlan(
-                "VALUES lists are not supported".to_string(),
-            )),
+            LogicalPlan::EmptyRelation(relation) => {
+                let output_schema = row_schema_from_dfschema(relation.schema.as_ref())?;
+                if !relation.produce_one_row {
+                    return Ok(self.build_empty_node(output_schema));
+                }
+                let one_row = DbspOneRowNode::new(output_schema.clone());
+                let id =
+                    self.add_node(vec![], DbspNodeKind::OneRow(one_row), output_schema.clone());
+                Ok(PlannedNode {
+                    id,
+                    schema: output_schema,
+                })
+            }
+            LogicalPlan::Values(values) => {
+                let output_schema = row_schema_from_dfschema(values.schema.as_ref())?;
+                let values_node =
+                    DbspValuesNode::try_new(output_schema.clone(), values.values.clone())?;
+                let id = self.add_node(
+                    vec![],
+                    DbspNodeKind::Values(values_node),
+                    output_schema.clone(),
+                );
+                Ok(PlannedNode {
+                    id,
+                    schema: output_schema,
+                })
+            }
             LogicalPlan::Explain(_) => Err(PlannerError::UnsupportedPlan(
                 "EXPLAIN plans are not supported".to_string(),
             )),
@@ -245,4 +265,18 @@ impl<'cfg> PlannerContext<'cfg> {
             ),
         }
     }
+}
+
+pub(super) fn row_schema_from_dfschema(schema: &DFSchema) -> Result<Arc<RowSchema>, PlannerError> {
+    let fields = schema
+        .iter()
+        .map(|(_, field)| {
+            Ok(Field::new(
+                field.name().to_string(),
+                DbspScalarType::try_from_arrow(field.data_type())?,
+                field.is_nullable(),
+            ))
+        })
+        .collect::<Result<Vec<_>, anyhow::Error>>()?;
+    RowSchema::try_new(fields).map_err(PlannerError::from)
 }

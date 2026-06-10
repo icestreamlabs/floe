@@ -725,7 +725,7 @@ pub(super) fn record_ingest_queue_metrics(metrics_input: IngestMetrics<'_>) {
     let queue_depth: usize = metrics_input
         .connector_queues
         .iter()
-        .map(|queue| queue.pending.len())
+        .map(ConnectorQueue::pending_rows)
         .sum();
     let total_queue_depth = queue_depth.saturating_add(metrics_input.connector_receiver_len);
     metrics::record_ingest_queue_depth(total_queue_depth);

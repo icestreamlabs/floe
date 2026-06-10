@@ -31,3 +31,11 @@ fn floe_validation_queries_use_supported_floe_surface_for_string_queries() {
         assert!(!lower.contains("split_part("), "{query_id}: {query}");
     }
 }
+
+#[test]
+fn engine_selector_accepts_comma_separated_engines() {
+    let selector = Engine::parse("floe,risingwave").expect("engine selector");
+
+    assert_eq!(selector.selected(), vec![Engine::Floe, Engine::RisingWave]);
+    assert_eq!(selector.as_str(), "floe,risingwave");
+}

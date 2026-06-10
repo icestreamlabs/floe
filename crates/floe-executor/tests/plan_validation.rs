@@ -4,12 +4,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use datafusion::common::Column;
+use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::logical_expr::{JoinType, LogicalPlanBuilder, col, lit, table_scan};
 
 use floe_executor::dbsp_plan::{
     CircuitNode, CircuitPlan, DbspAggregateFunction, DbspAggregateNode, DbspNodeKind,
-    DbspPlanBuilder, DbspScalarType, DbspSourceNode, DbspWindowAggregateNode, DbspWindowPolicy,
-    DbspWindowSpec, Field, PlannerConfig, RowSchema, TableDescriptor,
+    DbspPlanBuilder, DbspScalarType, DbspSourceNode, DbspValuesNode, DbspWindowAggregateNode,
+    DbspWindowPolicy, DbspWindowSpec, Field, PlannerConfig, RowSchema, TableDescriptor,
     nexmark_auction_table as raw_nexmark_auction_table, nexmark_bid_table as raw_nexmark_bid_table,
     nexmark_config as raw_nexmark_config, nexmark_person_table as raw_nexmark_person_table,
     validate_dbsp_plan,
@@ -112,6 +113,33 @@ fn accepts_topn_operator() -> Result<()> {
 }
 
 #[test]
+fn accepts_empty_operator_without_sources() -> Result<()> {
+    let planner = planner();
+    let plan = empty_plan(&planner)?;
+    let sources = BTreeSet::new();
+
+    let validated = validate_dbsp_plan(&plan, &sources, "mv_empty")?;
+    assert_eq!(validated.root_node, plan.root);
+    assert!(validated.required_sources.is_empty());
+    let root = plan.node(plan.root).expect("root");
+    assert!(matches!(root.kind, DbspNodeKind::Empty(_)));
+    Ok(())
+}
+
+#[test]
+fn accepts_values_operator_without_sources() -> Result<()> {
+    let plan = values_plan()?;
+    let sources = BTreeSet::new();
+
+    let validated = validate_dbsp_plan(&plan, &sources, "mv_values")?;
+    assert_eq!(validated.root_node, plan.root);
+    assert!(validated.required_sources.is_empty());
+    let root = plan.node(plan.root).expect("root");
+    assert!(matches!(root.kind, DbspNodeKind::Values(_)));
+    Ok(())
+}
+
+#[test]
 fn accepts_union_operator() -> Result<()> {
     let planner = planner();
     let plan = union_plan(&planner)?;
@@ -148,6 +176,31 @@ fn accepts_window_aggregate_operator() -> Result<()> {
 
     let validated = validate_dbsp_plan(&plan, &sources, "mv_window")?;
     assert_eq!(validated.root_node, plan.root);
+    Ok(())
+}
+
+#[test]
+fn accepts_boolean_group_key_and_ordering_plans() -> Result<()> {
+    let table = bool_events_table()?;
+    let schema = table.schema().to_arrow_schema();
+    let mut config = PlannerConfig::new();
+    config.register_owned_table(table.clone());
+    let planner = DbspPlanBuilder::new(config);
+
+    let grouped_plan = table_scan(Some(table.name()), &schema, None)?
+        .aggregate(vec![col("active")], vec![count(lit(1_i64)).alias("count")])?
+        .build()?;
+    let grouped_circuit = planner.build(&grouped_plan)?;
+    let mut sources = BTreeSet::new();
+    sources.insert(table.source_name().to_string());
+    validate_dbsp_plan(&grouped_circuit, &sources, "mv_bool_group")?;
+
+    let ordered_plan = table_scan(Some(table.name()), &schema, None)?
+        .sort(vec![col("active").sort(false, true)])?
+        .limit(0, Some(5))?
+        .build()?;
+    let ordered_circuit = planner.build(&ordered_plan)?;
+    validate_dbsp_plan(&ordered_circuit, &sources, "mv_bool_topn")?;
     Ok(())
 }
 
@@ -270,6 +323,35 @@ fn topn_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     Ok(planner.build(&logical_plan)?)
 }
 
+fn empty_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
+    let bid = nexmark_bid_table();
+    let logical_plan = table_scan(Some(bid.name()), &schema_for(bid), None)?
+        .limit(0, Some(0))?
+        .build()?;
+    Ok(planner.build(&logical_plan)?)
+}
+
+fn values_plan() -> Result<CircuitPlan> {
+    let schema = RowSchema::try_new(vec![
+        Field::new("id", DbspScalarType::Int64, false),
+        Field::new("note", DbspScalarType::Utf8, false),
+    ])?;
+    let values = DbspValuesNode::try_new(
+        Arc::clone(&schema),
+        vec![vec![lit(1_i64), lit("a")], vec![lit(2_i64), lit("b")]],
+    )?;
+    let node = CircuitNode {
+        id: 0,
+        kind: DbspNodeKind::Values(values),
+        inputs: vec![],
+        output_schema: schema,
+    };
+    Ok(CircuitPlan {
+        root: 0,
+        nodes: vec![node],
+    })
+}
+
 fn union_plan(planner: &DbspPlanBuilder) -> Result<CircuitPlan> {
     let bid = nexmark_bid_table();
     let left = table_scan(Some(bid.name()), &schema_for(bid), None)?.build()?;
@@ -341,6 +423,17 @@ fn window_aggregate_plan() -> Result<CircuitPlan> {
         root: 1,
         nodes: vec![source, window_node],
     })
+}
+
+fn bool_events_table() -> Result<TableDescriptor> {
+    Ok(TableDescriptor::try_new(
+        "events",
+        vec![
+            Field::new("id", DbspScalarType::Int64, false),
+            Field::new("active", DbspScalarType::Bool, false),
+        ],
+        &["id"],
+    )?)
 }
 
 fn planner() -> DbspPlanBuilder {

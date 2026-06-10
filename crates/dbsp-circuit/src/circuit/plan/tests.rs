@@ -65,6 +65,20 @@ fn join_requires_matching_key_types() {
 }
 
 #[test]
+fn join_accepts_boolean_keys() {
+    let schema = base_schema();
+    let join = DbspJoinNode::try_new(
+        DbspJoinType::Inner,
+        schema.clone(),
+        schema.clone(),
+        vec![(col("flag"), col("flag"))],
+        None,
+    )
+    .expect("boolean-key join");
+    assert_eq!(join.keys[0].data_type(), &DbspScalarType::Bool);
+}
+
+#[test]
 fn left_outer_join_marks_right_columns_nullable() {
     let left = base_schema();
     let right = RowSchema::try_new(vec![
@@ -194,6 +208,35 @@ fn aggregate_output_schema_combines_keys_and_aggs() {
     )
     .expect("aggregate");
     assert_eq!(agg.output_schema().len(), 2);
+}
+
+#[test]
+fn aggregate_accepts_boolean_group_keys() {
+    let schema = base_schema();
+    let agg = DbspAggregateNode::try_new(
+        schema.clone(),
+        vec![(col("flag"), Some("flag".to_string()))],
+        vec![(DbspAggregateFunction::Count, None, None, false, None)],
+    )
+    .expect("boolean group key");
+    assert_eq!(
+        agg.output_schema().field(0).expect("group key").data_type,
+        DbspScalarType::Bool
+    );
+}
+
+#[test]
+fn topn_accepts_boolean_order_and_partition_keys() {
+    let schema = base_schema();
+    let order =
+        OrderExpr::try_new(col("flag"), schema.clone(), true, true).expect("boolean ordering");
+    let topn = DbspTopNNode::try_new(schema, vec![col("flag")], vec![order], 5, 0)
+        .expect("boolean topn keys");
+    assert_eq!(
+        topn.order_by()[0].expression().data_type(),
+        &DbspScalarType::Bool
+    );
+    assert_eq!(topn.partition_by()[0].data_type(), &DbspScalarType::Bool);
 }
 
 #[test]

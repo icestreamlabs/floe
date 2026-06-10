@@ -47,7 +47,7 @@ use floe_executor::checkpoint::{
 use floe_executor::source_journal::{
     KafkaSourceJournal, KafkaSourceJournalRange, VectorizedSourceBatchJournal,
     append_vectorized_entry_to_batch, kafka_source_journal_initial_checksum,
-    update_kafka_source_journal_checksum,
+    update_kafka_source_journal_checksum, update_kafka_source_journal_checksum_parts,
 };
 use floe_executor::{
     DbspMaintenance, FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
@@ -141,11 +141,21 @@ fn is_reconnectable_postgres_cdc_error(err: &anyhow::Error) -> bool {
 struct ConnectorQueue {
     id: usize,
     name: String,
-    pending: VecDeque<QueuedAppendIngestEvent>,
+    pending: VecDeque<QueuedAppendIngestItem>,
+}
+
+enum QueuedAppendIngestItem {
+    Event(QueuedAppendIngestEvent),
+    KafkaRaw(QueuedKafkaRawIngestBatch),
 }
 
 struct QueuedAppendIngestEvent {
     event: core_source::AppendIngestEvent,
+    commit_ack: Option<core_source::CommitAck>,
+}
+
+struct QueuedKafkaRawIngestBatch {
+    batch: core_source::KafkaRawIngestBatch,
     commit_ack: Option<core_source::CommitAck>,
 }
 
@@ -155,9 +165,17 @@ struct SelectedAppendIngestEvent {
     commit_ack: Option<core_source::CommitAck>,
 }
 
+struct SelectedKafkaRawIngestBatch {
+    source_id: Option<usize>,
+    batch: core_source::KafkaRawIngestBatch,
+    commit_ack: Option<core_source::CommitAck>,
+}
+
 struct BatchSelection {
     batch: Vec<SelectedAppendIngestEvent>,
+    kafka_raw_batches: Vec<SelectedKafkaRawIngestBatch>,
     per_connector_counts: Vec<usize>,
+    selected_rows: usize,
 }
 
 struct QueuedCdcTransaction {
@@ -240,6 +258,19 @@ impl ConnectorQueue {
             id,
             name: name.into(),
             pending: VecDeque::new(),
+        }
+    }
+
+    fn pending_rows(&self) -> usize {
+        self.pending.iter().map(QueuedAppendIngestItem::len).sum()
+    }
+}
+
+impl QueuedAppendIngestItem {
+    fn len(&self) -> usize {
+        match self {
+            Self::Event(_) => 1,
+            Self::KafkaRaw(batch) => batch.batch.len(),
         }
     }
 }

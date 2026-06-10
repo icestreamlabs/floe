@@ -3,8 +3,8 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int64Array,
-    StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array,
+    Int64Array, StringArray, TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -255,6 +255,7 @@ fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> 
             DataType::Boolean => payload.push(0x08),
             DataType::Date32 => payload.push(0x0A),
             DataType::Decimal128(_, _) => payload.push(0x0C),
+            DataType::Float64 => payload.push(0x0E),
             DataType::Null => payload.push(0x00),
             other => {
                 return internal_err!(
@@ -314,6 +315,13 @@ fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> 
             };
             payload.push(0x0B);
             payload.extend_from_slice(&values.value(row).to_le_bytes());
+        }
+        DataType::Float64 => {
+            let Some(values) = column.as_any().downcast_ref::<Float64Array>() else {
+                return internal_err!("expected Float64 payload array");
+            };
+            payload.push(0x0D);
+            payload.extend_from_slice(&values.value(row).to_bits().to_le_bytes());
         }
         DataType::Null => {
             payload.push(0x00);

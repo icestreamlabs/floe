@@ -8,10 +8,11 @@ pub use arrow_batch::{
     KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME, delta_arrow_fields, delta_arrow_schema,
 };
 pub use plan::{
-    DbspAggregateFunction, DbspAggregateNode, DbspAsofJoinSpec, DbspDistinctNode, DbspExpression,
-    DbspJoinNode, DbspJoinType, DbspNodeKind, DbspPredicate, DbspProjectNode, DbspRangeJoinSpec,
-    DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
-    DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, OrderExpr, ProjectItem,
+    DbspAggregateFunction, DbspAggregateNode, DbspAsofJoinSpec, DbspDistinctNode, DbspEmptyNode,
+    DbspExpression, DbspJoinNode, DbspJoinType, DbspNodeKind, DbspOneRowNode, DbspPredicate,
+    DbspProjectNode, DbspRangeJoinSpec, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode,
+    DbspUnionNode, DbspValuesNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec,
+    OrderExpr, ProjectItem,
 };
 pub use schema::{Field, FieldRef, PrimaryKey, RowSchema};
 pub use tables::{
