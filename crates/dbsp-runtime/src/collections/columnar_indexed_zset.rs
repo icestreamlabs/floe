@@ -18,6 +18,9 @@ use super::columnar_zset::{
     value_array_refs,
 };
 
+const RANGE_LOOKUP_MIN_KEYS: usize = 128;
+const RANGE_LOOKUP_CHUNK_KEYS: usize = 512;
+
 pub struct SlateBackedColumnarIndexedZSet {
     table: Arc<dyn KeyValueTable>,
     namespace: String,
@@ -170,7 +173,7 @@ impl SlateBackedColumnarIndexedZSet {
     }
 
     pub async fn lookup_key_batches(&self, key_batches: &[RecordBatch]) -> Result<ColumnarZSet> {
-        let key_bytes = self.key_bytes_from_batches(key_batches)?;
+        let mut key_bytes = self.key_bytes_from_batches(key_batches)?;
         if key_bytes.is_empty() {
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
         }
@@ -179,27 +182,14 @@ impl SlateBackedColumnarIndexedZSet {
         }
 
         let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
-        for key in key_bytes {
-            for (entry_key, entry_value) in self
-                .table
-                .scan_range_bytes(
-                    prefix_bounds(&self.index_prefix_for_key(&key)?),
-                    &ScanOptions::default(),
-                )
-                .await
-                .context("scan columnar index key postings")?
-            {
-                let segment_id = segment_id_from_index_key(entry_key.as_ref())?;
-                for (row_index, weight) in decode_index_postings(entry_value.as_ref())? {
-                    if weight != 0 {
-                        refs_by_segment
-                            .entry(segment_id)
-                            .or_default()
-                            .push(row_index);
-                    }
-                }
-            }
-        }
+        if key_bytes.len() >= RANGE_LOOKUP_MIN_KEYS {
+            key_bytes.sort_unstable();
+            self.lookup_key_ranges(&key_bytes, &mut refs_by_segment)
+                .await?;
+        } else {
+            self.lookup_keys_individually(&key_bytes, &mut refs_by_segment)
+                .await?;
+        };
 
         if refs_by_segment.is_empty() {
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
@@ -216,6 +206,94 @@ impl SlateBackedColumnarIndexedZSet {
         }
         ColumnarZSet::try_new_weighted(Arc::clone(&self.value_schema), batches)
             .context("build columnar indexed zset lookup result")
+    }
+
+    async fn lookup_keys_individually(
+        &self,
+        key_bytes: &[Vec<u8>],
+        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
+    ) -> Result<()> {
+        for key in key_bytes {
+            let entries = self
+                .table
+                .scan_range_bytes(
+                    prefix_bounds(&self.index_prefix_for_key(key)?),
+                    &ScanOptions::default(),
+                )
+                .await
+                .context("scan columnar index key postings")?;
+            self.collect_posting_entries(entries, None, refs_by_segment)?;
+        }
+        Ok(())
+    }
+
+    async fn lookup_key_ranges(
+        &self,
+        sorted_key_bytes: &[Vec<u8>],
+        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
+    ) -> Result<()> {
+        for chunk in sorted_key_bytes.chunks(RANGE_LOOKUP_CHUNK_KEYS) {
+            let Some(first_key) = chunk.first() else {
+                continue;
+            };
+            let Some(last_key) = chunk.last() else {
+                continue;
+            };
+            let start = self.index_prefix_for_key(first_key)?;
+            let end = prefix_bounds(&self.index_prefix_for_key(last_key)?).end;
+            let wanted_keys = chunk.iter().cloned().collect::<HashSet<Vec<u8>>>();
+            let entries = self
+                .table
+                .scan_range_bytes(start..end, &ScanOptions::default())
+                .await
+                .context("scan columnar index key posting range")?;
+            self.collect_posting_entries(entries, Some(&wanted_keys), refs_by_segment)?;
+        }
+        Ok(())
+    }
+
+    fn collect_posting_entries<K, V>(
+        &self,
+        entries: Vec<(K, V)>,
+        wanted_keys: Option<&HashSet<Vec<u8>>>,
+        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        for (entry_key, entry_value) in entries {
+            if let Some(wanted_keys) = wanted_keys {
+                let key_bytes = self.lookup_key_bytes_from_index_key(entry_key.as_ref())?;
+                if !wanted_keys.contains(key_bytes) {
+                    continue;
+                }
+            }
+            let segment_id = segment_id_from_index_key(entry_key.as_ref())?;
+            for (row_index, weight) in decode_index_postings(entry_value.as_ref())? {
+                if weight != 0 {
+                    refs_by_segment
+                        .entry(segment_id)
+                        .or_default()
+                        .push(row_index);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_key_bytes_from_index_key<'a>(&self, index_key: &'a [u8]) -> Result<&'a [u8]> {
+        if !index_key.starts_with(&self.index_prefix) {
+            bail!("columnar index posting key prefix mismatch");
+        }
+        let mut cursor = self.index_prefix.len();
+        let key_len = usize::try_from(read_u32(index_key, &mut cursor)?)
+            .context("columnar index key length out of range")?;
+        let key_bytes = read_bytes(index_key, &mut cursor, key_len, "columnar index key bytes")?;
+        if index_key.len() < cursor.saturating_add(8) {
+            bail!("columnar index posting key missing segment id");
+        }
+        Ok(key_bytes)
     }
 
     async fn clear_persisted(&self) -> Result<()> {
@@ -759,6 +837,43 @@ mod tests {
             lookup_rows(&found),
             vec![(1, "a".to_string(), 10, 1), (1, "b".to_string(), 20, 2)]
         );
+    }
+
+    #[tokio::test]
+    async fn columnar_index_large_lookup_uses_chunked_range_scans() {
+        let inner = build_table("columnar-index-large-lookup").await;
+        let counting = Arc::new(CountingTable::new(inner));
+        let table: Arc<dyn KeyValueTable> = counting.clone();
+        let mut index =
+            SlateBackedColumnarIndexedZSet::new(table, "orders_by_id", value_schema(), vec![0])
+                .await
+                .expect("index");
+        let rows = RANGE_LOOKUP_MIN_KEYS * 2;
+        let ids = (0..rows as i64).collect::<Vec<_>>();
+        let delta = ColumnarZSet::try_new_weighted(
+            value_schema(),
+            vec![weighted_batch(
+                ids.clone(),
+                vec!["n"; rows],
+                ids.iter().map(|id| id * 10).collect(),
+                vec![1; rows],
+            )],
+        )
+        .expect("delta");
+        index.apply_delta(&delta).await.expect("apply delta");
+
+        counting.reset_scan_range_calls();
+        let found = index
+            .lookup_key_batches(&[key_batch(ids)])
+            .await
+            .expect("lookup");
+        let found_rows = found
+            .batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        assert_eq!(found_rows, rows);
+        assert_eq!(counting.scan_range_calls(), 1);
     }
 
     #[tokio::test]

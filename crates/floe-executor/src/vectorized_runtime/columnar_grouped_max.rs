@@ -834,10 +834,10 @@ async fn apply_grouped_max_delta(
             if let Some(new_max) = new_max {
                 builder.append(&delta.batch, delta.row_idx, columnar.max_idx, new_max, 1)?;
             }
+            columnar
+                .max_state
+                .write_max(&mut writes, &group_key, new_max)?;
         }
-        columnar
-            .max_state
-            .write_max(&mut writes, &group_key, new_max)?;
         if new_max.is_some() {
             merge_group_key_bounds_update(&mut bounds_update, &group_key);
         }
