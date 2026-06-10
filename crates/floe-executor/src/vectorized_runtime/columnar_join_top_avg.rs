@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int64Array, UInt32Array};
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
@@ -118,9 +118,12 @@ pub(super) async fn build_columnar_join_top_avg_materialized_view_state(
         .with_context(|| format!("find join-top-avg right key '{}'", plan.right_key_column))?;
     if output_schema.fields().len() != 2
         || output_schema.field(0).data_type() != &DataType::Int64
-        || output_schema.field(1).data_type() != &DataType::Float64
+        || !matches!(
+            output_schema.field(1).data_type(),
+            DataType::Float64 | DataType::Int64
+        )
     {
-        bail!("join-top-avg output schema must be (Int64, Float64)");
+        bail!("join-top-avg output schema must be (Int64, Float64|Int64)");
     }
 
     let mv_namespace = namespaces::materialized_view(view_name)?;
@@ -363,7 +366,7 @@ async fn apply_avg_delta(
 
     let weighted_schema = weighted_snapshot_schema(output_schema)?;
     let mut groups = Vec::new();
-    let mut avgs = Vec::new();
+    let mut avgs = JoinTopAvgOutputValues::new(output_schema)?;
     let mut weights = Vec::new();
     let mut writes = WriteBatch::new();
     for (group, (sum_delta, count_delta)) in pending {
@@ -379,13 +382,13 @@ async fn apply_avg_delta(
         }
         if old_count > 0 {
             groups.push(group);
-            avgs.push(old_sum as f64 / old_count as f64);
+            avgs.push(old_sum, old_count)?;
             weights.push(-1);
         }
         state.write(&mut writes, group, new_sum, new_count)?;
         if new_count > 0 {
             groups.push(group);
-            avgs.push(new_sum as f64 / new_count as f64);
+            avgs.push(new_sum, new_count)?;
             weights.push(1);
         }
     }
@@ -401,10 +404,44 @@ async fn apply_avg_delta(
         weighted_schema,
         vec![
             Arc::new(Int64Array::from(groups)) as ArrayRef,
-            Arc::new(Float64Array::from(avgs)) as ArrayRef,
+            avgs.into_array(),
             Arc::new(Int64Array::from(weights)) as ArrayRef,
         ],
     )?])
+}
+
+enum JoinTopAvgOutputValues {
+    Float64(Vec<f64>),
+    Int64(Vec<i64>),
+}
+
+impl JoinTopAvgOutputValues {
+    fn new(output_schema: &SchemaRef) -> Result<Self> {
+        match output_schema.field(1).data_type() {
+            DataType::Float64 => Ok(Self::Float64(Vec::new())),
+            DataType::Int64 => Ok(Self::Int64(Vec::new())),
+            other => bail!("join-top-avg unsupported output value type {other:?}"),
+        }
+    }
+
+    fn push(&mut self, sum: i64, count: i64) -> Result<()> {
+        ensure!(
+            count > 0,
+            "join-top-avg cannot emit average with non-positive count"
+        );
+        match self {
+            Self::Float64(values) => values.push(sum as f64 / count as f64),
+            Self::Int64(values) => values.push((sum as f64 / count as f64) as i64),
+        }
+        Ok(())
+    }
+
+    fn into_array(self) -> ArrayRef {
+        match self {
+            Self::Float64(values) => Arc::new(Float64Array::from(values)),
+            Self::Int64(values) => Arc::new(Int64Array::from(values)),
+        }
+    }
 }
 
 fn source_input_delta(
@@ -571,8 +608,16 @@ impl JoinTopAvgEvaluator {
     ) -> Result<Option<i64>> {
         let left_ids = int64_column(left_batch, self.left.id)?;
         let auction_id = left_ids.value(left_row_idx);
-        let auction_start = i64_or_timestamp_value(left_batch, self.left.date_time, left_row_idx)?;
-        let auction_expires = i64_or_timestamp_value(left_batch, self.left.expires, left_row_idx)?;
+        let Some(auction_start) =
+            nullable_i64_or_timestamp_value(left_batch, self.left.date_time, left_row_idx)?
+        else {
+            return Ok(None);
+        };
+        let Some(auction_expires) =
+            nullable_i64_or_timestamp_value(left_batch, self.left.expires, left_row_idx)?
+        else {
+            return Ok(None);
+        };
         let mut best: Option<(i64, i64)> = None;
         for right_batch in right_batches {
             let right_auctions = int64_column(right_batch, self.right.auction)?;
@@ -584,8 +629,14 @@ impl JoinTopAvgEvaluator {
                 {
                     continue;
                 }
-                let bid_time =
-                    i64_or_timestamp_value(right_batch, self.right.date_time, right_row_idx)?;
+                let Some(bid_time) = nullable_i64_or_timestamp_value(
+                    right_batch,
+                    self.right.date_time,
+                    right_row_idx,
+                )?
+                else {
+                    continue;
+                };
                 if bid_time < auction_start || bid_time > auction_expires {
                     continue;
                 }
@@ -1014,14 +1065,18 @@ fn field_index(schema: &SchemaRef, names: &[&str]) -> Result<usize> {
     bail!("join-top-avg schema missing field aliases {names:?}")
 }
 
-fn i64_or_timestamp_value(batch: &RecordBatch, idx: usize, row_idx: usize) -> Result<i64> {
+fn nullable_i64_or_timestamp_value(
+    batch: &RecordBatch,
+    idx: usize,
+    row_idx: usize,
+) -> Result<Option<i64>> {
     match batch.schema().field(idx).data_type() {
         DataType::Int64 => {
             let values = int64_column(batch, idx)?;
             if values.is_null(row_idx) {
-                bail!("join-top-avg time column cannot be NULL");
+                return Ok(None);
             }
-            Ok(values.value(row_idx))
+            Ok(Some(values.value(row_idx)))
         }
         DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Millisecond, _) => {
             let values = batch
@@ -1030,9 +1085,9 @@ fn i64_or_timestamp_value(batch: &RecordBatch, idx: usize, row_idx: usize) -> Re
                 .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
                 .ok_or_else(|| anyhow::anyhow!("join-top-avg column must be TimestampMillis"))?;
             if values.is_null(row_idx) {
-                bail!("join-top-avg timestamp column cannot be NULL");
+                return Ok(None);
             }
-            Ok(values.value(row_idx))
+            Ok(Some(values.value(row_idx)))
         }
         other => bail!("join-top-avg unsupported time column type {other:?}"),
     }

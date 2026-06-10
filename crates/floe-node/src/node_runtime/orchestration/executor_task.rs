@@ -878,13 +878,13 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     "state_write",
                     tick_all_start.elapsed().as_millis() as u64,
                 );
-                tracing::error!(epoch, error = %err, "failed to run vectorized materialization tick");
+                tracing::error!(epoch, error = ?err, "failed to run vectorized materialization tick");
                 let failed_acks = std::mem::take(tick_commit_acks);
                 record_fatal_tick_failure(
                     failed_acks,
                     &failure_for_executor,
                     &executor_cancel,
-                    format!("failed to run vectorized materialization tick {epoch}: {err}"),
+                    format!("failed to run vectorized materialization tick {epoch}: {err:?}"),
                 )
                 .await;
                 metrics::inc_ingest_tick("error");

@@ -265,6 +265,17 @@ fn top_avg_rows(batches: &[RecordBatch]) -> Vec<(i64, f64)> {
     rows
 }
 
+fn top_avg_int_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let groups = int64_values(batch, 0);
+        let avgs = int64_values(batch, 1);
+        rows.extend(groups.into_iter().zip(avgs));
+    }
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
 fn grouped_stats_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64, f64, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -8371,6 +8382,224 @@ async fn join_top_avg_uses_slate_backed_columnar_operator_incrementally() {
         weighted_top_avg_rows(&delta),
         vec![(101, 175.0, -1), (101, 125.0, 1)]
     );
+}
+
+#[tokio::test]
+async fn join_top_avg_accepts_casted_int_average_output() {
+    let auctions = SourceDefinition::new(
+        "auction",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+            SourceColumn::new_nullable("expires", SourceDataType::TimestampMillis, false),
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("auction source definition");
+    let bids = SourceDefinition::new(
+        "bid",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("bid source definition");
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let auction_batch = RecordBatch::try_new(
+        Arc::clone(&auction_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(TimestampMillisecondArray::from(vec![10, 10])),
+            Arc::new(TimestampMillisecondArray::from(vec![100, 100])),
+            Arc::new(Int64Array::from(vec![101, 101])),
+        ],
+    )
+    .expect("auction batch");
+    let bid_batch = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![100, 200, 50])),
+            Arc::new(TimestampMillisecondArray::from(vec![20, 15, 25])),
+        ],
+    )
+    .expect("bid batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("moving_avg_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT seller, CAST(AVG(price) AS BIGINT) AS moving_avg_price \
+        FROM (SELECT a.seller, b.price, b.\"dateTime\", \
+        ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC) AS rownum \
+        FROM auction a JOIN bid b ON a.id = b.auction \
+        WHERE b.\"dateTime\" BETWEEN a.\"dateTime\" AND a.expires) ranked \
+        WHERE rownum <= 1 GROUP BY seller";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_seller_avg_int",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(
+            build_operator_state_table("vectorized-columnar-join-top-avg-int").await,
+        ),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoinTopAvg
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "auction",
+            vec![auction_batch.clone()],
+            vec![auction_batch],
+        )
+        .await
+        .expect("append auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bid",
+            vec![bid_batch.clone()],
+            vec![bid_batch],
+        )
+        .await
+        .expect("append bids");
+    runtime.run_tick(1).await.expect("tick");
+
+    let handle = registry
+        .get("mv_seller_avg_int")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    assert_eq!(top_avg_int_rows(&snapshot), vec![(101, 125)]);
+}
+
+#[tokio::test]
+async fn join_top_avg_accepts_q4_max_then_casted_average_shape() {
+    let auctions = SourceDefinition::new(
+        "nexmark_auction",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::TimestampMillis, true),
+            SourceColumn::new_nullable("expires", SourceDataType::TimestampMillis, true),
+            SourceColumn::new_nullable("category", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("auction source definition");
+    let bids = SourceDefinition::new(
+        "nexmark_bid",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::TimestampMillis, true),
+        ],
+    )
+    .expect("bid source definition");
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let auction_batch = RecordBatch::try_new(
+        Arc::clone(&auction_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(10),
+                Some(10),
+                Some(10),
+                None,
+            ])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(100),
+                Some(100),
+                Some(100),
+                Some(100),
+            ])),
+            Arc::new(Int64Array::from(vec![10, 10, 20, 10])),
+        ],
+    )
+    .expect("auction batch");
+    let bid_batch = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2, 3, 3, 4])),
+            Arc::new(Int64Array::from(vec![100, 200, 50, 500, 300, 400, 1000])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(20),
+                Some(15),
+                Some(25),
+                None,
+                Some(30),
+                Some(200),
+                Some(40),
+            ])),
+        ],
+    )
+    .expect("bid batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Int64, false),
+        Field::new("avg_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT category, CAST(AVG(max) AS BIGINT) AS avg_price \
+        FROM (SELECT MAX(b.price) AS max, a.category \
+        FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+        WHERE b.date_time BETWEEN a.date_time AND a.expires \
+        GROUP BY a.id, a.category) per_auction GROUP BY category";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_q4_avg_price",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(
+            build_operator_state_table("vectorized-columnar-join-top-avg-q4").await,
+        ),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarJoinTopAvg
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_auction",
+            vec![auction_batch.clone()],
+            vec![auction_batch],
+        )
+        .await
+        .expect("append auctions");
+    runtime.run_tick(1).await.expect("auction-only tick");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_bid",
+            vec![bid_batch.clone()],
+            vec![bid_batch],
+        )
+        .await
+        .expect("append bids");
+    runtime.run_tick(2).await.expect("bid tick");
+
+    let handle = registry.get("mv_q4_avg_price").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(top_avg_int_rows(&snapshot), vec![(10, 125), (20, 300)]);
 }
 
 #[tokio::test]
