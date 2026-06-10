@@ -10,7 +10,7 @@ use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
+use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::empty::EmptyExec;
 use dbsp::create_logical_plan_with_asof_preplanner;
@@ -3096,6 +3096,67 @@ fn normalize_batches(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<Ve
             )?)
         })
         .collect()
+}
+
+fn direct_projection_indices(
+    logical_plan: &LogicalPlan,
+    input_schema: &SchemaRef,
+) -> Option<Vec<usize>> {
+    let LogicalPlan::Projection(projection) = logical_plan else {
+        return None;
+    };
+    projection
+        .expr
+        .iter()
+        .map(|expr| match strip_projection_alias(expr) {
+            Expr::Column(column) => input_schema.index_of(&column.name).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn direct_project_record_batches(
+    batches: &[RecordBatch],
+    output_schema: &SchemaRef,
+    indices: &[usize],
+    label: &str,
+) -> Result<Vec<RecordBatch>> {
+    if indices.len() != output_schema.fields().len() {
+        bail!(
+            "{label} direct projection width {} does not match output width {}",
+            indices.len(),
+            output_schema.fields().len()
+        );
+    }
+    let mut output = Vec::new();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let mut columns = Vec::with_capacity(indices.len());
+        for (output_idx, input_idx) in indices.iter().copied().enumerate() {
+            let column = batch.column(input_idx);
+            let expected_type = output_schema.field(output_idx).data_type();
+            if column.data_type() != expected_type {
+                bail!(
+                    "{label} direct projection column {} type {:?} does not match expected {:?}",
+                    output_idx,
+                    column.data_type(),
+                    expected_type
+                );
+            }
+            columns.push(Arc::clone(column));
+        }
+        output.push(RecordBatch::try_new(Arc::clone(output_schema), columns)?);
+    }
+    Ok(output)
+}
+
+fn strip_projection_alias(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(alias) => strip_projection_alias(alias.expr.as_ref()),
+        _ => expr,
+    }
 }
 
 pub fn weighted_batch_from_diffs(

@@ -38,7 +38,8 @@ use super::columnar_join::{
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
-    collect_incremental_output, normalize_batches,
+    collect_incremental_output, direct_project_record_batches, direct_projection_indices,
+    normalize_batches,
 };
 
 const SUMMARY_TAG: u8 = b's';
@@ -108,6 +109,7 @@ struct GroupedMaxDerivedProjectionState {
     provider: Arc<DynamicStateTableProvider>,
     input_schema: SchemaRef,
     plan: Arc<dyn ExecutionPlan>,
+    direct_projection: Option<Vec<usize>>,
 }
 
 struct SlateGroupedMaxState {
@@ -403,6 +405,7 @@ async fn build_derived_projection_state(
         ctx.register_udf(udf);
     }
     let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(input_schema)));
+    let direct_projection = direct_projection_indices(&logical_plan, input_schema);
     let logical_plan =
         rebind_derived_projection_plan(logical_plan, input_name, Arc::clone(&provider))?;
     let plan = ctx.state().create_physical_plan(&logical_plan).await?;
@@ -411,6 +414,7 @@ async fn build_derived_projection_state(
         provider,
         input_schema: Arc::clone(input_schema),
         plan,
+        direct_projection,
     })
 }
 
@@ -684,6 +688,14 @@ async fn collect_grouped_max_projection_output(
                 .await
         }
         GroupedMaxProjectionState::Derived(derived) => {
+            if let Some(indices) = derived.direct_projection.as_ref() {
+                return direct_project_record_batches(
+                    source_batches,
+                    &columnar.projection_schema,
+                    indices,
+                    "grouped-max",
+                );
+            }
             let provider_batches =
                 rewrap_record_batches_with_schema(source_batches, &derived.input_schema)?;
             derived.provider.set_batches(provider_batches)?;
