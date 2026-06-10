@@ -28,7 +28,15 @@ pub struct SlateBackedColumnarIndexedZSet {
     segment_store: ArrowSegmentStore,
     index_prefix: Vec<u8>,
     state_key: Vec<u8>,
+    bounds_key: Vec<u8>,
     next_segment_id: u64,
+    key_bounds: Option<IndexKeyBounds>,
+}
+
+#[derive(Clone)]
+struct IndexKeyBounds {
+    min: Vec<u8>,
+    max: Vec<u8>,
 }
 
 impl SlateBackedColumnarIndexedZSet {
@@ -49,7 +57,10 @@ impl SlateBackedColumnarIndexedZSet {
         index_prefix.extend_from_slice(b"columnar/");
         let mut state_key = keyspace::namespace_prefix(keyspace::prefix::INDEX, &namespace);
         state_key.extend_from_slice(b"columnar_state/next_segment_id");
+        let mut bounds_key = keyspace::namespace_prefix(keyspace::prefix::INDEX, &namespace);
+        bounds_key.extend_from_slice(b"columnar_state/key_bounds");
         let next_segment_id = read_next_segment_id(table.as_ref(), &state_key).await?;
+        let key_bounds = read_key_bounds(table.as_ref(), &bounds_key).await?;
         Ok(Self {
             table,
             namespace,
@@ -60,7 +71,9 @@ impl SlateBackedColumnarIndexedZSet {
             segment_store,
             index_prefix,
             state_key,
+            bounds_key,
             next_segment_id,
+            key_bounds,
         })
     }
 
@@ -88,6 +101,7 @@ impl SlateBackedColumnarIndexedZSet {
         self.validate_delta(zset)?;
         self.clear_persisted().await?;
         self.next_segment_id = 1;
+        self.key_bounds = None;
         self.apply_delta(zset).await?;
         Ok(())
     }
@@ -113,6 +127,11 @@ impl SlateBackedColumnarIndexedZSet {
         if postings.is_empty() {
             return Ok(None);
         }
+        let next_bounds = if self.key_bounds.is_some() || self.next_segment_id == 1 {
+            merge_key_bounds(self.key_bounds.as_ref(), postings.keys())
+        } else {
+            None
+        };
 
         let segment_id = self.next_segment_id;
         self.next_segment_id = self.next_segment_id.saturating_add(1);
@@ -139,16 +158,23 @@ impl SlateBackedColumnarIndexedZSet {
             self.state_key.clone(),
             self.next_segment_id.to_be_bytes().to_vec(),
         );
+        if let Some(bounds) = next_bounds.as_ref() {
+            write_batch.put(self.bounds_key.clone(), encode_key_bounds(bounds)?);
+        }
         self.table
             .write_batch(write_batch)
             .await
             .context("persist columnar indexed zset delta")?;
+        self.key_bounds = next_bounds;
         Ok(Some(segment_id))
     }
 
     pub async fn lookup_key_batches(&self, key_batches: &[RecordBatch]) -> Result<ColumnarZSet> {
         let key_bytes = self.key_bytes_from_batches(key_batches)?;
         if key_bytes.is_empty() {
+            return ColumnarZSet::empty(Arc::clone(&self.value_schema));
+        }
+        if !keys_overlap_bounds(&key_bytes, self.key_bounds.as_ref()) {
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
         }
 
@@ -211,6 +237,7 @@ impl SlateBackedColumnarIndexedZSet {
             write_batch.delete(self.segment_store.key_for_segment(segment_id));
         }
         write_batch.delete(self.state_key.clone());
+        write_batch.delete(self.bounds_key.clone());
         self.table
             .write_batch(write_batch)
             .await
@@ -372,6 +399,79 @@ async fn read_next_segment_id(table: &dyn KeyValueTable, state_key: &[u8]) -> Re
     Ok(u64::from_be_bytes(bytes.as_ref().try_into()?))
 }
 
+async fn read_key_bounds(
+    table: &dyn KeyValueTable,
+    bounds_key: &[u8],
+) -> Result<Option<IndexKeyBounds>> {
+    let Some(bytes) = table
+        .get_bytes(bounds_key)
+        .await
+        .context("read columnar indexed zset key bounds")?
+    else {
+        return Ok(None);
+    };
+    decode_key_bounds(bytes.as_ref()).map(Some)
+}
+
+fn merge_key_bounds<'a>(
+    current: Option<&IndexKeyBounds>,
+    keys: impl IntoIterator<Item = &'a Vec<u8>>,
+) -> Option<IndexKeyBounds> {
+    let mut min = current.map(|bounds| bounds.min.clone());
+    let mut max = current.map(|bounds| bounds.max.clone());
+    for key in keys {
+        if min
+            .as_ref()
+            .is_none_or(|current_min| key.as_slice() < current_min.as_slice())
+        {
+            min = Some(key.clone());
+        }
+        if max
+            .as_ref()
+            .is_none_or(|current_max| key.as_slice() > current_max.as_slice())
+        {
+            max = Some(key.clone());
+        }
+    }
+    min.zip(max).map(|(min, max)| IndexKeyBounds { min, max })
+}
+
+fn keys_overlap_bounds(keys: &[Vec<u8>], bounds: Option<&IndexKeyBounds>) -> bool {
+    let Some(bounds) = bounds else {
+        return true;
+    };
+    let Some(delta_bounds) = merge_key_bounds(None, keys.iter()) else {
+        return false;
+    };
+    delta_bounds.max.as_slice() >= bounds.min.as_slice()
+        && delta_bounds.min.as_slice() <= bounds.max.as_slice()
+}
+
+fn encode_key_bounds(bounds: &IndexKeyBounds) -> Result<Vec<u8>> {
+    let min_len = u32::try_from(bounds.min.len()).context("columnar index min key too large")?;
+    let max_len = u32::try_from(bounds.max.len()).context("columnar index max key too large")?;
+    let mut out = Vec::with_capacity(8 + bounds.min.len() + bounds.max.len());
+    out.extend_from_slice(&min_len.to_be_bytes());
+    out.extend_from_slice(&bounds.min);
+    out.extend_from_slice(&max_len.to_be_bytes());
+    out.extend_from_slice(&bounds.max);
+    Ok(out)
+}
+
+fn decode_key_bounds(bytes: &[u8]) -> Result<IndexKeyBounds> {
+    let mut cursor = 0;
+    let min_len = usize::try_from(read_u32(bytes, &mut cursor)?)
+        .context("columnar index min key length out of range")?;
+    let min = read_bytes(bytes, &mut cursor, min_len, "columnar index min key")?.to_vec();
+    let max_len = usize::try_from(read_u32(bytes, &mut cursor)?)
+        .context("columnar index max key length out of range")?;
+    let max = read_bytes(bytes, &mut cursor, max_len, "columnar index max key")?.to_vec();
+    if cursor != bytes.len() {
+        bail!("columnar index key bounds payload has trailing bytes");
+    }
+    Ok(IndexKeyBounds { min, max })
+}
+
 fn filter_nonzero_weight_rows(
     batch: &RecordBatch,
     value_column_count: usize,
@@ -467,6 +567,22 @@ fn read_exact_at<const N: usize>(bytes: &[u8], cursor: &mut usize, label: &str) 
         .map_err(|_| anyhow!("{label} expected {N} bytes"))
 }
 
+fn read_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    label: &str,
+) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("{label} overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow!("{label} truncated"))?;
+    *cursor = end;
+    Ok(chunk)
+}
+
 fn segment_id_from_index_key(key: &[u8]) -> Result<u64> {
     if key.len() < 8 {
         bail!("columnar index key missing segment id suffix");
@@ -480,12 +596,61 @@ fn segment_id_from_index_key(key: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use object_store::memory::InMemory;
     use slatedb::Db;
+    use slatedb::WriteBatch;
+    use slatedb::config::ScanOptions;
 
     use crate::storage::SlateTable;
+
+    struct CountingTable {
+        inner: Arc<dyn KeyValueTable>,
+        scan_range_calls: AtomicUsize,
+    }
+
+    impl CountingTable {
+        fn new(inner: Arc<dyn KeyValueTable>) -> Self {
+            Self {
+                inner,
+                scan_range_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn reset_scan_range_calls(&self) {
+            self.scan_range_calls.store(0, Ordering::Relaxed);
+        }
+
+        fn scan_range_calls(&self) -> usize {
+            self.scan_range_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl KeyValueTable for CountingTable {
+        async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get_bytes(key).await
+        }
+
+        async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+            self.inner.write_batch(batch).await
+        }
+
+        async fn scan_range_bytes(
+            &self,
+            range: Range<Vec<u8>>,
+            options: &ScanOptions,
+        ) -> Result<Vec<(Bytes, Bytes)>> {
+            self.scan_range_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.scan_range_bytes(range, options).await
+        }
+    }
 
     async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -657,5 +822,113 @@ mod tests {
                 (3, "c".to_string(), 30, 1)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn columnar_index_skips_lookup_when_keys_are_outside_persisted_bounds() {
+        let inner = build_table("columnar-index-key-bounds").await;
+        let counting = Arc::new(CountingTable::new(inner));
+        let table: Arc<dyn KeyValueTable> = counting.clone();
+        let mut index =
+            SlateBackedColumnarIndexedZSet::new(table, "orders_by_id", value_schema(), vec![0])
+                .await
+                .expect("index");
+        let delta = ColumnarZSet::try_new_weighted(
+            value_schema(),
+            vec![weighted_batch(
+                vec![10, 20],
+                vec!["a", "b"],
+                vec![100, 200],
+                vec![1, 1],
+            )],
+        )
+        .expect("delta");
+        index.apply_delta(&delta).await.expect("apply delta");
+
+        counting.reset_scan_range_calls();
+        let below = index
+            .lookup_key_batches(&[key_batch(vec![1, 2])])
+            .await
+            .expect("lookup below bounds");
+        assert!(below.is_empty());
+        assert_eq!(counting.scan_range_calls(), 0);
+
+        counting.reset_scan_range_calls();
+        let above = index
+            .lookup_key_batches(&[key_batch(vec![30, 40])])
+            .await
+            .expect("lookup above bounds");
+        assert!(above.is_empty());
+        assert_eq!(counting.scan_range_calls(), 0);
+
+        counting.reset_scan_range_calls();
+        let within = index
+            .lookup_key_batches(&[key_batch(vec![15])])
+            .await
+            .expect("lookup inside bounds");
+        assert!(within.is_empty());
+        assert!(counting.scan_range_calls() > 0);
+
+        let table: Arc<dyn KeyValueTable> = counting.clone();
+        let reopened =
+            SlateBackedColumnarIndexedZSet::new(table, "orders_by_id", value_schema(), vec![0])
+                .await
+                .expect("reopened index");
+        counting.reset_scan_range_calls();
+        let reopened_above = reopened
+            .lookup_key_batches(&[key_batch(vec![30])])
+            .await
+            .expect("reopened lookup above bounds");
+        assert!(reopened_above.is_empty());
+        assert_eq!(counting.scan_range_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn columnar_index_without_persisted_bounds_remains_conservative_after_append() {
+        let inner = build_table("columnar-index-missing-key-bounds").await;
+        let counting = Arc::new(CountingTable::new(inner));
+        let table: Arc<dyn KeyValueTable> = counting.clone();
+        let mut index = SlateBackedColumnarIndexedZSet::new(
+            Arc::clone(&table),
+            "orders_by_id",
+            value_schema(),
+            vec![0],
+        )
+        .await
+        .expect("index");
+        let first = ColumnarZSet::try_new_weighted(
+            value_schema(),
+            vec![weighted_batch(vec![10], vec!["a"], vec![100], vec![1])],
+        )
+        .expect("first delta");
+        index.apply_delta(&first).await.expect("apply first");
+        index
+            .table
+            .delete(&index.bounds_key)
+            .await
+            .expect("delete bounds");
+
+        let mut reopened = SlateBackedColumnarIndexedZSet::new(
+            Arc::clone(&table),
+            "orders_by_id",
+            value_schema(),
+            vec![0],
+        )
+        .await
+        .expect("reopened index");
+        let second = ColumnarZSet::try_new_weighted(
+            value_schema(),
+            vec![weighted_batch(vec![20], vec!["b"], vec![200], vec![1])],
+        )
+        .expect("second delta");
+        reopened.apply_delta(&second).await.expect("apply second");
+
+        counting.reset_scan_range_calls();
+        let found = reopened
+            .lookup_key_batches(&[key_batch(vec![10])])
+            .await
+            .expect("lookup old key");
+        assert_eq!(lookup_rows(&found), vec![(10, "a".to_string(), 100, 1)]);
+        assert!(counting.scan_range_calls() > 0);
     }
 }
