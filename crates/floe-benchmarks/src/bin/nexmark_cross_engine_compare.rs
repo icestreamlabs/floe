@@ -18,6 +18,7 @@ const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
     "q17", "q18", "q19", "q20", "q21", "q22",
 ];
 const DEFAULT_FLOE_NEXMARK_BATCH_ROWS: u64 = 8_192;
+const DEFAULT_FLOE_KAFKA_POLL_MS: u64 = 1;
 const DEFAULT_FLOE_SOURCE_JOURNAL: &str = "auto";
 const NEXMARK_BASE_TS_MS: i64 = 1_700_000_000_000;
 const NEXMARK_BID_AUCTION_CARDINALITY: u64 = 10_000;
@@ -336,7 +337,7 @@ impl Config {
                 "FLOE_KAFKA_GROUP_ID_PREFIX",
                 "floe-stream-bench",
             ),
-            floe_kafka_poll_ms: env_parse("FLOE_KAFKA_POLL_MS", 10)?,
+            floe_kafka_poll_ms: env_parse("FLOE_KAFKA_POLL_MS", DEFAULT_FLOE_KAFKA_POLL_MS)?,
             floe_kafka_max_messages_per_tick: env_parse(
                 "FLOE_KAFKA_MAX_MESSAGES_PER_TICK",
                 DEFAULT_FLOE_NEXMARK_BATCH_ROWS,

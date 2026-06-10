@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -18,8 +17,89 @@ use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector
 use crate::source::AppendIngestEventSender;
 use floe_core::source::{AppendIngestEvent, SourceDefinition};
 
-static KAFKA_CONNECTOR_TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
-const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 256;
+const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 32;
+
+#[derive(Default)]
+struct KafkaConnectorTickMetrics {
+    messages: u64,
+    events: u64,
+    errors: u64,
+    blocking_polls: u64,
+    empty_blocking_polls: u64,
+    drain_polls: u64,
+    empty_drain_polls: u64,
+    committed_offset_batches: u64,
+    poll_blocking_us: u64,
+    poll_drain_us: u64,
+    parse_us: u64,
+    message_us: u64,
+    send_us: u64,
+    commit_us: u64,
+    tick_us: u64,
+}
+
+#[derive(Default)]
+struct KafkaConnectorTickWindow {
+    ticks: u64,
+    idle_ticks: u64,
+    messages: u64,
+    events: u64,
+    errors: u64,
+    blocking_polls: u64,
+    empty_blocking_polls: u64,
+    drain_polls: u64,
+    empty_drain_polls: u64,
+    committed_offset_batches: u64,
+    poll_blocking_us: u64,
+    poll_drain_us: u64,
+    parse_us: u64,
+    message_us: u64,
+    send_us: u64,
+    commit_us: u64,
+    tick_us: u64,
+    max_tick_us: u64,
+}
+
+impl KafkaConnectorTickWindow {
+    fn record(&mut self, metrics: &KafkaConnectorTickMetrics) {
+        self.ticks = self.ticks.saturating_add(1);
+        if metrics.events == 0 {
+            self.idle_ticks = self.idle_ticks.saturating_add(1);
+        }
+        self.messages = self.messages.saturating_add(metrics.messages);
+        self.events = self.events.saturating_add(metrics.events);
+        self.errors = self.errors.saturating_add(metrics.errors);
+        self.blocking_polls = self.blocking_polls.saturating_add(metrics.blocking_polls);
+        self.empty_blocking_polls = self
+            .empty_blocking_polls
+            .saturating_add(metrics.empty_blocking_polls);
+        self.drain_polls = self.drain_polls.saturating_add(metrics.drain_polls);
+        self.empty_drain_polls = self
+            .empty_drain_polls
+            .saturating_add(metrics.empty_drain_polls);
+        self.committed_offset_batches = self
+            .committed_offset_batches
+            .saturating_add(metrics.committed_offset_batches);
+        self.poll_blocking_us = self
+            .poll_blocking_us
+            .saturating_add(metrics.poll_blocking_us);
+        self.poll_drain_us = self.poll_drain_us.saturating_add(metrics.poll_drain_us);
+        self.parse_us = self.parse_us.saturating_add(metrics.parse_us);
+        self.message_us = self.message_us.saturating_add(metrics.message_us);
+        self.send_us = self.send_us.saturating_add(metrics.send_us);
+        self.commit_us = self.commit_us.saturating_add(metrics.commit_us);
+        self.tick_us = self.tick_us.saturating_add(metrics.tick_us);
+        self.max_tick_us = self.max_tick_us.max(metrics.tick_us);
+    }
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+    start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn avg_u64(total: u64, count: u64) -> u64 {
+    if count == 0 { 0 } else { total / count }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KafkaMessageFormat {
@@ -102,6 +182,8 @@ pub struct KafkaConnector {
     last_committed_tick_id: u64,
     started_at: Option<Instant>,
     first_batch_logged: bool,
+    tick_counter: u64,
+    tick_window: KafkaConnectorTickWindow,
 }
 
 impl KafkaConnector {
@@ -141,6 +223,8 @@ impl KafkaConnector {
             last_committed_tick_id: 0,
             started_at: None,
             first_batch_logged: false,
+            tick_counter: 0,
+            tick_window: KafkaConnectorTickWindow::default(),
         })
     }
 
@@ -426,69 +510,125 @@ impl Connector for KafkaConnector {
     }
 
     async fn tick(&mut self, ctx: &ConnectorContext) -> Result<ConnectorTick> {
+        let metrics_enabled =
+            tracing::enabled!(target: "floe_node_core::kafka_connector", tracing::Level::DEBUG);
+        let tick_start = metrics_enabled.then(Instant::now);
         let consumer = self
             .consumer
             .as_ref()
             .context("kafka connector is not initialized")?;
         let mut emitted = 0usize;
         let mut staged = Vec::new();
+        let mut metrics = KafkaConnectorTickMetrics::default();
+        if metrics_enabled {
+            metrics.blocking_polls = 1;
+        }
 
+        let poll_start = metrics_enabled.then(Instant::now);
         if let Some(message) = consumer.poll(self.config.poll_timeout) {
+            if let Some(poll_start) = poll_start {
+                metrics.poll_blocking_us = elapsed_us(poll_start);
+            }
             match message {
                 Ok(message) => {
-                    let mut events = self.handle_message(&message)?;
-                    emitted = emitted.saturating_add(events.len());
-                    staged.append(&mut events);
+                    let event_count =
+                        self.stage_message(&message, &mut staged, &mut metrics, metrics_enabled)?;
+                    emitted = emitted.saturating_add(event_count);
                 }
                 Err(err) => {
+                    if metrics_enabled {
+                        metrics.errors = metrics.errors.saturating_add(1);
+                    }
                     tracing::warn!(error = %err, "failed to receive kafka message");
                 }
+            }
+        } else {
+            if let Some(poll_start) = poll_start {
+                metrics.poll_blocking_us = elapsed_us(poll_start);
+                metrics.empty_blocking_polls = metrics.empty_blocking_polls.saturating_add(1);
             }
         }
 
         while emitted < self.config.max_messages_per_tick {
+            if metrics_enabled {
+                metrics.drain_polls = metrics.drain_polls.saturating_add(1);
+            }
+            let poll_start = metrics_enabled.then(Instant::now);
             match consumer.poll(Duration::ZERO) {
                 Some(Ok(message)) => {
-                    let mut events = self.handle_message(&message)?;
-                    emitted = emitted.saturating_add(events.len());
-                    staged.append(&mut events);
+                    if let Some(poll_start) = poll_start {
+                        metrics.poll_drain_us =
+                            metrics.poll_drain_us.saturating_add(elapsed_us(poll_start));
+                    }
+                    let event_count =
+                        self.stage_message(&message, &mut staged, &mut metrics, metrics_enabled)?;
+                    emitted = emitted.saturating_add(event_count);
                 }
                 Some(Err(err)) => {
+                    if let Some(poll_start) = poll_start {
+                        metrics.poll_drain_us =
+                            metrics.poll_drain_us.saturating_add(elapsed_us(poll_start));
+                        metrics.errors = metrics.errors.saturating_add(1);
+                    }
                     tracing::warn!(error = %err, "failed to receive kafka message");
                 }
-                None => break,
+                None => {
+                    if let Some(poll_start) = poll_start {
+                        metrics.poll_drain_us =
+                            metrics.poll_drain_us.saturating_add(elapsed_us(poll_start));
+                        metrics.empty_drain_polls = metrics.empty_drain_polls.saturating_add(1);
+                    }
+                    break;
+                }
             }
         }
 
         if !staged.is_empty() {
+            let send_start = metrics_enabled.then(Instant::now);
             ctx.send_batch(staged)
                 .await
                 .context("failed to enqueue kafka event batch")?;
+            if let Some(send_start) = send_start {
+                metrics.send_us = elapsed_us(send_start);
+            }
             if !self.first_batch_logged {
                 self.first_batch_logged = true;
-                tracing::info!(
-                    emitted,
-                    time_to_first_batch_ms = self
-                        .started_at
-                        .map(|started| started.elapsed().as_millis() as u64)
-                        .unwrap_or_default(),
-                    "kafka connector emitted first batch"
-                );
+                let time_to_first_batch_ms = self
+                    .started_at
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or_default();
+                if metrics_enabled {
+                    tracing::info!(
+                        emitted,
+                        kafka_messages = metrics.messages,
+                        poll_blocking_us = metrics.poll_blocking_us,
+                        poll_drain_us = metrics.poll_drain_us,
+                        parse_us = metrics.parse_us,
+                        message_us = metrics.message_us,
+                        send_us = metrics.send_us,
+                        time_to_first_batch_ms,
+                        "kafka connector emitted first batch"
+                    );
+                } else {
+                    tracing::info!(
+                        emitted,
+                        time_to_first_batch_ms,
+                        "kafka connector emitted first batch"
+                    );
+                }
             }
         }
 
-        self.commit_offsets_if_requested().await?;
-
-        if KAFKA_CONNECTOR_TICK_LOG_COUNTER
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(KAFKA_CONNECTOR_TICK_LOG_EVERY)
-        {
-            tracing::info!(
-                emitted,
-                max_messages_per_tick = self.config.max_messages_per_tick,
-                poll_timeout_ms = self.config.poll_timeout.as_millis() as u64,
-                "kafka connector tick metrics"
-            );
+        let commit_start = metrics_enabled.then(Instant::now);
+        if self.commit_offsets_if_requested().await? {
+            metrics.committed_offset_batches = metrics.committed_offset_batches.saturating_add(1);
+        }
+        if let Some(commit_start) = commit_start {
+            metrics.commit_us = elapsed_us(commit_start);
+        }
+        if let Some(tick_start) = tick_start {
+            metrics.tick_us = elapsed_us(tick_start);
+            self.record_tick_metrics(&metrics);
         }
 
         if emitted > 0 {
@@ -619,12 +759,77 @@ fn parse_debezium_events(
 }
 
 impl KafkaConnector {
-    async fn commit_offsets_if_requested(&mut self) -> Result<()> {
+    fn stage_message(
+        &self,
+        message: &BorrowedMessage<'_>,
+        staged: &mut Vec<AppendIngestEvent>,
+        metrics: &mut KafkaConnectorTickMetrics,
+        metrics_enabled: bool,
+    ) -> Result<usize> {
+        let message_start = metrics_enabled.then(Instant::now);
+        if metrics_enabled {
+            metrics.messages = metrics.messages.saturating_add(1);
+        }
+
+        let parse_start = metrics_enabled.then(Instant::now);
+        let mut events = self.handle_message(message)?;
+        if let Some(parse_start) = parse_start {
+            metrics.parse_us = metrics.parse_us.saturating_add(elapsed_us(parse_start));
+        }
+
+        let event_count = events.len();
+        staged.append(&mut events);
+        if let Some(message_start) = message_start {
+            metrics.events = metrics.events.saturating_add(event_count as u64);
+            metrics.message_us = metrics.message_us.saturating_add(elapsed_us(message_start));
+        }
+        Ok(event_count)
+    }
+
+    fn record_tick_metrics(&mut self, metrics: &KafkaConnectorTickMetrics) {
+        self.tick_counter = self.tick_counter.saturating_add(1);
+        self.tick_window.record(metrics);
+        if self.tick_counter == 1
+            || self
+                .tick_counter
+                .is_multiple_of(KAFKA_CONNECTOR_TICK_LOG_EVERY)
+        {
+            let window = std::mem::take(&mut self.tick_window);
+            tracing::debug!(
+                tick = self.tick_counter,
+                window_ticks = window.ticks,
+                idle_ticks = window.idle_ticks,
+                kafka_messages = window.messages,
+                emitted_events = window.events,
+                errors = window.errors,
+                blocking_polls = window.blocking_polls,
+                empty_blocking_polls = window.empty_blocking_polls,
+                drain_polls = window.drain_polls,
+                empty_drain_polls = window.empty_drain_polls,
+                committed_offset_batches = window.committed_offset_batches,
+                poll_blocking_us = window.poll_blocking_us,
+                poll_drain_us = window.poll_drain_us,
+                parse_us = window.parse_us,
+                message_us = window.message_us,
+                send_us = window.send_us,
+                commit_us = window.commit_us,
+                tick_us = window.tick_us,
+                avg_tick_us = avg_u64(window.tick_us, window.ticks),
+                max_tick_us = window.max_tick_us,
+                avg_events_per_tick = avg_u64(window.events, window.ticks),
+                max_messages_per_tick = self.config.max_messages_per_tick,
+                poll_timeout_ms = self.config.poll_timeout.as_millis() as u64,
+                "kafka connector tick window metrics"
+            );
+        }
+    }
+
+    async fn commit_offsets_if_requested(&mut self) -> Result<bool> {
         let Some(consumer) = self.consumer.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(receiver) = self.config.commit_offsets_rx.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
 
         let mut latest_commit = None;
@@ -632,10 +837,10 @@ impl KafkaConnector {
             latest_commit = Some(receiver.borrow_and_update().clone());
         }
         let Some(commit) = latest_commit else {
-            return Ok(());
+            return Ok(false);
         };
         if commit.tick_id <= self.last_committed_tick_id {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut tpl = TopicPartitionList::new();
@@ -656,14 +861,14 @@ impl KafkaConnector {
         }
         if !has_offsets {
             self.last_committed_tick_id = commit.tick_id;
-            return Ok(());
+            return Ok(false);
         }
 
         consumer
             .commit(&tpl, CommitMode::Sync)
             .context("commit kafka offsets after tick commit")?;
         self.last_committed_tick_id = commit.tick_id;
-        Ok(())
+        Ok(true)
     }
 }
 
