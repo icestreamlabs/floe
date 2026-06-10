@@ -1,4 +1,5 @@
 use super::*;
+use crate::namespaces;
 use crate::source_decoder::{SourceArrowBatchBuilder, SourceArrowBatches};
 use datafusion::arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
@@ -7,13 +8,13 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::execution::context::SessionContext;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
-use dbsp::storage::{KeyValueTable, SlateTable};
+use dbsp::storage::{KeyValueTable, SlateTable, keyspace};
 use floe_core::source::{
     AppendIngestEvent, SourceColumn, SourceDataType, SourceDefinition, SourceRegistry,
 };
 use object_store::memory::InMemory;
 use serde_json::json;
-use slatedb::Db;
+use slatedb::{Db, config::ScanOptions};
 
 use crate::table_provider::MaterializedViewTableProvider;
 
@@ -748,6 +749,23 @@ async fn build_operator_state_table(name: &str) -> Arc<dyn KeyValueTable> {
     Arc::new(SlateTable::new(db))
 }
 
+async fn assert_stateless_source_namespace_empty(table: &Arc<dyn KeyValueTable>, view_name: &str) {
+    let namespace = format!(
+        "{}/columnar/stateless/input",
+        namespaces::materialized_view(view_name).expect("materialized view namespace")
+    );
+    let prefix = keyspace::namespace_prefix(keyspace::prefix::ZSET, &namespace);
+    let entries = table
+        .scan_prefix(&prefix, &ScanOptions::default())
+        .await
+        .expect("scan stateless source namespace");
+    assert!(
+        entries.is_empty(),
+        "stateless source namespace should be ephemeral, found {} persisted keys",
+        entries.len()
+    );
+}
+
 fn assert_columnar_join_strategy(runtime: &VectorizedExecutionRuntime, expected: &str) {
     let actual = runtime.materialized_views[0]
         .columnar_join
@@ -1001,6 +1019,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
         .await
         .expect("append initial source rows");
     runtime.run_tick(1).await.expect("initial tick");
+    assert_stateless_source_namespace_empty(&table, "mv_orders").await;
 
     let handle = registry.get("mv_orders").expect("materialized view");
     assert!(handle.arrow_snapshot_for(1).is_none());
@@ -1033,6 +1052,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
         .await
         .expect("apply weighted delta");
     runtime.run_tick(2).await.expect("weighted tick");
+    assert_stateless_source_namespace_empty(&table, "mv_orders").await;
 
     assert!(handle.arrow_snapshot_for(2).is_none());
     let snapshot = scan_materialized_view_table(
