@@ -1547,15 +1547,20 @@ async fn run_columnar_join_state_tick_inner(
             .await
             .context("apply right join delta to SlateDB-backed columnar index")?;
     }
-    columnar.left.snapshot =
-        apply_source_snapshot_delta(&columnar.left.schema, &columnar.left.snapshot, &left_delta)
-            .await?;
-    columnar.right.snapshot = apply_source_snapshot_delta(
-        &columnar.right.schema,
-        &columnar.right.snapshot,
-        &right_delta,
-    )
-    .await?;
+    if maintain_output_snapshot {
+        columnar.left.snapshot = apply_source_snapshot_delta(
+            &columnar.left.schema,
+            &columnar.left.snapshot,
+            &left_delta,
+        )
+        .await?;
+        columnar.right.snapshot = apply_source_snapshot_delta(
+            &columnar.right.schema,
+            &columnar.right.snapshot,
+            &right_delta,
+        )
+        .await?;
+    }
 
     Ok(ColumnarJoinTick {
         delta: persisted_output_delta,
