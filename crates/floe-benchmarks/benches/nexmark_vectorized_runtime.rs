@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -55,6 +55,69 @@ struct NexmarkRuntimeCase {
 struct NexmarkRuntimeSourceBatches {
     source_name: &'static str,
     batches: Vec<RecordBatch>,
+}
+
+#[derive(Default)]
+struct Q4RuntimeTiming {
+    auction_append: Duration,
+    auction_tick: Duration,
+    bid_append: Duration,
+    bid_tick: Duration,
+    final_snapshot: Duration,
+    bid_tick_samples: Vec<Duration>,
+}
+
+impl Q4RuntimeTiming {
+    fn record_bid_tick(&mut self, elapsed: Duration) {
+        self.bid_tick += elapsed;
+        self.bid_tick_samples.push(elapsed);
+    }
+
+    fn print(&mut self, total: Duration) {
+        self.bid_tick_samples.sort_unstable();
+        let bid_tick_count = self.bid_tick_samples.len();
+        let bid_tick_p50 = percentile_duration(&self.bid_tick_samples, 50);
+        let bid_tick_p95 = percentile_duration(&self.bid_tick_samples, 95);
+        let bid_tick_max = self.bid_tick_samples.last().copied().unwrap_or_default();
+        eprintln!(
+            "[q4-runtime-timing] total_ms={:.3} auction_append_ms={:.3} auction_tick_ms={:.3} bid_append_ms={:.3} bid_tick_ms={:.3} final_snapshot_ms={:.3} bid_tick_count={} bid_tick_mean_ms={:.3} bid_tick_p50_ms={:.3} bid_tick_p95_ms={:.3} bid_tick_max_ms={:.3}",
+            duration_ms(total),
+            duration_ms(self.auction_append),
+            duration_ms(self.auction_tick),
+            duration_ms(self.bid_append),
+            duration_ms(self.bid_tick),
+            duration_ms(self.final_snapshot),
+            bid_tick_count,
+            duration_ms_mean(self.bid_tick, bid_tick_count),
+            duration_ms(bid_tick_p50),
+            duration_ms(bid_tick_p95),
+            duration_ms(bid_tick_max),
+        );
+    }
+}
+
+fn q4_timing_enabled() -> bool {
+    std::env::var_os("FLOE_PROFILE_Q4_TIMING").is_some()
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn duration_ms_mean(total: Duration, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        duration_ms(total) / count as f64
+    }
+}
+
+fn percentile_duration(sorted: &[Duration], percentile: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let idx = ((sorted.len() - 1) * percentile) / 100;
+    sorted[idx]
 }
 
 const PROFILE_CATEGORY_COUNT: usize = 9;
@@ -966,12 +1029,19 @@ async fn build_q4_repeated_state_runtime_case(
     RecordBatch,
     Vec<RecordBatch>,
 )> {
+    let profile_timing = q4_timing_enabled();
+    let total_start = Instant::now();
     let mut sources = SourceRegistry::new();
+    let definitions_start = Instant::now();
     let definitions = generator::definitions()?;
     sources.extend(definitions.clone());
     let output_schema = (case.output_schema)();
+    let definitions_elapsed = definitions_start.elapsed();
+    let table_start = Instant::now();
     let table = build_operator_state_table(case.id).await?;
+    let table_elapsed = table_start.elapsed();
     let registry = Arc::new(MaterializedViewRegistry::new());
+    let runtime_start = Instant::now();
     let execution = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
@@ -985,7 +1055,9 @@ async fn build_q4_repeated_state_runtime_case(
     )
     .await
     .with_context(|| format!("build vectorized runtime for {}", case.id))?;
+    let runtime_elapsed = runtime_start.elapsed();
 
+    let input_start = Instant::now();
     let auction_schema = definitions
         .iter()
         .find(|definition| definition.name() == "nexmark_auction")
@@ -1010,6 +1082,18 @@ async fn build_q4_repeated_state_runtime_case(
         })
         .collect::<Result<Vec<_>>>()
         .context("build q4 repeated-state bid batches")?;
+    let input_elapsed = input_start.elapsed();
+
+    if profile_timing {
+        eprintln!(
+            "[q4-build-timing] total_ms={:.3} definitions_ms={:.3} table_ms={:.3} runtime_ms={:.3} input_batches_ms={:.3}",
+            duration_ms(total_start.elapsed()),
+            duration_ms(definitions_elapsed),
+            duration_ms(table_elapsed),
+            duration_ms(runtime_elapsed),
+            duration_ms(input_elapsed),
+        );
+    }
 
     Ok((execution, registry, auction_batch, bid_batches))
 }
@@ -1050,6 +1134,11 @@ async fn run_q4_repeated_state_runtime_case(
     auction_batch: RecordBatch,
     bid_batches: Vec<RecordBatch>,
 ) -> Result<()> {
+    let profile_timing = q4_timing_enabled();
+    let total_start = Instant::now();
+    let mut timing = Q4RuntimeTiming::default();
+
+    let start = Instant::now();
     execution
         .append_source_batches_for_execution_and_query(
             "nexmark_auction",
@@ -1057,9 +1146,14 @@ async fn run_q4_repeated_state_runtime_case(
             Vec::new(),
         )
         .await?;
+    timing.auction_append += start.elapsed();
+
+    let start = Instant::now();
     execution.run_tick(1).await?;
+    timing.auction_tick += start.elapsed();
 
     for (tick, bid_batch) in bid_batches.into_iter().enumerate() {
+        let start = Instant::now();
         execution
             .append_source_batches_for_execution_and_query(
                 "nexmark_bid",
@@ -1067,9 +1161,14 @@ async fn run_q4_repeated_state_runtime_case(
                 Vec::new(),
             )
             .await?;
+        timing.bid_append += start.elapsed();
+
+        let start = Instant::now();
         execution.run_tick((tick + 2) as i64).await?;
+        timing.record_bid_tick(start.elapsed());
     }
 
+    let start = Instant::now();
     let final_version = (Q4_REPEATED_TICKS + 1) as i64;
     let handle = registry
         .get(case.view_name)
@@ -1079,6 +1178,10 @@ async fn run_q4_repeated_state_runtime_case(
         .ok_or_else(|| anyhow::anyhow!("missing final snapshot for {}", case.view_name))?;
     let rows = snapshot.iter().map(RecordBatch::num_rows).sum::<usize>();
     black_box(rows);
+    timing.final_snapshot += start.elapsed();
+    if profile_timing {
+        timing.print(total_start.elapsed());
+    }
     Ok(())
 }
 
