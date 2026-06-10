@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float64Array,
-    Int64Array, StringArray, TimestampMillisecondArray,
+    Int64Array, StringArray, TimestampMillisecondArray, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -256,6 +256,7 @@ fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> 
             DataType::Date32 => payload.push(0x0A),
             DataType::Decimal128(_, _) => payload.push(0x0C),
             DataType::Float64 => payload.push(0x0E),
+            DataType::UInt64 => payload.push(0x0F),
             DataType::Null => payload.push(0x00),
             other => {
                 return internal_err!(
@@ -322,6 +323,13 @@ fn encode_payload_cell(column: &ArrayRef, row: usize, payload: &mut Vec<u8>) -> 
             };
             payload.push(0x0D);
             payload.extend_from_slice(&values.value(row).to_bits().to_le_bytes());
+        }
+        DataType::UInt64 => {
+            let Some(values) = column.as_any().downcast_ref::<UInt64Array>() else {
+                return internal_err!("expected UInt64 payload array");
+            };
+            payload.push(0x10);
+            payload.extend_from_slice(&values.value(row).to_le_bytes());
         }
         DataType::Null => {
             payload.push(0x00);
@@ -535,7 +543,7 @@ fn to_execution_error(err: anyhow::Error) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{BinaryArray, Int64Array, StringArray};
+    use datafusion::arrow::array::{BinaryArray, Int64Array, StringArray, UInt64Array};
 
     fn int_weight_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -577,6 +585,44 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("weight column");
         assert_eq!(ids.values(), &[2]);
+        assert_eq!(weights.values(), &[3]);
+    }
+
+    #[tokio::test]
+    async fn consolidates_uint64_columns_without_datafusion_roundtrip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rank", DataType::UInt64, false),
+            Field::new(WEIGHT_COLUMN_NAME, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(UInt64Array::from(vec![1, 1, 2])),
+                Arc::new(Int64Array::from(vec![1, -1, 3])),
+            ],
+        )
+        .expect("delta batch");
+
+        let output = DeltaConsolidator::new(Arc::clone(&schema))
+            .expect("consolidator")
+            .consolidate_with_stats(vec![batch])
+            .await
+            .expect("consolidate");
+
+        assert_eq!(output.stats.input_rows, 3);
+        assert_eq!(output.stats.grouped_rows, 2);
+        assert_eq!(output.stats.output_rows, 1);
+        let ranks = output.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("rank column");
+        let weights = output.batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("weight column");
+        assert_eq!(ranks.values(), &[2]);
         assert_eq!(weights.values(), &[3]);
     }
 
