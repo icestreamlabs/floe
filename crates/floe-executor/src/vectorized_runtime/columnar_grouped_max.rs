@@ -17,12 +17,12 @@ use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
-use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
+use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
-use crate::delta_consolidation::weighted_snapshot_schema;
+use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
@@ -44,7 +44,6 @@ use super::{
 };
 
 const SUMMARY_TAG: u8 = b's';
-const VALUE_TAG: u8 = b'v';
 
 pub(super) struct ColumnarGroupedMaxPlan {
     input: ColumnarGroupedMaxInputPlan,
@@ -86,6 +85,7 @@ pub(super) struct ColumnarGroupedMaxMaterializedViewState {
     input_snapshot: Vec<RecordBatch>,
     output_zset: SlateBackedColumnarZSet,
     max_state: SlateGroupedMaxState,
+    value_index: SlateBackedColumnarIndexedZSet,
     projection_delta: GroupedMaxProjectionState,
     projection_schema: SchemaRef,
     group_schema: SchemaRef,
@@ -137,6 +137,11 @@ struct PendingMaxGroupDelta {
     value_deltas: HashMap<i64, i64>,
     batch: RecordBatch,
     row_idx: usize,
+}
+
+struct PendingMaxDelta {
+    groups: HashMap<Vec<u8>, PendingMaxGroupDelta>,
+    projected_delta: ColumnarZSet,
 }
 
 pub(super) struct ColumnarGroupedMaxTick {
@@ -281,6 +286,7 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
 ) -> Result<ColumnarGroupedMaxMaterializedViewState> {
     let output_namespace = format!("{mv_namespace}/columnar/grouped_max/output");
     let state_namespace = format!("{mv_namespace}/columnar/grouped_max/state");
+    let value_index_namespace = format!("{mv_namespace}/columnar/grouped_max/value_index");
     let output_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
         output_namespace,
@@ -374,6 +380,16 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
 
     let assume_empty_state = output_zset.current_handle().is_none();
 
+    let group_key_indices = (0..plan.max_idx).collect::<Vec<_>>();
+    let value_index = SlateBackedColumnarIndexedZSet::new(
+        Arc::clone(&table),
+        value_index_namespace,
+        Arc::clone(&plan.projection_schema),
+        group_key_indices,
+    )
+    .await
+    .context("initialize SlateDB-backed grouped-max value index")?;
+
     Ok(ColumnarGroupedMaxMaterializedViewState {
         input_name,
         source_schema,
@@ -382,6 +398,7 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
         input_snapshot,
         output_zset,
         max_state: SlateGroupedMaxState::new(table, &state_namespace, assume_empty_state).await?,
+        value_index,
         projection_delta,
         projection_schema: plan.projection_schema,
         group_schema: plan.group_schema,
@@ -678,10 +695,13 @@ async fn prepare_join_grouped_max_input_delta(
 async fn grouped_max_pending_delta(
     columnar: &ColumnarGroupedMaxMaterializedViewState,
     input_batches: &[RecordBatch],
-) -> Result<HashMap<Vec<u8>, PendingMaxGroupDelta>> {
+) -> Result<PendingMaxDelta> {
     let mut pending = HashMap::new();
     if input_batches.is_empty() {
-        return Ok(pending);
+        return Ok(PendingMaxDelta {
+            groups: pending,
+            projected_delta: ColumnarZSet::empty(Arc::clone(&columnar.projection_schema))?,
+        });
     }
 
     let mut positive_source_batches = Vec::new();
@@ -705,7 +725,23 @@ async fn grouped_max_pending_delta(
         collect_grouped_max_projection_output(columnar, &negative_source_batches).await?;
     add_projected_value_batches_to_pending(columnar, &negative_output, -1, &mut pending)?;
     pending.retain(|_, delta| !delta.value_deltas.is_empty());
-    Ok(pending)
+
+    let weighted_schema = weighted_snapshot_schema(&columnar.projection_schema)?;
+    let mut weighted_projected =
+        add_weight_column_to_batches(&positive_output, &weighted_schema, 1)
+            .context("build grouped-max positive projected value delta")?;
+    weighted_projected.extend(
+        add_weight_column_to_batches(&negative_output, &weighted_schema, -1)
+            .context("build grouped-max negative projected value delta")?,
+    );
+    let projected_delta =
+        ColumnarZSet::try_new_weighted(Arc::clone(&columnar.projection_schema), weighted_projected)
+            .context("build grouped-max projected value zset delta")?;
+
+    Ok(PendingMaxDelta {
+        groups: pending,
+        projected_delta,
+    })
 }
 
 async fn collect_grouped_max_projection_output(
@@ -800,15 +836,15 @@ fn add_projected_value_batches_to_pending(
 }
 
 async fn apply_grouped_max_delta(
-    columnar: &ColumnarGroupedMaxMaterializedViewState,
-    pending: HashMap<Vec<u8>, PendingMaxGroupDelta>,
+    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
+    pending: PendingMaxDelta,
 ) -> Result<Vec<RecordBatch>> {
     let total_start = profile::start();
     let mut builder = WeightedMaxOutputBuilder::new(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
     )?;
-    if pending.is_empty() {
+    if pending.groups.is_empty() {
         let phase_start = profile::start();
         let output = builder.finish();
         profile::record_since("grouped_max.apply_finish_output", phase_start);
@@ -816,41 +852,21 @@ async fn apply_grouped_max_delta(
         return output;
     }
 
+    let phase_start = profile::start();
+    columnar
+        .value_index
+        .apply_delta(&pending.projected_delta)
+        .await
+        .context("persist grouped-max projected value index delta")?;
+    profile::record_since("grouped_max.apply_value_index", phase_start);
+
     let mut writes = WriteBatch::new();
     let mut bounds_update = None;
     let mut max_updates = Vec::new();
     let phase_start = profile::start();
-    for (group_key, delta) in pending {
+    for (group_key, delta) in pending.groups {
         let old_max = columnar.max_state.load_max(&group_key)?;
-        let mut updated_counts = HashMap::new();
-        for (value, value_delta) in &delta.value_deltas {
-            let old_count =
-                if columnar
-                    .max_state
-                    .value_count_read_required(old_max, *value, *value_delta)
-                {
-                    columnar
-                        .max_state
-                        .load_value_count(&group_key, *value)
-                        .await?
-                } else {
-                    0
-                };
-            let new_count = old_count
-                .checked_add(*value_delta)
-                .ok_or_else(|| anyhow::anyhow!("grouped-max value count overflow"))?;
-            if new_count < 0 {
-                bail!("grouped-max state removed more values than were present");
-            }
-            updated_counts.insert(*value, new_count);
-            columnar
-                .max_state
-                .write_value_count(&mut writes, &group_key, *value, new_count)?;
-        }
-        let new_max = columnar
-            .max_state
-            .new_max_after_delta(&group_key, old_max, &updated_counts)
-            .await?;
+        let new_max = new_max_after_projected_delta(columnar, old_max, &delta).await?;
         if old_max != new_max {
             if let Some(old_max) = old_max {
                 builder.append(&delta.batch, delta.row_idx, columnar.max_idx, old_max, -1)?;
@@ -889,6 +905,98 @@ async fn apply_grouped_max_delta(
     profile::record_since("grouped_max.apply_finish_output", phase_start);
     profile::record_since("grouped_max.apply_total_inner", total_start);
     output
+}
+
+async fn new_max_after_projected_delta(
+    columnar: &ColumnarGroupedMaxMaterializedViewState,
+    old_max: Option<i64>,
+    delta: &PendingMaxGroupDelta,
+) -> Result<Option<i64>> {
+    let max_added = delta
+        .value_deltas
+        .iter()
+        .filter_map(|(value, delta)| (*delta > 0).then_some(*value))
+        .max();
+
+    match old_max {
+        None => Ok(max_added),
+        Some(old_max) => {
+            if max_added.is_some_and(|value| value > old_max) {
+                return Ok(max_added);
+            }
+            let old_max_may_be_removed = delta
+                .value_deltas
+                .get(&old_max)
+                .is_some_and(|value_delta| *value_delta < 0);
+            if !old_max_may_be_removed {
+                return Ok(Some(old_max));
+            }
+            recompute_grouped_max_from_value_index(columnar, delta).await
+        }
+    }
+}
+
+async fn recompute_grouped_max_from_value_index(
+    columnar: &ColumnarGroupedMaxMaterializedViewState,
+    delta: &PendingMaxGroupDelta,
+) -> Result<Option<i64>> {
+    let lookup_batch = group_lookup_batch(columnar, delta)?;
+    let values = columnar
+        .value_index
+        .lookup_key_batches(&[lookup_batch])
+        .await
+        .context("lookup grouped-max values by group")?;
+    max_from_projected_value_zset(&values, columnar.max_idx)
+}
+
+fn group_lookup_batch(
+    columnar: &ColumnarGroupedMaxMaterializedViewState,
+    delta: &PendingMaxGroupDelta,
+) -> Result<RecordBatch> {
+    let row_idx =
+        u32::try_from(delta.row_idx).context("grouped-max group row index exceeds u32")?;
+    let indices = UInt32Array::from(vec![row_idx]);
+    let columns = (0..columnar.max_idx)
+        .map(|idx| take(delta.batch.column(idx).as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<ArrayRef>, _>>()
+        .context("take grouped-max group lookup row")?;
+    RecordBatch::try_new(Arc::clone(&columnar.group_schema), columns)
+        .context("build grouped-max group lookup batch")
+}
+
+fn max_from_projected_value_zset(zset: &ColumnarZSet, max_idx: usize) -> Result<Option<i64>> {
+    let mut counts = HashMap::new();
+    for batch in zset.batches() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let values = batch
+            .column(max_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("grouped-max indexed value must be Int64"))?;
+        let weights = batch
+            .column(max_idx + 1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("grouped-max indexed weight must be Int64"))?;
+        for row_idx in 0..batch.num_rows() {
+            if values.is_null(row_idx) {
+                continue;
+            }
+            let value = values.value(row_idx);
+            let weight = weights.value(row_idx);
+            let count = counts.entry(value).or_insert(0_i64);
+            let next = (*count)
+                .checked_add(weight)
+                .ok_or_else(|| anyhow::anyhow!("grouped-max indexed count overflow"))?;
+            *count = next;
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .filter_map(|(value, count)| (count > 0).then_some(value))
+        .max())
 }
 
 impl SlateGroupedMaxState {
@@ -951,105 +1059,6 @@ impl SlateGroupedMaxState {
             values.insert(group_key.to_vec(), decode_i64(&value_bytes)?);
         }
         Ok(values)
-    }
-
-    async fn load_value_count(&self, group_key: &[u8], value: i64) -> Result<i64> {
-        let Some(bytes) = self
-            .table
-            .get_bytes(&self.value_key(group_key, value)?)
-            .await
-            .context("read grouped-max value count state")?
-        else {
-            return Ok(0);
-        };
-        decode_i64(bytes.as_ref())
-    }
-
-    fn value_count_read_required(
-        &self,
-        old_max: Option<i64>,
-        value: i64,
-        value_delta: i64,
-    ) -> bool {
-        match old_max {
-            None => false,
-            Some(old_max) => value_delta < 0 || value <= old_max,
-        }
-    }
-
-    async fn new_max_after_delta(
-        &self,
-        group_key: &[u8],
-        old_max: Option<i64>,
-        updated_counts: &HashMap<i64, i64>,
-    ) -> Result<Option<i64>> {
-        let mut max_added = None;
-        for (value, count) in updated_counts {
-            if *count > 0 {
-                max_added = Some(max_added.map_or(*value, |current: i64| current.max(*value)));
-            }
-        }
-
-        match old_max {
-            None => Ok(max_added),
-            Some(old_max) => {
-                let old_max_still_present = match updated_counts.get(&old_max) {
-                    Some(count) => *count > 0,
-                    None => true,
-                };
-                if old_max_still_present {
-                    return Ok(Some(max_added.map_or(old_max, |value| value.max(old_max))));
-                }
-                self.scan_max_with_overlay(group_key, updated_counts).await
-            }
-        }
-    }
-
-    async fn scan_max_with_overlay(
-        &self,
-        group_key: &[u8],
-        updated_counts: &HashMap<i64, i64>,
-    ) -> Result<Option<i64>> {
-        let value_prefix = self.group_key(VALUE_TAG, group_key)?;
-        let mut max = None;
-        for (key, value_bytes) in self
-            .table
-            .scan_prefix(&value_prefix, &ScanOptions::default())
-            .await
-            .context("scan grouped-max value count state")?
-        {
-            let value = decode_i64_sortable(
-                key.get(value_prefix.len()..)
-                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-max value key"))?,
-            )?;
-            let old_count = decode_i64(&value_bytes)?;
-            let count = updated_counts.get(&value).copied().unwrap_or(old_count);
-            if count > 0 {
-                max = Some(max.map_or(value, |current: i64| current.max(value)));
-            }
-        }
-        for (value, count) in updated_counts {
-            if *count > 0 {
-                max = Some(max.map_or(*value, |current: i64| current.max(*value)));
-            }
-        }
-        Ok(max)
-    }
-
-    fn write_value_count(
-        &self,
-        batch: &mut WriteBatch,
-        group_key: &[u8],
-        value: i64,
-        count: i64,
-    ) -> Result<()> {
-        let key = self.value_key(group_key, value)?;
-        if count == 0 {
-            batch.delete(key);
-        } else {
-            batch.put(key, count.to_be_bytes());
-        }
-        Ok(())
     }
 
     fn write_max(&self, batch: &mut WriteBatch, group_key: &[u8], max: Option<i64>) -> Result<()> {
@@ -1131,12 +1140,6 @@ impl SlateGroupedMaxState {
             batch.put(self.bounds_key.clone(), encoded);
         }
         Ok(())
-    }
-
-    fn value_key(&self, group_key: &[u8], value: i64) -> Result<Vec<u8>> {
-        let mut key = self.group_key(VALUE_TAG, group_key)?;
-        key.extend_from_slice(&encode_i64_sortable(value));
-        Ok(key)
     }
 
     fn tag_prefix(&self, tag: u8) -> Vec<u8> {
@@ -1543,17 +1546,6 @@ fn read_bytes_at<'a>(
     Ok(chunk)
 }
 
-fn encode_i64_sortable(value: i64) -> [u8; 8] {
-    ((value as u64) ^ (1 << 63)).to_be_bytes()
-}
-
-fn decode_i64_sortable(bytes: &[u8]) -> Result<i64> {
-    let bytes: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("grouped-max value key suffix must be 8 bytes"))?;
-    Ok((u64::from_be_bytes(bytes) ^ (1 << 63)) as i64)
-}
-
 fn decode_i64(bytes: &[u8]) -> Result<i64> {
     let bytes: [u8; 8] = bytes
         .try_into()
@@ -1637,16 +1629,10 @@ mod tests {
         let mut bounds_update = None;
         let mut max_updates = Vec::new();
         state
-            .write_value_count(&mut batch, &[10], 100, 1)
-            .expect("write count 10");
-        state
             .write_max(&mut batch, &[10], Some(100))
             .expect("write max 10");
         max_updates.push((vec![10], Some(100)));
         merge_group_key_bounds_update(&mut bounds_update, &[10]);
-        state
-            .write_value_count(&mut batch, &[20], 200, 1)
-            .expect("write count 20");
         state
             .write_max(&mut batch, &[20], Some(200))
             .expect("write max 20");
@@ -1694,9 +1680,6 @@ mod tests {
         let mut batch = WriteBatch::new();
         let mut bounds_update = None;
         let mut max_updates = Vec::new();
-        state
-            .write_value_count(&mut batch, &[10], 100, 1)
-            .expect("write count");
         state
             .write_max(&mut batch, &[10], Some(100))
             .expect("write max");
