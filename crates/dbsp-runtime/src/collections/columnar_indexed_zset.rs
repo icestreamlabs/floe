@@ -19,7 +19,7 @@ use super::columnar_zset::{
 };
 
 const RANGE_LOOKUP_MIN_KEYS: usize = 128;
-const RANGE_LOOKUP_CHUNK_KEYS: usize = 512;
+const RANGE_LOOKUP_CHUNK_KEYS: usize = 2_048;
 
 pub struct SlateBackedColumnarIndexedZSet {
     table: Arc<dyn KeyValueTable>,
