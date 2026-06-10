@@ -115,6 +115,7 @@ pub(super) struct ColumnarJoinMaterializedViewState {
     left_delta_right_delta: JoinDeltaEvaluator,
     initial_snapshot: Vec<RecordBatch>,
     execution_strategy: ColumnarJoinExecutionStrategy,
+    persist_source_input_zsets: bool,
 }
 
 impl ColumnarJoinMaterializedViewState {
@@ -475,6 +476,47 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinMaterializedViewState> {
+    build_columnar_join_materialized_view_state_in_namespace_with_options(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_join_materialized_view_state_in_namespace_delta_only(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarJoinPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarJoinMaterializedViewState> {
+    build_columnar_join_materialized_view_state_in_namespace_with_options(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        false,
+    )
+    .await
+}
+
+async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarJoinPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+    persist_source_input_zsets: bool,
+) -> Result<ColumnarJoinMaterializedViewState> {
     let ColumnarJoinPlan {
         logical_plan,
         left,
@@ -542,6 +584,7 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         join_key_indices
             .as_ref()
             .map(|indices| indices.left.as_slice()),
+        persist_source_input_zsets,
     ))
     .await
     .context("build SlateDB-backed left join input state")?;
@@ -557,6 +600,7 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         join_key_indices
             .as_ref()
             .map(|indices| indices.right.as_slice()),
+        persist_source_input_zsets,
     ))
     .await
     .context("build SlateDB-backed right join input state")?;
@@ -623,6 +667,7 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         left_delta_right_delta,
         initial_snapshot,
         execution_strategy,
+        persist_source_input_zsets,
     })
 }
 
@@ -690,6 +735,7 @@ async fn build_join_input_state(
     udfs: &[ScalarUDF],
     output_initialized: bool,
     index_key_indices: Option<&[usize]>,
+    persist_source_input_zsets: bool,
 ) -> Result<ColumnarJoinSourceState> {
     match input.kind {
         ColumnarJoinInputPlanKind::Source { source_name } => {
@@ -724,15 +770,19 @@ async fn build_join_input_state(
                         input.input_name
                     )
                 })?;
-                index
-                    .rebuild_from_zset(&snapshot_zset)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "rebuild SlateDB-backed {side} join input index for '{}'",
-                            input.input_name
-                        )
-                    })?;
+                let should_rebuild_index = persist_source_input_zsets
+                    || (!index.has_persisted_segments() && !snapshot_zset.is_empty());
+                if should_rebuild_index {
+                    index
+                        .rebuild_from_zset(&snapshot_zset)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "rebuild SlateDB-backed {side} join input index for '{}'",
+                                input.input_name
+                            )
+                        })?;
+                }
                 Some(Box::new(index))
             } else {
                 None
@@ -941,14 +991,17 @@ async fn build_join_input_state(
         }
         ColumnarJoinInputPlanKind::Join { plan } => {
             let join_namespace = format!("{namespace}/state");
-            let state = Box::pin(build_columnar_join_materialized_view_state_in_namespace(
-                table,
-                join_namespace,
-                &input.schema,
-                *plan,
-                sources,
-                udfs,
-            ))
+            let state = Box::pin(
+                build_columnar_join_materialized_view_state_in_namespace_with_options(
+                    table,
+                    join_namespace,
+                    &input.schema,
+                    *plan,
+                    sources,
+                    udfs,
+                    persist_source_input_zsets,
+                ),
+            )
             .await
             .with_context(|| {
                 format!(
@@ -1416,13 +1469,14 @@ async fn run_columnar_join_state_tick_inner(
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
     let right_input_delta =
         source_input_delta(&columnar.right, insert_batches, weighted_delta_batches)?;
+    let persist_source_delta = maintain_output_snapshot || columnar.persist_source_input_zsets;
     let left_delta = {
         let left_zset = columnar
             .left
             .input_zset
             .as_mut()
             .context("incremental join left source zset missing")?;
-        persisted_source_delta(left_zset, left_input_delta).await?
+        prepare_join_source_delta(left_zset, left_input_delta, persist_source_delta).await?
     };
     let right_delta = {
         let right_zset = columnar
@@ -1430,7 +1484,7 @@ async fn run_columnar_join_state_tick_inner(
             .input_zset
             .as_mut()
             .context("incremental join right source zset missing")?;
-        persisted_source_delta(right_zset, right_input_delta).await?
+        prepare_join_source_delta(right_zset, right_input_delta, persist_source_delta).await?
     };
     let left_signed = signed_source_delta(&columnar.left.schema, left_delta.batches())?;
     let right_signed = signed_source_delta(&columnar.right.schema, right_delta.batches())?;
@@ -2462,6 +2516,18 @@ async fn persisted_source_delta(
     let base = zset.current_handle().map(|handle| handle.version);
     zset.create_version(&input_delta, base).await?;
     Ok(input_delta)
+}
+
+async fn prepare_join_source_delta(
+    zset: &mut SlateBackedColumnarZSet,
+    input_delta: ColumnarZSet,
+    persist: bool,
+) -> Result<ColumnarZSet> {
+    if persist {
+        persisted_source_delta(zset, input_delta).await
+    } else {
+        Ok(input_delta)
+    }
 }
 
 fn signed_source_delta(

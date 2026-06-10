@@ -42,8 +42,8 @@ use super::columnar_grouped_max::{
 };
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
-    build_columnar_join_materialized_view_state_in_namespace, columnar_join_plan_for_plan,
-    run_columnar_join_state_tick_delta_only,
+    build_columnar_join_materialized_view_state_in_namespace_delta_only,
+    columnar_join_plan_for_plan, run_columnar_join_state_tick_delta_only,
 };
 use super::columnar_join_topn::{
     ColumnarJoinTopNMaterializedViewState, ColumnarJoinTopNPlan,
@@ -1015,7 +1015,7 @@ async fn build_boxed_join_grouped_stats_input_state(
     udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarJoinMaterializedViewState>> {
     Ok(Box::new(
-        build_columnar_join_materialized_view_state_in_namespace(
+        build_columnar_join_materialized_view_state_in_namespace_delta_only(
             table,
             namespace,
             output_schema,

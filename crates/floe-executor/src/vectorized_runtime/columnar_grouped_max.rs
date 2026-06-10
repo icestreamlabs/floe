@@ -32,8 +32,8 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
-    build_columnar_join_materialized_view_state_in_namespace, columnar_join_plan_for_plan,
-    run_columnar_join_state_tick_delta_only,
+    build_columnar_join_materialized_view_state_in_namespace_delta_only,
+    columnar_join_plan_for_plan, run_columnar_join_state_tick_delta_only,
 };
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
@@ -399,14 +399,16 @@ async fn build_boxed_join_grouped_max_input_state(
     udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarJoinMaterializedViewState>> {
     Ok(Box::new(
-        Box::pin(build_columnar_join_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
-        ))
+        Box::pin(
+            build_columnar_join_materialized_view_state_in_namespace_delta_only(
+                table,
+                namespace,
+                output_schema,
+                plan,
+                sources,
+                udfs,
+            ),
+        )
         .await?,
     ))
 }

@@ -100,6 +100,10 @@ impl SlateBackedColumnarIndexedZSet {
         &self.key_indices
     }
 
+    pub fn has_persisted_segments(&self) -> bool {
+        self.next_segment_id > 1
+    }
+
     pub async fn rebuild_from_zset(&mut self, zset: &ColumnarZSet) -> Result<()> {
         self.validate_delta(zset)?;
         self.clear_persisted().await?;

@@ -431,7 +431,7 @@ impl SlateBackedColumnarZSet {
         );
 
         if let Some(base_version) = base {
-            let mut base_manifest = self.load_manifest_record(base_version).await?;
+            let mut base_manifest = self.base_manifest_for_write(base_version).await?;
             base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
             batch.put(
                 self.manifest_key(base_version),
@@ -577,6 +577,15 @@ impl SlateBackedColumnarZSet {
         encoding::decode(bytes.as_ref()).context("decode Arrow columnar zset manifest")
     }
 
+    async fn base_manifest_for_write(&self, version: u64) -> Result<ColumnarVersionManifest> {
+        if version == self.current_version
+            && let Some(manifest) = self.manifest.as_ref()
+        {
+            return Ok(manifest.clone());
+        }
+        self.load_manifest_record(version).await
+    }
+
     fn empty_like(&self) -> ColumnarZSet {
         ColumnarZSet {
             value_schema: Arc::clone(&self.value_schema),
@@ -659,7 +668,7 @@ impl SlateBackedColumnarI64ZSet {
         );
 
         if let Some(base_version) = base {
-            let mut base_manifest = self.load_manifest_record(base_version).await?;
+            let mut base_manifest = self.base_manifest_for_write(base_version).await?;
             base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
             batch.put(
                 self.manifest_key(base_version),
@@ -809,6 +818,15 @@ impl SlateBackedColumnarI64ZSet {
             .with_context(|| format!("read columnar zset manifest {version}"))?
             .ok_or_else(|| anyhow::anyhow!("missing columnar zset manifest {version}"))?;
         encoding::decode(bytes.as_ref()).context("decode columnar zset manifest")
+    }
+
+    async fn base_manifest_for_write(&self, version: u64) -> Result<ColumnarVersionManifest> {
+        if version == self.current_version
+            && let Some(manifest) = self.manifest.as_ref()
+        {
+            return Ok(manifest.clone());
+        }
+        self.load_manifest_record(version).await
     }
 
     #[allow(dead_code)]
