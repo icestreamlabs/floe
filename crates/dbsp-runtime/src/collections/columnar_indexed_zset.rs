@@ -44,6 +44,29 @@ struct IndexKeyBounds {
     max: Vec<u8>,
 }
 
+struct LookupKeySet {
+    buckets: HashMap<u16, HashSet<Vec<u8>>>,
+    bounds: Option<IndexKeyBounds>,
+    len: usize,
+}
+
+impl LookupKeySet {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn overlaps_persisted_bounds(&self, persisted_bounds: Option<&IndexKeyBounds>) -> bool {
+        let Some(persisted_bounds) = persisted_bounds else {
+            return true;
+        };
+        let Some(bounds) = self.bounds.as_ref() else {
+            return false;
+        };
+        bounds.max.as_slice() >= persisted_bounds.min.as_slice()
+            && bounds.min.as_slice() <= persisted_bounds.max.as_slice()
+    }
+}
+
 impl SlateBackedColumnarIndexedZSet {
     pub async fn new(
         table: Arc<dyn KeyValueTable>,
@@ -184,8 +207,7 @@ impl SlateBackedColumnarIndexedZSet {
             Bytes::from(segment_bytes),
         );
         let posting_buckets = bucket_postings(postings);
-        for (bucket, mut entries) in posting_buckets {
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (bucket, entries) in posting_buckets {
             write_batch.put_bytes(
                 Bytes::from(self.bucket_index_key(bucket, segment_id)),
                 Bytes::from(encode_bucket_postings(&entries)?),
@@ -221,15 +243,15 @@ impl SlateBackedColumnarIndexedZSet {
     pub async fn lookup_key_batches(&self, key_batches: &[RecordBatch]) -> Result<ColumnarZSet> {
         let total_start = profile::start();
         let phase_start = profile::start();
-        let key_bytes = self.key_bytes_from_batches(key_batches)?;
-        if key_bytes.is_empty() {
+        let lookup_keys = self.lookup_keys_from_batches(key_batches)?;
+        if lookup_keys.is_empty() {
             profile::record_since("columnar_index.lookup.key_bytes", phase_start);
             profile::record_since("columnar_index.lookup.total", total_start);
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
         }
         profile::record_since("columnar_index.lookup.key_bytes", phase_start);
         let phase_start = profile::start();
-        if !keys_overlap_bounds(&key_bytes, self.key_bounds.as_ref()) {
+        if !lookup_keys.overlaps_persisted_bounds(self.key_bounds.as_ref()) {
             profile::record_since("columnar_index.lookup.bounds_check", phase_start);
             profile::record_since("columnar_index.lookup.total", total_start);
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
@@ -237,9 +259,8 @@ impl SlateBackedColumnarIndexedZSet {
         profile::record_since("columnar_index.lookup.bounds_check", phase_start);
 
         let phase_start = profile::start();
-        let key_buckets = keys_by_bucket(key_bytes);
         let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
-        self.lookup_key_buckets(&key_buckets, &mut refs_by_segment)
+        self.lookup_key_buckets(&lookup_keys.buckets, &mut refs_by_segment)
             .await?;
         profile::record_since("columnar_index.lookup.collect_postings", phase_start);
 
@@ -273,32 +294,9 @@ impl SlateBackedColumnarIndexedZSet {
         refs_by_segment: &mut HashMap<u64, Vec<u32>>,
     ) -> Result<()> {
         for (bucket, wanted_keys) in key_buckets {
-            let entries = self
-                .table
-                .scan_prefix_bytes(&self.bucket_prefix(*bucket), &ScanOptions::default())
-                .await
-                .context("scan columnar index bucket postings")?;
-            self.collect_bucket_posting_entries(entries, wanted_keys, refs_by_segment)?;
-        }
-        Ok(())
-    }
-
-    fn collect_bucket_posting_entries<K, V>(
-        &self,
-        entries: Vec<(K, V)>,
-        wanted_keys: &HashSet<Vec<u8>>,
-        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
-    ) -> Result<()>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        for (entry_key, entry_value) in entries {
-            let segment_id = self.segment_id_from_bucket_key(entry_key.as_ref())?;
-            decode_bucket_postings_for_keys(
-                entry_value.as_ref(),
-                wanted_keys,
-                |row_index, weight| {
+            let mut visit_entry = |entry_key: &[u8], entry_value: &[u8]| -> Result<()> {
+                let segment_id = self.segment_id_from_bucket_key(entry_key)?;
+                decode_bucket_postings_for_keys(entry_value, wanted_keys, |row_index, weight| {
                     if weight != 0 {
                         refs_by_segment
                             .entry(segment_id)
@@ -306,8 +304,16 @@ impl SlateBackedColumnarIndexedZSet {
                             .push(row_index);
                     }
                     Ok(())
-                },
-            )?;
+                })
+            };
+            self.table
+                .scan_prefix_bytes_for_each(
+                    &self.bucket_prefix(*bucket),
+                    &ScanOptions::default(),
+                    &mut visit_entry,
+                )
+                .await
+                .context("scan columnar index bucket postings")?;
         }
         Ok(())
     }
@@ -377,9 +383,11 @@ impl SlateBackedColumnarIndexedZSet {
         Ok(postings)
     }
 
-    fn key_bytes_from_batches(&self, key_batches: &[RecordBatch]) -> Result<Vec<Vec<u8>>> {
-        let mut keys = Vec::new();
-        let mut seen = HashSet::new();
+    fn lookup_keys_from_batches(&self, key_batches: &[RecordBatch]) -> Result<LookupKeySet> {
+        let mut buckets: HashMap<u16, HashSet<Vec<u8>>> = HashMap::new();
+        let mut min = None::<Vec<u8>>;
+        let mut max = None::<Vec<u8>>;
+        let mut len = 0_usize;
         let converter = row_converter_for_schema(&self.key_schema)?;
         for batch in key_batches {
             if batch.schema().as_ref() != self.key_schema.as_ref() {
@@ -393,13 +401,35 @@ impl SlateBackedColumnarIndexedZSet {
                 .convert_columns(&columns)
                 .context("encode columnar index lookup keys")?;
             for row_idx in 0..batch.num_rows() {
-                let key = rows.row(row_idx).data().to_vec();
-                if seen.insert(key.clone()) {
-                    keys.push(key);
+                let key = rows.row(row_idx).data();
+                let bucket = index_bucket(key);
+                let bucket_keys = buckets.entry(bucket).or_default();
+                if bucket_keys.contains(key) {
+                    continue;
                 }
+                let key = key.to_vec();
+                if min
+                    .as_ref()
+                    .is_none_or(|current_min| key.as_slice() < current_min.as_slice())
+                {
+                    min = Some(key.clone());
+                }
+                if max
+                    .as_ref()
+                    .is_none_or(|current_max| key.as_slice() > current_max.as_slice())
+                {
+                    max = Some(key.clone());
+                }
+                bucket_keys.insert(key);
+                len = len.saturating_add(1);
             }
         }
-        Ok(keys)
+        let bounds = min.zip(max).map(|(min, max)| IndexKeyBounds { min, max });
+        Ok(LookupKeySet {
+            buckets,
+            bounds,
+            len,
+        })
     }
 
     async fn take_segment_rows(
@@ -543,28 +573,6 @@ fn merge_key_bounds<'a>(
         }
     }
     min.zip(max).map(|(min, max)| IndexKeyBounds { min, max })
-}
-
-fn keys_overlap_bounds(keys: &[Vec<u8>], bounds: Option<&IndexKeyBounds>) -> bool {
-    let Some(bounds) = bounds else {
-        return true;
-    };
-    let Some(delta_bounds) = merge_key_bounds(None, keys.iter()) else {
-        return false;
-    };
-    delta_bounds.max.as_slice() >= bounds.min.as_slice()
-        && delta_bounds.min.as_slice() <= bounds.max.as_slice()
-}
-
-fn keys_by_bucket(keys: Vec<Vec<u8>>) -> HashMap<u16, HashSet<Vec<u8>>> {
-    let mut buckets = HashMap::new();
-    for key in keys {
-        buckets
-            .entry(index_bucket(&key))
-            .or_insert_with(HashSet::new)
-            .insert(key);
-    }
-    buckets
 }
 
 fn bucket_postings(
