@@ -35,6 +35,11 @@ use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::incremental_source_for_plan;
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
+use super::columnar_grouped_max::{
+    ColumnarGroupedMaxMaterializedViewState, ColumnarGroupedMaxPlan,
+    build_columnar_grouped_max_materialized_view_state_in_namespace,
+    columnar_grouped_max_plan_for_plan, run_columnar_grouped_max_state_tick,
+};
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
     build_columnar_join_materialized_view_state_in_namespace, columnar_join_plan_for_plan,
@@ -89,6 +94,7 @@ impl ColumnarGroupedStatsPlan {
             ColumnarGroupedStatsInputPlan::JoinTopN { plan, .. } => {
                 plan.source_names().into_iter().collect()
             }
+            ColumnarGroupedStatsInputPlan::GroupedMax { plan, .. } => plan.source_names(),
             ColumnarGroupedStatsInputPlan::GroupedStats { plan, .. } => plan.source_names(),
             ColumnarGroupedStatsInputPlan::TopN { plan, .. } => plan.source_names(),
         }
@@ -117,6 +123,12 @@ enum ColumnarGroupedStatsInputPlan {
         projection_input_schema: SchemaRef,
         plan: Box<ColumnarJoinTopNPlan>,
     },
+    GroupedMax {
+        input_name: String,
+        source_schema: SchemaRef,
+        projection_input_schema: SchemaRef,
+        plan: Box<ColumnarGroupedMaxPlan>,
+    },
     GroupedStats {
         input_name: String,
         source_schema: SchemaRef,
@@ -138,6 +150,7 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     join: Option<Box<ColumnarJoinMaterializedViewState>>,
     multijoin: Option<Box<ColumnarMultiJoinMaterializedViewState>>,
     join_topn: Option<Box<ColumnarJoinTopNMaterializedViewState>>,
+    grouped_max: Option<Box<ColumnarGroupedMaxMaterializedViewState>>,
     grouped_stats: Option<Box<ColumnarGroupedStatsMaterializedViewState>>,
     topn: Option<Box<ColumnarTopNMaterializedViewState>>,
     input_snapshot: Vec<RecordBatch>,
@@ -297,6 +310,21 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let input =
         if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
             ColumnarGroupedStatsInputPlan::Source { source_name }
+        } else if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(
+            aggregate.input.as_ref(),
+            sources,
+            &df_schema_to_arrow(aggregate.input.schema())?,
+        )? {
+            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
+            let projection_input_schema = derived_projection_input_schema(&source_schema);
+            let input_name = derived_relation_name(aggregate.input.as_ref())
+                .unwrap_or_else(|| "__floe_grouped_stats_grouped_max_input".to_string());
+            ColumnarGroupedStatsInputPlan::GroupedMax {
+                input_name,
+                source_schema,
+                projection_input_schema,
+                plan: Box::new(grouped_max),
+            }
         } else if let Some(grouped_stats) = columnar_grouped_stats_plan_for_plan(
             aggregate.input.as_ref(),
             sources,
@@ -427,6 +455,11 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
             ..
         }
         | ColumnarGroupedStatsInputPlan::JoinTopN {
+            input_name,
+            projection_input_schema,
+            ..
+        }
+        | ColumnarGroupedStatsInputPlan::GroupedMax {
             input_name,
             projection_input_schema,
             ..
@@ -577,6 +610,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         join,
         multijoin,
         join_topn,
+        grouped_max,
         grouped_stats,
         topn,
         input_snapshot,
@@ -606,6 +640,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 source_name,
                 Arc::clone(&source.schema),
                 Some(input_zset),
+                None,
                 None,
                 None,
                 None,
@@ -660,6 +695,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 None,
                 None,
                 None,
+                None,
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -707,6 +743,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 None,
                 None,
                 Some(multijoin),
+                None,
                 None,
                 None,
                 None,
@@ -760,6 +797,58 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 Some(join_topn),
                 None,
                 None,
+                None,
+                input_snapshot,
+                GroupedStatsProjectionState::Derived(projection_delta),
+            )
+        }
+        ColumnarGroupedStatsInputPlan::GroupedMax {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: grouped_max_plan,
+        } => {
+            let grouped_max_namespace =
+                format!("{mv_namespace}/columnar/grouped_stats/grouped_max_input");
+            let grouped_max = Box::pin(build_boxed_grouped_max_grouped_stats_input_state(
+                Arc::clone(&table),
+                grouped_max_namespace,
+                &source_schema,
+                *grouped_max_plan,
+                sources,
+                udfs,
+            ))
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed grouped-stats grouped-max input for '{}'",
+                    input_name
+                )
+            })?;
+            let input_snapshot = grouped_max.initial_snapshot();
+            let projection_delta = build_derived_projection_state(
+                LogicalPlan::Projection(plan.projection.clone()),
+                &input_name,
+                &projection_input_schema,
+                udfs,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "build grouped-stats grouped-max projection delta plan for '{}'",
+                    input_name
+                )
+            })?;
+            (
+                input_name,
+                source_schema,
+                None,
+                None,
+                None,
+                None,
+                Some(grouped_max),
+                None,
+                None,
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -804,6 +893,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
+                None,
                 None,
                 None,
                 None,
@@ -858,6 +948,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 None,
                 None,
                 None,
+                None,
                 Some(topn),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
@@ -884,6 +975,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         join,
         multijoin,
         join_topn,
+        grouped_max,
         grouped_stats,
         topn,
         input_snapshot,
@@ -921,6 +1013,29 @@ async fn build_boxed_join_grouped_stats_input_state(
             plan,
             sources,
             udfs,
+        )
+        .await?,
+    ))
+}
+
+async fn build_boxed_grouped_max_grouped_stats_input_state(
+    table: Arc<dyn KeyValueTable>,
+    namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarGroupedMaxPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<Box<ColumnarGroupedMaxMaterializedViewState>> {
+    Ok(Box::new(
+        Box::pin(
+            build_columnar_grouped_max_materialized_view_state_in_namespace(
+                table,
+                namespace,
+                output_schema,
+                plan,
+                sources,
+                udfs,
+            ),
         )
         .await?,
     ))
@@ -1168,6 +1283,14 @@ async fn prepare_grouped_stats_input_delta(
         )
         .await;
     }
+    if columnar.grouped_max.is_some() {
+        return prepare_grouped_max_grouped_stats_input_delta(
+            columnar,
+            insert_batches,
+            weighted_delta_batches,
+        )
+        .await;
+    }
     if columnar.grouped_stats.is_some() {
         return prepare_grouped_stats_grouped_stats_input_delta(
             columnar,
@@ -1299,6 +1422,34 @@ async fn prepare_join_topn_grouped_stats_input_delta(
     .with_context(|| {
         format!(
             "evaluate grouped-stats nested join-topn input '{}'",
+            columnar.input_name
+        )
+    })?;
+    if tick.input_changed {
+        columnar.input_snapshot = tick.next_snapshot;
+    }
+    Ok(tick.delta)
+}
+
+async fn prepare_grouped_max_grouped_stats_input_delta(
+    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<ColumnarZSet> {
+    let Some(grouped_max) = columnar.grouped_max.as_mut() else {
+        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
+    };
+    let tick = Box::pin(run_columnar_grouped_max_state_tick(
+        grouped_max.as_mut(),
+        insert_batches,
+        weighted_delta_batches,
+        &columnar.source_schema,
+        &columnar.input_snapshot,
+    ))
+    .await
+    .with_context(|| {
+        format!(
+            "evaluate grouped-stats nested grouped-max input '{}'",
             columnar.input_name
         )
     })?;
