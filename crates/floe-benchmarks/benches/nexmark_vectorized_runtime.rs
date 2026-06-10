@@ -21,6 +21,12 @@ use tokio::runtime::Runtime;
 
 const ROWS_PER_TICK: usize = 8_192;
 const TICKS: usize = 8;
+const Q4_REPEATED_AUCTION_ROWS: usize = 10_000;
+const Q4_REPEATED_BID_ROWS: usize = 1_000_000;
+const Q4_REPEATED_BID_ROWS_PER_TICK: usize = 8_192;
+const Q4_REPEATED_TICKS: usize =
+    (Q4_REPEATED_BID_ROWS + Q4_REPEATED_BID_ROWS_PER_TICK - 1) / Q4_REPEATED_BID_ROWS_PER_TICK;
+const Q4_QUERY: &str = r#"SELECT category, AVG(max) FROM (SELECT MAX(b.price) AS max, a.category FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category"#;
 
 #[derive(Clone, Copy)]
 struct NexmarkRuntimeSource {
@@ -94,7 +100,7 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
                 },
             ],
             view_name: "mv_nexmark_q4",
-            query: r#"SELECT category, AVG(max) FROM (SELECT MAX(b.price) AS max, a.category FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category"#,
+            query: Q4_QUERY,
             output_schema: q4_output_schema,
         },
         NexmarkRuntimeCase {
@@ -639,6 +645,63 @@ fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_nexmark_q4_repeated_state_runtime(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("create tokio runtime");
+    let case = NexmarkRuntimeCase {
+        id: "q4_repeated_state",
+        sources: &[
+            NexmarkRuntimeSource {
+                source_name: "nexmark_auction",
+                batch: auction_batch,
+            },
+            NexmarkRuntimeSource {
+                source_name: "nexmark_bid",
+                batch: bid_batch,
+            },
+        ],
+        view_name: "mv_nexmark_q4_repeated_state",
+        query: Q4_QUERY,
+        output_schema: q4_output_schema,
+    };
+
+    let mut group = c.benchmark_group("nexmark_vectorized_runtime_q4_repeated_state");
+    group.throughput(Throughput::Elements(
+        (Q4_REPEATED_AUCTION_ROWS + Q4_REPEATED_BID_ROWS) as u64,
+    ));
+    group.bench_with_input(
+        BenchmarkId::new(
+            case.id,
+            format!(
+                "{} auctions + {}x{} bids",
+                Q4_REPEATED_AUCTION_ROWS, Q4_REPEATED_BID_ROWS_PER_TICK, Q4_REPEATED_TICKS
+            ),
+        ),
+        &case,
+        |b, case| {
+            b.iter_batched(
+                || {
+                    runtime
+                        .block_on(build_q4_repeated_state_runtime_case(case))
+                        .expect("build q4 repeated-state runtime benchmark case")
+                },
+                |(mut execution, registry, auction_batch, bid_batches)| {
+                    runtime
+                        .block_on(run_q4_repeated_state_runtime_case(
+                            case,
+                            &mut execution,
+                            registry,
+                            auction_batch,
+                            bid_batches,
+                        ))
+                        .expect("run q4 repeated-state runtime benchmark case")
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+    group.finish();
+}
+
 async fn build_runtime_case(
     case: &NexmarkRuntimeCase,
 ) -> Result<(
@@ -691,6 +754,62 @@ async fn build_runtime_case(
     Ok((execution, registry, source_batches))
 }
 
+async fn build_q4_repeated_state_runtime_case(
+    case: &NexmarkRuntimeCase,
+) -> Result<(
+    VectorizedExecutionRuntime,
+    Arc<MaterializedViewRegistry>,
+    RecordBatch,
+    Vec<RecordBatch>,
+)> {
+    let mut sources = SourceRegistry::new();
+    let definitions = generator::definitions()?;
+    sources.extend(definitions.clone());
+    let output_schema = (case.output_schema)();
+    let table = build_operator_state_table(case.id).await?;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let execution = VectorizedExecutionRuntime::new_with_udfs_and_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            case.view_name,
+            case.query,
+            output_schema,
+        )],
+        Arc::clone(&registry),
+        planner_udfs(),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .with_context(|| format!("build vectorized runtime for {}", case.id))?;
+
+    let auction_schema = definitions
+        .iter()
+        .find(|definition| definition.name() == "nexmark_auction")
+        .ok_or_else(|| anyhow::anyhow!("missing nexmark_auction definition"))?
+        .to_arrow_schema();
+    let bid_schema = definitions
+        .iter()
+        .find(|definition| definition.name() == "nexmark_bid")
+        .ok_or_else(|| anyhow::anyhow!("missing nexmark_bid definition"))?
+        .to_arrow_schema();
+    let auction_batch = auction_batch(auction_schema, 0, Q4_REPEATED_AUCTION_ROWS)
+        .context("build q4 repeated-state auction batch")?;
+    let bid_batches = (0..Q4_REPEATED_TICKS)
+        .map(|tick| {
+            let start = tick * Q4_REPEATED_BID_ROWS_PER_TICK;
+            let remaining = Q4_REPEATED_BID_ROWS.saturating_sub(start);
+            bid_batch(
+                Arc::clone(&bid_schema),
+                start,
+                remaining.min(Q4_REPEATED_BID_ROWS_PER_TICK),
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+        .context("build q4 repeated-state bid batches")?;
+
+    Ok((execution, registry, auction_batch, bid_batches))
+}
+
 async fn run_runtime_case(
     case: &NexmarkRuntimeCase,
     execution: &mut VectorizedExecutionRuntime,
@@ -714,6 +833,45 @@ async fn run_runtime_case(
         .ok_or_else(|| anyhow::anyhow!("missing materialized view {}", case.view_name))?;
     let snapshot = handle
         .arrow_snapshot_for(TICKS as i64)
+        .ok_or_else(|| anyhow::anyhow!("missing final snapshot for {}", case.view_name))?;
+    let rows = snapshot.iter().map(RecordBatch::num_rows).sum::<usize>();
+    black_box(rows);
+    Ok(())
+}
+
+async fn run_q4_repeated_state_runtime_case(
+    case: &NexmarkRuntimeCase,
+    execution: &mut VectorizedExecutionRuntime,
+    registry: Arc<MaterializedViewRegistry>,
+    auction_batch: RecordBatch,
+    bid_batches: Vec<RecordBatch>,
+) -> Result<()> {
+    execution
+        .append_source_batches_for_execution_and_query(
+            "nexmark_auction",
+            vec![auction_batch],
+            Vec::new(),
+        )
+        .await?;
+    execution.run_tick(1).await?;
+
+    for (tick, bid_batch) in bid_batches.into_iter().enumerate() {
+        execution
+            .append_source_batches_for_execution_and_query(
+                "nexmark_bid",
+                vec![bid_batch],
+                Vec::new(),
+            )
+            .await?;
+        execution.run_tick((tick + 2) as i64).await?;
+    }
+
+    let final_version = (Q4_REPEATED_TICKS + 1) as i64;
+    let handle = registry
+        .get(case.view_name)
+        .ok_or_else(|| anyhow::anyhow!("missing materialized view {}", case.view_name))?;
+    let snapshot = handle
+        .arrow_snapshot_for(final_version)
         .ok_or_else(|| anyhow::anyhow!("missing final snapshot for {}", case.view_name))?;
     let rows = snapshot.iter().map(RecordBatch::num_rows).sum::<usize>();
     black_box(rows);
@@ -1308,5 +1466,9 @@ fn q20_output_schema() -> SchemaRef {
     ]))
 }
 
-criterion_group!(benches, bench_nexmark_vectorized_runtime);
+criterion_group!(
+    benches,
+    bench_nexmark_vectorized_runtime,
+    bench_nexmark_q4_repeated_state_runtime
+);
 criterion_main!(benches);
