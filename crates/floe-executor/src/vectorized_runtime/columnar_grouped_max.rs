@@ -33,7 +33,7 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
     build_columnar_join_materialized_view_state_in_namespace, columnar_join_plan_for_plan,
-    run_columnar_join_state_tick,
+    run_columnar_join_state_tick_delta_only,
 };
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
@@ -477,6 +477,43 @@ pub(super) async fn run_columnar_grouped_max_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedMaxTick> {
+    run_columnar_grouped_max_state_tick_inner(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        output_schema,
+        previous_snapshot,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn run_columnar_grouped_max_state_tick_delta_only(
+    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarGroupedMaxTick> {
+    run_columnar_grouped_max_state_tick_inner(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        output_schema,
+        previous_snapshot,
+        false,
+    )
+    .await
+}
+
+async fn run_columnar_grouped_max_state_tick_inner(
+    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+    maintain_output_snapshot: bool,
+) -> Result<ColumnarGroupedMaxTick> {
     let persisted_input_delta =
         prepare_grouped_max_input_delta(columnar, insert_batches, weighted_delta_batches).await?;
     let input_changed = !persisted_input_delta.batches().is_empty();
@@ -501,11 +538,17 @@ pub(super) async fn run_columnar_grouped_max_state_tick(
         output_delta
     };
 
-    let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot =
-        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
-            .await
-            .context("apply Slate-backed grouped-max columnar snapshot delta")?;
+    let next_snapshot = if maintain_output_snapshot {
+        apply_weighted_snapshot_delta(
+            output_schema,
+            previous_snapshot,
+            persisted_output_delta.batches().to_vec(),
+        )
+        .await
+        .context("apply Slate-backed grouped-max columnar snapshot delta")?
+    } else {
+        Vec::new()
+    };
 
     Ok(ColumnarGroupedMaxTick {
         delta: persisted_output_delta,
@@ -575,7 +618,7 @@ async fn prepare_join_grouped_max_input_delta(
     let Some(join) = columnar.join.as_mut() else {
         return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
     };
-    let tick = Box::pin(run_columnar_join_state_tick(
+    let tick = Box::pin(run_columnar_join_state_tick_delta_only(
         join.as_mut(),
         insert_batches,
         weighted_delta_batches,
@@ -589,7 +632,7 @@ async fn prepare_join_grouped_max_input_delta(
             columnar.input_name
         )
     })?;
-    if tick.input_changed {
+    if tick.input_changed && !tick.next_snapshot.is_empty() {
         columnar.input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)

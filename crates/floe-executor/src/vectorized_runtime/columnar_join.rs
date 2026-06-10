@@ -1361,6 +1361,43 @@ pub(super) async fn run_columnar_join_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarJoinTick> {
+    run_columnar_join_state_tick_inner(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        output_schema,
+        previous_snapshot,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn run_columnar_join_state_tick_delta_only(
+    columnar: &mut ColumnarJoinMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarJoinTick> {
+    run_columnar_join_state_tick_inner(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        output_schema,
+        previous_snapshot,
+        false,
+    )
+    .await
+}
+
+async fn run_columnar_join_state_tick_inner(
+    columnar: &mut ColumnarJoinMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+    maintain_output_snapshot: bool,
+) -> Result<ColumnarJoinTick> {
     if columnar.execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff {
         return Box::pin(run_columnar_snapshot_diff_join_state_tick(
             columnar,
@@ -1487,11 +1524,17 @@ pub(super) async fn run_columnar_join_state_tick(
         output_delta
     };
 
-    let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot =
-        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
-            .await
-            .context("apply Slate-backed join columnar snapshot delta")?;
+    let next_snapshot = if maintain_output_snapshot {
+        apply_weighted_snapshot_delta(
+            output_schema,
+            previous_snapshot,
+            persisted_output_delta.batches().to_vec(),
+        )
+        .await
+        .context("apply Slate-backed join columnar snapshot delta")?
+    } else {
+        Vec::new()
+    };
     if let Some(index) = columnar.left.input_index.as_deref_mut() {
         index
             .apply_delta(&left_delta)

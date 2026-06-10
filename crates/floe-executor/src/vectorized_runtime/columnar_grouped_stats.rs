@@ -38,12 +38,12 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 use super::columnar_grouped_max::{
     ColumnarGroupedMaxMaterializedViewState, ColumnarGroupedMaxPlan,
     build_columnar_grouped_max_materialized_view_state_in_namespace,
-    columnar_grouped_max_plan_for_plan, run_columnar_grouped_max_state_tick,
+    columnar_grouped_max_plan_for_plan, run_columnar_grouped_max_state_tick_delta_only,
 };
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
     build_columnar_join_materialized_view_state_in_namespace, columnar_join_plan_for_plan,
-    run_columnar_join_state_tick,
+    run_columnar_join_state_tick_delta_only,
 };
 use super::columnar_join_topn::{
     ColumnarJoinTopNMaterializedViewState, ColumnarJoinTopNPlan,
@@ -1355,7 +1355,7 @@ async fn prepare_join_grouped_stats_input_delta(
     let Some(join) = columnar.join.as_mut() else {
         return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
     };
-    let tick = Box::pin(run_columnar_join_state_tick(
+    let tick = Box::pin(run_columnar_join_state_tick_delta_only(
         join.as_mut(),
         insert_batches,
         weighted_delta_batches,
@@ -1369,7 +1369,7 @@ async fn prepare_join_grouped_stats_input_delta(
             columnar.input_name
         )
     })?;
-    if tick.input_changed {
+    if tick.input_changed && !tick.next_snapshot.is_empty() {
         columnar.input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)
@@ -1439,7 +1439,7 @@ async fn prepare_grouped_max_grouped_stats_input_delta(
     let Some(grouped_max) = columnar.grouped_max.as_mut() else {
         return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
     };
-    let tick = Box::pin(run_columnar_grouped_max_state_tick(
+    let tick = Box::pin(run_columnar_grouped_max_state_tick_delta_only(
         grouped_max.as_mut(),
         insert_batches,
         weighted_delta_batches,
@@ -1453,7 +1453,7 @@ async fn prepare_grouped_max_grouped_stats_input_delta(
             columnar.input_name
         )
     })?;
-    if tick.input_changed {
+    if tick.input_changed && !tick.next_snapshot.is_empty() {
         columnar.input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)
