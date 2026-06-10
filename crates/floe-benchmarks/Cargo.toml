@@ -25,6 +25,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 criterion = "0.5"
 datafusion = { workspace = true }
 dbsp = { path = "../dbsp" }

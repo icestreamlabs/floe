@@ -1,6 +1,13 @@
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use bytes::Bytes;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
@@ -17,6 +24,8 @@ use floe_node_core::planner::planner_udfs;
 use floe_node_core::source::SourceRegistry;
 use object_store::memory::InMemory;
 use slatedb::Db;
+use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 use tokio::runtime::Runtime;
 
 const ROWS_PER_TICK: usize = 8_192;
@@ -46,6 +55,201 @@ struct NexmarkRuntimeCase {
 struct NexmarkRuntimeSourceBatches {
     source_name: &'static str,
     batches: Vec<RecordBatch>,
+}
+
+const PROFILE_CATEGORY_COUNT: usize = 9;
+const PROFILE_CATEGORY_NAMES: [&str; PROFILE_CATEGORY_COUNT] = [
+    "join",
+    "grouped_max_state",
+    "grouped_max_output",
+    "grouped_stats_state",
+    "grouped_stats_output",
+    "zset_segment",
+    "zset_manifest",
+    "zset_state",
+    "other",
+];
+
+#[derive(Default)]
+struct KeyValueTableProfileMetrics {
+    get_calls: AtomicU64,
+    get_nanos: AtomicU64,
+    get_calls_by_category: [AtomicU64; PROFILE_CATEGORY_COUNT],
+    get_nanos_by_category: [AtomicU64; PROFILE_CATEGORY_COUNT],
+    write_calls: AtomicU64,
+    write_nanos: AtomicU64,
+    scan_calls: AtomicU64,
+    scan_nanos: AtomicU64,
+    scan_calls_by_category: [AtomicU64; PROFILE_CATEGORY_COUNT],
+    scan_nanos_by_category: [AtomicU64; PROFILE_CATEGORY_COUNT],
+}
+
+struct ProfilingKeyValueTable {
+    name: String,
+    inner: Arc<dyn KeyValueTable>,
+    metrics: Arc<KeyValueTableProfileMetrics>,
+}
+
+impl ProfilingKeyValueTable {
+    fn new(name: String, inner: Arc<dyn KeyValueTable>) -> Self {
+        Self {
+            name,
+            inner,
+            metrics: Arc::new(KeyValueTableProfileMetrics::default()),
+        }
+    }
+
+    fn record_elapsed(calls: &AtomicU64, nanos: &AtomicU64, start: Instant) -> u64 {
+        calls.fetch_add(1, Ordering::Relaxed);
+        let elapsed = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        nanos.fetch_add(elapsed, Ordering::Relaxed);
+        elapsed
+    }
+
+    fn record_get_elapsed(&self, key: &[u8], start: Instant) {
+        let elapsed = Self::record_elapsed(&self.metrics.get_calls, &self.metrics.get_nanos, start);
+        let category = profile_category_for_key(key);
+        self.metrics.get_calls_by_category[category].fetch_add(1, Ordering::Relaxed);
+        self.metrics.get_nanos_by_category[category].fetch_add(elapsed, Ordering::Relaxed);
+    }
+
+    fn record_scan_elapsed(&self, range: &Range<Vec<u8>>, start: Instant) {
+        let elapsed =
+            Self::record_elapsed(&self.metrics.scan_calls, &self.metrics.scan_nanos, start);
+        let category = profile_category_for_key(&range.start);
+        self.metrics.scan_calls_by_category[category].fetch_add(1, Ordering::Relaxed);
+        self.metrics.scan_nanos_by_category[category].fetch_add(elapsed, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ProfilingKeyValueTable {
+    fn drop(&mut self) {
+        let get_calls = self.metrics.get_calls.load(Ordering::Relaxed);
+        let get_nanos = self.metrics.get_nanos.load(Ordering::Relaxed);
+        let write_calls = self.metrics.write_calls.load(Ordering::Relaxed);
+        let write_nanos = self.metrics.write_nanos.load(Ordering::Relaxed);
+        let scan_calls = self.metrics.scan_calls.load(Ordering::Relaxed);
+        let scan_nanos = self.metrics.scan_nanos.load(Ordering::Relaxed);
+        eprintln!(
+            "[key-value-table-profile] name={} get_calls={} get_ms={:.3} write_calls={} write_ms={:.3} scan_calls={} scan_ms={:.3}",
+            self.name,
+            get_calls,
+            get_nanos as f64 / 1_000_000.0,
+            write_calls,
+            write_nanos as f64 / 1_000_000.0,
+            scan_calls,
+            scan_nanos as f64 / 1_000_000.0,
+        );
+        for idx in 0..PROFILE_CATEGORY_COUNT {
+            let get_calls = self.metrics.get_calls_by_category[idx].load(Ordering::Relaxed);
+            let get_nanos = self.metrics.get_nanos_by_category[idx].load(Ordering::Relaxed);
+            let scan_calls = self.metrics.scan_calls_by_category[idx].load(Ordering::Relaxed);
+            let scan_nanos = self.metrics.scan_nanos_by_category[idx].load(Ordering::Relaxed);
+            if get_calls == 0 && scan_calls == 0 {
+                continue;
+            }
+            eprintln!(
+                "[key-value-table-profile-category] name={} category={} get_calls={} get_ms={:.3} scan_calls={} scan_ms={:.3}",
+                self.name,
+                PROFILE_CATEGORY_NAMES[idx],
+                get_calls,
+                get_nanos as f64 / 1_000_000.0,
+                scan_calls,
+                scan_nanos as f64 / 1_000_000.0,
+            );
+        }
+    }
+}
+
+fn profile_category_for_key(key: &[u8]) -> usize {
+    if contains_bytes(key, b"columnar/grouped_max/state") {
+        1
+    } else if contains_bytes(key, b"columnar/grouped_max/output") {
+        2
+    } else if contains_bytes(key, b"columnar/grouped_stats/state") {
+        3
+    } else if contains_bytes(key, b"columnar/grouped_stats/output") {
+        4
+    } else if contains_bytes(key, b"columnar/join") {
+        0
+    } else if contains_bytes(key, b"segment/data") {
+        5
+    } else if contains_bytes(key, b"manifest/columnar") {
+        6
+    } else if contains_bytes(key, b"version_state/current") {
+        7
+    } else {
+        8
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[async_trait]
+impl KeyValueTable for ProfilingKeyValueTable {
+    async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let start = Instant::now();
+        let result = self.inner.get_bytes(key).await;
+        self.record_get_elapsed(key, start);
+        result
+    }
+
+    async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        let start = Instant::now();
+        let result = self.inner.write_batch(batch).await;
+        let _ = Self::record_elapsed(&self.metrics.write_calls, &self.metrics.write_nanos, start);
+        result
+    }
+
+    async fn scan_range_bytes(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let category_range = range.clone();
+        let start = Instant::now();
+        let result = self.inner.scan_range_bytes(range, options).await;
+        self.record_scan_elapsed(&category_range, start);
+        result
+    }
+
+    async fn scan_range_bytes_until(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        should_continue_after_entry: &mut (
+                 dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<bool> + Send
+             ),
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let category_range = range.clone();
+        let start = Instant::now();
+        let result = self
+            .inner
+            .scan_range_bytes_until(range, options, should_continue_after_entry)
+            .await;
+        self.record_scan_elapsed(&category_range, start);
+        result
+    }
+
+    async fn scan_range_bytes_for_each(
+        &self,
+        range: Range<Vec<u8>>,
+        options: &ScanOptions,
+        visit_entry: &mut (dyn for<'a, 'b> FnMut(&'a [u8], &'b [u8]) -> Result<()> + Send),
+    ) -> Result<()> {
+        let category_range = range.clone();
+        let start = Instant::now();
+        let result = self
+            .inner
+            .scan_range_bytes_for_each(range, options, visit_entry)
+            .await;
+        self.record_scan_elapsed(&category_range, start);
+        result
+    }
 }
 
 fn bench_nexmark_vectorized_runtime(c: &mut Criterion) {
@@ -881,7 +1085,14 @@ async fn run_q4_repeated_state_runtime_case(
 async fn build_operator_state_table(name: &str) -> Result<Arc<dyn KeyValueTable>> {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let db = Arc::new(Db::open(format!("nexmark-vectorized-runtime-{name}"), store).await?);
-    Ok(Arc::new(SlateTable::new(db)))
+    let table = Arc::new(SlateTable::new(db)) as Arc<dyn KeyValueTable>;
+    if std::env::var_os("FLOE_PROFILE_KEY_VALUE_TABLE").is_some() {
+        return Ok(Arc::new(ProfilingKeyValueTable::new(
+            name.to_string(),
+            table,
+        )));
+    }
+    Ok(table)
 }
 
 fn bid_batch(schema: SchemaRef, start: usize, rows: usize) -> Result<RecordBatch> {
