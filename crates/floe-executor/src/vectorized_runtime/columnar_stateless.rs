@@ -114,6 +114,12 @@ pub(super) async fn run_columnar_stateless_materialized_view_tick(
     };
 
     let plan_start = Instant::now();
+    let append_only_batches = if weighted_delta_batches.contains_key(columnar.source_name.as_str())
+    {
+        None
+    } else {
+        insert_batches.get(columnar.source_name.as_str())
+    };
     let input_delta =
         if let Some(weighted_batches) = weighted_delta_batches.get(columnar.source_name.as_str()) {
             ColumnarZSet::try_new_weighted(
@@ -142,21 +148,22 @@ pub(super) async fn run_columnar_stateless_materialized_view_tick(
             ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
         };
 
-    let persisted_input_delta = if let Some(handle) = columnar
+    let created_input_handle = columnar
         .input_zset
         .create_version(&input_delta, None)
-        .await?
-    {
-        columnar.input_zset.read_delta(&handle).await?
+        .await?;
+    let output_delta_batches = if let Some(source_batches) = append_only_batches {
+        stateless_append_only_output_delta_batches(columnar, source_batches, &mv.output_schema)
+            .await?
     } else {
-        input_delta
+        let persisted_input_delta = if let Some(handle) = created_input_handle {
+            columnar.input_zset.read_delta(&handle).await?
+        } else {
+            input_delta
+        };
+        stateless_output_delta_batches(columnar, persisted_input_delta.batches(), &mv.output_schema)
+            .await?
     };
-    let output_delta_batches = stateless_output_delta_batches(
-        columnar,
-        persisted_input_delta.batches(),
-        &mv.output_schema,
-    )
-    .await?;
     let output_delta =
         ColumnarZSet::try_new_weighted(Arc::clone(&mv.output_schema), output_delta_batches)
             .context("build stateless output zset delta")?;
@@ -264,6 +271,25 @@ async fn stateless_output_delta_batches(
         -1,
     )?);
     Ok(output_delta_batches)
+}
+
+async fn stateless_append_only_output_delta_batches(
+    columnar: &ColumnarStatelessMaterializedViewState,
+    source_batches: &[RecordBatch],
+    output_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    if source_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let weighted_schema = weighted_snapshot_schema(output_schema)?;
+    let positive_output =
+        collect_incremental_output(&columnar.incremental, source_batches, output_schema).await?;
+    Ok(add_weight_column_to_batches(
+        &positive_output,
+        &weighted_schema,
+        1,
+    )?)
 }
 
 fn columnar_zset_weight_sum(zset: &ColumnarZSet) -> Result<i64> {
