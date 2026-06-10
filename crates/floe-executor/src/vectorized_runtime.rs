@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -184,18 +184,43 @@ pub enum VectorizedMaterializedViewExecutionPolicy {
 #[derive(Clone, Default)]
 pub struct VectorizedExecutionRuntimeOptions {
     pub maintain_source_query_tables: bool,
+    pub source_query_table_names: Option<BTreeSet<String>>,
     pub operator_state_table: Option<Arc<dyn KeyValueTable>>,
 }
 
 impl VectorizedExecutionRuntimeOptions {
     pub fn with_source_query_tables(mut self) -> Self {
         self.maintain_source_query_tables = true;
+        self.source_query_table_names = None;
+        self
+    }
+
+    pub fn with_source_query_tables_for<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.maintain_source_query_tables = true;
+        self.source_query_table_names = Some(names.into_iter().map(Into::into).collect());
         self
     }
 
     pub fn with_operator_state_table(mut self, table: Arc<dyn KeyValueTable>) -> Self {
         self.operator_state_table = Some(table);
         self
+    }
+
+    fn maintains_query_table_for(&self, source_name: &str) -> bool {
+        if !self.maintain_source_query_tables {
+            return false;
+        }
+        let Some(names) = self.source_query_table_names.as_ref() else {
+            return true;
+        };
+        names.contains(source_name)
+            || source_name
+                .strip_prefix("nexmark_")
+                .is_some_and(|alias| names.contains(alias))
     }
 }
 
@@ -206,6 +231,7 @@ impl std::fmt::Debug for VectorizedExecutionRuntimeOptions {
                 "maintain_source_query_tables",
                 &self.maintain_source_query_tables,
             )
+            .field("source_query_table_names", &self.source_query_table_names)
             .field(
                 "operator_state_table",
                 &self.operator_state_table.as_ref().map(|_| "SlateDB"),
@@ -439,8 +465,8 @@ impl VectorizedExecutionRuntime {
                 Arc::clone(&schema),
                 key_indices.as_deref(),
             )?);
-            let query_provider = options
-                .maintain_source_query_tables
+            let maintain_query_table = options.maintains_query_table_for(definition.name());
+            let query_provider = maintain_query_table
                 .then(|| dynamic_state_provider(Arc::clone(&schema), key_indices.as_deref()))
                 .transpose()?
                 .map(Arc::new);
@@ -468,7 +494,7 @@ impl VectorizedExecutionRuntime {
                 } else {
                     (None, None)
                 };
-            let query_alias_provider = if options.maintain_source_query_tables {
+            let query_alias_provider = if maintain_query_table {
                 alias_schema
                     .as_ref()
                     .map(|schema| {

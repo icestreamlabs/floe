@@ -1,8 +1,8 @@
 use super::*;
 use crate::node_runtime::orchestration::{
     PostgresCdcRuntimePlanRequest, PostgresCdcRuntimeReconnectPolicy,
-    kafka_metadata_journal_required_sources, merge_catalog_source_connectors,
-    postgres_cdc_runtime_plan, source_journal_required_sources,
+    apply_durable_table_source_journal_policy, kafka_metadata_journal_required_sources,
+    merge_catalog_source_connectors, postgres_cdc_runtime_plan, source_journal_required_sources,
     validate_materialized_views_do_not_query_raw_cdc_sources,
 };
 use floe_sql_parser::parse_floe_statement;

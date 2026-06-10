@@ -39,6 +39,22 @@ pub(in crate::node_runtime) fn kafka_metadata_journal_required_sources(
         .collect()
 }
 
+pub(in crate::node_runtime) fn apply_durable_table_source_journal_policy(
+    source_journal_sources: &mut BTreeSet<String>,
+    kafka_metadata_sources: &mut BTreeSet<String>,
+    durable_table_source_names: &BTreeSet<String>,
+    required_sources: &BTreeSet<String>,
+    mode: SourceJournalConfig,
+) {
+    if mode != SourceJournalConfig::Auto {
+        return;
+    }
+    for source in durable_table_source_names.intersection(required_sources) {
+        source_journal_sources.insert(source.clone());
+        kafka_metadata_sources.remove(source);
+    }
+}
+
 pub(super) fn source_is_replayable_from_connector(definition: &SourceDefinition) -> bool {
     definition.properties().iter().any(|(key, value)| {
         key.starts_with("connector.") && key.ends_with(".type") && value.as_str() == "kafka"

@@ -44,7 +44,8 @@ use source_replay::{
     replay_committed_vectorized_source_journal_entries, source_is_replayable_from_connector,
 };
 pub(super) use source_replay::{
-    kafka_metadata_journal_required_sources, source_journal_required_sources,
+    apply_durable_table_source_journal_policy, kafka_metadata_journal_required_sources,
+    source_journal_required_sources,
 };
 use source_requirements::required_column_masks_by_source_id;
 #[cfg(test)]
@@ -145,6 +146,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut materialized_view_map: HashMap<String, MaterializedViewDefinition> = HashMap::new();
     let mut catalog_sources: HashMap<String, CatalogSourceDefinition> = HashMap::new();
     let mut source_backed_tables: HashMap<String, SourceBackedTableDefinition> = HashMap::new();
+    let mut durable_table_source_names: BTreeSet<String> = BTreeSet::new();
     let mut replication_pipelines: HashMap<String, CatalogReplicationPipelineDefinition> =
         HashMap::new();
     let mut sql_sink_specs = Vec::new();
@@ -272,6 +274,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         }
                     }
                     source_registry.register(source_definition_from_table(&table)?);
+                    durable_table_source_names.insert(table.name().to_string());
                     if let Some(binding) = source_backed_table {
                         source_backed_tables.insert(binding.table_name().to_string(), binding);
                     }
@@ -332,6 +335,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             .context("load persisted table definitions")?
         {
             source_registry.register(source_definition_from_table(&table)?);
+            durable_table_source_names.insert(table.name().to_string());
         }
     }
     validate_source_backed_tables(&catalog_sources, &source_backed_tables, &source_registry)?;
@@ -390,17 +394,25 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         all_required_sources.extend(required_sources.iter().cloned());
         plan_required_sources.push(required_sources);
     }
+    all_required_sources.extend(durable_table_source_names.iter().cloned());
     let source_journal_mode = config
         .as_ref()
         .and_then(|config| config.storage.source_journal)
         .unwrap_or(SourceJournalConfig::Auto);
-    let source_journal_required_sources = source_journal_required_sources(
+    let mut source_journal_required_sources = source_journal_required_sources(
         &source_registry,
         &all_required_sources,
         source_journal_mode,
     );
-    let kafka_metadata_journal_required_sources = kafka_metadata_journal_required_sources(
+    let mut kafka_metadata_journal_required_sources = kafka_metadata_journal_required_sources(
         &source_registry,
+        &all_required_sources,
+        source_journal_mode,
+    );
+    apply_durable_table_source_journal_policy(
+        &mut source_journal_required_sources,
+        &mut kafka_metadata_journal_required_sources,
+        &durable_table_source_names,
         &all_required_sources,
         source_journal_mode,
     );
@@ -521,11 +533,16 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let maintain_source_query_tables = !run_args.disable_pgwire;
+    let source_query_table_names = if run_args.disable_pgwire {
+        BTreeSet::new()
+    } else {
+        durable_table_source_names.clone()
+    };
     let mut vectorized_runtime_options = VectorizedExecutionRuntimeOptions::default()
         .with_operator_state_table(checkpoint_manager.store().table());
-    if maintain_source_query_tables {
-        vectorized_runtime_options = vectorized_runtime_options.with_source_query_tables();
+    if !source_query_table_names.is_empty() {
+        vectorized_runtime_options = vectorized_runtime_options
+            .with_source_query_tables_for(source_query_table_names.clone());
     }
     let mut vectorized_runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &source_registry,
@@ -699,7 +716,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &definitions,
         &all_required_sources,
         required_columns_by_source_id,
-        maintain_source_query_tables,
+        &source_query_table_names,
         &kafka_metadata_journal_required_sources,
         &source_journal_required_sources,
         &postgres_cdc_runtime_plans_by_connector,

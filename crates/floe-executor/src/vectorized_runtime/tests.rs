@@ -10457,6 +10457,41 @@ async fn source_query_tables_are_not_maintained_by_default() {
     assert!(runtime.table_providers().is_empty());
 }
 
+#[tokio::test]
+async fn source_query_tables_can_be_limited_by_name() {
+    let orders = SourceDefinition::new(
+        "orders",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("orders source definition");
+    let raw_events = SourceDefinition::new(
+        "raw_events",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("raw_events source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(orders);
+    sources.register(raw_events);
+
+    let runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        Vec::new(),
+        Arc::new(MaterializedViewRegistry::new()),
+        VectorizedExecutionRuntimeOptions::default().with_source_query_tables_for(["orders"]),
+    )
+    .await
+    .expect("runtime");
+
+    let mut names = runtime
+        .table_providers()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    names.sort();
+
+    assert_eq!(names, vec!["orders".to_string()]);
+}
+
 #[test]
 fn weighted_batch_from_diffs_rejects_non_unit_weights() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
