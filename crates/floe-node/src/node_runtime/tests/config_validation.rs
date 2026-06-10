@@ -1,4 +1,6 @@
 use super::*;
+use datafusion::arrow::array::{ArrayRef, Int64Array};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
 #[test]
 fn build_batch_limits_per_connector() {
@@ -115,6 +117,121 @@ fn build_batch_splits_raw_kafka_batches_by_limits() {
     assert_eq!(selection.per_connector_counts, vec![2]);
     assert_eq!(queues[0].pending_rows(), 1);
     assert_eq!(pending_events.pending(), 1);
+}
+
+#[test]
+fn build_batch_splits_arrow_kafka_batches_without_metadata_ranges() {
+    let pending_events = core_source::PendingAppendIngestEventCounter::default();
+    pending_events.record_enqueue(3);
+    let mut queues = vec![ConnectorQueue {
+        id: 0,
+        name: "kafka".to_string(),
+        pending: VecDeque::from([QueuedAppendIngestItem::KafkaArrow(
+            QueuedKafkaArrowIngestBatch {
+                batch: kafka_arrow_batch("s1", 3, false),
+                commit_ack: None,
+            },
+        )]),
+    }];
+
+    let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);
+    let selection = build_batch(BuildBatchRequest {
+        queues: &mut queues,
+        source_id_by_name: &source_id_by_name,
+        source_count: 1,
+        start_index: 0,
+        max_batch: 10,
+        max_per_source: 2,
+        max_per_connector: 10,
+        pending_events: &pending_events,
+    });
+
+    assert_eq!(selection.batch.len(), 0);
+    assert_eq!(selection.kafka_arrow_batches.len(), 1);
+    assert_eq!(selection.kafka_arrow_batches[0].source_id, Some(0));
+    assert_eq!(selection.kafka_arrow_batches[0].batch.len(), 2);
+    assert_eq!(
+        selection.kafka_arrow_batches[0].batch.execution.num_rows(),
+        2
+    );
+    assert_eq!(selection.selected_rows, 2);
+    assert_eq!(queues[0].pending_rows(), 1);
+    assert_eq!(pending_events.pending(), 1);
+}
+
+#[test]
+fn build_batch_defers_arrow_kafka_batches_with_metadata_ranges_when_partially_filled() {
+    let pending_events = core_source::PendingAppendIngestEventCounter::default();
+    pending_events.record_enqueue(4);
+    let mut queues = vec![ConnectorQueue {
+        id: 0,
+        name: "kafka".to_string(),
+        pending: VecDeque::from([
+            queued_event("s1", 1),
+            QueuedAppendIngestItem::KafkaArrow(QueuedKafkaArrowIngestBatch {
+                batch: kafka_arrow_batch("s1", 3, true),
+                commit_ack: None,
+            }),
+        ]),
+    }];
+
+    let source_id_by_name = HashMap::from([("s1".to_string(), 0usize)]);
+    let selection = build_batch(BuildBatchRequest {
+        queues: &mut queues,
+        source_id_by_name: &source_id_by_name,
+        source_count: 1,
+        start_index: 0,
+        max_batch: 10,
+        max_per_source: 3,
+        max_per_connector: 10,
+        pending_events: &pending_events,
+    });
+
+    assert_eq!(selection.batch.len(), 1);
+    assert_eq!(selection.kafka_arrow_batches.len(), 0);
+    assert_eq!(selection.selected_rows, 1);
+    assert_eq!(queues[0].pending_rows(), 3);
+    assert_eq!(pending_events.pending(), 3);
+}
+
+fn kafka_arrow_batch(
+    source: &str,
+    rows: usize,
+    include_metadata_range: bool,
+) -> core_source::KafkaArrowIngestBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let values = (0..rows)
+        .map(|value| i64::try_from(value).unwrap())
+        .collect::<Vec<_>>();
+    let execution =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
+            .expect("record batch");
+    let records = (0..rows)
+        .map(|offset| core_source::KafkaArrowIngestRecord {
+            topic: Arc::<str>::from("topic"),
+            partition: 0,
+            offset: i64::try_from(offset).unwrap(),
+            event_time_ms: None,
+        })
+        .collect();
+    let kafka_metadata_ranges = include_metadata_range
+        .then(|| core_source::KafkaArrowIngestJournalRange {
+            topic: Arc::<str>::from("topic"),
+            partition: 0,
+            start_offset: 0,
+            end_offset: i64::try_from(rows.saturating_sub(1)).unwrap(),
+            row_count: u64::try_from(rows).unwrap(),
+            checksum: 42,
+        })
+        .into_iter()
+        .collect();
+    core_source::KafkaArrowIngestBatch {
+        source: source.to_string(),
+        execution,
+        query: None,
+        records,
+        kafka_metadata_ranges,
+    }
 }
 
 #[test]

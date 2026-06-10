@@ -59,6 +59,7 @@ async fn kafka_connector_ingests_messages() {
         message_format: None,
         commit_offsets_rx: None,
         resume_from_offsets: Vec::new(),
+        arrow_decode: None,
     };
     let mut connector = KafkaConnector::new(config, Vec::new()).expect("connector config");
     let ctx = ConnectorContext::new(tx);

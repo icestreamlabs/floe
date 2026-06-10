@@ -361,17 +361,26 @@ pub(super) async fn recv_from_ready(
         return false;
     };
     if let Some(queue) = queues.get_mut(batch.connector_id) {
+        let commit_ack = batch.commit_ack;
         queue.pending.extend(batch.events.into_iter().map(|event| {
             QueuedAppendIngestItem::Event(QueuedAppendIngestEvent {
                 event,
-                commit_ack: batch.commit_ack.clone(),
+                commit_ack: commit_ack.clone(),
             })
         }));
         if let Some(kafka_raw) = batch.kafka_raw {
             queue.pending.push_back(QueuedAppendIngestItem::KafkaRaw(
                 QueuedKafkaRawIngestBatch {
                     batch: kafka_raw,
-                    commit_ack: batch.commit_ack,
+                    commit_ack: commit_ack.clone(),
+                },
+            ));
+        }
+        if let Some(kafka_arrow) = batch.kafka_arrow {
+            queue.pending.push_back(QueuedAppendIngestItem::KafkaArrow(
+                QueuedKafkaArrowIngestBatch {
+                    batch: kafka_arrow,
+                    commit_ack,
                 },
             ));
         }
@@ -405,17 +414,26 @@ pub(super) fn drain_ready(
 ) {
     while let Ok(batch) = receiver.try_recv() {
         if let Some(queue) = queues.get_mut(batch.connector_id) {
+            let commit_ack = batch.commit_ack;
             queue.pending.extend(batch.events.into_iter().map(|event| {
                 QueuedAppendIngestItem::Event(QueuedAppendIngestEvent {
                     event,
-                    commit_ack: batch.commit_ack.clone(),
+                    commit_ack: commit_ack.clone(),
                 })
             }));
             if let Some(kafka_raw) = batch.kafka_raw {
                 queue.pending.push_back(QueuedAppendIngestItem::KafkaRaw(
                     QueuedKafkaRawIngestBatch {
                         batch: kafka_raw,
-                        commit_ack: batch.commit_ack,
+                        commit_ack: commit_ack.clone(),
+                    },
+                ));
+            }
+            if let Some(kafka_arrow) = batch.kafka_arrow {
+                queue.pending.push_back(QueuedAppendIngestItem::KafkaArrow(
+                    QueuedKafkaArrowIngestBatch {
+                        batch: kafka_arrow,
+                        commit_ack,
                     },
                 ));
             }
@@ -447,6 +465,7 @@ pub(super) fn build_batch(request: BuildBatchRequest<'_>) -> BatchSelection {
     } = request;
     let mut batch = Vec::with_capacity(max_batch);
     let mut kafka_raw_batches = Vec::new();
+    let mut kafka_arrow_batches = Vec::new();
     let mut selected_rows = 0usize;
     let mut per_source_counts = vec![0usize; source_count];
     let mut unknown_source_counts: HashMap<String, usize> = HashMap::new();
@@ -537,6 +556,51 @@ pub(super) fn build_batch(request: BuildBatchRequest<'_>) -> BatchSelection {
                         commit_ack: queued.commit_ack,
                     });
                 }
+                QueuedAppendIngestItem::KafkaArrow(mut queued) => {
+                    let source_id = source_id_by_name.get(queued.batch.source.as_str()).copied();
+                    let count = if let Some(source_id) = source_id {
+                        &mut per_source_counts[source_id]
+                    } else {
+                        unknown_source_counts
+                            .entry(queued.batch.source.clone())
+                            .or_insert(0)
+                    };
+                    let remaining_source = max_per_source.saturating_sub(*count);
+                    let remaining_connector = max_per_connector.saturating_sub(*per_connector);
+                    let remaining_batch = max_batch.saturating_sub(selected_rows);
+                    let allowed = remaining_source
+                        .min(remaining_connector)
+                        .min(remaining_batch)
+                        .min(queued.batch.len());
+                    if allowed == 0
+                        || (allowed < queued.batch.len()
+                            && !queued.batch.kafka_metadata_ranges.is_empty())
+                    {
+                        deferred_queue.push_back(QueuedAppendIngestItem::KafkaArrow(queued));
+                        continue;
+                    }
+                    let commit_ack = queued.commit_ack;
+                    let selected_batch = if allowed == queued.batch.len() {
+                        queued.batch
+                    } else {
+                        let remaining = queued.batch.split_off(allowed);
+                        deferred_queue.push_back(QueuedAppendIngestItem::KafkaArrow(
+                            QueuedKafkaArrowIngestBatch {
+                                batch: remaining,
+                                commit_ack: commit_ack.clone(),
+                            },
+                        ));
+                        queued.batch
+                    };
+                    *count += allowed;
+                    *per_connector += allowed;
+                    selected_rows += allowed;
+                    kafka_arrow_batches.push(SelectedKafkaArrowIngestBatch {
+                        source_id,
+                        batch: selected_batch,
+                        commit_ack,
+                    });
+                }
             }
         }
     }
@@ -552,6 +616,7 @@ pub(super) fn build_batch(request: BuildBatchRequest<'_>) -> BatchSelection {
     BatchSelection {
         batch,
         kafka_raw_batches,
+        kafka_arrow_batches,
         per_connector_counts,
         selected_rows,
     }

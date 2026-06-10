@@ -19,6 +19,10 @@ pub(super) struct SpawnConnectorTasksConfig<'a> {
     pub(super) run_args: &'a cli::RunArgs,
     pub(super) recovered_kafka_offsets: Vec<KafkaCheckpointOffset>,
     pub(super) source_journal_skipped_sources: BTreeSet<String>,
+    pub(super) required_columns_by_source_id: Arc<Vec<Option<Arc<[bool]>>>>,
+    pub(super) query_batches_by_source_id: Arc<Vec<bool>>,
+    pub(super) materialized_source_ids: Arc<Vec<bool>>,
+    pub(super) kafka_metadata_journal_source_ids: Arc<Vec<usize>>,
     pub(super) executor_running: Arc<AtomicBool>,
     pub(super) storage_reachable: Arc<AtomicBool>,
     pub(super) runtime_ready: Arc<AtomicBool>,
@@ -28,6 +32,65 @@ pub(super) struct SpawnConnectorTasksConfig<'a> {
     pub(super) cdc_transaction_sender: mpsc::Sender<QueuedCdcTransaction>,
     pub(super) cdc_table_store: CdcTableStore,
     pub(super) postgres_cdc_settings: floe_config::PostgresCdcConfig,
+}
+
+fn kafka_arrow_decode_config(
+    default_source: Option<&str>,
+    message_format: Option<&str>,
+    definitions: &[SourceDefinition],
+    required_columns_by_source_id: &[Option<Arc<[bool]>>],
+    query_batches_by_source_id: &[bool],
+    materialized_source_ids: &[bool],
+    kafka_metadata_journal_source_ids: &[usize],
+    max_messages_per_tick: usize,
+    max_batch: usize,
+    max_per_source: usize,
+    max_per_connector: usize,
+) -> Option<floe_node_core::kafka_connector::KafkaArrowDecodeConfig> {
+    let source = default_source?;
+    let format_is_floe_json = message_format
+        .map(|format| format.eq_ignore_ascii_case("floe_json"))
+        .unwrap_or(true);
+    if !format_is_floe_json {
+        return None;
+    }
+    let source_id = definitions
+        .iter()
+        .position(|definition| definition.name() == source)?;
+    if !materialized_source_ids
+        .get(source_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let max_rows_per_batch = max_messages_per_tick
+        .min(max_batch)
+        .min(max_per_source)
+        .min(max_per_connector);
+    if max_rows_per_batch == 0 {
+        return None;
+    }
+    let batch_mode = if query_batches_by_source_id
+        .get(source_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        SourceArrowBatchMode::ExecutionAndQuery
+    } else {
+        SourceArrowBatchMode::ExecutionOnly
+    };
+    Some(floe_node_core::kafka_connector::KafkaArrowDecodeConfig {
+        source: source.to_string(),
+        definition: definitions[source_id].clone(),
+        required_columns: required_columns_by_source_id
+            .get(source_id)
+            .cloned()
+            .flatten(),
+        batch_mode,
+        max_rows_per_batch,
+        include_metadata_journal: kafka_metadata_journal_source_ids.contains(&source_id),
+    })
 }
 
 pub(super) fn spawn_connector_tasks(
@@ -45,6 +108,10 @@ pub(super) fn spawn_connector_tasks(
         run_args,
         recovered_kafka_offsets,
         source_journal_skipped_sources,
+        required_columns_by_source_id,
+        query_batches_by_source_id,
+        materialized_source_ids,
+        kafka_metadata_journal_source_ids,
         executor_running,
         storage_reachable,
         runtime_ready,
@@ -141,6 +208,19 @@ pub(super) fn spawn_connector_tasks(
                 };
                 let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
                 kafka_commit_senders.push(commit_tx);
+                let arrow_decode = kafka_arrow_decode_config(
+                    default_source.as_deref(),
+                    format.as_deref(),
+                    &definitions,
+                    &required_columns_by_source_id,
+                    &query_batches_by_source_id,
+                    &materialized_source_ids,
+                    &kafka_metadata_journal_source_ids,
+                    max_messages_per_tick,
+                    run_args.ingest_batch_size,
+                    run_args.ingest_batch_per_source,
+                    run_args.ingest_batch_per_connector,
+                );
                 let definitions = definitions.clone();
                 let failure_state = Arc::clone(&failure_state);
                 connector_handles.push(tokio::spawn(async move {
@@ -157,6 +237,7 @@ pub(super) fn spawn_connector_tasks(
                         message_format: format,
                         commit_offsets_rx: Some(commit_rx),
                         resume_from_offsets,
+                        arrow_decode,
                     };
                     let mut connector = match KafkaConnector::new(config, definitions) {
                         Ok(connector) => connector,

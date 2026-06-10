@@ -9,6 +9,7 @@ pub(super) struct ExecutorTickBuffers {
     pub(super) tick_source_offsets: Vec<SourceOffsetsByPartition>,
     pub(super) tick_kafka_offsets: HashMap<(Arc<str>, i32), i64>,
     pub(super) tick_kafka_source_ranges: Vec<KafkaSourceRangesByPartition>,
+    pub(super) tick_kafka_source_precomputed_ranges: Vec<Vec<KafkaSourceJournalRange>>,
     pub(super) tick_postgres_lsns: HashMap<String, (u64, String)>,
     pub(super) tick_postgres_sources: HashMap<String, String>,
     pub(super) tick_postgres_table_lsns: Vec<(String, String, String, u64)>,
@@ -37,6 +38,7 @@ impl ExecutorTickBuffers {
             tick_source_offsets: (0..source_count).map(|_| None).collect(),
             tick_kafka_offsets: HashMap::new(),
             tick_kafka_source_ranges: (0..source_count).map(|_| None).collect(),
+            tick_kafka_source_precomputed_ranges: (0..source_count).map(|_| Vec::new()).collect(),
             tick_postgres_lsns: HashMap::new(),
             tick_postgres_sources: HashMap::new(),
             tick_postgres_table_lsns: Vec::new(),
@@ -84,6 +86,9 @@ impl ExecutorTickBuffers {
         self.tick_kafka_offsets.clear();
         for ranges in &mut self.tick_kafka_source_ranges {
             *ranges = None;
+        }
+        for ranges in &mut self.tick_kafka_source_precomputed_ranges {
+            ranges.clear();
         }
         self.tick_postgres_lsns.clear();
         self.tick_postgres_sources.clear();

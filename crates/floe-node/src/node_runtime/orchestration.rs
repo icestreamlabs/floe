@@ -804,6 +804,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         run_args: &run_args,
         recovered_kafka_offsets: recovered_kafka_offsets.clone(),
         source_journal_skipped_sources: source_journal_skipped_sources.clone(),
+        required_columns_by_source_id: Arc::clone(
+            &runtime_source_indexes.required_columns_by_source_id,
+        ),
+        query_batches_by_source_id: Arc::clone(&runtime_source_indexes.query_batches_by_source_id),
+        materialized_source_ids: Arc::clone(&runtime_source_indexes.materialized_source_ids),
+        kafka_metadata_journal_source_ids: Arc::clone(
+            &runtime_source_indexes.kafka_metadata_journal_source_ids,
+        ),
         executor_running: Arc::clone(&executor_running),
         storage_reachable: Arc::clone(&storage_reachable),
         runtime_ready: Arc::clone(&runtime_ready),

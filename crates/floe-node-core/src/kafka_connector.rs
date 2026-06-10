@@ -14,8 +14,15 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
-use crate::source::{AppendIngestEventSender, KafkaRawIngestBatch, KafkaRawIngestRecord};
+use crate::source::{
+    AppendIngestEventSender, KafkaArrowIngestBatch, KafkaArrowIngestJournalRange,
+    KafkaArrowIngestRecord, KafkaRawIngestBatch, KafkaRawIngestRecord,
+};
 use floe_core::source::{AppendIngestEvent, SourceDefinition};
+use floe_executor::source_journal::{
+    kafka_source_journal_initial_checksum, update_kafka_source_journal_checksum_parts,
+};
+use floe_executor::{SourceArrowBatchBuilder, SourceArrowBatchMode};
 
 const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 32;
 
@@ -130,6 +137,7 @@ pub struct KafkaConnectorConfig {
     pub message_format: Option<String>,
     pub commit_offsets_rx: Option<watch::Receiver<KafkaOffsetCommit>>,
     pub resume_from_offsets: Vec<KafkaTopicPartitionOffset>,
+    pub arrow_decode: Option<KafkaArrowDecodeConfig>,
 }
 
 impl KafkaConnectorConfig {
@@ -139,6 +147,16 @@ impl KafkaConnectorConfig {
             .saturating_mul(10)
             .clamp(Duration::from_millis(50), Duration::from_secs(5))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct KafkaArrowDecodeConfig {
+    pub source: String,
+    pub definition: SourceDefinition,
+    pub required_columns: Option<Arc<[bool]>>,
+    pub batch_mode: SourceArrowBatchMode,
+    pub max_rows_per_batch: usize,
+    pub include_metadata_journal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +236,20 @@ impl KafkaConnector {
             "kafka replay idle timeout must be positive"
         );
         let message_format = KafkaMessageFormat::parse(config.message_format.as_deref())?;
+        if let Some(arrow_decode) = &config.arrow_decode {
+            ensure!(
+                message_format == KafkaMessageFormat::FloeJson,
+                "Kafka Arrow decode fast path only supports floe_json messages"
+            );
+            ensure!(
+                config.default_source.as_deref() == Some(arrow_decode.source.as_str()),
+                "Kafka Arrow decode source must match the connector default source"
+            );
+            ensure!(
+                arrow_decode.max_rows_per_batch > 0,
+                "Kafka Arrow decode max rows per batch must be positive"
+            );
+        }
         let topic_arcs = config
             .topics
             .iter()
@@ -451,6 +483,153 @@ impl KafkaConnector {
     }
 }
 
+struct KafkaArrowBatchStager {
+    config: KafkaArrowDecodeConfig,
+    builder: SourceArrowBatchBuilder,
+    records: Vec<KafkaArrowIngestRecord>,
+    journal_ranges: HashMap<(Arc<str>, i32), KafkaArrowJournalAccumulator>,
+    batches: Vec<KafkaArrowIngestBatch>,
+}
+
+impl KafkaArrowBatchStager {
+    fn new(config: KafkaArrowDecodeConfig) -> Self {
+        let builder = Self::new_builder(&config);
+        let capacity = config.max_rows_per_batch;
+        Self {
+            config,
+            builder,
+            records: Vec::with_capacity(capacity),
+            journal_ranges: HashMap::new(),
+            batches: Vec::new(),
+        }
+    }
+
+    fn new_builder(config: &KafkaArrowDecodeConfig) -> SourceArrowBatchBuilder {
+        SourceArrowBatchBuilder::new_with_execution_required_columns_and_batch_mode(
+            config.definition.clone(),
+            config.max_rows_per_batch,
+            config.required_columns.clone(),
+            config.batch_mode,
+        )
+    }
+
+    fn append_payload(
+        &mut self,
+        topic: Arc<str>,
+        partition: i32,
+        offset: i64,
+        payload: &[u8],
+        fallback_event_time_ms: Option<u64>,
+    ) -> Result<()> {
+        if self.records.len() >= self.config.max_rows_per_batch {
+            self.finish_current()?;
+        }
+        let event_time_ms = self
+            .builder
+            .append_json_payload(&self.config.source, payload)?
+            .or(fallback_event_time_ms);
+        if self.config.include_metadata_journal {
+            let entry = self
+                .journal_ranges
+                .entry((Arc::clone(&topic), partition))
+                .or_insert_with(|| {
+                    KafkaArrowJournalAccumulator::new(Arc::clone(&topic), partition, offset)
+                });
+            entry.observe_raw_payload(offset, &self.config.source, payload);
+        }
+        self.records.push(KafkaArrowIngestRecord {
+            topic,
+            partition,
+            offset,
+            event_time_ms,
+        });
+        if self.records.len() >= self.config.max_rows_per_batch {
+            self.finish_current()?;
+        }
+        Ok(())
+    }
+
+    fn finish_current(&mut self) -> Result<()> {
+        if self.builder.is_empty() {
+            return Ok(());
+        }
+        let Some(batches) = self.builder.finish()? else {
+            return Ok(());
+        };
+        let (execution, query) = batches.into_parts();
+        let records = std::mem::replace(
+            &mut self.records,
+            Vec::with_capacity(self.config.max_rows_per_batch),
+        );
+        let kafka_metadata_ranges = if self.config.include_metadata_journal {
+            std::mem::take(&mut self.journal_ranges)
+                .into_values()
+                .map(KafkaArrowJournalAccumulator::into_range)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.batches.push(KafkaArrowIngestBatch {
+            source: self.config.source.clone(),
+            execution,
+            query,
+            records,
+            kafka_metadata_ranges,
+        });
+        self.builder = Self::new_builder(&self.config);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<KafkaArrowIngestBatch>> {
+        self.finish_current()?;
+        Ok(self.batches)
+    }
+}
+
+struct KafkaArrowJournalAccumulator {
+    topic: Arc<str>,
+    partition: i32,
+    start_offset: i64,
+    end_offset: i64,
+    row_count: u64,
+    checksum: u64,
+}
+
+impl KafkaArrowJournalAccumulator {
+    fn new(topic: Arc<str>, partition: i32, offset: i64) -> Self {
+        Self {
+            topic,
+            partition,
+            start_offset: offset,
+            end_offset: offset,
+            row_count: 0,
+            checksum: kafka_source_journal_initial_checksum(),
+        }
+    }
+
+    fn observe_raw_payload(&mut self, offset: i64, source: &str, payload: &[u8]) {
+        self.start_offset = self.start_offset.min(offset);
+        self.end_offset = self.end_offset.max(offset);
+        self.row_count = self.row_count.saturating_add(1);
+        update_kafka_source_journal_checksum_parts(
+            &mut self.checksum,
+            offset,
+            &[source.as_bytes(), &[0], payload],
+        );
+    }
+
+    fn into_range(self) -> KafkaArrowIngestJournalRange {
+        KafkaArrowIngestJournalRange {
+            topic: self.topic,
+            partition: self.partition,
+            start_offset: self.start_offset,
+            end_offset: self.end_offset,
+            row_count: self.row_count,
+            checksum: self.checksum,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Connector for KafkaConnector {
     fn name(&self) -> &str {
@@ -536,9 +715,15 @@ impl Connector for KafkaConnector {
             .consumer
             .as_ref()
             .context("kafka connector is not initialized")?;
-        let raw_source = self.raw_default_source(ctx).map(str::to_string);
+        let arrow_decode = self.arrow_decode_config(ctx).cloned();
+        let raw_source = if arrow_decode.is_none() {
+            self.raw_default_source(ctx).map(str::to_string)
+        } else {
+            None
+        };
         let mut emitted = 0usize;
         let mut staged = Vec::new();
+        let mut staged_arrow = arrow_decode.map(KafkaArrowBatchStager::new);
         let mut staged_raw = raw_source.as_ref().map(|source| KafkaRawIngestBatch {
             source: source.clone(),
             records: Vec::new(),
@@ -555,7 +740,15 @@ impl Connector for KafkaConnector {
             }
             match message {
                 Ok(message) => {
-                    let event_count = if let Some(raw_batch) = staged_raw.as_mut() {
+                    let event_count = if let Some(arrow_stager) = staged_arrow.as_mut() {
+                        self.stage_arrow_or_event_message(
+                            &message,
+                            arrow_stager,
+                            &mut staged,
+                            &mut metrics,
+                            metrics_enabled,
+                        )?
+                    } else if let Some(raw_batch) = staged_raw.as_mut() {
                         self.stage_raw_or_event_message(
                             &message,
                             raw_batch,
@@ -593,7 +786,15 @@ impl Connector for KafkaConnector {
                         metrics.poll_drain_us =
                             metrics.poll_drain_us.saturating_add(elapsed_us(poll_start));
                     }
-                    let event_count = if let Some(raw_batch) = staged_raw.as_mut() {
+                    let event_count = if let Some(arrow_stager) = staged_arrow.as_mut() {
+                        self.stage_arrow_or_event_message(
+                            &message,
+                            arrow_stager,
+                            &mut staged,
+                            &mut metrics,
+                            metrics_enabled,
+                        )?
+                    } else if let Some(raw_batch) = staged_raw.as_mut() {
                         self.stage_raw_or_event_message(
                             &message,
                             raw_batch,
@@ -622,6 +823,23 @@ impl Connector for KafkaConnector {
                     }
                     break;
                 }
+            }
+        }
+
+        if let Some(arrow_stager) = staged_arrow.take() {
+            for arrow_batch in arrow_stager.finish()? {
+                let row_count = arrow_batch.len();
+                let send_start = metrics_enabled.then(Instant::now);
+                if let Err(err) = ctx.send_kafka_arrow_batch(arrow_batch).await {
+                    anyhow::bail!(
+                        "failed to enqueue Arrow kafka event batch with {} records",
+                        err.0.len()
+                    );
+                }
+                if let Some(send_start) = send_start {
+                    metrics.send_us = metrics.send_us.saturating_add(elapsed_us(send_start));
+                }
+                tracing::debug!(rows = row_count, "kafka connector sent Arrow ingest batch");
             }
         }
 
@@ -666,6 +884,7 @@ impl Connector for KafkaConnector {
                     message_us = metrics.message_us,
                     send_us = metrics.send_us,
                     raw_fast_path = raw_source.is_some(),
+                    arrow_fast_path = self.arrow_decode_config(ctx).is_some(),
                     time_to_first_batch_ms,
                     "kafka connector emitted first batch"
                 );
@@ -673,6 +892,7 @@ impl Connector for KafkaConnector {
                 tracing::info!(
                     emitted,
                     raw_fast_path = raw_source.is_some(),
+                    arrow_fast_path = self.arrow_decode_config(ctx).is_some(),
                     time_to_first_batch_ms,
                     "kafka connector emitted first batch"
                 );
@@ -819,12 +1039,91 @@ fn parse_debezium_events(
 }
 
 impl KafkaConnector {
+    fn arrow_decode_config<'a>(
+        &'a self,
+        ctx: &ConnectorContext,
+    ) -> Option<&'a KafkaArrowDecodeConfig> {
+        if self.message_format != KafkaMessageFormat::FloeJson
+            || !ctx.supports_kafka_arrow_batches()
+        {
+            return None;
+        }
+        self.config.arrow_decode.as_ref()
+    }
+
     fn raw_default_source<'a>(&'a self, ctx: &ConnectorContext) -> Option<&'a str> {
         if self.message_format != KafkaMessageFormat::FloeJson || !ctx.supports_kafka_raw_batches()
         {
             return None;
         }
         self.config.default_source.as_deref()
+    }
+
+    fn stage_arrow_or_event_message(
+        &self,
+        message: &BorrowedMessage<'_>,
+        arrow_stager: &mut KafkaArrowBatchStager,
+        staged_events: &mut Vec<AppendIngestEvent>,
+        metrics: &mut KafkaConnectorTickMetrics,
+        metrics_enabled: bool,
+    ) -> Result<usize> {
+        let Some(payload) = message.payload() else {
+            tracing::warn!(
+                topic = message.topic(),
+                partition = message.partition(),
+                offset = message.offset(),
+                "kafka message missing payload"
+            );
+            return Ok(0);
+        };
+        if floe_json_payload_needs_event_parser(payload) {
+            arrow_stager.finish_current()?;
+            return self.stage_message(message, staged_events, metrics, metrics_enabled);
+        }
+
+        let message_start = metrics_enabled.then(Instant::now);
+        if metrics_enabled {
+            metrics.messages = metrics.messages.saturating_add(1);
+        }
+        let topic = self
+            .topic_arcs
+            .get(message.topic())
+            .cloned()
+            .unwrap_or_else(|| Arc::<str>::from(message.topic()));
+        let parse_start = metrics_enabled.then(Instant::now);
+        match arrow_stager.append_payload(
+            topic,
+            message.partition(),
+            message.offset(),
+            payload,
+            kafka_message_timestamp_ms(message),
+        ) {
+            Ok(()) => {
+                if let Some(parse_start) = parse_start {
+                    metrics.parse_us = metrics.parse_us.saturating_add(elapsed_us(parse_start));
+                }
+                if let Some(message_start) = message_start {
+                    metrics.events = metrics.events.saturating_add(1);
+                    metrics.message_us =
+                        metrics.message_us.saturating_add(elapsed_us(message_start));
+                }
+                Ok(1)
+            }
+            Err(err) => {
+                if let Some(parse_start) = parse_start {
+                    metrics.parse_us = metrics.parse_us.saturating_add(elapsed_us(parse_start));
+                }
+                tracing::warn!(
+                    source = %arrow_stager.config.source,
+                    topic = message.topic(),
+                    partition = message.partition(),
+                    offset = message.offset(),
+                    error = %err,
+                    "failed to decode kafka payload into Arrow"
+                );
+                Ok(0)
+            }
+        }
     }
 
     fn stage_raw_or_event_message(

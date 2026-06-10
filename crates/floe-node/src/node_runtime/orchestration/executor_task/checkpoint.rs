@@ -544,16 +544,18 @@ pub(super) fn build_kafka_metadata_journal_batches(
     source_ids: &[usize],
     tick_source_max_event_ts: &[Option<i64>],
     tick_kafka_source_ranges: &mut [Option<KafkaSourceJournalRangeMap>],
+    tick_kafka_source_precomputed_ranges: &mut [Vec<KafkaSourceJournalRange>],
 ) -> Vec<KafkaMetadataJournalBatch> {
     let mut batches = Vec::new();
     for &source_id in source_ids {
-        let Some(ranges_by_partition) = tick_kafka_source_ranges[source_id].take() else {
-            continue;
-        };
-        let mut ranges = ranges_by_partition
-            .into_values()
-            .map(KafkaSourceJournalRangeAccumulator::into_range)
-            .collect::<Vec<_>>();
+        let mut ranges = std::mem::take(&mut tick_kafka_source_precomputed_ranges[source_id]);
+        if let Some(ranges_by_partition) = tick_kafka_source_ranges[source_id].take() {
+            ranges.extend(
+                ranges_by_partition
+                    .into_values()
+                    .map(KafkaSourceJournalRangeAccumulator::into_range),
+            );
+        }
         ranges.sort_by(|left, right| {
             left.topic
                 .cmp(&right.topic)

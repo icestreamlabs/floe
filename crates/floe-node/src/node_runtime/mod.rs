@@ -147,6 +147,7 @@ struct ConnectorQueue {
 enum QueuedAppendIngestItem {
     Event(QueuedAppendIngestEvent),
     KafkaRaw(QueuedKafkaRawIngestBatch),
+    KafkaArrow(QueuedKafkaArrowIngestBatch),
 }
 
 struct QueuedAppendIngestEvent {
@@ -156,6 +157,11 @@ struct QueuedAppendIngestEvent {
 
 struct QueuedKafkaRawIngestBatch {
     batch: core_source::KafkaRawIngestBatch,
+    commit_ack: Option<core_source::CommitAck>,
+}
+
+struct QueuedKafkaArrowIngestBatch {
+    batch: core_source::KafkaArrowIngestBatch,
     commit_ack: Option<core_source::CommitAck>,
 }
 
@@ -171,9 +177,16 @@ struct SelectedKafkaRawIngestBatch {
     commit_ack: Option<core_source::CommitAck>,
 }
 
+struct SelectedKafkaArrowIngestBatch {
+    source_id: Option<usize>,
+    batch: core_source::KafkaArrowIngestBatch,
+    commit_ack: Option<core_source::CommitAck>,
+}
+
 struct BatchSelection {
     batch: Vec<SelectedAppendIngestEvent>,
     kafka_raw_batches: Vec<SelectedKafkaRawIngestBatch>,
+    kafka_arrow_batches: Vec<SelectedKafkaArrowIngestBatch>,
     per_connector_counts: Vec<usize>,
     selected_rows: usize,
 }
@@ -271,6 +284,7 @@ impl QueuedAppendIngestItem {
         match self {
             Self::Event(_) => 1,
             Self::KafkaRaw(batch) => batch.batch.len(),
+            Self::KafkaArrow(batch) => batch.batch.len(),
         }
     }
 }

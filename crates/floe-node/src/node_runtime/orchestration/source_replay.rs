@@ -374,6 +374,7 @@ fn kafka_replay_connector_config(
             message_format: format.clone(),
             commit_offsets_rx: None,
             resume_from_offsets: Vec::new(),
+            arrow_decode: None,
         });
     }
     Err(anyhow!(

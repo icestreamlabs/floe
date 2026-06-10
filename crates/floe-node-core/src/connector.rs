@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::source::{
-    AppendIngestEventBatch, AppendIngestEventSender, KafkaRawIngestBatch, send_batch, send_event,
-    send_kafka_raw_batch,
+    AppendIngestEventBatch, AppendIngestEventSender, KafkaArrowIngestBatch, KafkaRawIngestBatch,
+    send_batch, send_event, send_kafka_arrow_batch, send_kafka_raw_batch,
 };
 use floe_core::source::{AppendIngestEvent, SourceDefinition};
 
@@ -50,11 +50,22 @@ impl ConnectorContext {
         self.sender.supports_kafka_raw_batches()
     }
 
+    pub fn supports_kafka_arrow_batches(&self) -> bool {
+        self.sender.supports_kafka_arrow_batches()
+    }
+
     pub async fn send_kafka_raw_batch(
         &self,
         batch: KafkaRawIngestBatch,
     ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<KafkaRawIngestBatch>> {
         send_kafka_raw_batch(&self.sender, batch).await
+    }
+
+    pub async fn send_kafka_arrow_batch(
+        &self,
+        batch: KafkaArrowIngestBatch,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<KafkaArrowIngestBatch>> {
+        send_kafka_arrow_batch(&self.sender, batch).await
     }
 }
 

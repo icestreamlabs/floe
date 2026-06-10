@@ -1,3 +1,4 @@
+use datafusion::arrow::record_batch::RecordBatch;
 pub use floe_core::source::{
     AppendIngestEvent, AppendIngestResumeToken, SourceDefinition, SourceRegistry,
 };
@@ -35,11 +36,73 @@ impl KafkaRawIngestBatch {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct KafkaArrowIngestRecord {
+    pub topic: Arc<str>,
+    pub partition: i32,
+    pub offset: i64,
+    pub event_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KafkaArrowIngestJournalRange {
+    pub topic: Arc<str>,
+    pub partition: i32,
+    pub start_offset: i64,
+    pub end_offset: i64,
+    pub row_count: u64,
+    pub checksum: u64,
+}
+
+#[derive(Debug)]
+pub struct KafkaArrowIngestBatch {
+    pub source: String,
+    pub execution: RecordBatch,
+    pub query: Option<RecordBatch>,
+    pub records: Vec<KafkaArrowIngestRecord>,
+    pub kafka_metadata_ranges: Vec<KafkaArrowIngestJournalRange>,
+}
+
+impl KafkaArrowIngestBatch {
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn split_off(&mut self, at: usize) -> Self {
+        assert!(
+            self.kafka_metadata_ranges.is_empty(),
+            "Kafka Arrow batches with precomputed metadata ranges cannot be split"
+        );
+        let len = self.len();
+        assert!(at <= len, "Kafka Arrow split index out of bounds");
+        let records = self.records.split_off(at);
+        let execution = self.execution.slice(at, len - at);
+        self.execution = self.execution.slice(0, at);
+        let query = self.query.as_mut().map(|query| {
+            let remaining = query.slice(at, len - at);
+            *query = query.slice(0, at);
+            remaining
+        });
+        Self {
+            source: self.source.clone(),
+            execution,
+            query,
+            records,
+            kafka_metadata_ranges: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RoutedAppendIngestEventBatch {
     pub connector_id: usize,
     pub events: AppendIngestEventBatch,
     pub kafka_raw: Option<KafkaRawIngestBatch>,
+    pub kafka_arrow: Option<KafkaArrowIngestBatch>,
     pub commit_ack: Option<CommitAck>,
 }
 
@@ -168,6 +231,10 @@ impl AppendIngestEventSender {
     pub fn supports_kafka_raw_batches(&self) -> bool {
         matches!(self, AppendIngestEventSender::Routed { .. })
     }
+
+    pub fn supports_kafka_arrow_batches(&self) -> bool {
+        matches!(self, AppendIngestEventSender::Routed { .. })
+    }
 }
 
 pub async fn send_event(
@@ -206,6 +273,7 @@ pub async fn send_batch(
                     connector_id: *connector_id,
                     events,
                     kafka_raw: None,
+                    kafka_arrow: None,
                     commit_ack: None,
                 })
                 .await
@@ -252,6 +320,7 @@ pub async fn send_batch_with_commit_ack(
                     connector_id: *connector_id,
                     events,
                     kafka_raw: None,
+                    kafka_arrow: None,
                     commit_ack: Some(CommitAck::new(count, ack_tx)),
                 })
                 .await
@@ -285,6 +354,7 @@ pub async fn send_kafka_raw_batch(
                     connector_id: *connector_id,
                     events: Vec::new(),
                     kafka_raw: Some(batch),
+                    kafka_arrow: None,
                     commit_ack: None,
                 })
                 .await
@@ -294,6 +364,44 @@ pub async fn send_kafka_raw_batch(
                     err.0
                         .kafka_raw
                         .expect("routed raw Kafka batch missing after send failure"),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+pub async fn send_kafka_arrow_batch(
+    sender: &AppendIngestEventSender,
+    batch: KafkaArrowIngestBatch,
+) -> Result<(), SendError<KafkaArrowIngestBatch>> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    match sender {
+        AppendIngestEventSender::Direct { .. } => Err(SendError(batch)),
+        AppendIngestEventSender::Routed {
+            connector_id,
+            sender,
+            pending,
+        } => {
+            let count = batch.len();
+            pending.record_enqueue(count);
+            if let Err(err) = sender
+                .send(RoutedAppendIngestEventBatch {
+                    connector_id: *connector_id,
+                    events: Vec::new(),
+                    kafka_raw: None,
+                    kafka_arrow: Some(batch),
+                    commit_ack: None,
+                })
+                .await
+            {
+                pending.record_dequeue(count);
+                return Err(SendError(
+                    err.0
+                        .kafka_arrow
+                        .expect("routed Arrow Kafka batch missing after send failure"),
                 ));
             }
             Ok(())
