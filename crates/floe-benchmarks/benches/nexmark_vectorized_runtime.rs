@@ -15,6 +15,7 @@ use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMilli
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::storage::{KeyValueTable, SlateTable};
+use dbsp::{print_runtime_phase_profile, reset_runtime_phase_profile};
 use floe_executor::{
     MaterializedViewRegistry, VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions,
     VectorizedMaterializedViewPlan, print_columnar_phase_profile, reset_columnar_phase_profile,
@@ -1138,6 +1139,7 @@ async fn run_q4_repeated_state_runtime_case(
     let total_start = Instant::now();
     let mut timing = Q4RuntimeTiming::default();
     reset_columnar_phase_profile();
+    reset_runtime_phase_profile();
 
     let start = Instant::now();
     execution
@@ -1184,6 +1186,7 @@ async fn run_q4_repeated_state_runtime_case(
         timing.print(total_start.elapsed());
     }
     print_columnar_phase_profile(case.id);
+    print_runtime_phase_profile(case.id);
     Ok(())
 }
 

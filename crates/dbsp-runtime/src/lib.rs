@@ -10,6 +10,7 @@ pub mod handles;
 mod metrics;
 pub mod operator_state_registry;
 pub mod operators;
+mod profile;
 pub mod relation_state;
 pub mod stream;
 
@@ -42,6 +43,7 @@ pub use operators::top1::PartitionedTop1Op;
 pub use operators::topn::TopNOp;
 pub use operators::union::UnionOp;
 pub use operators::window::{WindowAggregateBatchConfig, WindowAggregateOp, WindowKey};
+pub use profile::{print_runtime_phase_profile, reset_runtime_phase_profile};
 pub use relation_state::RelationState;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,

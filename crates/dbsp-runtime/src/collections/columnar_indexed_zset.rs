@@ -6,9 +6,11 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
+use bytes::Bytes;
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
+use crate::profile;
 use crate::storage::keyspace;
 use crate::storage::segment::{ArrowSegmentStore, encode_segment_envelope};
 use crate::storage::{KeyValueTable, prefix_bounds};
@@ -114,78 +116,126 @@ impl SlateBackedColumnarIndexedZSet {
     }
 
     pub async fn apply_delta(&mut self, delta: &ColumnarZSet) -> Result<Option<u64>> {
+        let total_start = profile::start();
+        let phase_start = profile::start();
         self.validate_delta(delta)?;
         if delta.is_empty() {
+            profile::record_since("columnar_index.apply_delta.total", total_start);
             return Ok(None);
         }
+        profile::record_since("columnar_index.apply_delta.validate", phase_start);
 
+        let phase_start = profile::start();
         let batch = concat_batches(&delta.weighted_schema(), delta.batches())
             .context("concat columnar index delta batches")?;
+        profile::record_since("columnar_index.apply_delta.concat", phase_start);
+        let phase_start = profile::start();
         let batch = filter_nonzero_weight_rows(&batch, delta.value_column_count())
             .context("filter columnar index zero-weight rows")?;
         if batch.num_rows() == 0 {
+            profile::record_since("columnar_index.apply_delta.filter_nonzero", phase_start);
+            profile::record_since("columnar_index.apply_delta.total", total_start);
             return Ok(None);
         }
+        profile::record_since("columnar_index.apply_delta.filter_nonzero", phase_start);
 
+        let phase_start = profile::start();
         let segment_delta =
             ColumnarZSet::try_new_weighted(Arc::clone(&self.value_schema), vec![batch.clone()])
                 .context("build columnar indexed zset segment delta")?;
+        profile::record_since(
+            "columnar_index.apply_delta.build_segment_delta",
+            phase_start,
+        );
+        let phase_start = profile::start();
         let postings = self.index_postings_for_batch(&batch)?;
         if postings.is_empty() {
+            profile::record_since("columnar_index.apply_delta.build_postings", phase_start);
+            profile::record_since("columnar_index.apply_delta.total", total_start);
             return Ok(None);
         }
+        profile::record_since("columnar_index.apply_delta.build_postings", phase_start);
+        let phase_start = profile::start();
         let next_bounds = if self.key_bounds.is_some() || self.next_segment_id == 1 {
             merge_key_bounds(self.key_bounds.as_ref(), postings.keys())
         } else {
             None
         };
+        profile::record_since("columnar_index.apply_delta.merge_bounds", phase_start);
 
         let segment_id = self.next_segment_id;
         self.next_segment_id = self.next_segment_id.saturating_add(1);
+        let phase_start = profile::start();
         let stats = segment_stats_arrow(&segment_delta)?;
+        profile::record_since("columnar_index.apply_delta.segment_stats", phase_start);
+        let phase_start = profile::start();
         let (segment_bytes, _) = encode_segment_envelope(
             Arc::clone(&self.weighted_schema),
             segment_delta.batches(),
             stats,
         )
         .context("encode columnar indexed zset segment")?;
+        profile::record_since("columnar_index.apply_delta.encode_segment", phase_start);
 
+        let phase_start = profile::start();
         let mut write_batch = WriteBatch::new();
-        write_batch.put(
-            self.segment_store.key_for_segment(segment_id),
-            segment_bytes,
+        write_batch.put_bytes(
+            Bytes::from(self.segment_store.key_for_segment(segment_id)),
+            Bytes::from(segment_bytes),
         );
         for (key_bytes, key_postings) in postings {
-            write_batch.put(
-                self.index_key(&key_bytes, segment_id)?,
-                encode_index_postings(&key_postings),
+            write_batch.put_bytes(
+                Bytes::from(self.index_key(&key_bytes, segment_id)?),
+                Bytes::from(encode_index_postings(&key_postings)),
             );
         }
-        write_batch.put(
-            self.state_key.clone(),
-            self.next_segment_id.to_be_bytes().to_vec(),
+        write_batch.put_bytes(
+            Bytes::from(self.state_key.clone()),
+            Bytes::from(self.next_segment_id.to_be_bytes().to_vec()),
         );
         if let Some(bounds) = next_bounds.as_ref() {
-            write_batch.put(self.bounds_key.clone(), encode_key_bounds(bounds)?);
+            write_batch.put_bytes(
+                Bytes::from(self.bounds_key.clone()),
+                Bytes::from(encode_key_bounds(bounds)?),
+            );
         }
+        profile::record_since("columnar_index.apply_delta.build_write_batch", phase_start);
+        let phase_start = profile::start();
         self.table
             .write_batch(write_batch)
             .await
             .context("persist columnar indexed zset delta")?;
+        profile::record_since("columnar_index.apply_delta.write_batch", phase_start);
+        let phase_start = profile::start();
         self.key_bounds = next_bounds;
+        profile::record_since(
+            "columnar_index.apply_delta.update_memory_state",
+            phase_start,
+        );
+        profile::record_since("columnar_index.apply_delta.total", total_start);
         Ok(Some(segment_id))
     }
 
     pub async fn lookup_key_batches(&self, key_batches: &[RecordBatch]) -> Result<ColumnarZSet> {
+        let total_start = profile::start();
+        let phase_start = profile::start();
         let mut key_bytes = self.key_bytes_from_batches(key_batches)?;
         if key_bytes.is_empty() {
+            profile::record_since("columnar_index.lookup.key_bytes", phase_start);
+            profile::record_since("columnar_index.lookup.total", total_start);
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
         }
+        profile::record_since("columnar_index.lookup.key_bytes", phase_start);
+        let phase_start = profile::start();
         if !keys_overlap_bounds(&key_bytes, self.key_bounds.as_ref()) {
+            profile::record_since("columnar_index.lookup.bounds_check", phase_start);
+            profile::record_since("columnar_index.lookup.total", total_start);
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
         }
+        profile::record_since("columnar_index.lookup.bounds_check", phase_start);
 
         let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
+        let phase_start = profile::start();
         if key_bytes.len() >= RANGE_LOOKUP_MIN_KEYS {
             key_bytes.sort_unstable();
             self.lookup_key_ranges(&key_bytes, &mut refs_by_segment)
@@ -194,11 +244,14 @@ impl SlateBackedColumnarIndexedZSet {
             self.lookup_keys_individually(&key_bytes, &mut refs_by_segment)
                 .await?;
         };
+        profile::record_since("columnar_index.lookup.collect_postings", phase_start);
 
         if refs_by_segment.is_empty() {
+            profile::record_since("columnar_index.lookup.total", total_start);
             return ColumnarZSet::empty(Arc::clone(&self.value_schema));
         }
 
+        let phase_start = profile::start();
         let mut batches = Vec::new();
         let mut segment_ids = refs_by_segment.keys().copied().collect::<Vec<_>>();
         segment_ids.sort_unstable();
@@ -208,8 +261,13 @@ impl SlateBackedColumnarIndexedZSet {
                 .expect("segment refs missing");
             batches.extend(self.take_segment_rows(segment_id, indices).await?);
         }
-        ColumnarZSet::try_new_weighted(Arc::clone(&self.value_schema), batches)
-            .context("build columnar indexed zset lookup result")
+        profile::record_since("columnar_index.lookup.take_segment_rows", phase_start);
+        let phase_start = profile::start();
+        let output = ColumnarZSet::try_new_weighted(Arc::clone(&self.value_schema), batches)
+            .context("build columnar indexed zset lookup result");
+        profile::record_since("columnar_index.lookup.build_result_zset", phase_start);
+        profile::record_since("columnar_index.lookup.total", total_start);
+        output
     }
 
     async fn lookup_keys_individually(

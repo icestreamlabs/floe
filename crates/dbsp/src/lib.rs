@@ -38,7 +38,10 @@ pub use circuit::{
     nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
 };
 pub use collections::ZSet;
-pub use dbsp_runtime::{LogicalWorkCollector, LogicalWorkSnapshot};
+pub use dbsp_runtime::{
+    LogicalWorkCollector, LogicalWorkSnapshot, print_runtime_phase_profile,
+    reset_runtime_phase_profile,
+};
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use operator_state_registry::{
     OperatorStateHandle, install_operator_state_restore, install_operator_state_restore_for_graph,
