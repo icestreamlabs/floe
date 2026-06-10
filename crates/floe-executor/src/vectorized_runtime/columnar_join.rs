@@ -86,10 +86,6 @@ impl ColumnarJoinPlan {
             .chain(self.right.source_names())
             .collect()
     }
-
-    pub(super) fn force_snapshot_diff_execution(&mut self) {
-        self.execution_strategy = ColumnarJoinExecutionStrategy::SnapshotDiff;
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

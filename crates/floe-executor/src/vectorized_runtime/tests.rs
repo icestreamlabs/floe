@@ -11229,7 +11229,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
 }
 
 #[tokio::test]
-async fn q4_uses_generic_columnar_join_aggregate_semantics() {
+async fn q4_uses_incremental_grouped_stats_composition_semantics() {
     let auctions = SourceDefinition::new(
         "auction",
         vec![
@@ -11317,7 +11317,7 @@ async fn q4_uses_generic_columnar_join_aggregate_semantics() {
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarJoinAggregate
+        MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
     runtime
@@ -11385,7 +11385,7 @@ async fn q4_uses_generic_columnar_join_aggregate_semantics() {
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarJoinAggregate
+        MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(4).await.expect("recovered tick");
 
