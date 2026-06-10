@@ -17,7 +17,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::storage::{KeyValueTable, SlateTable};
 use floe_executor::{
     MaterializedViewRegistry, VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions,
-    VectorizedMaterializedViewPlan,
+    VectorizedMaterializedViewPlan, print_columnar_phase_profile, reset_columnar_phase_profile,
 };
 use floe_node_core::generator;
 use floe_node_core::planner::planner_udfs;
@@ -1137,6 +1137,7 @@ async fn run_q4_repeated_state_runtime_case(
     let profile_timing = q4_timing_enabled();
     let total_start = Instant::now();
     let mut timing = Q4RuntimeTiming::default();
+    reset_columnar_phase_profile();
 
     let start = Instant::now();
     execution
@@ -1182,6 +1183,7 @@ async fn run_q4_repeated_state_runtime_case(
     if profile_timing {
         timing.print(total_start.elapsed());
     }
+    print_columnar_phase_profile(case.id);
     Ok(())
 }
 

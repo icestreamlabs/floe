@@ -60,6 +60,7 @@ use super::columnar_topn::{
     build_columnar_topn_materialized_view_state_in_namespace, columnar_topn_plan_for_plan,
     run_columnar_topn_state_tick,
 };
+use super::profile;
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
@@ -1241,14 +1242,24 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedStatsTick> {
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let persisted_input_delta =
         prepare_grouped_stats_input_delta(columnar, insert_batches, weighted_delta_batches).await?;
+    profile::record_since("grouped_stats.prepare_input", phase_start);
     let input_changed = !persisted_input_delta.batches().is_empty();
+    let phase_start = profile::start();
     let pending = grouped_stats_pending_delta(columnar, persisted_input_delta.batches()).await?;
+    profile::record_since("grouped_stats.pending_delta", phase_start);
+    let phase_start = profile::start();
     let output_delta_batches = apply_grouped_stats_delta(columnar, pending).await?;
+    profile::record_since("grouped_stats.apply_delta", phase_start);
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-stats output zset delta")?;
+    profile::record_since("grouped_stats.build_output_zset", phase_start);
+    let phase_start = profile::start();
     columnar
         .output_zset
         .create_version(
@@ -1259,14 +1270,18 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
                 .map(|handle| handle.version),
         )
         .await?;
+    profile::record_since("grouped_stats.output_create_version", phase_start);
     let persisted_output_delta = output_delta;
 
     let delta_batches = persisted_output_delta.batches().to_vec();
+    let phase_start = profile::start();
     let next_snapshot =
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
             .await
             .context("apply Slate-backed grouped-stats columnar snapshot delta")?;
+    profile::record_since("grouped_stats.output_snapshot_delta", phase_start);
 
+    profile::record_since("grouped_stats.total", total_start);
     Ok(ColumnarGroupedStatsTick {
         delta: persisted_output_delta,
         next_snapshot,

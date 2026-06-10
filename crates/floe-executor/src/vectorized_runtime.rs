@@ -44,7 +44,10 @@ mod columnar_multijoin;
 mod columnar_stateless;
 mod columnar_topn;
 mod columnar_union;
+mod profile;
 mod source_state;
+
+pub use profile::{print_columnar_phase_profile, reset_columnar_phase_profile};
 
 use columnar_composed::{
     ColumnarComposedMaterializedViewState,

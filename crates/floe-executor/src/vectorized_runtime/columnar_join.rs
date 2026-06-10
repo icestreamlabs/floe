@@ -65,6 +65,7 @@ use super::columnar_union::{
     build_columnar_union_materialized_view_state_in_namespace, columnar_union_plan_for_plan,
     run_columnar_union_state_tick,
 };
+use super::profile;
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
     normalize_batches,
@@ -1465,6 +1466,8 @@ async fn run_columnar_join_state_tick_inner(
         .await;
     }
 
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let left_input_delta =
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
     let right_input_delta =
@@ -1486,12 +1489,16 @@ async fn run_columnar_join_state_tick_inner(
             .context("incremental join right source zset missing")?;
         prepare_join_source_delta(right_zset, right_input_delta, persist_source_delta).await?
     };
+    profile::record_since("join.prepare_source_delta", phase_start);
+    let phase_start = profile::start();
     let left_signed = signed_source_delta(&columnar.left.schema, left_delta.batches())?;
     let right_signed = signed_source_delta(&columnar.right.schema, right_delta.batches())?;
+    profile::record_since("join.signed_delta", phase_start);
     let join_key_indices = columnar
         .join_key_indices
         .as_ref()
         .context("incremental join key indices missing")?;
+    let phase_start = profile::start();
     let right_state_for_left_delta = lookup_indexed_join_state_for_delta(
         columnar
             .right
@@ -1504,6 +1511,8 @@ async fn run_columnar_join_state_tick_inner(
         "right",
     )
     .await?;
+    profile::record_since("join.lookup_right_total", phase_start);
+    let phase_start = profile::start();
     let left_state_for_right_delta = lookup_indexed_join_state_for_delta(
         columnar
             .left
@@ -1516,7 +1525,9 @@ async fn run_columnar_join_state_tick_inner(
         "left",
     )
     .await?;
+    profile::record_since("join.lookup_left_total", phase_start);
 
+    let phase_start = profile::start();
     let mut output_delta_batches = Vec::new();
     collect_join_outputs(
         columnar,
@@ -1561,10 +1572,13 @@ async fn run_columnar_join_state_tick_inner(
         &right_signed,
     )
     .await?;
+    profile::record_since("join.collect_outputs", phase_start);
 
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build join output zset delta")?;
+    profile::record_since("join.build_output_zset", phase_start);
     tracing::debug!(
         left_delta_rows = left_delta
             .batches()
@@ -1593,6 +1607,7 @@ async fn run_columnar_join_state_tick_inner(
         "SlateDB-backed join columnar DBSP state tick completed"
     );
     if maintain_output_snapshot {
+        let phase_start = profile::start();
         columnar
             .output_zset
             .create_version(
@@ -1603,33 +1618,42 @@ async fn run_columnar_join_state_tick_inner(
                     .map(|handle| handle.version),
             )
             .await?;
+        profile::record_since("join.output_create_version", phase_start);
     }
     let persisted_output_delta = output_delta;
 
     let next_snapshot = if maintain_output_snapshot {
-        apply_weighted_snapshot_delta(
+        let phase_start = profile::start();
+        let next_snapshot = apply_weighted_snapshot_delta(
             output_schema,
             previous_snapshot,
             persisted_output_delta.batches().to_vec(),
         )
         .await
-        .context("apply Slate-backed join columnar snapshot delta")?
+        .context("apply Slate-backed join columnar snapshot delta")?;
+        profile::record_since("join.output_snapshot_delta", phase_start);
+        next_snapshot
     } else {
         Vec::new()
     };
     if let Some(index) = columnar.left.input_index.as_deref_mut() {
+        let phase_start = profile::start();
         index
             .apply_delta(&left_delta)
             .await
             .context("apply left join delta to SlateDB-backed columnar index")?;
+        profile::record_since("join.apply_left_index", phase_start);
     }
     if let Some(index) = columnar.right.input_index.as_deref_mut() {
+        let phase_start = profile::start();
         index
             .apply_delta(&right_delta)
             .await
             .context("apply right join delta to SlateDB-backed columnar index")?;
+        profile::record_since("join.apply_right_index", phase_start);
     }
     if maintain_output_snapshot {
+        let phase_start = profile::start();
         columnar.left.snapshot = apply_source_snapshot_delta(
             &columnar.left.schema,
             &columnar.left.snapshot,
@@ -1642,8 +1666,10 @@ async fn run_columnar_join_state_tick_inner(
             &right_delta,
         )
         .await?;
+        profile::record_since("join.source_snapshot_delta", phase_start);
     }
 
+    profile::record_since("join.total", total_start);
     Ok(ColumnarJoinTick {
         delta: persisted_output_delta,
         next_snapshot,
@@ -2552,19 +2578,51 @@ async fn lookup_indexed_join_state_for_delta(
     state_schema: &SchemaRef,
     side: &str,
 ) -> Result<Vec<RecordBatch>> {
+    let total_start = profile::start();
+    let key_phase = match side {
+        "right" => "join.lookup_right_build_keys",
+        "left" => "join.lookup_left_build_keys",
+        _ => "join.lookup_build_keys",
+    };
+    let lookup_phase = match side {
+        "right" => "join.lookup_right_index_scan",
+        "left" => "join.lookup_left_index_scan",
+        _ => "join.lookup_index_scan",
+    };
+    let materialize_phase = match side {
+        "right" => "join.lookup_right_materialize",
+        "left" => "join.lookup_left_materialize",
+        _ => "join.lookup_materialize",
+    };
+    let total_phase = match side {
+        "right" => "join.lookup_right_inner_total",
+        "left" => "join.lookup_left_inner_total",
+        _ => "join.lookup_inner_total",
+    };
+
+    let phase_start = profile::start();
     let key_batches =
         lookup_key_batches_from_delta(delta_batches, delta_key_indices, &state_index.key_schema())
             .with_context(|| format!("build {side} join state lookup keys"))?;
+    profile::record_since(key_phase, phase_start);
+    let phase_start = profile::start();
     let weighted_lookup = state_index
         .lookup_key_batches(&key_batches)
         .await
         .with_context(|| format!("lookup {side} join state by indexed keys"))?;
+    profile::record_since(lookup_phase, phase_start);
     if weighted_lookup.is_empty() {
+        profile::record_since(total_phase, total_start);
         return Ok(Vec::new());
     }
-    apply_weighted_snapshot_delta(state_schema, &[], weighted_lookup.batches().to_vec())
-        .await
-        .with_context(|| format!("materialize {side} indexed join state lookup"))
+    let phase_start = profile::start();
+    let materialized =
+        apply_weighted_snapshot_delta(state_schema, &[], weighted_lookup.batches().to_vec())
+            .await
+            .with_context(|| format!("materialize {side} indexed join state lookup"))?;
+    profile::record_since(materialize_phase, phase_start);
+    profile::record_since(total_phase, total_start);
+    Ok(materialized)
 }
 
 fn lookup_key_batches_from_delta(

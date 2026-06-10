@@ -40,5 +40,5 @@ pub use table_provider::{MaterializedViewTableProvider, SlateTableProvider};
 pub use vectorized_runtime::{
     VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions,
     VectorizedMaterializedViewExecutionPolicy, VectorizedMaterializedViewPlan,
-    weighted_batch_from_diffs,
+    print_columnar_phase_profile, reset_columnar_phase_profile, weighted_batch_from_diffs,
 };

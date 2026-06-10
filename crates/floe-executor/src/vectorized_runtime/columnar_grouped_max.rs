@@ -35,6 +35,7 @@ use super::columnar_join::{
     build_columnar_join_materialized_view_state_in_namespace_delta_only,
     columnar_join_plan_for_plan, run_columnar_join_state_tick_delta_only,
 };
+use super::profile;
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
@@ -537,15 +538,25 @@ async fn run_columnar_grouped_max_state_tick_inner(
     previous_snapshot: &[RecordBatch],
     maintain_output_snapshot: bool,
 ) -> Result<ColumnarGroupedMaxTick> {
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let persisted_input_delta =
         prepare_grouped_max_input_delta(columnar, insert_batches, weighted_delta_batches).await?;
+    profile::record_since("grouped_max.prepare_input", phase_start);
     let input_changed = !persisted_input_delta.batches().is_empty();
+    let phase_start = profile::start();
     let pending = grouped_max_pending_delta(columnar, persisted_input_delta.batches()).await?;
+    profile::record_since("grouped_max.pending_delta", phase_start);
+    let phase_start = profile::start();
     let output_delta_batches = apply_grouped_max_delta(columnar, pending).await?;
+    profile::record_since("grouped_max.apply_delta", phase_start);
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-max output zset delta")?;
+    profile::record_since("grouped_max.build_output_zset", phase_start);
     if maintain_output_snapshot {
+        let phase_start = profile::start();
         columnar
             .output_zset
             .create_version(
@@ -556,21 +567,26 @@ async fn run_columnar_grouped_max_state_tick_inner(
                     .map(|handle| handle.version),
             )
             .await?;
+        profile::record_since("grouped_max.output_create_version", phase_start);
     }
     let persisted_output_delta = output_delta;
 
     let next_snapshot = if maintain_output_snapshot {
-        apply_weighted_snapshot_delta(
+        let phase_start = profile::start();
+        let next_snapshot = apply_weighted_snapshot_delta(
             output_schema,
             previous_snapshot,
             persisted_output_delta.batches().to_vec(),
         )
         .await
-        .context("apply Slate-backed grouped-max columnar snapshot delta")?
+        .context("apply Slate-backed grouped-max columnar snapshot delta")?;
+        profile::record_since("grouped_max.output_snapshot_delta", phase_start);
+        next_snapshot
     } else {
         Vec::new()
     };
 
+    profile::record_since("grouped_max.total", total_start);
     Ok(ColumnarGroupedMaxTick {
         delta: persisted_output_delta,
         next_snapshot,
@@ -787,17 +803,23 @@ async fn apply_grouped_max_delta(
     columnar: &ColumnarGroupedMaxMaterializedViewState,
     pending: HashMap<Vec<u8>, PendingMaxGroupDelta>,
 ) -> Result<Vec<RecordBatch>> {
+    let total_start = profile::start();
     let mut builder = WeightedMaxOutputBuilder::new(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
     )?;
     if pending.is_empty() {
-        return builder.finish();
+        let phase_start = profile::start();
+        let output = builder.finish();
+        profile::record_since("grouped_max.apply_finish_output", phase_start);
+        profile::record_since("grouped_max.apply_total_inner", total_start);
+        return output;
     }
 
     let mut writes = WriteBatch::new();
     let mut bounds_update = None;
     let mut max_updates = Vec::new();
+    let phase_start = profile::start();
     for (group_key, delta) in pending {
         let old_max = columnar.max_state.load_max(&group_key)?;
         let mut updated_counts = HashMap::new();
@@ -845,17 +867,28 @@ async fn apply_grouped_max_delta(
             merge_group_key_bounds_update(&mut bounds_update, &group_key);
         }
     }
+    profile::record_since("grouped_max.apply_update_loop", phase_start);
+    let phase_start = profile::start();
     columnar
         .max_state
         .write_group_bounds(&mut writes, bounds_update.as_ref())?;
+    profile::record_since("grouped_max.apply_write_batch_build_tail", phase_start);
+    let phase_start = profile::start();
     columnar
         .max_state
         .table
         .write_batch(writes)
         .await
         .context("persist grouped-max state updates")?;
+    profile::record_since("grouped_max.apply_write_batch", phase_start);
+    let phase_start = profile::start();
     columnar.max_state.apply_max_updates(max_updates)?;
-    builder.finish()
+    profile::record_since("grouped_max.apply_summary_cache_update", phase_start);
+    let phase_start = profile::start();
+    let output = builder.finish();
+    profile::record_since("grouped_max.apply_finish_output", phase_start);
+    profile::record_since("grouped_max.apply_total_inner", total_start);
+    output
 }
 
 impl SlateGroupedMaxState {
