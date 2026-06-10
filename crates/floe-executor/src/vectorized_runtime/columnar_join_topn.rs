@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,7 +18,7 @@ use datafusion::logical_expr::logical_plan::{Filter, Join, Limit, Sort, TableSca
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, ScalarUDF};
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
-use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
+use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
 use crate::delta_consolidation::diff_snapshot_batches;
@@ -80,6 +81,7 @@ struct JoinTopNSourceState {
     schema: SchemaRef,
     key_idx: Option<usize>,
     input_zset: SlateBackedColumnarZSet,
+    input_index: Option<Box<SlateBackedColumnarIndexedZSet>>,
     snapshot: Vec<RecordBatch>,
 }
 
@@ -142,6 +144,15 @@ struct JoinTopNBestBid {
     right_row_idx: usize,
     price: i64,
     bid_time: i64,
+    bidder: i64,
+    bid_extra: Option<String>,
+}
+
+struct JoinTopNLeftRow {
+    batch_idx: usize,
+    row_idx: usize,
+    auction_start: i64,
+    auction_expires: i64,
 }
 
 pub(super) fn columnar_join_topn_plan_for_plan(
@@ -359,14 +370,14 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
 
     let left_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
-        left_namespace,
+        left_namespace.clone(),
         Arc::clone(&left_source.schema),
     )
     .await
     .context("initialize SlateDB-backed join-topn left input zset")?;
     let right_zset = SlateBackedColumnarZSet::new(
         Arc::clone(&table),
-        right_namespace,
+        right_namespace.clone(),
         Arc::clone(&right_source.schema),
     )
     .await
@@ -384,6 +395,54 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
             .await
             .context("load join-topn output snapshot")?,
     )?;
+    let left_snapshot_zset = left_zset
+        .materialize_columnar()
+        .await
+        .context("load join-topn left input snapshot")?;
+    let right_snapshot_zset = right_zset
+        .materialize_columnar()
+        .await
+        .context("load join-topn right input snapshot")?;
+    let (left_index, right_index, left_snapshot, right_snapshot) = match &plan.kind {
+        ColumnarJoinTopNPlanKind::PartitionedBestBid { .. } => {
+            let mut left_index = SlateBackedColumnarIndexedZSet::new(
+                Arc::clone(&table),
+                format!("{left_namespace}/index"),
+                Arc::clone(&left_source.schema),
+                vec![left_key_idx.context("partitioned join-topn left key index is missing")?],
+            )
+            .await
+            .context("initialize SlateDB-backed join-topn left input index")?;
+            left_index
+                .rebuild_from_zset(&left_snapshot_zset)
+                .await
+                .context("rebuild SlateDB-backed join-topn left input index")?;
+            let mut right_index = SlateBackedColumnarIndexedZSet::new(
+                Arc::clone(&table),
+                format!("{right_namespace}/index"),
+                Arc::clone(&right_source.schema),
+                vec![right_key_idx.context("partitioned join-topn right key index is missing")?],
+            )
+            .await
+            .context("initialize SlateDB-backed join-topn right input index")?;
+            right_index
+                .rebuild_from_zset(&right_snapshot_zset)
+                .await
+                .context("rebuild SlateDB-backed join-topn right input index")?;
+            (
+                Some(Box::new(left_index)),
+                Some(Box::new(right_index)),
+                Vec::new(),
+                Vec::new(),
+            )
+        }
+        ColumnarJoinTopNPlanKind::GlobalSnapshotDiff { .. } => (
+            None,
+            None,
+            snapshot_batches_from_zset(&left_snapshot_zset)?,
+            snapshot_batches_from_zset(&right_snapshot_zset)?,
+        ),
+    };
 
     let left_name = plan.left_source;
     let right_name = plan.right_source;
@@ -419,24 +478,16 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
             source_name: left_name,
             schema: Arc::clone(&left_source.schema),
             key_idx: left_key_idx,
-            snapshot: snapshot_batches_from_zset(
-                &left_zset
-                    .materialize_columnar()
-                    .await
-                    .context("load join-topn left input snapshot")?,
-            )?,
+            input_index: left_index,
+            snapshot: left_snapshot,
             input_zset: left_zset,
         },
         right: JoinTopNSourceState {
             source_name: right_name,
             schema: Arc::clone(&right_source.schema),
             key_idx: right_key_idx,
-            snapshot: snapshot_batches_from_zset(
-                &right_zset
-                    .materialize_columnar()
-                    .await
-                    .context("load join-topn right input snapshot")?,
-            )?,
+            input_index: right_index,
+            snapshot: right_snapshot,
             input_zset: right_zset,
         },
         output_zset,
@@ -496,15 +547,7 @@ pub(super) async fn run_columnar_join_topn_state_tick(
         persisted_source_delta(&mut columnar.right.input_zset, right_input_delta).await?;
     let input_changed = !left_delta.batches().is_empty() || !right_delta.batches().is_empty();
 
-    let next_left_snapshot =
-        apply_source_snapshot_delta(&columnar.left.schema, &columnar.left.snapshot, &left_delta)
-            .await?;
-    let next_right_snapshot = apply_source_snapshot_delta(
-        &columnar.right.schema,
-        &columnar.right.snapshot,
-        &right_delta,
-    )
-    .await?;
+    let mut global_next_snapshots = None;
     let output_delta_batches = match &columnar.evaluator {
         JoinTopNEvaluator::PartitionedBestBid(evaluator) => {
             let left_key_idx = columnar
@@ -519,30 +562,34 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             collect_i64_keys_from_delta(&left_delta, left_key_idx, &mut touched_keys)?;
             collect_i64_keys_from_delta(&right_delta, right_key_idx, &mut touched_keys)?;
 
-            let previous_left = filter_batches_to_i64_keys(
+            let previous_left = lookup_indexed_join_topn_state_for_i64_keys(
+                columnar
+                    .left
+                    .input_index
+                    .as_deref()
+                    .context("partitioned join-topn left source index missing")?,
+                &touched_keys,
                 &columnar.left.schema,
-                left_key_idx,
-                &columnar.left.snapshot,
+                "left",
+            )
+            .await?;
+            let previous_right = lookup_indexed_join_topn_state_for_i64_keys(
+                columnar
+                    .right
+                    .input_index
+                    .as_deref()
+                    .context("partitioned join-topn right source index missing")?,
                 &touched_keys,
-            )?;
-            let previous_right = filter_batches_to_i64_keys(
                 &columnar.right.schema,
-                right_key_idx,
-                &columnar.right.snapshot,
-                &touched_keys,
-            )?;
-            let next_left = filter_batches_to_i64_keys(
-                &columnar.left.schema,
-                left_key_idx,
-                &next_left_snapshot,
-                &touched_keys,
-            )?;
-            let next_right = filter_batches_to_i64_keys(
-                &columnar.right.schema,
-                right_key_idx,
-                &next_right_snapshot,
-                &touched_keys,
-            )?;
+                "right",
+            )
+            .await?;
+            let next_left =
+                apply_source_snapshot_delta(&columnar.left.schema, &previous_left, &left_delta)
+                    .await?;
+            let next_right =
+                apply_source_snapshot_delta(&columnar.right.schema, &previous_right, &right_delta)
+                    .await?;
 
             let (previous_output, next_output) = if touched_keys.is_empty() {
                 (Vec::new(), Vec::new())
@@ -567,6 +614,18 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             if !input_changed {
                 Vec::new()
             } else {
+                let next_left_snapshot = apply_source_snapshot_delta(
+                    &columnar.left.schema,
+                    &columnar.left.snapshot,
+                    &left_delta,
+                )
+                .await?;
+                let next_right_snapshot = apply_source_snapshot_delta(
+                    &columnar.right.schema,
+                    &columnar.right.snapshot,
+                    &right_delta,
+                )
+                .await?;
                 let next_output = evaluator
                     .evaluate(
                         &columnar.left.source_name,
@@ -576,10 +635,16 @@ pub(super) async fn run_columnar_join_topn_state_tick(
                     )
                     .await
                     .context("evaluate global join-topn output")?;
-                diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
-                    .await
-                    .context("diff global join-topn output")?
-                    .batches
+                let batches = diff_snapshot_batches(
+                    Arc::clone(output_schema),
+                    previous_snapshot,
+                    &next_output,
+                )
+                .await
+                .context("diff global join-topn output")?
+                .batches;
+                global_next_snapshots = Some((next_left_snapshot, next_right_snapshot));
+                batches
             }
         }
     };
@@ -609,8 +674,26 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             .await
             .context("apply Slate-backed join-topn columnar snapshot delta")?;
 
-    columnar.left.snapshot = next_left_snapshot;
-    columnar.right.snapshot = next_right_snapshot;
+    match global_next_snapshots {
+        Some((next_left_snapshot, next_right_snapshot)) => {
+            columnar.left.snapshot = next_left_snapshot;
+            columnar.right.snapshot = next_right_snapshot;
+        }
+        None => {
+            if let Some(index) = columnar.left.input_index.as_deref_mut() {
+                index
+                    .apply_delta(&left_delta)
+                    .await
+                    .context("apply left join-topn delta to SlateDB-backed columnar index")?;
+            }
+            if let Some(index) = columnar.right.input_index.as_deref_mut() {
+                index
+                    .apply_delta(&right_delta)
+                    .await
+                    .context("apply right join-topn delta to SlateDB-backed columnar index")?;
+            }
+        }
+    }
     Ok(ColumnarJoinTopNTick {
         delta: persisted_output_delta,
         next_snapshot,
@@ -694,40 +777,43 @@ fn collect_i64_keys_from_delta(
     Ok(())
 }
 
-fn filter_batches_to_i64_keys(
-    schema: &SchemaRef,
-    key_idx: usize,
-    batches: &[RecordBatch],
+async fn lookup_indexed_join_topn_state_for_i64_keys(
+    index: &SlateBackedColumnarIndexedZSet,
     keys: &HashSet<i64>,
+    state_schema: &SchemaRef,
+    side: &str,
 ) -> Result<Vec<RecordBatch>> {
+    let key_batches = i64_lookup_key_batches(keys, &index.key_schema())
+        .with_context(|| format!("build {side} join-topn lookup keys"))?;
+    let weighted_lookup = index
+        .lookup_key_batches(&key_batches)
+        .await
+        .with_context(|| format!("lookup {side} join-topn state by indexed keys"))?;
+    if weighted_lookup.is_empty() {
+        return Ok(Vec::new());
+    }
+    apply_weighted_snapshot_delta(state_schema, &[], weighted_lookup.batches().to_vec())
+        .await
+        .with_context(|| format!("materialize {side} indexed join-topn state lookup"))
+}
+
+fn i64_lookup_key_batches(keys: &HashSet<i64>, key_schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let mut output = Vec::new();
-    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
-        let values = batch
-            .column(key_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| anyhow::anyhow!("join-topn key column must be Int64"))?;
-        let mut indices = Vec::new();
-        for row_idx in 0..batch.num_rows() {
-            if !values.is_null(row_idx) && keys.contains(&values.value(row_idx)) {
-                indices.push(u32::try_from(row_idx).context("join-topn batch exceeds u32 rows")?);
-            }
-        }
-        if indices.is_empty() {
-            continue;
-        }
-        let indices = UInt32Array::from(indices);
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|column| take(column.as_ref(), &indices, None))
-            .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-        output.push(RecordBatch::try_new(Arc::clone(schema), columns)?);
+    if key_schema.fields().len() != 1 {
+        bail!("partitioned join-topn indexed lookup requires one key column");
     }
-    Ok(output)
+    if !matches!(key_schema.field(0).data_type(), DataType::Int64) {
+        bail!("partitioned join-topn indexed lookup key must be Int64");
+    }
+    let mut values = keys.iter().copied().collect::<Vec<_>>();
+    values.sort_unstable();
+    let batch = RecordBatch::try_new(
+        Arc::clone(key_schema),
+        vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+    )?;
+    Ok(vec![batch])
 }
 
 impl JoinTopNBestBidEvaluator {
@@ -790,32 +876,29 @@ impl JoinTopNBestBidEvaluator {
         left_batches: &[RecordBatch],
         right_batches: &[RecordBatch],
     ) -> Result<Vec<RecordBatch>> {
+        let left_rows = self.left_rows_by_auction(left_batches)?;
+        if left_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let best_by_auction = self.best_bids_by_auction(&left_rows, right_batches)?;
+        if best_by_auction.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut builders = self
             .output_schema
             .fields()
             .iter()
-            .map(|field| ScalarColumnBuilder::new(field.data_type(), left_batches.len()))
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), best_by_auction.len()))
             .collect::<Result<Vec<_>>>()?;
 
-        for (left_batch_idx, left_batch) in left_batches.iter().enumerate() {
-            let left_ids = int64_column(left_batch, self.left.id)?;
-            for left_row_idx in 0..left_batch.num_rows() {
-                if left_ids.is_null(left_row_idx) {
-                    continue;
-                }
-                let auction_id = left_ids.value(left_row_idx);
-                let Some(best) = self.best_bid_for_auction(
-                    auction_id,
-                    left_batch_idx,
-                    left_row_idx,
-                    left_batches,
-                    right_batches,
-                )?
-                else {
-                    continue;
-                };
-                self.append_output_row(&mut builders, left_batches, right_batches, &best)?;
-            }
+        let mut auction_ids = best_by_auction.keys().copied().collect::<Vec<_>>();
+        auction_ids.sort_unstable();
+        for auction_id in auction_ids {
+            let best = best_by_auction
+                .get(&auction_id)
+                .expect("best bid missing for auction id");
+            self.append_output_row(&mut builders, left_batches, right_batches, best)?;
         }
 
         let columns = builders
@@ -830,54 +913,88 @@ impl JoinTopNBestBidEvaluator {
         }
     }
 
-    fn best_bid_for_auction(
+    fn left_rows_by_auction(
         &self,
-        auction_id: i64,
-        left_batch_idx: usize,
-        left_row_idx: usize,
         left_batches: &[RecordBatch],
+    ) -> Result<HashMap<i64, JoinTopNLeftRow>> {
+        let mut left_rows = HashMap::new();
+        for (left_batch_idx, left_batch) in left_batches.iter().enumerate() {
+            let left_ids = int64_column(left_batch, self.left.id)?;
+            for left_row_idx in 0..left_batch.num_rows() {
+                if left_ids.is_null(left_row_idx) {
+                    continue;
+                }
+                let auction_id = left_ids.value(left_row_idx);
+                let auction_start =
+                    i64_or_timestamp_value(left_batch, self.left.date_time, left_row_idx)?;
+                let auction_expires =
+                    i64_or_timestamp_value(left_batch, self.left.expires, left_row_idx)?;
+                left_rows.entry(auction_id).or_insert(JoinTopNLeftRow {
+                    batch_idx: left_batch_idx,
+                    row_idx: left_row_idx,
+                    auction_start,
+                    auction_expires,
+                });
+            }
+        }
+        Ok(left_rows)
+    }
+
+    fn best_bids_by_auction(
+        &self,
+        left_rows: &HashMap<i64, JoinTopNLeftRow>,
         right_batches: &[RecordBatch],
-    ) -> Result<Option<JoinTopNBestBid>> {
-        let left_batch = &left_batches[left_batch_idx];
-        let auction_start = i64_or_timestamp_value(left_batch, self.left.date_time, left_row_idx)?;
-        let auction_expires = i64_or_timestamp_value(left_batch, self.left.expires, left_row_idx)?;
-        let mut best: Option<JoinTopNBestBid> = None;
+    ) -> Result<HashMap<i64, JoinTopNBestBid>> {
+        let mut best_by_auction = HashMap::with_capacity(left_rows.len());
         for (right_batch_idx, right_batch) in right_batches.iter().enumerate() {
             let right_auctions = int64_column(right_batch, self.right.auction)?;
+            let right_bidders = int64_column(right_batch, self.right.bidder)?;
             let right_prices = int64_column(right_batch, self.right.price)?;
+            let right_extras = string_column(right_batch, self.right.extra)?;
             for right_row_idx in 0..right_batch.num_rows() {
                 if right_auctions.is_null(right_row_idx)
+                    || right_bidders.is_null(right_row_idx)
                     || right_prices.is_null(right_row_idx)
-                    || right_auctions.value(right_row_idx) != auction_id
                 {
                     continue;
                 }
+                let auction_id = right_auctions.value(right_row_idx);
+                let Some(left) = left_rows.get(&auction_id) else {
+                    continue;
+                };
                 let bid_time =
                     i64_or_timestamp_value(right_batch, self.right.date_time, right_row_idx)?;
-                if bid_time < auction_start || bid_time > auction_expires {
+                if bid_time < left.auction_start || bid_time > left.auction_expires {
                     continue;
                 }
                 let price = right_prices.value(right_row_idx);
-                let replace = match &best {
-                    Some(current) => {
-                        price > current.price
-                            || (price == current.price && bid_time < current.bid_time)
-                    }
-                    None => true,
+                let bidder = right_bidders.value(right_row_idx);
+                let bid_extra = if right_extras.is_null(right_row_idx) {
+                    None
+                } else {
+                    Some(right_extras.value(right_row_idx))
                 };
+                let replace = best_by_auction.get(&auction_id).is_none_or(|current| {
+                    bid_orders_before(price, bid_time, bidder, bid_extra, current)
+                });
                 if replace {
-                    best = Some(JoinTopNBestBid {
-                        left_batch_idx,
-                        left_row_idx,
-                        right_batch_idx,
-                        right_row_idx,
-                        price,
-                        bid_time,
-                    });
+                    best_by_auction.insert(
+                        auction_id,
+                        JoinTopNBestBid {
+                            left_batch_idx: left.batch_idx,
+                            left_row_idx: left.row_idx,
+                            right_batch_idx,
+                            right_row_idx,
+                            price,
+                            bid_time,
+                            bidder,
+                            bid_extra: bid_extra.map(str::to_owned),
+                        },
+                    );
                 }
             }
         }
-        Ok(best)
+        Ok(best_by_auction)
     }
 
     fn append_output_row(
@@ -899,6 +1016,32 @@ impl JoinTopNBestBidEvaluator {
             builder.append_encoded_scalar(value.as_ref())?;
         }
         Ok(())
+    }
+}
+
+fn bid_orders_before(
+    price: i64,
+    bid_time: i64,
+    bidder: i64,
+    bid_extra: Option<&str>,
+    current: &JoinTopNBestBid,
+) -> bool {
+    price > current.price
+        || (price == current.price
+            && (bid_time < current.bid_time
+                || (bid_time == current.bid_time
+                    && (bidder < current.bidder
+                        || (bidder == current.bidder
+                            && optional_str_cmp_asc(bid_extra, current.bid_extra.as_deref())
+                                == Ordering::Less)))))
+}
+
+fn optional_str_cmp_asc(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => left.cmp(right),
     }
 }
 
@@ -1056,6 +1199,14 @@ fn int64_column(batch: &RecordBatch, idx: usize) -> Result<&Int64Array> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| anyhow::anyhow!("join-topn column must be Int64"))
+}
+
+fn string_column(batch: &RecordBatch, idx: usize) -> Result<&StringArray> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("join-topn column must be Utf8"))
 }
 
 fn field_index(schema: &SchemaRef, names: &[&str]) -> Result<usize> {

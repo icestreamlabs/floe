@@ -254,6 +254,25 @@ fn join_topn_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     rows
 }
 
+fn join_topn_rows_with_extra(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, String)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let ids = int64_values(batch, 0);
+        let bidders = int64_values(batch, 11);
+        let prices = int64_values(batch, 12);
+        let extras = string_values(batch, 14);
+        rows.extend(
+            ids.into_iter()
+                .zip(bidders)
+                .zip(prices)
+                .zip(extras)
+                .map(|(((id, bidder), price), extra)| (id, bidder, price, extra)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn grouped_stats_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64, f64, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -7837,13 +7856,14 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
     let initial_bids = RecordBatch::try_new(
         Arc::clone(&bid_schema),
         vec![
-            Arc::new(Int64Array::from(vec![1, 1, 2])),
-            Arc::new(Int64Array::from(vec![10, 11, 12])),
-            Arc::new(Int64Array::from(vec![100, 200, 50])),
-            Arc::new(TimestampMillisecondArray::from(vec![20, 15, 25])),
+            Arc::new(Int64Array::from(vec![1, 1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 11, 9, 12])),
+            Arc::new(Int64Array::from(vec![100, 200, 200, 50])),
+            Arc::new(TimestampMillisecondArray::from(vec![20, 15, 15, 25])),
             Arc::new(StringArray::from(vec![
                 "bid-extra-10",
                 "bid-extra-11",
+                "bid-extra-09",
                 "bid-extra-12",
             ])),
         ],
@@ -7889,7 +7909,8 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
         FROM (SELECT a.id, a.\"itemName\", a.description, a.\"initialBid\", a.reserve, \
         a.\"dateTime\", a.expires, a.seller, a.category, a.extra, b.auction, b.bidder, \
         b.price, b.\"dateTime\" AS \"bidTime\", b.extra AS \"bidExtra\", \
-        ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.\"dateTime\" ASC) AS rownum \
+        ROW_NUMBER() OVER (PARTITION BY a.id ORDER BY b.price DESC, b.\"dateTime\" ASC, \
+        b.bidder ASC, b.extra ASC) AS rownum \
         FROM auction a JOIN bid b ON a.id = b.auction \
         WHERE b.\"dateTime\" BETWEEN a.\"dateTime\" AND a.expires) ranked \
         WHERE rownum <= 1";
@@ -7930,7 +7951,14 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
 
     let handle = registry.get("mv_top_bid").expect("materialized view");
     let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
-    assert_eq!(join_topn_rows(&snapshot), vec![(1, 11, 200), (2, 12, 50)]);
+    assert_eq!(join_topn_rows(&snapshot), vec![(1, 9, 200), (2, 12, 50)]);
+    assert_eq!(
+        join_topn_rows_with_extra(&snapshot),
+        vec![
+            (1, 9, 200, "bid-extra-09".to_string()),
+            (2, 12, 50, "bid-extra-12".to_string())
+        ]
+    );
 
     let better_bid = RecordBatch::try_new(
         Arc::clone(&bid_schema),
@@ -8010,7 +8038,14 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
     let snapshot = recovered_handle
         .arrow_snapshot_for(4)
         .expect("post-retract snapshot");
-    assert_eq!(join_topn_rows(&snapshot), vec![(1, 11, 200), (2, 12, 50)]);
+    assert_eq!(join_topn_rows(&snapshot), vec![(1, 9, 200), (2, 12, 50)]);
+    assert_eq!(
+        join_topn_rows_with_extra(&snapshot),
+        vec![
+            (1, 9, 200, "bid-extra-09".to_string()),
+            (2, 12, 50, "bid-extra-12".to_string())
+        ]
+    );
 }
 
 #[tokio::test]
