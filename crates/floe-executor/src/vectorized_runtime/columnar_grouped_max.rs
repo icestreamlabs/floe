@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap, hash_map::Entry};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -115,6 +115,20 @@ struct GroupedMaxDerivedProjectionState {
 struct SlateGroupedMaxState {
     table: Arc<dyn KeyValueTable>,
     key_prefix: Vec<u8>,
+    bounds_key: Vec<u8>,
+    group_bounds: Mutex<GroupKeyBoundsState>,
+}
+
+#[derive(Clone)]
+enum GroupKeyBoundsState {
+    Unknown,
+    Empty,
+    Present { min: Vec<u8>, max: Vec<u8> },
+}
+
+struct GroupKeyBoundsUpdate {
+    min: Vec<u8>,
+    max: Vec<u8>,
 }
 
 struct PendingMaxGroupDelta {
@@ -356,6 +370,8 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
             }
         };
 
+    let assume_empty_state = output_zset.current_handle().is_none();
+
     Ok(ColumnarGroupedMaxMaterializedViewState {
         input_name,
         source_schema,
@@ -363,7 +379,7 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
         join,
         input_snapshot,
         output_zset,
-        max_state: SlateGroupedMaxState::new(table, &state_namespace),
+        max_state: SlateGroupedMaxState::new(table, &state_namespace, assume_empty_state).await?,
         projection_delta,
         projection_schema: plan.projection_schema,
         group_schema: plan.group_schema,
@@ -779,14 +795,23 @@ async fn apply_grouped_max_delta(
     }
 
     let mut writes = WriteBatch::new();
+    let mut bounds_update = None;
     for (group_key, delta) in pending {
         let old_max = columnar.max_state.load_max(&group_key).await?;
         let mut updated_counts = HashMap::new();
         for (value, value_delta) in &delta.value_deltas {
-            let old_count = columnar
-                .max_state
-                .load_value_count(&group_key, *value)
-                .await?;
+            let old_count =
+                if columnar
+                    .max_state
+                    .value_count_read_required(old_max, *value, *value_delta)
+                {
+                    columnar
+                        .max_state
+                        .load_value_count(&group_key, *value)
+                        .await?
+                } else {
+                    0
+                };
             let new_count = old_count
                 .checked_add(*value_delta)
                 .ok_or_else(|| anyhow::anyhow!("grouped-max value count overflow"))?;
@@ -813,7 +838,13 @@ async fn apply_grouped_max_delta(
         columnar
             .max_state
             .write_max(&mut writes, &group_key, new_max)?;
+        if new_max.is_some() {
+            merge_group_key_bounds_update(&mut bounds_update, &group_key);
+        }
     }
+    columnar
+        .max_state
+        .write_group_bounds(&mut writes, bounds_update.as_ref())?;
     columnar
         .max_state
         .table
@@ -824,14 +855,35 @@ async fn apply_grouped_max_delta(
 }
 
 impl SlateGroupedMaxState {
-    fn new(table: Arc<dyn KeyValueTable>, namespace: &str) -> Self {
-        Self {
+    async fn new(
+        table: Arc<dyn KeyValueTable>,
+        namespace: &str,
+        assume_empty: bool,
+    ) -> Result<Self> {
+        let key_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace);
+        let mut bounds_key = key_prefix.clone();
+        bounds_key.extend_from_slice(b"bounds/group_key");
+        let group_bounds = match table
+            .get_bytes(&bounds_key)
+            .await
+            .context("read grouped-max group key bounds")?
+        {
+            Some(bytes) => decode_group_key_bounds(bytes.as_ref())?,
+            None if assume_empty => GroupKeyBoundsState::Empty,
+            None => GroupKeyBoundsState::Unknown,
+        };
+        Ok(Self {
             table,
-            key_prefix: keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace),
-        }
+            key_prefix,
+            bounds_key,
+            group_bounds: Mutex::new(group_bounds),
+        })
     }
 
     async fn load_max(&self, group_key: &[u8]) -> Result<Option<i64>> {
+        if !self.group_key_may_exist(group_key)? {
+            return Ok(None);
+        }
         let Some(bytes) = self
             .table
             .get_bytes(&self.group_key(SUMMARY_TAG, group_key)?)
@@ -853,6 +905,18 @@ impl SlateGroupedMaxState {
             return Ok(0);
         };
         decode_i64(bytes.as_ref())
+    }
+
+    fn value_count_read_required(
+        &self,
+        old_max: Option<i64>,
+        value: i64,
+        value_delta: i64,
+    ) -> bool {
+        match old_max {
+            None => false,
+            Some(old_max) => value_delta < 0 || value <= old_max,
+        }
     }
 
     async fn new_max_after_delta(
@@ -936,6 +1000,59 @@ impl SlateGroupedMaxState {
             batch.put(key, max.to_be_bytes());
         } else {
             batch.delete(key);
+        }
+        Ok(())
+    }
+
+    fn group_key_may_exist(&self, group_key: &[u8]) -> Result<bool> {
+        let bounds = self
+            .group_bounds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max group bounds poisoned"))?;
+        Ok(match &*bounds {
+            GroupKeyBoundsState::Unknown => true,
+            GroupKeyBoundsState::Empty => false,
+            GroupKeyBoundsState::Present { min, max } => {
+                group_key >= min.as_slice() && group_key <= max.as_slice()
+            }
+        })
+    }
+
+    fn write_group_bounds(
+        &self,
+        batch: &mut WriteBatch,
+        update: Option<&GroupKeyBoundsUpdate>,
+    ) -> Result<()> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+        let mut bounds = self
+            .group_bounds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max group bounds poisoned"))?;
+        let next = match bounds.clone() {
+            GroupKeyBoundsState::Unknown => None,
+            GroupKeyBoundsState::Empty => Some(GroupKeyBoundsState::Present {
+                min: update.min.clone(),
+                max: update.max.clone(),
+            }),
+            GroupKeyBoundsState::Present { min, max } => Some(GroupKeyBoundsState::Present {
+                min: if update.min.as_slice() < min.as_slice() {
+                    update.min.clone()
+                } else {
+                    min.clone()
+                },
+                max: if update.max.as_slice() > max.as_slice() {
+                    update.max.clone()
+                } else {
+                    max.clone()
+                },
+            }),
+        };
+        if let Some(next) = next {
+            let encoded = encode_group_key_bounds(&next)?;
+            *bounds = next;
+            batch.put(self.bounds_key.clone(), encoded);
         }
         Ok(())
     }
@@ -1261,6 +1378,75 @@ fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
+fn merge_group_key_bounds_update(update: &mut Option<GroupKeyBoundsUpdate>, group_key: &[u8]) {
+    match update {
+        Some(update) => {
+            if group_key < update.min.as_slice() {
+                update.min = group_key.to_vec();
+            }
+            if group_key > update.max.as_slice() {
+                update.max = group_key.to_vec();
+            }
+        }
+        None => {
+            *update = Some(GroupKeyBoundsUpdate {
+                min: group_key.to_vec(),
+                max: group_key.to_vec(),
+            });
+        }
+    }
+}
+
+fn encode_group_key_bounds(bounds: &GroupKeyBoundsState) -> Result<Vec<u8>> {
+    let GroupKeyBoundsState::Present { min, max } = bounds else {
+        bail!("grouped-max can only persist present group key bounds");
+    };
+    let min_len = u32::try_from(min.len()).context("grouped-max min group key too large")?;
+    let max_len = u32::try_from(max.len()).context("grouped-max max group key too large")?;
+    let mut out = Vec::with_capacity(8 + min.len() + max.len());
+    out.extend_from_slice(&min_len.to_be_bytes());
+    out.extend_from_slice(min);
+    out.extend_from_slice(&max_len.to_be_bytes());
+    out.extend_from_slice(max);
+    Ok(out)
+}
+
+fn decode_group_key_bounds(bytes: &[u8]) -> Result<GroupKeyBoundsState> {
+    let mut cursor = 0;
+    let min_len = read_u32_at(bytes, &mut cursor)? as usize;
+    let min = read_bytes_at(bytes, &mut cursor, min_len, "grouped-max min group key")?.to_vec();
+    let max_len = read_u32_at(bytes, &mut cursor)? as usize;
+    let max = read_bytes_at(bytes, &mut cursor, max_len, "grouped-max max group key")?.to_vec();
+    if cursor != bytes.len() {
+        bail!("grouped-max group key bounds payload has trailing bytes");
+    }
+    Ok(GroupKeyBoundsState::Present { min, max })
+}
+
+fn read_u32_at(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let chunk = read_bytes_at(bytes, cursor, 4, "grouped-max u32")?;
+    let value = <[u8; 4]>::try_from(chunk)
+        .map(u32::from_be_bytes)
+        .map_err(|_| anyhow::anyhow!("grouped-max u32 expected 4 bytes"))?;
+    Ok(value)
+}
+
+fn read_bytes_at<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    label: &str,
+) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("{label} overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow::anyhow!("{label} truncated"))?;
+    *cursor = end;
+    Ok(chunk)
+}
+
 fn encode_i64_sortable(value: i64) -> [u8; 8] {
     ((value as u64) ^ (1 << 63)).to_be_bytes()
 }
@@ -1277,4 +1463,164 @@ fn decode_i64(bytes: &[u8]) -> Result<i64> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("grouped-max state value must be 8 bytes"))?;
     Ok(i64::from_be_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+
+    struct CountingTable {
+        inner: Arc<dyn KeyValueTable>,
+        get_bytes_calls: AtomicUsize,
+    }
+
+    impl CountingTable {
+        fn new(inner: Arc<dyn KeyValueTable>) -> Self {
+            Self {
+                inner,
+                get_bytes_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn reset_get_bytes_calls(&self) {
+            self.get_bytes_calls.store(0, Ordering::Relaxed);
+        }
+
+        fn get_bytes_calls(&self) -> usize {
+            self.get_bytes_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl KeyValueTable for CountingTable {
+        async fn get_bytes(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.get_bytes_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_bytes(key).await
+        }
+
+        async fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+            self.inner.write_batch(batch).await
+        }
+
+        async fn scan_range_bytes(
+            &self,
+            range: Range<Vec<u8>>,
+            options: &ScanOptions,
+        ) -> Result<Vec<(Bytes, Bytes)>> {
+            self.inner.scan_range_bytes(range, options).await
+        }
+    }
+
+    async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
+        Arc::new(dbsp::storage::SlateTable::new(db))
+    }
+
+    #[tokio::test]
+    async fn grouped_max_skips_summary_reads_outside_persisted_bounds() {
+        let inner = build_table("grouped-max-key-bounds").await;
+        let counting = Arc::new(CountingTable::new(inner));
+        let table: Arc<dyn KeyValueTable> = counting.clone();
+        let state = SlateGroupedMaxState::new(Arc::clone(&table), "grouped_max", true)
+            .await
+            .expect("state");
+
+        counting.reset_get_bytes_calls();
+        assert_eq!(state.load_max(&[1]).await.expect("fresh empty load"), None);
+        assert_eq!(counting.get_bytes_calls(), 0);
+
+        let mut batch = WriteBatch::new();
+        let mut bounds_update = None;
+        state
+            .write_value_count(&mut batch, &[10], 100, 1)
+            .expect("write count 10");
+        state
+            .write_max(&mut batch, &[10], Some(100))
+            .expect("write max 10");
+        merge_group_key_bounds_update(&mut bounds_update, &[10]);
+        state
+            .write_value_count(&mut batch, &[20], 200, 1)
+            .expect("write count 20");
+        state
+            .write_max(&mut batch, &[20], Some(200))
+            .expect("write max 20");
+        merge_group_key_bounds_update(&mut bounds_update, &[20]);
+        state
+            .write_group_bounds(&mut batch, bounds_update.as_ref())
+            .expect("write bounds");
+        table.write_batch(batch).await.expect("persist state");
+
+        counting.reset_get_bytes_calls();
+        assert_eq!(state.load_max(&[1]).await.expect("below bounds"), None);
+        assert_eq!(counting.get_bytes_calls(), 0);
+
+        counting.reset_get_bytes_calls();
+        assert_eq!(state.load_max(&[30]).await.expect("above bounds"), None);
+        assert_eq!(counting.get_bytes_calls(), 0);
+
+        counting.reset_get_bytes_calls();
+        assert_eq!(
+            state.load_max(&[10]).await.expect("inside bounds"),
+            Some(100)
+        );
+        assert_eq!(counting.get_bytes_calls(), 1);
+
+        let reopened = SlateGroupedMaxState::new(Arc::clone(&table), "grouped_max", false)
+            .await
+            .expect("reopened state");
+        counting.reset_get_bytes_calls();
+        assert_eq!(
+            reopened
+                .load_max(&[30])
+                .await
+                .expect("reopened above bounds"),
+            None
+        );
+        assert_eq!(counting.get_bytes_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn grouped_max_missing_bounds_remains_conservative() {
+        let inner = build_table("grouped-max-missing-key-bounds").await;
+        let counting = Arc::new(CountingTable::new(inner));
+        let table: Arc<dyn KeyValueTable> = counting.clone();
+        let state = SlateGroupedMaxState::new(Arc::clone(&table), "grouped_max", true)
+            .await
+            .expect("state");
+        let mut batch = WriteBatch::new();
+        let mut bounds_update = None;
+        state
+            .write_value_count(&mut batch, &[10], 100, 1)
+            .expect("write count");
+        state
+            .write_max(&mut batch, &[10], Some(100))
+            .expect("write max");
+        merge_group_key_bounds_update(&mut bounds_update, &[10]);
+        state
+            .write_group_bounds(&mut batch, bounds_update.as_ref())
+            .expect("write bounds");
+        table.write_batch(batch).await.expect("persist state");
+        table
+            .delete(&state.bounds_key)
+            .await
+            .expect("delete bounds");
+
+        let reopened = SlateGroupedMaxState::new(Arc::clone(&table), "grouped_max", false)
+            .await
+            .expect("reopened state");
+        counting.reset_get_bytes_calls();
+        assert_eq!(
+            reopened.load_max(&[30]).await.expect("unknown bounds load"),
+            None
+        );
+        assert_eq!(counting.get_bytes_calls(), 1);
+    }
 }
