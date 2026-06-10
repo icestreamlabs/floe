@@ -73,16 +73,34 @@ enum Engine {
 
 impl Engine {
     fn parse(raw: &str) -> Result<EngineSelector> {
-        match raw {
-            "floe" => Ok(EngineSelector::One(Self::Floe)),
-            "materialize" => Ok(EngineSelector::One(Self::Materialize)),
-            "risingwave" => Ok(EngineSelector::One(Self::RisingWave)),
-            "feldera" => Ok(EngineSelector::One(Self::Feldera)),
-            "all" => Ok(EngineSelector::All),
-            other => {
-                bail!("unknown engine '{other}' (expected floe|materialize|risingwave|feldera|all)")
+        let raw = raw.trim();
+        if raw == "all" {
+            return Ok(EngineSelector::new(Engine::all()));
+        }
+        let mut engines = Vec::new();
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                bail!("empty engine in selector '{raw}'");
+            }
+            let engine = match part {
+                "floe" => Self::Floe,
+                "materialize" => Self::Materialize,
+                "risingwave" => Self::RisingWave,
+                "feldera" => Self::Feldera,
+                "all" => bail!("'all' cannot be combined with other engines in '{raw}'"),
+                other => bail!(
+                    "unknown engine '{other}' (expected comma-separated floe|materialize|risingwave|feldera or all)"
+                ),
+            };
+            if !engines.contains(&engine) {
+                engines.push(engine);
             }
         }
+        if engines.is_empty() {
+            bail!("empty engine selector");
+        }
+        Ok(EngineSelector::new(engines))
     }
 
     fn as_str(self) -> &'static str {
@@ -105,24 +123,34 @@ impl Engine {
 }
 
 #[derive(Debug, Clone)]
-enum EngineSelector {
-    One(Engine),
-    All,
+struct EngineSelector {
+    engines: Vec<Engine>,
 }
 
 impl EngineSelector {
-    fn selected(&self) -> Vec<Engine> {
-        match self {
-            Self::One(engine) => vec![*engine],
-            Self::All => Engine::all().to_vec(),
+    fn new<I>(engines: I) -> Self
+    where
+        I: IntoIterator<Item = Engine>,
+    {
+        Self {
+            engines: engines.into_iter().collect(),
         }
     }
 
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::One(engine) => engine.as_str(),
-            Self::All => "all",
-        }
+    fn selected(&self) -> Vec<Engine> {
+        self.engines.clone()
+    }
+
+    fn contains(&self, engine: Engine) -> bool {
+        self.engines.contains(&engine)
+    }
+
+    fn as_str(&self) -> String {
+        self.engines
+            .iter()
+            .map(|engine| engine.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
