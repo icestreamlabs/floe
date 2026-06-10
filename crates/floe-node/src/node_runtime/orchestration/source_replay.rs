@@ -244,6 +244,27 @@ async fn replay_kafka_source_journal_entry_as_arrow(
             SourceArrowBatchBuilder::new(definition.clone(), replayed.events.len().max(1));
         let mut row_count = 0u64;
         let mut checksum = kafka_source_journal_initial_checksum();
+        let mut raw_row_count = 0u64;
+        let mut raw_checksum = kafka_source_journal_initial_checksum();
+        for raw_payload in &replayed.raw_payloads {
+            if raw_payload.topic.as_ref() != range.topic.as_str()
+                || raw_payload.partition != range.partition
+                || raw_payload.offset < range.start_offset
+                || raw_payload.offset > range.end_offset
+            {
+                continue;
+            }
+            update_kafka_source_journal_checksum_parts(
+                &mut raw_checksum,
+                raw_payload.offset,
+                &[
+                    entry.source.as_bytes(),
+                    &[0],
+                    raw_payload.payload.as_slice(),
+                ],
+            );
+            raw_row_count = raw_row_count.saturating_add(1);
+        }
         for event in replayed.events {
             let Some(event_source_id) = source_id_by_name.get(event.source()).copied() else {
                 continue;
@@ -283,9 +304,12 @@ async fn replay_kafka_source_journal_entry_as_arrow(
                 .with_context(|| format!("decode replayed kafka event for '{}'", entry.source))?;
             row_count = row_count.saturating_add(1);
         }
-        if row_count != range.row_count || checksum != range.checksum {
+        let event_checksum_matches = row_count == range.row_count && checksum == range.checksum;
+        let raw_checksum_matches =
+            raw_row_count == range.row_count && raw_checksum == range.checksum;
+        if !event_checksum_matches && !raw_checksum_matches {
             return Err(anyhow!(
-                "kafka replay validation failed for source '{}' tick {} range {}[{}] {}..{}: expected rows/checksum {}/{:016x}, got {}/{:016x}",
+                "kafka replay validation failed for source '{}' tick {} range {}[{}] {}..{}: expected rows/checksum {}/{:016x}, got event {}/{:016x} and raw {}/{:016x}",
                 entry.source,
                 entry.tick_id,
                 range.topic,
@@ -295,7 +319,9 @@ async fn replay_kafka_source_journal_entry_as_arrow(
                 range.row_count,
                 range.checksum,
                 row_count,
-                checksum
+                checksum,
+                raw_row_count,
+                raw_checksum
             ));
         }
         let Some(batch) = builder.finish_query_batch()? else {

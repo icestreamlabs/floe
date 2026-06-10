@@ -74,11 +74,11 @@ fn event(source: &str, id: i64) -> core_source::AppendIngestEvent {
     core_source::AppendIngestEvent::new(source, json!({ "id": id }))
 }
 
-fn queued_event(source: &str, id: i64) -> QueuedAppendIngestEvent {
-    QueuedAppendIngestEvent {
+fn queued_event(source: &str, id: i64) -> QueuedAppendIngestItem {
+    QueuedAppendIngestItem::Event(QueuedAppendIngestEvent {
         event: event(source, id),
         commit_ack: None,
-    }
+    })
 }
 
 #[path = "tests/config_validation.rs"]

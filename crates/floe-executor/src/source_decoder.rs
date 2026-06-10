@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,6 +10,8 @@ use datafusion::arrow::array::{
 use floe_core::decimal::parse_decimal_text_to_i128;
 use floe_core::source::SourceColumn;
 use floe_core::source::{AppendIngestEvent, SourceDataType, SourceDefinition};
+use serde::Deserializer;
+use serde::de::{Error as DeError, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::stream_types::Timestamp;
@@ -31,6 +35,7 @@ impl<'a> PayloadRefExt<'a> for Option<&'a Value> {
 pub struct SourceArrowBatchBuilder {
     definition: SourceDefinition,
     builders: Vec<Option<SourceArrowColumnBuilder>>,
+    column_index_by_name: HashMap<String, usize>,
     execution_required_columns: Option<Arc<[bool]>>,
     batch_mode: SourceArrowBatchMode,
     row_count: usize,
@@ -124,9 +129,16 @@ impl SourceArrowBatchBuilder {
                     .then(|| SourceArrowColumnBuilder::new(column.data_type(), capacity))
             })
             .collect();
+        let column_index_by_name = definition
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| (column.name().to_string(), idx))
+            .collect();
         Self {
             definition,
             builders,
+            column_index_by_name,
             execution_required_columns,
             batch_mode,
             row_count: 0,
@@ -155,6 +167,34 @@ impl SourceArrowBatchBuilder {
                 observe_skipped_event_timestamp(column, value, &mut event_ts);
             }
         }
+        self.row_count += 1;
+        Ok(event_ts)
+    }
+
+    pub fn append_json_payload(
+        &mut self,
+        source: &str,
+        payload: &[u8],
+    ) -> Result<Option<Timestamp>> {
+        if source != self.definition.name() {
+            bail!(
+                "event source {} does not match definition {}",
+                source,
+                self.definition.name()
+            );
+        }
+        let visitor = SourceJsonObjectVisitor {
+            definition: &self.definition,
+            builders: &mut self.builders,
+            column_index_by_name: &self.column_index_by_name,
+        };
+        let mut deserializer = serde_json::Deserializer::from_slice(payload);
+        let event_ts = deserializer
+            .deserialize_any(visitor)
+            .context("source payload must be a JSON object")?;
+        deserializer
+            .end()
+            .context("source payload has trailing data after JSON object")?;
         self.row_count += 1;
         Ok(event_ts)
     }
@@ -302,6 +342,90 @@ fn observe_skipped_event_timestamp(
     }
 }
 
+struct SourceJsonObjectVisitor<'a> {
+    definition: &'a SourceDefinition,
+    builders: &'a mut [Option<SourceArrowColumnBuilder>],
+    column_index_by_name: &'a HashMap<String, usize>,
+}
+
+impl<'de> Visitor<'de> for SourceJsonObjectVisitor<'_> {
+    type Value = Option<Timestamp>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> std::result::Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut seen = vec![false; self.definition.columns().len()];
+        let mut event_ts = None;
+        while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+            let Some(&idx) = self.column_index_by_name.get(key.as_ref()) else {
+                let _: IgnoredAny = map.next_value()?;
+                continue;
+            };
+            seen[idx] = true;
+            let column = &self.definition.columns()[idx];
+            match self.builders[idx].as_mut() {
+                Some(builder) => {
+                    builder.append_deserialized_json_value(column, &mut map, &mut event_ts)?
+                }
+                None => observe_skipped_deserialized_json_value(column, &mut map, &mut event_ts)?,
+            }
+        }
+
+        for (idx, column) in self.definition.columns().iter().enumerate() {
+            if seen[idx] {
+                continue;
+            }
+            if let Some(builder) = self.builders[idx].as_mut() {
+                if column.nullable() {
+                    builder.append_null().map_err(M::Error::custom)?;
+                } else {
+                    return Err(M::Error::custom(format!(
+                        "missing field '{}' in source payload",
+                        column.name()
+                    )));
+                }
+            }
+        }
+        Ok(event_ts)
+    }
+}
+
+fn observe_skipped_deserialized_json_value<'de, M>(
+    column: &SourceColumn,
+    map: &mut M,
+    event_ts: &mut Option<Timestamp>,
+) -> std::result::Result<(), M::Error>
+where
+    M: MapAccess<'de>,
+{
+    if event_ts.is_none() && matches!(column.data_type(), SourceDataType::TimestampMillis) {
+        let value = map.next_value::<Option<i64>>()?;
+        if let Some(number) = value
+            && number >= 0
+        {
+            *event_ts = Some(number as u64);
+        }
+        return Ok(());
+    }
+    let _: IgnoredAny = map.next_value()?;
+    Ok(())
+}
+
+fn non_nullable_null_error<'de, M>(column: &SourceColumn) -> M::Error
+where
+    M: MapAccess<'de>,
+{
+    M::Error::custom(format!(
+        "null value violates non-nullable column '{}'",
+        column.name()
+    ))
+}
+
 impl SourceArrowColumnBuilder {
     fn new(data_type: &SourceDataType, capacity: usize) -> Self {
         match data_type {
@@ -326,6 +450,118 @@ impl SourceArrowColumnBuilder {
                 capacity,
                 capacity.saturating_mul(16),
             )),
+        }
+    }
+
+    fn append_deserialized_json_value<'de, M>(
+        &mut self,
+        column: &SourceColumn,
+        map: &mut M,
+        event_ts: &mut Option<Timestamp>,
+    ) -> std::result::Result<(), M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        match (column.data_type(), self) {
+            (SourceDataType::Int64, Self::Int64(builder)) => {
+                match map.next_value::<Option<i64>>()? {
+                    Some(value) => builder.append_value(value),
+                    None if column.nullable() => builder.append_null(),
+                    None => return Err(non_nullable_null_error::<M>(column)),
+                }
+                Ok(())
+            }
+            (SourceDataType::Bool, Self::Bool(builder)) => {
+                match map.next_value::<Option<bool>>()? {
+                    Some(value) => builder.append_value(value),
+                    None if column.nullable() => builder.append_null(),
+                    None => return Err(non_nullable_null_error::<M>(column)),
+                }
+                Ok(())
+            }
+            (SourceDataType::Utf8, Self::Utf8(builder)) => {
+                match map.next_value::<Option<String>>()? {
+                    Some(value) => builder.append_value(value),
+                    None if column.nullable() => builder.append_null(),
+                    None => return Err(non_nullable_null_error::<M>(column)),
+                }
+                Ok(())
+            }
+            (SourceDataType::TimestampMillis, Self::TimestampMillis(builder)) => {
+                match map.next_value::<Option<i64>>()? {
+                    Some(value) => {
+                        builder.append_value(value);
+                        if event_ts.is_none() && value >= 0 {
+                            *event_ts = Some(value as u64);
+                        }
+                    }
+                    None if column.nullable() => builder.append_null(),
+                    None => return Err(non_nullable_null_error::<M>(column)),
+                }
+                Ok(())
+            }
+            (SourceDataType::DateDays, Self::DateDays(builder)) => {
+                match map.next_value::<Option<i64>>()? {
+                    Some(value) => {
+                        let value = i32::try_from(value).map_err(|_| {
+                            M::Error::custom(format!(
+                                "date days value out of range for '{}': {value}",
+                                column.name()
+                            ))
+                        })?;
+                        builder.append_value(value);
+                    }
+                    None if column.nullable() => builder.append_null(),
+                    None => return Err(non_nullable_null_error::<M>(column)),
+                }
+                Ok(())
+            }
+            (SourceDataType::Decimal128 { scale, .. }, Self::Decimal128(builder)) => {
+                let value = map.next_value::<Value>()?;
+                if value.is_null() {
+                    if column.nullable() {
+                        builder.append_null();
+                        return Ok(());
+                    }
+                    return Err(non_nullable_null_error::<M>(column));
+                }
+                let number = match &value {
+                    Value::String(value) => parse_decimal_text_to_i128(value, *scale),
+                    Value::Number(value) => parse_decimal_text_to_i128(&value.to_string(), *scale),
+                    other => {
+                        return Err(M::Error::custom(format!(
+                            "expected decimal string or JSON number, found {other}"
+                        )));
+                    }
+                }
+                .map_err(M::Error::custom)?;
+                builder.append_value(number);
+                Ok(())
+            }
+            (SourceDataType::Numeric, Self::Numeric(builder)) => {
+                let value = map.next_value::<Value>()?;
+                if value.is_null() {
+                    if column.nullable() {
+                        builder.append_null();
+                        return Ok(());
+                    }
+                    return Err(non_nullable_null_error::<M>(column));
+                }
+                match &value {
+                    Value::String(value) => builder.append_value(value),
+                    Value::Number(_) => builder.append_value(value.to_string()),
+                    other => {
+                        return Err(M::Error::custom(format!(
+                            "expected numeric string or JSON number, found {other}"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            (data_type, _) => Err(M::Error::custom(format!(
+                "source column '{}' does not match Arrow builder for {data_type:?}",
+                column.name()
+            ))),
         }
     }
 

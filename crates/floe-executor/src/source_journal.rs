@@ -237,12 +237,26 @@ pub fn kafka_source_journal_initial_checksum() -> u64 {
 }
 
 pub fn update_kafka_source_journal_checksum(checksum: &mut u64, offset: i64, row: &[u8]) {
+    update_kafka_source_journal_checksum_parts(checksum, offset, &[row]);
+}
+
+pub fn update_kafka_source_journal_checksum_parts(
+    checksum: &mut u64,
+    offset: i64,
+    row_parts: &[&[u8]],
+) {
     update_fnv64(checksum, &offset.to_le_bytes());
+    let row_len = row_parts
+        .iter()
+        .map(|part| part.len())
+        .fold(0usize, usize::saturating_add);
     update_fnv64(
         checksum,
-        &(u64::try_from(row.len()).unwrap_or(u64::MAX)).to_le_bytes(),
+        &(u64::try_from(row_len).unwrap_or(u64::MAX)).to_le_bytes(),
     );
-    update_fnv64(checksum, row);
+    for part in row_parts {
+        update_fnv64(checksum, part);
+    }
 }
 
 fn vectorized_entry_prefix() -> Vec<u8> {

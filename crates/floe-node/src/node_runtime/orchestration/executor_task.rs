@@ -444,12 +444,14 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 });
                 let BatchSelection {
                     batch,
+                    kafka_raw_batches,
                     per_connector_counts: selected_per_connector_counts,
+                    selected_rows,
                 } = selection;
                 per_connector_counts.clear();
                 per_connector_counts.extend(selected_per_connector_counts);
 
-                if batch.is_empty() {
+                if selected_rows == 0 {
                     continue;
                 }
 
@@ -459,13 +461,121 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     (next_connector + 1) % connector_queues.len()
                 };
 
-                batch_len = batch.len();
+                batch_len = selected_rows;
                 let decode_span = tracing::debug_span!(
                     "ingest_decode",
                     epoch = pending_epoch,
                     raw_batch_size = batch_len
                 );
                 let _decode_guard = decode_span.enter();
+                for SelectedKafkaRawIngestBatch {
+                    source_id,
+                    batch,
+                    commit_ack,
+                } in kafka_raw_batches
+                {
+                    let Some(source_id) = source_id else {
+                        tracing::debug!(
+                            source = %batch.source,
+                            rows = batch.len(),
+                            "dropping raw kafka batch for unknown source"
+                        );
+                        if let Some(ack) = commit_ack {
+                            ack.record_failed(format!("unknown source '{}'", batch.source))
+                                .await;
+                        }
+                        continue;
+                    };
+                    let source_name = source_names_by_id_for_task[source_id].as_str();
+                    if !materialized_source_ids_for_task
+                        .get(source_id)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        tracing::debug!(
+                            source = %source_name,
+                            rows = batch.len(),
+                            "dropping raw kafka batch for source outside active materialization set"
+                        );
+                        if let Some(ack) = commit_ack {
+                            ack.record_failed(format!(
+                                "source '{source_name}' is outside the active materialization set"
+                            ))
+                            .await;
+                        }
+                        continue;
+                    }
+                    let Some(builder) = arrow_builders_by_source
+                        .get_mut(source_id)
+                        .and_then(Option::as_mut)
+                    else {
+                        let message =
+                            format!("received raw kafka batch for unknown source '{source_name}'");
+                        tracing::error!(source = %source_name, "{message}");
+                        if let Some(ack) = commit_ack {
+                            ack.record_failed(message.clone()).await;
+                        }
+                        record_fatal_source_batch_failure(
+                            commit_acks_by_source,
+                            &failure_for_executor,
+                            &executor_cancel,
+                            message,
+                        )
+                        .await;
+                        break 'executor;
+                    };
+                    for record in batch.records {
+                        if let Ok(partition) = u32::try_from(record.partition)
+                            && let Ok(offset) = u64::try_from(record.offset)
+                        {
+                            let entry = tick_source_offsets[source_id]
+                                .get_or_insert_with(HashMap::new)
+                                .entry(partition)
+                                .or_insert(0);
+                            *entry = (*entry).max(offset);
+                        }
+                        let entry = tick_kafka_offsets
+                            .entry((Arc::clone(&record.topic), record.partition))
+                            .or_insert(0);
+                        *entry = (*entry).max(record.offset);
+
+                        let event_ts =
+                            match builder.append_json_payload(source_name, &record.payload) {
+                                Ok(event_ts) => event_ts,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        source = %source_name,
+                                        topic = %record.topic,
+                                        partition = record.partition,
+                                        offset = record.offset,
+                                        error = %err,
+                                        "failed to decode raw kafka payload into Arrow"
+                                    );
+                                    continue;
+                                }
+                            };
+                        if kafka_metadata_journal_source_ids_for_task.contains(&source_id) {
+                            observe_kafka_source_journal_raw_payload(
+                                &mut tick_kafka_source_ranges[source_id],
+                                source_name,
+                                Arc::clone(&record.topic),
+                                record.partition,
+                                record.offset,
+                                &record.payload,
+                            );
+                        }
+                        let event_ts = event_ts.or(record.event_time_ms);
+                        if let Some(ts) = event_ts {
+                            let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
+                            let entry = tick_source_max_event_ts[source_id].get_or_insert(i64::MIN);
+                            *entry = (*entry).max(ts_i64);
+                        }
+                        decoded_counts[source_id] = decoded_counts[source_id].saturating_add(1);
+                    }
+                    if let Some(ack) = commit_ack {
+                        commit_acks_by_source[source_id].push(ack);
+                    }
+                }
                 for SelectedAppendIngestEvent {
                     source_id,
                     event,

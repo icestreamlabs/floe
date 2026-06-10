@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::connector::{Connector, ConnectorContext, ConnectorTick, run_connector};
-use crate::source::AppendIngestEventSender;
+use crate::source::{AppendIngestEventSender, KafkaRawIngestBatch, KafkaRawIngestRecord};
 use floe_core::source::{AppendIngestEvent, SourceDefinition};
 
 const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 32;
@@ -171,6 +171,15 @@ pub struct KafkaReplayBatch {
     pub tick_id: u64,
     pub max_event_time_ms: Option<i64>,
     pub events: Vec<AppendIngestEvent>,
+    pub raw_payloads: Vec<KafkaReplayRawPayload>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KafkaReplayRawPayload {
+    pub topic: Arc<str>,
+    pub partition: i32,
+    pub offset: i64,
+    pub payload: Vec<u8>,
 }
 
 pub struct KafkaConnector {
@@ -285,6 +294,7 @@ impl KafkaConnector {
             .context("assign kafka replay partition")?;
 
         let mut events = Vec::new();
+        let mut raw_payloads = Vec::new();
         let mut idle_since = Instant::now();
         loop {
             match consumer.poll(poll_timeout) {
@@ -302,6 +312,14 @@ impl KafkaConnector {
                     }
                     let mut parsed = connector.handle_message(&message)?;
                     events.append(&mut parsed);
+                    if let Some(payload) = message.payload() {
+                        raw_payloads.push(KafkaReplayRawPayload {
+                            topic: Arc::<str>::from(message.topic()),
+                            partition: message.partition(),
+                            offset,
+                            payload: payload.to_vec(),
+                        });
+                    }
                     if offset >= range.end_offset {
                         break;
                     }
@@ -342,6 +360,7 @@ impl KafkaConnector {
             tick_id: range.tick_id,
             max_event_time_ms: range.max_event_time_ms,
             events,
+            raw_payloads,
         })
     }
 
@@ -517,8 +536,13 @@ impl Connector for KafkaConnector {
             .consumer
             .as_ref()
             .context("kafka connector is not initialized")?;
+        let raw_source = self.raw_default_source(ctx).map(str::to_string);
         let mut emitted = 0usize;
         let mut staged = Vec::new();
+        let mut staged_raw = raw_source.as_ref().map(|source| KafkaRawIngestBatch {
+            source: source.clone(),
+            records: Vec::new(),
+        });
         let mut metrics = KafkaConnectorTickMetrics::default();
         if metrics_enabled {
             metrics.blocking_polls = 1;
@@ -531,8 +555,17 @@ impl Connector for KafkaConnector {
             }
             match message {
                 Ok(message) => {
-                    let event_count =
-                        self.stage_message(&message, &mut staged, &mut metrics, metrics_enabled)?;
+                    let event_count = if let Some(raw_batch) = staged_raw.as_mut() {
+                        self.stage_raw_or_event_message(
+                            &message,
+                            raw_batch,
+                            &mut staged,
+                            &mut metrics,
+                            metrics_enabled,
+                        )?
+                    } else {
+                        self.stage_message(&message, &mut staged, &mut metrics, metrics_enabled)?
+                    };
                     emitted = emitted.saturating_add(event_count);
                 }
                 Err(err) => {
@@ -560,8 +593,17 @@ impl Connector for KafkaConnector {
                         metrics.poll_drain_us =
                             metrics.poll_drain_us.saturating_add(elapsed_us(poll_start));
                     }
-                    let event_count =
-                        self.stage_message(&message, &mut staged, &mut metrics, metrics_enabled)?;
+                    let event_count = if let Some(raw_batch) = staged_raw.as_mut() {
+                        self.stage_raw_or_event_message(
+                            &message,
+                            raw_batch,
+                            &mut staged,
+                            &mut metrics,
+                            metrics_enabled,
+                        )?
+                    } else {
+                        self.stage_message(&message, &mut staged, &mut metrics, metrics_enabled)?
+                    };
                     emitted = emitted.saturating_add(event_count);
                 }
                 Some(Err(err)) => {
@@ -583,39 +625,57 @@ impl Connector for KafkaConnector {
             }
         }
 
+        if let Some(raw_batch) = staged_raw.take()
+            && !raw_batch.is_empty()
+        {
+            let send_start = metrics_enabled.then(Instant::now);
+            if let Err(err) = ctx.send_kafka_raw_batch(raw_batch).await {
+                anyhow::bail!(
+                    "failed to enqueue raw kafka event batch with {} records",
+                    err.0.len()
+                );
+            }
+            if let Some(send_start) = send_start {
+                metrics.send_us = metrics.send_us.saturating_add(elapsed_us(send_start));
+            }
+        }
+
         if !staged.is_empty() {
             let send_start = metrics_enabled.then(Instant::now);
             ctx.send_batch(staged)
                 .await
                 .context("failed to enqueue kafka event batch")?;
             if let Some(send_start) = send_start {
-                metrics.send_us = elapsed_us(send_start);
+                metrics.send_us = metrics.send_us.saturating_add(elapsed_us(send_start));
             }
-            if !self.first_batch_logged {
-                self.first_batch_logged = true;
-                let time_to_first_batch_ms = self
-                    .started_at
-                    .map(|started| started.elapsed().as_millis() as u64)
-                    .unwrap_or_default();
-                if metrics_enabled {
-                    tracing::info!(
-                        emitted,
-                        kafka_messages = metrics.messages,
-                        poll_blocking_us = metrics.poll_blocking_us,
-                        poll_drain_us = metrics.poll_drain_us,
-                        parse_us = metrics.parse_us,
-                        message_us = metrics.message_us,
-                        send_us = metrics.send_us,
-                        time_to_first_batch_ms,
-                        "kafka connector emitted first batch"
-                    );
-                } else {
-                    tracing::info!(
-                        emitted,
-                        time_to_first_batch_ms,
-                        "kafka connector emitted first batch"
-                    );
-                }
+        }
+
+        if emitted > 0 && !self.first_batch_logged {
+            self.first_batch_logged = true;
+            let time_to_first_batch_ms = self
+                .started_at
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or_default();
+            if metrics_enabled {
+                tracing::info!(
+                    emitted,
+                    kafka_messages = metrics.messages,
+                    poll_blocking_us = metrics.poll_blocking_us,
+                    poll_drain_us = metrics.poll_drain_us,
+                    parse_us = metrics.parse_us,
+                    message_us = metrics.message_us,
+                    send_us = metrics.send_us,
+                    raw_fast_path = raw_source.is_some(),
+                    time_to_first_batch_ms,
+                    "kafka connector emitted first batch"
+                );
+            } else {
+                tracing::info!(
+                    emitted,
+                    raw_fast_path = raw_source.is_some(),
+                    time_to_first_batch_ms,
+                    "kafka connector emitted first batch"
+                );
             }
         }
 
@@ -759,6 +819,58 @@ fn parse_debezium_events(
 }
 
 impl KafkaConnector {
+    fn raw_default_source<'a>(&'a self, ctx: &ConnectorContext) -> Option<&'a str> {
+        if self.message_format != KafkaMessageFormat::FloeJson || !ctx.supports_kafka_raw_batches()
+        {
+            return None;
+        }
+        self.config.default_source.as_deref()
+    }
+
+    fn stage_raw_or_event_message(
+        &self,
+        message: &BorrowedMessage<'_>,
+        raw_batch: &mut KafkaRawIngestBatch,
+        staged_events: &mut Vec<AppendIngestEvent>,
+        metrics: &mut KafkaConnectorTickMetrics,
+        metrics_enabled: bool,
+    ) -> Result<usize> {
+        let Some(payload) = message.payload() else {
+            tracing::warn!(
+                topic = message.topic(),
+                partition = message.partition(),
+                offset = message.offset(),
+                "kafka message missing payload"
+            );
+            return Ok(0);
+        };
+        if floe_json_payload_needs_event_parser(payload) {
+            return self.stage_message(message, staged_events, metrics, metrics_enabled);
+        }
+
+        let message_start = metrics_enabled.then(Instant::now);
+        if metrics_enabled {
+            metrics.messages = metrics.messages.saturating_add(1);
+        }
+        let topic = self
+            .topic_arcs
+            .get(message.topic())
+            .cloned()
+            .unwrap_or_else(|| Arc::<str>::from(message.topic()));
+        raw_batch.records.push(KafkaRawIngestRecord {
+            payload: payload.to_vec(),
+            topic,
+            partition: message.partition(),
+            offset: message.offset(),
+            event_time_ms: kafka_message_timestamp_ms(message),
+        });
+        if let Some(message_start) = message_start {
+            metrics.events = metrics.events.saturating_add(1);
+            metrics.message_us = metrics.message_us.saturating_add(elapsed_us(message_start));
+        }
+        Ok(1)
+    }
+
     fn stage_message(
         &self,
         message: &BorrowedMessage<'_>,
@@ -870,6 +982,29 @@ impl KafkaConnector {
         self.last_committed_tick_id = commit.tick_id;
         Ok(true)
     }
+}
+
+fn floe_json_payload_needs_event_parser(payload: &[u8]) -> bool {
+    let first = payload
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    if first != Some(b'{') {
+        return true;
+    }
+    contains_json_field_name(payload, b"source") && contains_json_field_name(payload, b"data")
+}
+
+fn contains_json_field_name(payload: &[u8], field: &[u8]) -> bool {
+    let needle_len = field.len().saturating_add(2);
+    if payload.len() < needle_len {
+        return false;
+    }
+    payload.windows(needle_len).any(|window| {
+        window.first() == Some(&b'"')
+            && window.last() == Some(&b'"')
+            && &window[1..window.len() - 1] == field
+    })
 }
 
 fn kafka_message_timestamp_ms(message: &BorrowedMessage<'_>) -> Option<u64> {
