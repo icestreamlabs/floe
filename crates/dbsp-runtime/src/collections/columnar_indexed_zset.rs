@@ -11,17 +11,17 @@ use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
 use crate::profile;
+use crate::storage::KeyValueTable;
 use crate::storage::keyspace;
 use crate::storage::segment::{ArrowSegmentStore, encode_segment_envelope};
-use crate::storage::{KeyValueTable, prefix_bounds};
 
 use super::columnar_zset::{
     ColumnarZSet, row_converter_for_schema, segment_stats_arrow, validate_weighted_batch,
     value_array_refs,
 };
 
-const RANGE_LOOKUP_MIN_KEYS: usize = 128;
-const RANGE_LOOKUP_CHUNK_KEYS: usize = 2_048;
+const INDEX_BUCKET_COUNT: u16 = 16;
+const INDEX_BUCKET_TAG: u8 = b'b';
 
 pub struct SlateBackedColumnarIndexedZSet {
     table: Arc<dyn KeyValueTable>,
@@ -183,10 +183,12 @@ impl SlateBackedColumnarIndexedZSet {
             Bytes::from(self.segment_store.key_for_segment(segment_id)),
             Bytes::from(segment_bytes),
         );
-        for (key_bytes, key_postings) in postings {
+        let posting_buckets = bucket_postings(postings);
+        for (bucket, mut entries) in posting_buckets {
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
             write_batch.put_bytes(
-                Bytes::from(self.index_key(&key_bytes, segment_id)?),
-                Bytes::from(encode_index_postings(&key_postings)),
+                Bytes::from(self.bucket_index_key(bucket, segment_id)),
+                Bytes::from(encode_bucket_postings(&entries)?),
             );
         }
         write_batch.put_bytes(
@@ -219,7 +221,7 @@ impl SlateBackedColumnarIndexedZSet {
     pub async fn lookup_key_batches(&self, key_batches: &[RecordBatch]) -> Result<ColumnarZSet> {
         let total_start = profile::start();
         let phase_start = profile::start();
-        let mut key_bytes = self.key_bytes_from_batches(key_batches)?;
+        let key_bytes = self.key_bytes_from_batches(key_batches)?;
         if key_bytes.is_empty() {
             profile::record_since("columnar_index.lookup.key_bytes", phase_start);
             profile::record_since("columnar_index.lookup.total", total_start);
@@ -234,16 +236,11 @@ impl SlateBackedColumnarIndexedZSet {
         }
         profile::record_since("columnar_index.lookup.bounds_check", phase_start);
 
-        let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
         let phase_start = profile::start();
-        if key_bytes.len() >= RANGE_LOOKUP_MIN_KEYS {
-            key_bytes.sort_unstable();
-            self.lookup_key_ranges(&key_bytes, &mut refs_by_segment)
-                .await?;
-        } else {
-            self.lookup_keys_individually(&key_bytes, &mut refs_by_segment)
-                .await?;
-        };
+        let key_buckets = keys_by_bucket(key_bytes);
+        let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
+        self.lookup_key_buckets(&key_buckets, &mut refs_by_segment)
+            .await?;
         profile::record_since("columnar_index.lookup.collect_postings", phase_start);
 
         if refs_by_segment.is_empty() {
@@ -270,51 +267,26 @@ impl SlateBackedColumnarIndexedZSet {
         output
     }
 
-    async fn lookup_keys_individually(
+    async fn lookup_key_buckets(
         &self,
-        key_bytes: &[Vec<u8>],
+        key_buckets: &HashMap<u16, HashSet<Vec<u8>>>,
         refs_by_segment: &mut HashMap<u64, Vec<u32>>,
     ) -> Result<()> {
-        for key in key_bytes {
+        for (bucket, wanted_keys) in key_buckets {
             let entries = self
                 .table
-                .scan_prefix_bytes(&self.index_prefix_for_key(key)?, &ScanOptions::default())
+                .scan_prefix_bytes(&self.bucket_prefix(*bucket), &ScanOptions::default())
                 .await
-                .context("scan columnar index key postings")?;
-            self.collect_posting_entries(entries, None, refs_by_segment)?;
+                .context("scan columnar index bucket postings")?;
+            self.collect_bucket_posting_entries(entries, wanted_keys, refs_by_segment)?;
         }
         Ok(())
     }
 
-    async fn lookup_key_ranges(
-        &self,
-        sorted_key_bytes: &[Vec<u8>],
-        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
-    ) -> Result<()> {
-        for chunk in sorted_key_bytes.chunks(RANGE_LOOKUP_CHUNK_KEYS) {
-            let Some(first_key) = chunk.first() else {
-                continue;
-            };
-            let Some(last_key) = chunk.last() else {
-                continue;
-            };
-            let start = self.index_prefix_for_key(first_key)?;
-            let end = prefix_bounds(&self.index_prefix_for_key(last_key)?).end;
-            let wanted_keys = chunk.iter().cloned().collect::<HashSet<Vec<u8>>>();
-            let entries = self
-                .table
-                .scan_range_bytes(start..end, &ScanOptions::default())
-                .await
-                .context("scan columnar index key posting range")?;
-            self.collect_posting_entries(entries, Some(&wanted_keys), refs_by_segment)?;
-        }
-        Ok(())
-    }
-
-    fn collect_posting_entries<K, V>(
+    fn collect_bucket_posting_entries<K, V>(
         &self,
         entries: Vec<(K, V)>,
-        wanted_keys: Option<&HashSet<Vec<u8>>>,
+        wanted_keys: &HashSet<Vec<u8>>,
         refs_by_segment: &mut HashMap<u64, Vec<u32>>,
     ) -> Result<()>
     where
@@ -322,37 +294,22 @@ impl SlateBackedColumnarIndexedZSet {
         V: AsRef<[u8]>,
     {
         for (entry_key, entry_value) in entries {
-            if let Some(wanted_keys) = wanted_keys {
-                let key_bytes = self.lookup_key_bytes_from_index_key(entry_key.as_ref())?;
-                if !wanted_keys.contains(key_bytes) {
-                    continue;
-                }
-            }
-            let segment_id = segment_id_from_index_key(entry_key.as_ref())?;
-            for (row_index, weight) in decode_index_postings(entry_value.as_ref())? {
-                if weight != 0 {
-                    refs_by_segment
-                        .entry(segment_id)
-                        .or_default()
-                        .push(row_index);
-                }
-            }
+            let segment_id = self.segment_id_from_bucket_key(entry_key.as_ref())?;
+            decode_bucket_postings_for_keys(
+                entry_value.as_ref(),
+                wanted_keys,
+                |row_index, weight| {
+                    if weight != 0 {
+                        refs_by_segment
+                            .entry(segment_id)
+                            .or_default()
+                            .push(row_index);
+                    }
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
-    }
-
-    fn lookup_key_bytes_from_index_key<'a>(&self, index_key: &'a [u8]) -> Result<&'a [u8]> {
-        if !index_key.starts_with(&self.index_prefix) {
-            bail!("columnar index posting key prefix mismatch");
-        }
-        let mut cursor = self.index_prefix.len();
-        let key_len = usize::try_from(read_u32(index_key, &mut cursor)?)
-            .context("columnar index key length out of range")?;
-        let key_bytes = read_bytes(index_key, &mut cursor, key_len, "columnar index key bytes")?;
-        if index_key.len() < cursor.saturating_add(8) {
-            bail!("columnar index posting key missing segment id");
-        }
-        Ok(key_bytes)
     }
 
     async fn clear_persisted(&self) -> Result<()> {
@@ -484,17 +441,32 @@ impl SlateBackedColumnarIndexedZSet {
         Ok(batches)
     }
 
-    fn index_prefix_for_key(&self, key_bytes: &[u8]) -> Result<Vec<u8>> {
+    fn bucket_prefix(&self, bucket: u16) -> Vec<u8> {
         let mut prefix = self.index_prefix.clone();
-        prefix.extend_from_slice(&encode_len(key_bytes.len())?);
-        prefix.extend_from_slice(key_bytes);
-        Ok(prefix)
+        prefix.push(INDEX_BUCKET_TAG);
+        prefix.extend_from_slice(&bucket.to_be_bytes());
+        prefix
     }
 
-    fn index_key(&self, key_bytes: &[u8], segment_id: u64) -> Result<Vec<u8>> {
-        let mut key = self.index_prefix_for_key(key_bytes)?;
+    fn bucket_index_key(&self, bucket: u16, segment_id: u64) -> Vec<u8> {
+        let mut key = self.bucket_prefix(bucket);
         key.extend_from_slice(&segment_id.to_be_bytes());
-        Ok(key)
+        key
+    }
+
+    fn segment_id_from_bucket_key(&self, key: &[u8]) -> Result<u64> {
+        let prefix_len = self.index_prefix.len() + 1 + 2;
+        if key.len() != prefix_len + 8 {
+            bail!("columnar index bucket key has invalid length");
+        }
+        if !key.starts_with(&self.index_prefix) || key[self.index_prefix.len()] != INDEX_BUCKET_TAG
+        {
+            bail!("columnar index bucket key prefix mismatch");
+        }
+        let suffix = key
+            .get(prefix_len..prefix_len + 8)
+            .ok_or_else(|| anyhow!("columnar index bucket segment id truncated"))?;
+        Ok(u64::from_be_bytes(suffix.try_into()?))
     }
 }
 
@@ -584,6 +556,39 @@ fn keys_overlap_bounds(keys: &[Vec<u8>], bounds: Option<&IndexKeyBounds>) -> boo
         && delta_bounds.min.as_slice() <= bounds.max.as_slice()
 }
 
+fn keys_by_bucket(keys: Vec<Vec<u8>>) -> HashMap<u16, HashSet<Vec<u8>>> {
+    let mut buckets = HashMap::new();
+    for key in keys {
+        buckets
+            .entry(index_bucket(&key))
+            .or_insert_with(HashSet::new)
+            .insert(key);
+    }
+    buckets
+}
+
+fn bucket_postings(
+    postings: HashMap<Vec<u8>, Vec<(u32, i64)>>,
+) -> HashMap<u16, Vec<(Vec<u8>, Vec<(u32, i64)>)>> {
+    let mut buckets = HashMap::new();
+    for (key, postings) in postings {
+        buckets
+            .entry(index_bucket(&key))
+            .or_insert_with(Vec::new)
+            .push((key, postings));
+    }
+    buckets
+}
+
+fn index_bucket(key: &[u8]) -> u16 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in key {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % u64::from(INDEX_BUCKET_COUNT)) as u16
+}
+
 fn encode_key_bounds(bounds: &IndexKeyBounds) -> Result<Vec<u8>> {
     let min_len = u32::try_from(bounds.min.len()).context("columnar index min key too large")?;
     let max_len = u32::try_from(bounds.max.len()).context("columnar index max key too large")?;
@@ -643,36 +648,60 @@ fn weight_column(batch: &RecordBatch, value_column_count: usize) -> Result<&Int6
         .ok_or_else(|| anyhow!("columnar indexed zset weight column is not Int64"))
 }
 
-fn encode_index_postings(postings: &[(u32, i64)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + postings.len() * (4 + 8));
-    out.extend_from_slice(&(postings.len() as u32).to_be_bytes());
-    for (row_index, delta) in postings {
-        out.extend_from_slice(&row_index.to_be_bytes());
-        out.extend_from_slice(&delta.to_be_bytes());
+fn encode_bucket_postings(entries: &[(Vec<u8>, Vec<(u32, i64)>)]) -> Result<Vec<u8>> {
+    let mut capacity = 4;
+    for (key, postings) in entries {
+        capacity += 8 + key.len() + postings.len() * 12;
     }
-    out
-}
-
-fn decode_index_postings(bytes: &[u8]) -> Result<Vec<(u32, i64)>> {
-    let mut cursor = 0;
-    let count = read_u32(bytes, &mut cursor).context("decode columnar index postings count")?;
-    let mut out = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let row_index =
-            read_u32(bytes, &mut cursor).context("decode columnar index posting row index")?;
-        let weight =
-            read_i64(bytes, &mut cursor).context("decode columnar index posting weight")?;
-        out.push((row_index, weight));
-    }
-    if cursor != bytes.len() {
-        bail!("columnar index postings payload has trailing bytes");
+    let mut out = Vec::with_capacity(capacity);
+    let entry_count = u32::try_from(entries.len()).context("columnar index bucket too large")?;
+    out.extend_from_slice(&entry_count.to_be_bytes());
+    for (key, postings) in entries {
+        let key_len = u32::try_from(key.len()).context("columnar index key too large")?;
+        let posting_count =
+            u32::try_from(postings.len()).context("columnar index posting count too large")?;
+        out.extend_from_slice(&key_len.to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&posting_count.to_be_bytes());
+        for (row_index, delta) in postings {
+            out.extend_from_slice(&row_index.to_be_bytes());
+            out.extend_from_slice(&delta.to_be_bytes());
+        }
     }
     Ok(out)
 }
 
-fn encode_len(len: usize) -> Result<[u8; 4]> {
-    let len = u32::try_from(len).map_err(|_| anyhow!("columnar index key too large"))?;
-    Ok(len.to_be_bytes())
+fn decode_bucket_postings_for_keys(
+    bytes: &[u8],
+    wanted_keys: &HashSet<Vec<u8>>,
+    mut emit: impl FnMut(u32, i64) -> Result<()>,
+) -> Result<()> {
+    let mut cursor = 0;
+    let entry_count =
+        read_u32(bytes, &mut cursor).context("decode columnar index bucket entry count")?;
+    for _ in 0..entry_count {
+        let key_len = usize::try_from(
+            read_u32(bytes, &mut cursor).context("decode columnar index bucket key length")?,
+        )
+        .context("columnar index bucket key length out of range")?;
+        let key = read_bytes(bytes, &mut cursor, key_len, "columnar index bucket key")?;
+        let posting_count =
+            read_u32(bytes, &mut cursor).context("decode columnar index bucket posting count")?;
+        let wanted = wanted_keys.contains(key);
+        for _ in 0..posting_count {
+            let row_index =
+                read_u32(bytes, &mut cursor).context("decode columnar index posting row index")?;
+            let weight =
+                read_i64(bytes, &mut cursor).context("decode columnar index posting weight")?;
+            if wanted {
+                emit(row_index, weight)?;
+            }
+        }
+    }
+    if cursor != bytes.len() {
+        bail!("columnar index bucket postings payload has trailing bytes");
+    }
+    Ok(())
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
@@ -718,16 +747,6 @@ fn read_bytes<'a>(
         .ok_or_else(|| anyhow!("{label} truncated"))?;
     *cursor = end;
     Ok(chunk)
-}
-
-fn segment_id_from_index_key(key: &[u8]) -> Result<u64> {
-    if key.len() < 8 {
-        bail!("columnar index key missing segment id suffix");
-    }
-    let suffix = key
-        .get(key.len() - 8..)
-        .ok_or_else(|| anyhow!("columnar index segment id suffix truncated"))?;
-    Ok(u64::from_be_bytes(suffix.try_into()?))
 }
 
 #[cfg(test)]
@@ -899,7 +918,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn columnar_index_large_lookup_uses_chunked_range_scans() {
+    async fn columnar_index_large_lookup_uses_bounded_bucket_scans() {
         let inner = build_table("columnar-index-large-lookup").await;
         let counting = Arc::new(CountingTable::new(inner));
         let table: Arc<dyn KeyValueTable> = counting.clone();
@@ -907,7 +926,7 @@ mod tests {
             SlateBackedColumnarIndexedZSet::new(table, "orders_by_id", value_schema(), vec![0])
                 .await
                 .expect("index");
-        let rows = RANGE_LOOKUP_MIN_KEYS * 2;
+        let rows = usize::from(INDEX_BUCKET_COUNT) * 2;
         let ids = (0..rows as i64).collect::<Vec<_>>();
         let delta = ColumnarZSet::try_new_weighted(
             value_schema(),
@@ -932,7 +951,8 @@ mod tests {
             .map(RecordBatch::num_rows)
             .sum::<usize>();
         assert_eq!(found_rows, rows);
-        assert_eq!(counting.scan_range_calls(), 1);
+        assert!(counting.scan_range_calls() > 0);
+        assert!(counting.scan_range_calls() <= usize::from(INDEX_BUCKET_COUNT));
     }
 
     #[tokio::test]
