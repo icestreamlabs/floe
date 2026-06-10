@@ -348,6 +348,35 @@ struct SourceJsonObjectVisitor<'a> {
     column_index_by_name: &'a HashMap<String, usize>,
 }
 
+enum SeenColumns {
+    Inline(u128),
+    Heap(Vec<bool>),
+}
+
+impl SeenColumns {
+    fn new(column_count: usize) -> Self {
+        if column_count <= u128::BITS as usize {
+            Self::Inline(0)
+        } else {
+            Self::Heap(vec![false; column_count])
+        }
+    }
+
+    fn mark(&mut self, idx: usize) {
+        match self {
+            Self::Inline(bits) => *bits |= 1_u128 << idx,
+            Self::Heap(seen) => seen[idx] = true,
+        }
+    }
+
+    fn contains(&self, idx: usize) -> bool {
+        match self {
+            Self::Inline(bits) => (*bits & (1_u128 << idx)) != 0,
+            Self::Heap(seen) => seen[idx],
+        }
+    }
+}
+
 impl<'de> Visitor<'de> for SourceJsonObjectVisitor<'_> {
     type Value = Option<Timestamp>;
 
@@ -359,14 +388,14 @@ impl<'de> Visitor<'de> for SourceJsonObjectVisitor<'_> {
     where
         M: MapAccess<'de>,
     {
-        let mut seen = vec![false; self.definition.columns().len()];
+        let mut seen = SeenColumns::new(self.definition.columns().len());
         let mut event_ts = None;
         while let Some(key) = map.next_key::<Cow<'de, str>>()? {
             let Some(&idx) = self.column_index_by_name.get(key.as_ref()) else {
                 let _: IgnoredAny = map.next_value()?;
                 continue;
             };
-            seen[idx] = true;
+            seen.mark(idx);
             let column = &self.definition.columns()[idx];
             match self.builders[idx].as_mut() {
                 Some(builder) => {
@@ -377,7 +406,7 @@ impl<'de> Visitor<'de> for SourceJsonObjectVisitor<'_> {
         }
 
         for (idx, column) in self.definition.columns().iter().enumerate() {
-            if seen[idx] {
+            if seen.contains(idx) {
                 continue;
             }
             if let Some(builder) = self.builders[idx].as_mut() {
