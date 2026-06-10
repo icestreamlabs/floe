@@ -561,7 +561,10 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
     .await
     .context("build SlateDB-backed right join input state")?;
 
-    let rebuild_each_evaluate = execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff;
+    // DataFusion physical join plans are not reusable with swapped dynamic inputs across
+    // collect calls. Keep the logical plan cached, but rebuild the physical plan per delta
+    // evaluation so cross-tick indexed joins observe the current provider batches.
+    let rebuild_each_evaluate = true;
     let build_incremental_delta_evaluators =
         execution_strategy == ColumnarJoinExecutionStrategy::IncrementalInner;
     let left_delta_right_state = if build_incremental_delta_evaluators {
@@ -1508,6 +1511,33 @@ async fn run_columnar_join_state_tick_inner(
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build join output zset delta")?;
+    tracing::debug!(
+        left_delta_rows = left_delta
+            .batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        right_delta_rows = right_delta
+            .batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        right_state_rows = right_state_for_left_delta
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        left_state_rows = left_state_for_right_delta
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        output_delta_rows = output_delta
+            .batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        mode = "columnar_join_incremental",
+        "SlateDB-backed join columnar DBSP state tick completed"
+    );
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(

@@ -11428,6 +11428,347 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
 }
 
 #[tokio::test]
+async fn q4_nexmark_shape_uses_incremental_grouped_stats_composition_semantics() {
+    let auctions = SourceDefinition::new(
+        "nexmark_auction",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("item_name", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("description", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("initial_bid", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("reserve", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("category", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("expires", SourceDataType::TimestampMillis, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::TimestampMillis, false),
+            SourceColumn::new_nullable("extra", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("auction source definition");
+    let bids = SourceDefinition::new(
+        "nexmark_bid",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("channel", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("url", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::TimestampMillis, false),
+            SourceColumn::new_nullable("extra", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("bid source definition");
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let auction_batch = RecordBatch::try_new(
+        Arc::clone(&auction_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["item_1", "item_2"])),
+            Arc::new(StringArray::from(vec!["desc_1", "desc_2"])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+            Arc::new(Int64Array::from(vec![1000, 1000])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+            Arc::new(Int64Array::from(vec![10, 20])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                1_700_086_400_001_i64,
+                1_700_086_400_002,
+            ])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                1_700_000_000_001_i64,
+                1_700_000_000_002,
+            ])),
+            Arc::new(StringArray::from(vec![
+                "auction_extra_1",
+                "auction_extra_2",
+            ])),
+        ],
+    )
+    .expect("auction batch");
+    let bid_batch = RecordBatch::try_new(
+        Arc::clone(&bid_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![11, 12, 13])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(StringArray::from(vec!["web", "web", "web"])),
+            Arc::new(StringArray::from(vec!["/a", "/b", "/c"])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                1_700_000_000_001_i64,
+                1_700_000_000_002,
+                1_700_000_000_003,
+            ])),
+            Arc::new(StringArray::from(vec![
+                "bid_extra_1",
+                "bid_extra_2",
+                "bid_extra_3",
+            ])),
+        ],
+    )
+    .expect("bid batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-q4-nexmark-shape").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Int64, false),
+        Field::new("avg_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT category, CAST(AVG(max) AS BIGINT) AS avg_price \
+        FROM (SELECT MAX(b.price) AS max, a.category \
+        FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+        WHERE b.date_time BETWEEN a.date_time AND a.expires \
+        GROUP BY a.id, a.category) per_auction GROUP BY category";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_q4_nexmark",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_bid",
+            vec![bid_batch.clone()],
+            vec![bid_batch],
+        )
+        .await
+        .expect("append bids");
+    runtime.run_tick(1).await.expect("bid-only q4 tick");
+    let handle = registry.get("mv_q4_nexmark").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(1).expect("bid-only snapshot");
+    assert!(id_count_rows(&snapshot).is_empty());
+
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_auction",
+            vec![auction_batch.clone()],
+            vec![auction_batch],
+        )
+        .await
+        .expect("append auctions");
+    runtime.run_tick(2).await.expect("auction q4 tick");
+
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(10, 200), (20, 300)]);
+}
+
+#[tokio::test]
+async fn q4_nexmark_generated_batches_use_incremental_grouped_stats_semantics() {
+    const BASE_TS_MS: i64 = 1_700_000_000_000;
+
+    fn nexmark_auction_definition() -> SourceDefinition {
+        SourceDefinition::new(
+            "nexmark_auction",
+            vec![
+                SourceColumn::new("id", SourceDataType::Int64),
+                SourceColumn::new("item_name", SourceDataType::Utf8),
+                SourceColumn::new("description", SourceDataType::Utf8),
+                SourceColumn::new("initial_bid", SourceDataType::Int64),
+                SourceColumn::new("reserve", SourceDataType::Int64),
+                SourceColumn::new("seller", SourceDataType::Int64),
+                SourceColumn::new("category", SourceDataType::Int64),
+                SourceColumn::new("expires", SourceDataType::TimestampMillis),
+                SourceColumn::new("date_time", SourceDataType::TimestampMillis),
+                SourceColumn::new("extra", SourceDataType::Utf8),
+            ],
+        )
+        .expect("auction source definition")
+    }
+
+    fn nexmark_bid_definition() -> SourceDefinition {
+        SourceDefinition::new(
+            "nexmark_bid",
+            vec![
+                SourceColumn::new("auction", SourceDataType::Int64),
+                SourceColumn::new("bidder", SourceDataType::Int64),
+                SourceColumn::new("price", SourceDataType::Int64),
+                SourceColumn::new("channel", SourceDataType::Utf8),
+                SourceColumn::new("url", SourceDataType::Utf8),
+                SourceColumn::new("date_time", SourceDataType::TimestampMillis),
+                SourceColumn::new("extra", SourceDataType::Utf8),
+            ],
+        )
+        .expect("bid source definition")
+    }
+
+    fn generated_auction_batch(schema: SchemaRef, start: usize, rows: usize) -> RecordBatch {
+        let mut ids = Vec::with_capacity(rows);
+        let mut item_names = Vec::with_capacity(rows);
+        let mut descriptions = Vec::with_capacity(rows);
+        let mut initial_bids = Vec::with_capacity(rows);
+        let mut reserves = Vec::with_capacity(rows);
+        let mut sellers = Vec::with_capacity(rows);
+        let mut categories = Vec::with_capacity(rows);
+        let mut expires = Vec::with_capacity(rows);
+        let mut date_times = Vec::with_capacity(rows);
+        let mut extras = Vec::with_capacity(rows);
+        for auction_idx in start..(start + rows) {
+            let idx = i64::try_from(auction_idx).expect("auction idx");
+            let initial_bid = 5_000 + (idx % 25_000);
+            let date_time = BASE_TS_MS + idx;
+            ids.push(idx);
+            item_names.push(format!("item_{auction_idx}"));
+            descriptions.push(format!("auction_description_{auction_idx}"));
+            initial_bids.push(initial_bid);
+            reserves.push(initial_bid + 500);
+            sellers.push(50_000 + idx);
+            categories.push(((idx - 1).rem_euclid(10)) + 1);
+            expires.push(date_time + 86_400_000);
+            date_times.push(date_time);
+            extras.push(format!("auction_extra_{auction_idx}"));
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(item_names)),
+                Arc::new(StringArray::from(descriptions)),
+                Arc::new(Int64Array::from(initial_bids)),
+                Arc::new(Int64Array::from(reserves)),
+                Arc::new(Int64Array::from(sellers)),
+                Arc::new(Int64Array::from(categories)),
+                Arc::new(TimestampMillisecondArray::from(expires)),
+                Arc::new(TimestampMillisecondArray::from(date_times)),
+                Arc::new(StringArray::from(extras)),
+            ],
+        )
+        .expect("generated auction batch")
+    }
+
+    fn generated_bid_batch(schema: SchemaRef, start: usize, rows: usize) -> RecordBatch {
+        let mut auctions = Vec::with_capacity(rows);
+        let mut bidders = Vec::with_capacity(rows);
+        let mut prices = Vec::with_capacity(rows);
+        let mut channels = Vec::with_capacity(rows);
+        let mut urls = Vec::with_capacity(rows);
+        let mut date_times = Vec::with_capacity(rows);
+        let mut extras = Vec::with_capacity(rows);
+        for bid_idx in start..(start + rows) {
+            let idx = i64::try_from(bid_idx).expect("bid idx");
+            let auction = i64::try_from((bid_idx - 1) % 10_000 + 1).expect("auction id");
+            let channel = match bid_idx % 5 {
+                0 => "web",
+                1 => "apple",
+                2 => "google",
+                3 => "facebook",
+                _ => "baidu",
+            };
+            auctions.push(auction);
+            bidders.push(10_000 + idx);
+            prices.push(1_000 + (idx % 50_000));
+            channels.push(channel.to_string());
+            urls.push(format!("https://example.com/item/{bid_idx}"));
+            date_times.push(BASE_TS_MS + idx);
+            extras.push(format!("bid_extra_{bid_idx}"));
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(auctions)),
+                Arc::new(Int64Array::from(bidders)),
+                Arc::new(Int64Array::from(prices)),
+                Arc::new(StringArray::from(channels)),
+                Arc::new(StringArray::from(urls)),
+                Arc::new(TimestampMillisecondArray::from(date_times)),
+                Arc::new(StringArray::from(extras)),
+            ],
+        )
+        .expect("generated bid batch")
+    }
+
+    let auctions = nexmark_auction_definition();
+    let bids = nexmark_bid_definition();
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+    let table = build_operator_state_table("vectorized-columnar-q4-generated-batches").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("category", DataType::Int64, true),
+        Field::new("avg_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT category, CAST(AVG(max) AS BIGINT) AS avg_price \
+        FROM (SELECT MAX(b.price) AS max, a.category \
+        FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+        WHERE b.date_time BETWEEN a.date_time AND a.expires \
+        GROUP BY a.id, a.category) per_auction GROUP BY category";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_q4_generated",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    for (version, (start, rows)) in [(1, 8192), (8193, 1808)].into_iter().enumerate() {
+        let bid_batch = generated_bid_batch(Arc::clone(&bid_schema), start, rows);
+        runtime
+            .append_source_batches_for_execution_and_query(
+                "nexmark_bid",
+                vec![bid_batch.clone()],
+                vec![bid_batch],
+            )
+            .await
+            .expect("append generated bids");
+        let auction_batch = generated_auction_batch(Arc::clone(&auction_schema), start, rows);
+        runtime
+            .append_source_batches_for_execution_and_query(
+                "nexmark_auction",
+                vec![auction_batch.clone()],
+                vec![auction_batch],
+            )
+            .await
+            .expect("append generated auctions");
+        runtime
+            .run_tick((version + 1) as i64)
+            .await
+            .expect("generated q4 tick");
+    }
+
+    let handle = registry.get("mv_q4_generated").expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    assert_eq!(
+        id_count_rows(&snapshot),
+        vec![
+            (1, 5996),
+            (2, 5997),
+            (3, 5998),
+            (4, 5999),
+            (5, 6000),
+            (6, 6001),
+            (7, 6002),
+            (8, 6003),
+            (9, 6004),
+            (10, 6005),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     let bids = SourceDefinition::new(
         "bids",

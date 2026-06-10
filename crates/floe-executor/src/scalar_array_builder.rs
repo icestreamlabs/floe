@@ -193,6 +193,18 @@ impl ScalarColumnBuilder {
         }
     }
 
+    pub(crate) fn append_timestamp_millis_value(&mut self, value: i64) -> Result<()> {
+        match self {
+            Self::TimestampMillis { builder, .. } => {
+                builder.append_value(value);
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "expected timestamp(ms) column builder when appending timestamp millis value"
+            )),
+        }
+    }
+
     pub(crate) fn append_f64_value(&mut self, value: f64) -> Result<()> {
         match self {
             Self::Float64(builder) => {

@@ -71,15 +71,44 @@ pub(super) fn infer_join_relation_sides(
     join: &DbspJoinNode,
 ) -> HashMap<String, JoinInputSide> {
     let mut inferred = HashMap::new();
+    let mut relations = BTreeSet::new();
     if let Some(expressions) = projection_exprs {
         for expr in expressions {
+            accumulate_join_relations(expr, &mut relations);
             accumulate_join_relation_sides(expr, join, &mut inferred);
         }
     }
     if let Some(filter) = top_filter {
+        accumulate_join_relations(filter, &mut relations);
         accumulate_join_relation_sides(filter, join, &mut inferred);
     }
+    infer_unambiguous_opposite_relation(&relations, &mut inferred);
     inferred
+}
+
+fn accumulate_join_relations(expression: &Expr, relations: &mut BTreeSet<String>) {
+    for column in expression.column_refs() {
+        if let Some(relation) = column.relation.as_ref().map(ToString::to_string) {
+            relations.insert(relation);
+        }
+    }
+}
+
+fn infer_unambiguous_opposite_relation(
+    relations: &BTreeSet<String>,
+    inferred: &mut HashMap<String, JoinInputSide>,
+) {
+    if relations.len() != 2 || inferred.len() != 1 {
+        return;
+    }
+    let Some((&known_side, unknown_relation)) = inferred.values().next().zip(
+        relations
+            .iter()
+            .find(|relation| !inferred.contains_key(*relation)),
+    ) else {
+        return;
+    };
+    inferred.insert(unknown_relation.clone(), known_side.opposite());
 }
 
 pub(super) fn accumulate_join_relation_sides(

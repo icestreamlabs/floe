@@ -10,6 +10,10 @@ pub struct PlanSourceRequirements {
 }
 
 pub fn plan_source_requirements(plan: &CircuitPlan) -> Result<Option<Vec<PlanSourceRequirements>>> {
+    if has_ambiguous_join_input_filter(plan) {
+        return Ok(None);
+    }
+
     let Some(root) = plan.node(plan.root) else {
         return Ok(Some(Vec::new()));
     };
@@ -320,6 +324,95 @@ fn first_input(node: &CircuitNode, label: &str) -> Result<usize> {
         .first()
         .copied()
         .ok_or_else(|| anyhow!("{label} node missing required input"))
+}
+
+fn has_ambiguous_join_input_filter(plan: &CircuitPlan) -> bool {
+    plan.nodes().iter().any(|node| {
+        if select_above_join_references_duplicate_name(plan, node) {
+            return true;
+        }
+
+        let DbspNodeKind::Join(join) = &node.kind else {
+            return false;
+        };
+        if node.inputs.len() != 2 {
+            return false;
+        }
+        let duplicate_names =
+            duplicate_join_field_names(join.left_schema.as_ref(), join.right_schema.as_ref());
+        if duplicate_names.is_empty() {
+            return false;
+        }
+        node.inputs
+            .iter()
+            .any(|input| subtree_select_references_any(plan, *input, &duplicate_names))
+    })
+}
+
+fn select_above_join_references_duplicate_name(plan: &CircuitPlan, node: &CircuitNode) -> bool {
+    let DbspNodeKind::Select(select) = &node.kind else {
+        return false;
+    };
+    let Some(input_id) = node.inputs.first().copied() else {
+        return false;
+    };
+    let Some(input) = plan.node(input_id) else {
+        return false;
+    };
+    let DbspNodeKind::Join(join) = &input.kind else {
+        return false;
+    };
+    let duplicate_names =
+        duplicate_join_field_names(join.left_schema.as_ref(), join.right_schema.as_ref());
+    !duplicate_names.is_empty()
+        && select
+            .predicate()
+            .expression()
+            .expr()
+            .column_refs()
+            .iter()
+            .any(|column| duplicate_names.contains(column.name.as_str()))
+}
+
+fn duplicate_join_field_names(left: &RowSchema, right: &RowSchema) -> BTreeSet<String> {
+    let left_names = left
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<BTreeSet<_>>();
+    right
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            left_names
+                .contains(field.name.as_str())
+                .then_some(field.name.clone())
+        })
+        .collect()
+}
+
+fn subtree_select_references_any(
+    plan: &CircuitPlan,
+    node_id: usize,
+    field_names: &BTreeSet<String>,
+) -> bool {
+    let Some(node) = plan.node(node_id) else {
+        return false;
+    };
+    if let DbspNodeKind::Select(select) = &node.kind
+        && select
+            .predicate()
+            .expression()
+            .expr()
+            .column_refs()
+            .iter()
+            .any(|column| field_names.contains(column.name.as_str()))
+    {
+        return true;
+    }
+    node.inputs
+        .iter()
+        .any(|input| subtree_select_references_any(plan, *input, field_names))
 }
 
 fn extend_required_columns(

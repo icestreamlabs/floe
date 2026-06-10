@@ -140,11 +140,9 @@ impl<'cfg> PlannerContext<'cfg> {
                 }
 
                 let input = self.plan_node(&filter.input)?;
-                if let Some(optimized) = self.optimize_join_subtree(
-                    input.clone(),
-                    Some(normalized_predicate.clone()),
-                    None,
-                )? {
+                if let Some(optimized) =
+                    self.optimize_join_subtree(input.clone(), Some(filter.predicate.clone()), None)?
+                {
                     return Ok(optimized);
                 }
                 let mut predicate_schema = input.schema.clone();

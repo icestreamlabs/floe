@@ -410,7 +410,14 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     } else if let Some(mapping) =
         output_mapping_for_projection(plan_match.projection, aggregate, output_schema)
     {
-        mapping
+        if output_mapping_matches_types(&mapping, &aggregate_schema, output_schema) {
+            mapping
+        } else if plan_match.projection.is_some() {
+            post_aggregate_plan = Some(plan.clone());
+            Vec::new()
+        } else {
+            return Ok(None);
+        }
     } else if plan_match.projection.is_some() {
         post_aggregate_plan = Some(plan.clone());
         Vec::new()
@@ -1201,12 +1208,25 @@ pub(super) async fn run_columnar_grouped_stats_materialized_view_tick(
     })?;
 
     let delta_batches = tick.delta.batches().to_vec();
+    let delta_rows = delta_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let snapshot_rows = tick
+        .next_snapshot
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let input_changed = tick.input_changed;
     let handle = registry.register(mv.view_name.clone());
     handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
     mv.previous_snapshot = tick.next_snapshot;
     tracing::debug!(
         view = %mv.view_name,
         version,
+        delta_rows,
+        snapshot_rows,
+        input_changed,
         total_ms = plan_start.elapsed().as_millis() as u64,
         mode = "columnar_grouped_stats",
         "SlateDB-backed grouped-stats columnar DBSP materialized view tick completed"
@@ -3703,10 +3723,10 @@ fn rebind_post_aggregate_plan(
 ) -> Result<LogicalPlan> {
     let mut replaced = false;
     let logical_plan = unqualify_post_aggregate_columns(logical_plan)?;
-    let transformed = logical_plan.transform_up(|plan| match plan {
+    let transformed = logical_plan.transform_down(|plan| match plan {
         LogicalPlan::Aggregate(_) if !replaced => {
             replaced = true;
-            Ok(Transformed::yes(aggregate_scan.clone()))
+            Ok(Transformed::complete(aggregate_scan.clone()))
         }
         other => Ok(Transformed::no(other)),
     })?;
@@ -3961,6 +3981,21 @@ fn output_mapping_for_projection(
             Some((0..aggregate_schema.fields().len()).collect())
         }
     }
+}
+
+fn output_mapping_matches_types(
+    mapping: &[usize],
+    aggregate_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+) -> bool {
+    mapping.len() == output_schema.fields().len()
+        && mapping
+            .iter()
+            .zip(output_schema.fields())
+            .all(|(source_idx, output_field)| {
+                *source_idx < aggregate_schema.fields().len()
+                    && output_field.data_type() == aggregate_schema.field(*source_idx).data_type()
+            })
 }
 
 fn output_expr_source_idx(

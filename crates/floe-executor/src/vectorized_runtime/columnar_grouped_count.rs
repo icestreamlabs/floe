@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, UInt32Array};
+use datafusion::arrow::array::{
+    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, UInt32Array,
+};
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -33,8 +35,11 @@ use super::{
 pub(super) struct ColumnarGroupedCountPlan {
     source_name: String,
     aggregate: Aggregate,
+    hop_group_projection: Option<Projection>,
+    hop_groups: Vec<HopGroup>,
     aggregate_schema: SchemaRef,
     group_schema: SchemaRef,
+    hop_group_projection_schema: Option<SchemaRef>,
     output_mapping: Vec<usize>,
     count_idx: usize,
 }
@@ -51,9 +56,12 @@ pub(super) struct ColumnarGroupedCountMaterializedViewState {
     input_zset: SlateBackedColumnarZSet,
     output_zset: SlateBackedColumnarZSet,
     count_state: SlateGroupedCountState,
-    aggregate_delta: IncrementalMaterializedViewState,
+    aggregate_delta: Option<IncrementalMaterializedViewState>,
+    hop_group_projection_delta: Option<IncrementalMaterializedViewState>,
     aggregate_schema: SchemaRef,
     group_schema: SchemaRef,
+    hop_group_projection_schema: Option<SchemaRef>,
+    hop_groups: Vec<HopGroup>,
     output_mapping: Vec<usize>,
     count_idx: usize,
     initial_snapshot: Vec<RecordBatch>,
@@ -74,6 +82,13 @@ struct PendingGroupDelta {
     delta: i64,
     batch: RecordBatch,
     row_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HopGroup {
+    group_idx: usize,
+    slide_ms: i64,
+    size_ms: i64,
 }
 
 pub(super) struct ColumnarGroupedCountTick {
@@ -131,6 +146,8 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
     let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) else {
         return Ok(None);
     };
+    let (hop_groups, hop_group_projection, hop_group_projection_schema) =
+        hop_group_projection_for_aggregate(&aggregate)?;
     let group_fields = aggregate_schema
         .fields()
         .iter()
@@ -142,8 +159,11 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
     Ok(Some(ColumnarGroupedCountPlan {
         source_name,
         aggregate: aggregate.clone(),
+        hop_group_projection,
+        hop_groups,
         aggregate_schema,
         group_schema,
+        hop_group_projection_schema,
         output_mapping,
         count_idx,
     }))
@@ -196,14 +216,28 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
             .await
             .context("load grouped-count output snapshot")?,
     )?;
-    let aggregate_delta = build_incremental_materialized_view_state_from_logical_plan(
-        &plan.source_name,
-        sources,
-        udfs,
-        &LogicalPlan::Aggregate(plan.aggregate.clone()),
-    )
-    .await
-    .context("build grouped-count vectorized aggregate delta plan")?;
+    let (aggregate_delta, hop_group_projection_delta) =
+        if let Some(hop_group_projection) = plan.hop_group_projection.as_ref() {
+            let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
+                &plan.source_name,
+                sources,
+                udfs,
+                &LogicalPlan::Projection(hop_group_projection.clone()),
+            )
+            .await
+            .context("build grouped-count HOP group projection delta plan")?;
+            (None, Some(projection_delta))
+        } else {
+            let aggregate_delta = build_incremental_materialized_view_state_from_logical_plan(
+                &plan.source_name,
+                sources,
+                udfs,
+                &LogicalPlan::Aggregate(plan.aggregate.clone()),
+            )
+            .await
+            .context("build grouped-count vectorized aggregate delta plan")?;
+            (Some(aggregate_delta), None)
+        };
 
     Ok(ColumnarGroupedCountMaterializedViewState {
         source_name: plan.source_name,
@@ -218,8 +252,11 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
         output_zset,
         count_state: SlateGroupedCountState::new(table, &state_namespace),
         aggregate_delta,
+        hop_group_projection_delta,
         aggregate_schema: plan.aggregate_schema,
         group_schema: plan.group_schema,
+        hop_group_projection_schema: plan.hop_group_projection_schema,
+        hop_groups: plan.hop_groups,
         output_mapping: plan.output_mapping,
         count_idx: plan.count_idx,
         initial_snapshot,
@@ -369,22 +406,201 @@ async fn grouped_count_pending_delta(
         negative_source_batches.extend(unit_delta.negative);
     }
 
-    let positive_output = collect_incremental_output(
-        &columnar.aggregate_delta,
-        &positive_source_batches,
-        &columnar.aggregate_schema,
-    )
-    .await?;
-    add_aggregate_batches_to_pending(columnar, &positive_output, 1, &mut pending)?;
-    let negative_output = collect_incremental_output(
-        &columnar.aggregate_delta,
-        &negative_source_batches,
-        &columnar.aggregate_schema,
-    )
-    .await?;
-    add_aggregate_batches_to_pending(columnar, &negative_output, -1, &mut pending)?;
+    if let Some(hop_projection_delta) = columnar.hop_group_projection_delta.as_ref() {
+        let projection_schema = columnar
+            .hop_group_projection_schema
+            .as_ref()
+            .context("grouped-count HOP projection schema missing")?;
+        let positive_groups = collect_incremental_output(
+            hop_projection_delta,
+            &positive_source_batches,
+            projection_schema,
+        )
+        .await?;
+        add_hop_group_batches_to_pending(columnar, &positive_groups, 1, &mut pending)?;
+        let negative_groups = collect_incremental_output(
+            hop_projection_delta,
+            &negative_source_batches,
+            projection_schema,
+        )
+        .await?;
+        add_hop_group_batches_to_pending(columnar, &negative_groups, -1, &mut pending)?;
+    } else {
+        let aggregate_delta = columnar
+            .aggregate_delta
+            .as_ref()
+            .context("grouped-count aggregate delta plan missing")?;
+        let positive_output = collect_incremental_output(
+            aggregate_delta,
+            &positive_source_batches,
+            &columnar.aggregate_schema,
+        )
+        .await?;
+        add_aggregate_batches_to_pending(columnar, &positive_output, 1, &mut pending)?;
+        let negative_output = collect_incremental_output(
+            aggregate_delta,
+            &negative_source_batches,
+            &columnar.aggregate_schema,
+        )
+        .await?;
+        add_aggregate_batches_to_pending(columnar, &negative_output, -1, &mut pending)?;
+    }
     pending.retain(|_, delta| delta.delta != 0);
     Ok(pending)
+}
+
+fn add_hop_group_batches_to_pending(
+    columnar: &ColumnarGroupedCountMaterializedViewState,
+    batches: &[RecordBatch],
+    sign: i64,
+    pending: &mut HashMap<Vec<u8>, PendingGroupDelta>,
+) -> Result<()> {
+    let aggregate_batches = expand_hop_group_batches(columnar, batches)?;
+    add_aggregate_batches_to_pending(columnar, &aggregate_batches, sign, pending)
+}
+
+fn expand_hop_group_batches(
+    columnar: &ColumnarGroupedCountMaterializedViewState,
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let mut builders = columnar
+            .group_schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), batch.num_rows()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut counts = Int64Builder::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let mut hop_values = vec![None; columnar.count_idx];
+            append_hop_group_combinations(
+                columnar,
+                batch,
+                row_idx,
+                0,
+                &mut hop_values,
+                &mut builders,
+                &mut counts,
+            )?;
+        }
+        let expanded_rows = counts.len();
+        if expanded_rows == 0 {
+            continue;
+        }
+        let mut columns = builders
+            .iter_mut()
+            .map(ScalarColumnBuilder::finish_array)
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(counts.finish()) as ArrayRef);
+        let aggregate_schema = Arc::new(Schema::new(
+            columnar
+                .group_schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .chain(std::iter::once(Field::new(
+                    columnar.aggregate_schema.field(columnar.count_idx).name(),
+                    DataType::Int64,
+                    false,
+                )))
+                .collect::<Vec<_>>(),
+        ));
+        out.push(RecordBatch::try_new(aggregate_schema, columns)?);
+    }
+    Ok(out)
+}
+
+fn append_hop_group_combinations(
+    columnar: &ColumnarGroupedCountMaterializedViewState,
+    batch: &RecordBatch,
+    row_idx: usize,
+    group_idx: usize,
+    hop_values: &mut [Option<i64>],
+    builders: &mut [ScalarColumnBuilder],
+    counts: &mut Int64Builder,
+) -> Result<()> {
+    if group_idx == columnar.count_idx {
+        for idx in 0..columnar.count_idx {
+            if let Some(start) = hop_values[idx] {
+                builders[idx].append_timestamp_millis_value(start)?;
+            } else {
+                builders[idx].append_array_value(batch.column(idx).as_ref(), row_idx)?;
+            }
+        }
+        counts.append_value(1);
+        return Ok(());
+    }
+
+    if let Some(hop) = columnar
+        .hop_groups
+        .iter()
+        .find(|hop| hop.group_idx == group_idx)
+    {
+        let starts = hop_window_starts(batch.column(group_idx).as_ref(), row_idx, hop)?;
+        for start in starts {
+            hop_values[group_idx] = Some(start);
+            append_hop_group_combinations(
+                columnar,
+                batch,
+                row_idx,
+                group_idx + 1,
+                hop_values,
+                builders,
+                counts,
+            )?;
+        }
+        hop_values[group_idx] = None;
+        return Ok(());
+    }
+
+    append_hop_group_combinations(
+        columnar,
+        batch,
+        row_idx,
+        group_idx + 1,
+        hop_values,
+        builders,
+        counts,
+    )
+}
+
+fn hop_window_starts(array: &dyn Array, row_idx: usize, hop: &HopGroup) -> Result<Vec<i64>> {
+    if hop.slide_ms <= 0 || hop.size_ms <= 0 {
+        bail!("HOP window slide and size must be positive");
+    }
+    if array.is_null(row_idx) {
+        return Ok(Vec::new());
+    }
+    let values = array
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::TimestampMillisecondArray>()
+        .ok_or_else(|| anyhow::anyhow!("HOP group expression must produce timestamp(ms)"))?;
+    let time_ms = values.value(row_idx);
+    let last_start = time_ms.div_euclid(hop.slide_ms) * hop.slide_ms;
+    let mut starts = Vec::new();
+    let mut offset = 0_i64;
+    while offset < hop.size_ms {
+        let start = last_start
+            .checked_sub(offset)
+            .ok_or_else(|| anyhow::anyhow!("HOP window start overflow"))?;
+        let end = start
+            .checked_add(hop.size_ms)
+            .ok_or_else(|| anyhow::anyhow!("HOP window end overflow"))?;
+        if time_ms >= start && time_ms < end {
+            starts.push(start);
+        }
+        offset = offset
+            .checked_add(hop.slide_ms)
+            .ok_or_else(|| anyhow::anyhow!("HOP window offset overflow"))?;
+    }
+    Ok(starts)
 }
 
 fn add_aggregate_batches_to_pending(
@@ -669,6 +885,70 @@ fn distinct_count_aggregate_for_input_with_groups(
 ) -> Result<Aggregate> {
     Aggregate::try_new(Arc::new(input.clone()), group_expr, vec![count_all()])
         .context("build hidden grouped-count aggregate for distinct rows")
+}
+
+fn hop_group_projection_for_aggregate(
+    aggregate: &Aggregate,
+) -> Result<(Vec<HopGroup>, Option<Projection>, Option<SchemaRef>)> {
+    let mut hop_groups = Vec::new();
+    let mut projection_expr = Vec::with_capacity(aggregate.group_expr.len());
+    for (group_idx, expr) in aggregate.group_expr.iter().enumerate() {
+        if let Some((time_expr, slide_ms, size_ms)) = hop_group_expr(expr)? {
+            hop_groups.push(HopGroup {
+                group_idx,
+                slide_ms,
+                size_ms,
+            });
+            projection_expr.push(time_expr);
+        } else {
+            projection_expr.push(expr.clone());
+        }
+    }
+    if hop_groups.is_empty() {
+        return Ok((hop_groups, None, None));
+    }
+
+    let projection = Projection::try_new(projection_expr, Arc::clone(&aggregate.input))
+        .context("build grouped-count HOP group projection")?;
+    let projection_schema = df_schema_to_arrow(&projection.schema)?;
+    let aggregate_schema = df_schema_to_arrow(&aggregate.schema)?;
+    for (idx, projected) in projection_schema.fields().iter().enumerate() {
+        let expected = aggregate_schema.field(idx);
+        if projected.data_type() != expected.data_type() {
+            bail!(
+                "grouped-count HOP projection field {} type {:?} does not match aggregate group type {:?}",
+                idx,
+                projected.data_type(),
+                expected.data_type()
+            );
+        }
+    }
+    Ok((hop_groups, Some(projection), Some(projection_schema)))
+}
+
+fn hop_group_expr(expr: &Expr) -> Result<Option<(Expr, i64, i64)>> {
+    let Expr::ScalarFunction(function) = strip_alias(expr) else {
+        return Ok(None);
+    };
+    if !function.name().eq_ignore_ascii_case("hop") {
+        return Ok(None);
+    }
+    if function.args.len() < 3 {
+        bail!("HOP group expression requires time, slide, and size arguments");
+    }
+    let slide_ms = literal_i64(&function.args[1]).context("parse HOP slide milliseconds")?;
+    let size_ms = literal_i64(&function.args[2]).context("parse HOP size milliseconds")?;
+    if slide_ms <= 0 || size_ms <= 0 {
+        bail!("HOP slide and size must be positive");
+    }
+    Ok(Some((function.args[0].clone(), slide_ms, size_ms)))
+}
+
+fn literal_i64(expr: &Expr) -> Result<i64> {
+    match strip_alias(expr) {
+        Expr::Literal(ScalarValue::Int64(Some(value)), _) => Ok(*value),
+        other => bail!("expected Int64 literal, found {other:?}"),
+    }
 }
 
 fn output_mapping_for_projection(

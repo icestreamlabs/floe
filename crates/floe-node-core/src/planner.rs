@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use datafusion::arrow::array::{
     Array, ArrayRef, Int64Array, Int64Builder, StringArray, StringBuilder,
-    TimestampMillisecondArray,
+    TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::common::Result as DataFusionResult;
@@ -210,6 +210,44 @@ pub fn planner_udfs() -> Vec<ScalarUDF> {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| null_ts_value(udf_batch_len(args))))
+        },
+    );
+    let tumble_udf: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            let len = udf_batch_len(args);
+            let ts = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| null_ts_value(len))
+                .into_array(len)?;
+            let size = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| null_i64_value(len))
+                .into_array(len)?;
+            let (Some(ts), Some(size)) = (
+                ts.as_any().downcast_ref::<TimestampMillisecondArray>(),
+                size.as_any().downcast_ref::<Int64Array>(),
+            ) else {
+                return Ok(null_ts_value(len));
+            };
+
+            let mut out = TimestampMillisecondBuilder::with_capacity(len)
+                .with_data_type(DataType::Timestamp(TimeUnit::Millisecond, None));
+            for row_idx in 0..len {
+                if ts.is_null(row_idx) || size.is_null(row_idx) {
+                    out.append_null();
+                    continue;
+                }
+                let size_ms = size.value(row_idx);
+                if size_ms <= 0 {
+                    out.append_null();
+                    continue;
+                }
+                let millis = ts.value(row_idx);
+                out.append_value(millis.div_euclid(size_ms) * size_ms);
+            }
+            Ok(ColumnarValue::Array(Arc::new(out.finish())))
         },
     );
     let date_format_udf: ScalarFunctionImplementation = Arc::new(
@@ -434,7 +472,7 @@ pub fn planner_udfs() -> Vec<ScalarUDF> {
                 vec![ts.clone(), DataType::Int64, DataType::Int64],
             ],
             ts.clone(),
-            Arc::clone(&passthrough_ts),
+            Arc::clone(&tumble_udf),
         ),
         passthrough_window_udf(
             "hop",

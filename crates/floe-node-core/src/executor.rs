@@ -171,6 +171,7 @@ mod tests {
     use crate::planner::plan_materialized_views;
     use crate::source::SourceRegistry;
     use floe_executor::dbsp_plan::DbspNodeKind;
+    use floe_executor::plan_source_requirements;
 
     #[tokio::test]
     async fn plans_projection_materialized_view() {
@@ -184,7 +185,6 @@ mod tests {
         let planned = plan_materialized_views(&sources, &[definition])
             .await
             .expect("plan mv");
-
         let plans =
             build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
         assert_eq!(plans.len(), 1);
@@ -217,7 +217,6 @@ mod tests {
         let planned = plan_materialized_views(&sources, &[definition])
             .await
             .expect("plan mv");
-
         let plans =
             build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
         assert_eq!(plans.len(), 1);
@@ -254,6 +253,34 @@ mod tests {
                 .iter()
                 .any(|node| matches!(node.kind, DbspNodeKind::Join(_))),
             "expected plan to contain a join node"
+        );
+    }
+
+    #[tokio::test]
+    async fn q4_source_requirements_fall_back_for_ambiguous_join_filter() {
+        let mut sources = SourceRegistry::new();
+        sources.extend(generator::definitions().expect("generator definitions"));
+        let available_sources = available_sources_from_registry(&sources);
+
+        let definition = parse_materialized_view(
+            "CREATE MATERIALIZED VIEW mv AS \
+             SELECT category, CAST(AVG(max) AS BIGINT) AS avg_price \
+             FROM (SELECT MAX(b.price) AS max, a.category \
+             FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+             WHERE b.date_time BETWEEN a.date_time AND a.expires \
+             GROUP BY a.id, a.category) per_auction GROUP BY category",
+        )
+        .expect("parse mv");
+        let planned = plan_materialized_views(&sources, &[definition])
+            .await
+            .expect("plan mv");
+
+        let plans =
+            build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
+        let requirements = plan_source_requirements(&plans[0]).expect("source requirements");
+        assert!(
+            requirements.is_none(),
+            "ambiguous pushed join filters should use full-width execution batches"
         );
     }
 
