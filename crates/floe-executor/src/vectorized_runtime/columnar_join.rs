@@ -2616,13 +2616,59 @@ async fn lookup_indexed_join_state_for_delta(
         return Ok(Vec::new());
     }
     let phase_start = profile::start();
-    let materialized =
+    let materialized = if let Some(unit_positive) =
+        strip_unit_positive_weight_column(state_schema, weighted_lookup.batches())?
+    {
+        unit_positive
+    } else {
         apply_weighted_snapshot_delta(state_schema, &[], weighted_lookup.batches().to_vec())
             .await
-            .with_context(|| format!("materialize {side} indexed join state lookup"))?;
+            .with_context(|| format!("materialize {side} indexed join state lookup"))?
+    };
     profile::record_since(materialize_phase, phase_start);
     profile::record_since(total_phase, total_start);
     Ok(materialized)
+}
+
+fn strip_unit_positive_weight_column(
+    schema: &SchemaRef,
+    weighted_batches: &[RecordBatch],
+) -> Result<Option<Vec<RecordBatch>>> {
+    let weighted_schema = weighted_snapshot_schema(schema)?;
+    let weight_idx = weighted_schema.index_of(WEIGHT_COLUMN_NAME)?;
+    for batch in weighted_batches {
+        if batch.schema().as_ref() != weighted_schema.as_ref() {
+            bail!("indexed join state lookup schema does not match weighted state schema");
+        }
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("indexed join state weight column must be Int64"))?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) || weights.value(row_idx) != 1 {
+                return Ok(None);
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    for batch in weighted_batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let columns = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, column)| (idx != weight_idx).then(|| Arc::clone(column)))
+            .collect::<Vec<_>>();
+        output.push(
+            RecordBatch::try_new(Arc::clone(schema), columns)
+                .context("strip indexed join state weight column")?,
+        );
+    }
+    Ok(Some(output))
 }
 
 fn lookup_key_batches_from_delta(

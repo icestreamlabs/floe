@@ -44,6 +44,9 @@ use super::{
 };
 
 const SUMMARY_TAG: u8 = b's';
+const SUMMARY_LOG_TAG: u8 = b'l';
+const SUMMARY_SEQUENCE_TAG: u8 = b'q';
+const SUMMARY_BUCKET_COUNT: u16 = 16;
 
 pub(super) struct ColumnarGroupedMaxPlan {
     input: ColumnarGroupedMaxInputPlan,
@@ -117,6 +120,8 @@ struct SlateGroupedMaxState {
     table: Arc<dyn KeyValueTable>,
     key_prefix: Vec<u8>,
     bounds_key: Vec<u8>,
+    summary_sequence_key: Vec<u8>,
+    next_summary_segment_id: Mutex<u64>,
     group_bounds: Mutex<GroupKeyBoundsState>,
     max_summaries: Mutex<HashMap<Vec<u8>, i64>>,
 }
@@ -874,9 +879,6 @@ async fn apply_grouped_max_delta(
             if let Some(new_max) = new_max {
                 builder.append(&delta.batch, delta.row_idx, columnar.max_idx, new_max, 1)?;
             }
-            columnar
-                .max_state
-                .write_max(&mut writes, &group_key, new_max)?;
             max_updates.push((group_key.clone(), new_max));
         }
         if new_max.is_some() {
@@ -885,6 +887,9 @@ async fn apply_grouped_max_delta(
     }
     profile::record_since("grouped_max.apply_update_loop", phase_start);
     let phase_start = profile::start();
+    columnar
+        .max_state
+        .write_max_updates(&mut writes, &max_updates)?;
     columnar
         .max_state
         .write_group_bounds(&mut writes, bounds_update.as_ref())?;
@@ -1008,6 +1013,8 @@ impl SlateGroupedMaxState {
         let key_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace);
         let mut bounds_key = key_prefix.clone();
         bounds_key.extend_from_slice(b"bounds/group_key");
+        let mut summary_sequence_key = key_prefix.clone();
+        summary_sequence_key.push(SUMMARY_SEQUENCE_TAG);
         let group_bounds = match table
             .get_bytes(&bounds_key)
             .await
@@ -1017,10 +1024,14 @@ impl SlateGroupedMaxState {
             None if assume_empty => GroupKeyBoundsState::Empty,
             None => GroupKeyBoundsState::Unknown,
         };
+        let next_summary_segment_id =
+            read_summary_sequence(table.as_ref(), &summary_sequence_key).await?;
         let state = Self {
             table,
             key_prefix,
             bounds_key,
+            summary_sequence_key,
+            next_summary_segment_id: Mutex::new(next_summary_segment_id),
             group_bounds: Mutex::new(group_bounds),
             max_summaries: Mutex::new(HashMap::new()),
         };
@@ -1058,16 +1069,62 @@ impl SlateGroupedMaxState {
             let group_key = self.group_key_from_tagged_state_key(SUMMARY_TAG, &key)?;
             values.insert(group_key.to_vec(), decode_i64(&value_bytes)?);
         }
+        let summary_log_prefix = self.tag_prefix(SUMMARY_LOG_TAG);
+        let mut log_entries = Vec::new();
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&summary_log_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-max summary log")?
+        {
+            log_entries.push((self.summary_log_segment_id(&key)?, value_bytes));
+        }
+        log_entries.sort_by_key(|(segment_id, _)| *segment_id);
+        for (_, value_bytes) in log_entries {
+            for (group_key, max) in decode_summary_log_updates(value_bytes.as_ref())? {
+                if let Some(max) = max {
+                    values.insert(group_key, max);
+                } else {
+                    values.remove(group_key.as_slice());
+                }
+            }
+        }
         Ok(values)
     }
 
-    fn write_max(&self, batch: &mut WriteBatch, group_key: &[u8], max: Option<i64>) -> Result<()> {
-        let key = self.group_key(SUMMARY_TAG, group_key)?;
-        if let Some(max) = max {
-            batch.put(key, max.to_be_bytes());
-        } else {
-            batch.delete(key);
+    fn write_max_updates(
+        &self,
+        batch: &mut WriteBatch,
+        updates: &[(Vec<u8>, Option<i64>)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
         }
+        let mut next_segment_id = self
+            .next_summary_segment_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max summary sequence poisoned"))?;
+        let segment_id = *next_segment_id;
+        *next_segment_id = next_segment_id.saturating_add(1);
+
+        let mut buckets: HashMap<u16, Vec<(Vec<u8>, Option<i64>)>> = HashMap::new();
+        for (group_key, max) in updates {
+            buckets
+                .entry(summary_bucket(group_key))
+                .or_default()
+                .push((group_key.clone(), *max));
+        }
+        for (bucket, mut bucket_updates) in buckets {
+            bucket_updates.sort_by(|(left, _), (right, _)| left.cmp(right));
+            batch.put(
+                self.summary_log_key(bucket, segment_id),
+                encode_summary_log_updates(&bucket_updates)?,
+            );
+        }
+        batch.put(
+            self.summary_sequence_key.clone(),
+            (*next_segment_id).to_be_bytes(),
+        );
         Ok(())
     }
 
@@ -1148,14 +1205,25 @@ impl SlateGroupedMaxState {
         prefix
     }
 
-    fn group_key(&self, tag: u8, group_key: &[u8]) -> Result<Vec<u8>> {
-        let len =
-            u32::try_from(group_key.len()).context("grouped-max group key exceeds u32 bytes")?;
-        let mut key = self.key_prefix.clone();
-        key.push(tag);
-        key.extend_from_slice(&len.to_be_bytes());
-        key.extend_from_slice(group_key);
-        Ok(key)
+    fn summary_log_key(&self, bucket: u16, segment_id: u64) -> Vec<u8> {
+        let mut key = self.tag_prefix(SUMMARY_LOG_TAG);
+        key.extend_from_slice(&bucket.to_be_bytes());
+        key.extend_from_slice(&segment_id.to_be_bytes());
+        key
+    }
+
+    fn summary_log_segment_id(&self, key: &[u8]) -> Result<u64> {
+        let prefix_len = self.key_prefix.len() + 1 + 2;
+        if key.len() != prefix_len + 8
+            || !key.starts_with(&self.key_prefix)
+            || key.get(self.key_prefix.len()) != Some(&SUMMARY_LOG_TAG)
+        {
+            bail!("grouped-max summary log key prefix mismatch");
+        }
+        let bytes = key
+            .get(prefix_len..prefix_len + 8)
+            .ok_or_else(|| anyhow::anyhow!("grouped-max summary log segment id truncated"))?;
+        Ok(u64::from_be_bytes(bytes.try_into()?))
     }
 
     fn group_key_from_tagged_state_key<'a>(&self, tag: u8, key: &'a [u8]) -> Result<&'a [u8]> {
@@ -1522,6 +1590,93 @@ fn decode_group_key_bounds(bytes: &[u8]) -> Result<GroupKeyBoundsState> {
     Ok(GroupKeyBoundsState::Present { min, max })
 }
 
+async fn read_summary_sequence(table: &dyn KeyValueTable, key: &[u8]) -> Result<u64> {
+    let Some(bytes) = table
+        .get_bytes(key)
+        .await
+        .context("read grouped-max summary sequence")?
+    else {
+        return Ok(1);
+    };
+    let bytes: [u8; 8] = bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("grouped-max summary sequence must be 8 bytes"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn summary_bucket(group_key: &[u8]) -> u16 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in group_key {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % u64::from(SUMMARY_BUCKET_COUNT)) as u16
+}
+
+fn encode_summary_log_updates(updates: &[(Vec<u8>, Option<i64>)]) -> Result<Vec<u8>> {
+    let mut capacity = 4;
+    for (group_key, _) in updates {
+        capacity += 4 + group_key.len() + 1 + 8;
+    }
+    let mut out = Vec::with_capacity(capacity);
+    let update_count =
+        u32::try_from(updates.len()).context("grouped-max summary log update count too large")?;
+    out.extend_from_slice(&update_count.to_be_bytes());
+    for (group_key, max) in updates {
+        let group_key_len =
+            u32::try_from(group_key.len()).context("grouped-max summary group key too large")?;
+        out.extend_from_slice(&group_key_len.to_be_bytes());
+        out.extend_from_slice(group_key);
+        match max {
+            Some(max) => {
+                out.push(1);
+                out.extend_from_slice(&max.to_be_bytes());
+            }
+            None => {
+                out.push(0);
+                out.extend_from_slice(&0_i64.to_be_bytes());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_summary_log_updates(bytes: &[u8]) -> Result<Vec<(Vec<u8>, Option<i64>)>> {
+    let mut cursor = 0;
+    let update_count = read_u32_at(bytes, &mut cursor)?;
+    let mut updates = Vec::with_capacity(update_count as usize);
+    for _ in 0..update_count {
+        let group_key_len = read_u32_at(bytes, &mut cursor)? as usize;
+        let group_key = read_bytes_at(
+            bytes,
+            &mut cursor,
+            group_key_len,
+            "grouped-max summary group key",
+        )?
+        .to_vec();
+        let tag = *read_bytes_at(bytes, &mut cursor, 1, "grouped-max summary update tag")?
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("grouped-max summary update tag missing"))?;
+        let max = decode_i64(read_bytes_at(
+            bytes,
+            &mut cursor,
+            8,
+            "grouped-max summary max value",
+        )?)?;
+        let max = match tag {
+            0 => None,
+            1 => Some(max),
+            other => bail!("invalid grouped-max summary update tag {other}"),
+        };
+        updates.push((group_key, max));
+    }
+    if cursor != bytes.len() {
+        bail!("grouped-max summary log payload has trailing bytes");
+    }
+    Ok(updates)
+}
+
 fn read_u32_at(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
     let chunk = read_bytes_at(bytes, cursor, 4, "grouped-max u32")?;
     let value = <[u8; 4]>::try_from(chunk)
@@ -1629,13 +1784,13 @@ mod tests {
         let mut bounds_update = None;
         let mut max_updates = Vec::new();
         state
-            .write_max(&mut batch, &[10], Some(100))
-            .expect("write max 10");
+            .write_max_updates(&mut batch, &[(vec![10], Some(100))])
+            .expect("write max update 10");
         max_updates.push((vec![10], Some(100)));
         merge_group_key_bounds_update(&mut bounds_update, &[10]);
         state
-            .write_max(&mut batch, &[20], Some(200))
-            .expect("write max 20");
+            .write_max_updates(&mut batch, &[(vec![20], Some(200))])
+            .expect("write max update 20");
         max_updates.push((vec![20], Some(200)));
         merge_group_key_bounds_update(&mut bounds_update, &[20]);
         state
@@ -1681,8 +1836,8 @@ mod tests {
         let mut bounds_update = None;
         let mut max_updates = Vec::new();
         state
-            .write_max(&mut batch, &[10], Some(100))
-            .expect("write max");
+            .write_max_updates(&mut batch, &[(vec![10], Some(100))])
+            .expect("write max update");
         max_updates.push((vec![10], Some(100)));
         merge_group_key_bounds_update(&mut bounds_update, &[10]);
         state
