@@ -542,7 +542,7 @@ async fn run_columnar_grouped_max_state_tick_inner(
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-max output zset delta")?;
-    let persisted_output_delta = if let Some(handle) = columnar
+    columnar
         .output_zset
         .create_version(
             &output_delta,
@@ -551,12 +551,8 @@ async fn run_columnar_grouped_max_state_tick_inner(
                 .current_handle()
                 .map(|handle| handle.version),
         )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
+        .await?;
+    let persisted_output_delta = output_delta;
 
     let next_snapshot = if maintain_output_snapshot {
         apply_weighted_snapshot_delta(

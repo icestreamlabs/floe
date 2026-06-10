@@ -1538,7 +1538,7 @@ async fn run_columnar_join_state_tick_inner(
         mode = "columnar_join_incremental",
         "SlateDB-backed join columnar DBSP state tick completed"
     );
-    let persisted_output_delta = if let Some(handle) = columnar
+    columnar
         .output_zset
         .create_version(
             &output_delta,
@@ -1547,12 +1547,8 @@ async fn run_columnar_join_state_tick_inner(
                 .current_handle()
                 .map(|handle| handle.version),
         )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
+        .await?;
+    let persisted_output_delta = output_delta;
 
     let next_snapshot = if maintain_output_snapshot {
         apply_weighted_snapshot_delta(
@@ -1666,7 +1662,7 @@ async fn run_columnar_snapshot_diff_join_state_tick(
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build snapshot-diff join output zset delta")?;
-    let persisted_output_delta = if let Some(handle) = columnar
+    columnar
         .output_zset
         .create_version(
             &output_delta,
@@ -1675,12 +1671,8 @@ async fn run_columnar_snapshot_diff_join_state_tick(
                 .current_handle()
                 .map(|handle| handle.version),
         )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
+        .await?;
+    let persisted_output_delta = output_delta;
 
     let delta_batches = persisted_output_delta.batches().to_vec();
     let next_snapshot =
@@ -2466,11 +2458,8 @@ async fn persisted_source_delta(
     input_delta: ColumnarZSet,
 ) -> Result<ColumnarZSet> {
     let base = zset.current_handle().map(|handle| handle.version);
-    if let Some(handle) = zset.create_version(&input_delta, base).await? {
-        zset.read_delta(&handle).await
-    } else {
-        Ok(input_delta)
-    }
+    zset.create_version(&input_delta, base).await?;
+    Ok(input_delta)
 }
 
 fn signed_source_delta(

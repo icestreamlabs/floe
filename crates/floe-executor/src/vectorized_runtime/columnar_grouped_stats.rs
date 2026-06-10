@@ -1249,7 +1249,7 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-stats output zset delta")?;
-    let persisted_output_delta = if let Some(handle) = columnar
+    columnar
         .output_zset
         .create_version(
             &output_delta,
@@ -1258,12 +1258,8 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
                 .current_handle()
                 .map(|handle| handle.version),
         )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
+        .await?;
+    let persisted_output_delta = output_delta;
 
     let delta_batches = persisted_output_delta.batches().to_vec();
     let next_snapshot =
