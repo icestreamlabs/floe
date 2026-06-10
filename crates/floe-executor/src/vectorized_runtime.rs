@@ -2467,26 +2467,31 @@ impl VectorizedExecutionRuntime {
             .collect()
     }
 
-    pub async fn append_source_batches_for_execution_and_query(
+    pub fn append_source_batches_for_execution_and_query(
         &mut self,
         source_name: &str,
         execution_batches: Vec<RecordBatch>,
         query_batches: Vec<RecordBatch>,
-    ) -> Result<()> {
-        if execution_batches.is_empty() && query_batches.is_empty() {
-            return Ok(());
-        }
-        let state = self
-            .sources
-            .get(source_name)
-            .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
-            .clone();
-        for batch in execution_batches.iter().chain(query_batches.iter()) {
-            if batch.schema().as_ref() != state.schema.as_ref() {
-                bail!("source batch schema does not match source '{source_name}'");
+    ) -> std::future::Ready<Result<()>> {
+        // This path is synchronous; returning a ready future keeps existing async call sites
+        // without capturing the large runtime state in an async fn future.
+        let result = (|| {
+            if execution_batches.is_empty() && query_batches.is_empty() {
+                return Ok(());
             }
-        }
-        self.apply_insert_source_batches(source_name, &state, execution_batches, query_batches)
+            let state = self
+                .sources
+                .get(source_name)
+                .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
+                .clone();
+            for batch in execution_batches.iter().chain(query_batches.iter()) {
+                if batch.schema().as_ref() != state.schema.as_ref() {
+                    bail!("source batch schema does not match source '{source_name}'");
+                }
+            }
+            self.apply_insert_source_batches(source_name, &state, execution_batches, query_batches)
+        })();
+        std::future::ready(result)
     }
 
     pub async fn apply_weighted_source_delta(

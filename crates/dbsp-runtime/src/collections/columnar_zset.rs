@@ -915,7 +915,7 @@ fn validate_batch(schema: &SchemaRef, batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
-fn weighted_schema_for_value_schema(value_schema: &SchemaRef) -> Result<SchemaRef> {
+pub(super) fn weighted_schema_for_value_schema(value_schema: &SchemaRef) -> Result<SchemaRef> {
     if value_schema.index_of(COLUMNAR_WEIGHT_COLUMN).is_ok() {
         bail!(
             "value schema already contains reserved weight column '{}'",
@@ -941,7 +941,7 @@ fn validate_value_batch(value_schema: &SchemaRef, batch: &RecordBatch) -> Result
     Ok(())
 }
 
-fn validate_weighted_batch(
+pub(super) fn validate_weighted_batch(
     weighted_schema: &SchemaRef,
     value_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -961,13 +961,13 @@ fn validate_weighted_batch(
     Ok(())
 }
 
-fn value_array_refs(batch: &RecordBatch, value_column_count: usize) -> Vec<ArrayRef> {
+pub(super) fn value_array_refs(batch: &RecordBatch, value_column_count: usize) -> Vec<ArrayRef> {
     (0..value_column_count)
         .map(|idx| Arc::clone(batch.column(idx)))
         .collect()
 }
 
-fn row_converter_for_schema(value_schema: &SchemaRef) -> Result<RowConverter> {
+pub(super) fn row_converter_for_schema(value_schema: &SchemaRef) -> Result<RowConverter> {
     let fields = value_schema
         .fields()
         .iter()
@@ -976,7 +976,7 @@ fn row_converter_for_schema(value_schema: &SchemaRef) -> Result<RowConverter> {
     RowConverter::new(fields).context("build Arrow row converter for columnar zset")
 }
 
-fn segment_stats_arrow(delta: &ColumnarZSet) -> Result<SegmentWriteStats> {
+pub(super) fn segment_stats_arrow(delta: &ColumnarZSet) -> Result<SegmentWriteStats> {
     let converter = row_converter_for_schema(&delta.value_schema)?;
     let mut min_key_hash = u64::MAX;
     let mut max_key_hash = 0_u64;

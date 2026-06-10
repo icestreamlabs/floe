@@ -12,10 +12,12 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Join, TableScan};
-use datafusion::logical_expr::{JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
+use datafusion::logical_expr::{
+    Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, ScalarUDF,
+};
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
-use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
+use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
 use crate::delta_consolidation::{
@@ -72,6 +74,7 @@ pub(super) struct ColumnarJoinPlan {
     logical_plan: LogicalPlan,
     left: ColumnarJoinInputPlan,
     right: ColumnarJoinInputPlan,
+    join_key_pairs: Vec<ColumnarJoinKeyPair>,
     execution_strategy: ColumnarJoinExecutionStrategy,
 }
 
@@ -95,10 +98,22 @@ enum ColumnarJoinExecutionStrategy {
     SnapshotDiff,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ColumnarJoinKeyPair {
+    left: String,
+    right: String,
+}
+
+struct ColumnarJoinKeyIndices {
+    left: Vec<usize>,
+    right: Vec<usize>,
+}
+
 pub(super) struct ColumnarJoinMaterializedViewState {
     left: ColumnarJoinSourceState,
     right: ColumnarJoinSourceState,
     output_zset: SlateBackedColumnarZSet,
+    join_key_indices: Option<ColumnarJoinKeyIndices>,
     left_delta_right_state: Option<JoinDeltaEvaluator>,
     left_state_right_delta: Option<JoinDeltaEvaluator>,
     left_delta_right_delta: JoinDeltaEvaluator,
@@ -125,6 +140,7 @@ struct ColumnarJoinSourceState {
     source_name: Option<String>,
     schema: SchemaRef,
     input_zset: Option<SlateBackedColumnarZSet>,
+    input_index: Option<Box<SlateBackedColumnarIndexedZSet>>,
     snapshot: Vec<RecordBatch>,
     constant: Option<ColumnarJoinConstantState>,
     topn: Option<ColumnarJoinTopNInputState>,
@@ -315,10 +331,12 @@ fn columnar_join_plan_for_plan_with_options(
     if contains_unsupported_join_wrapper(plan, sources)? {
         return Ok(None);
     }
+    let join_key_pairs = simple_join_key_pairs(join, &left.schema, &right.schema);
     let execution_strategy = if matches!(join.join_type, JoinType::Inner)
         && left.source_name() != right.source_name()
         && left.is_source()
         && right.is_source()
+        && !join_key_pairs.is_empty()
     {
         ColumnarJoinExecutionStrategy::IncrementalInner
     } else {
@@ -329,8 +347,108 @@ fn columnar_join_plan_for_plan_with_options(
         logical_plan: plan.clone(),
         left,
         right,
+        join_key_pairs,
         execution_strategy,
     }))
+}
+
+fn simple_join_key_pairs(
+    join: &Join,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+) -> Vec<ColumnarJoinKeyPair> {
+    let mut pairs = Vec::new();
+    for (left, right) in &join.on {
+        if let Some(pair) = oriented_join_key_pair(left, right, left_schema, right_schema) {
+            pairs.push(pair);
+        }
+    }
+    if let Some(filter) = join.filter.as_ref() {
+        collect_filter_join_key_pairs(filter, left_schema, right_schema, &mut pairs);
+    }
+    let mut seen = BTreeSet::new();
+    pairs.retain(|pair| seen.insert((pair.left.clone(), pair.right.clone())));
+    pairs
+}
+
+fn collect_filter_join_key_pairs(
+    expr: &Expr,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    out: &mut Vec<ColumnarJoinKeyPair>,
+) {
+    let Expr::BinaryExpr(binary) = expr else {
+        return;
+    };
+    if binary.op == Operator::And {
+        collect_filter_join_key_pairs(binary.left.as_ref(), left_schema, right_schema, out);
+        collect_filter_join_key_pairs(binary.right.as_ref(), left_schema, right_schema, out);
+        return;
+    }
+    if binary.op == Operator::Eq
+        && let Some(pair) =
+            oriented_join_key_pair(&binary.left, &binary.right, left_schema, right_schema)
+    {
+        out.push(pair);
+    }
+}
+
+fn oriented_join_key_pair(
+    first: &Expr,
+    second: &Expr,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+) -> Option<ColumnarJoinKeyPair> {
+    let (Expr::Column(first), Expr::Column(second)) = (first, second) else {
+        return None;
+    };
+    let first_left = left_schema.index_of(&first.name).is_ok();
+    let first_right = right_schema.index_of(&first.name).is_ok();
+    let second_left = left_schema.index_of(&second.name).is_ok();
+    let second_right = right_schema.index_of(&second.name).is_ok();
+    if first_left && second_right && (!first_right || !second_left || first.name == second.name) {
+        return Some(ColumnarJoinKeyPair {
+            left: first.name.clone(),
+            right: second.name.clone(),
+        });
+    }
+    if second_left && first_right && (!second_right || !first_left || first.name == second.name) {
+        return Some(ColumnarJoinKeyPair {
+            left: second.name.clone(),
+            right: first.name.clone(),
+        });
+    }
+    None
+}
+
+fn resolve_join_key_indices(
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    key_pairs: &[ColumnarJoinKeyPair],
+) -> Result<ColumnarJoinKeyIndices> {
+    let left = key_pairs
+        .iter()
+        .map(|pair| {
+            left_schema.index_of(&pair.left).with_context(|| {
+                format!(
+                    "left join key column '{}' not found in input schema",
+                    pair.left
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let right = key_pairs
+        .iter()
+        .map(|pair| {
+            right_schema.index_of(&pair.right).with_context(|| {
+                format!(
+                    "right join key column '{}' not found in input schema",
+                    pair.right
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ColumnarJoinKeyIndices { left, right })
 }
 
 pub(super) async fn build_columnar_join_materialized_view_state(
@@ -342,14 +460,14 @@ pub(super) async fn build_columnar_join_materialized_view_state(
     udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
-    build_columnar_join_materialized_view_state_in_namespace(
+    Box::pin(build_columnar_join_materialized_view_state_in_namespace(
         table,
         mv_namespace,
         output_schema,
         plan,
         sources,
         udfs,
-    )
+    ))
     .await
 }
 
@@ -365,8 +483,18 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         logical_plan,
         left,
         right,
+        join_key_pairs,
         execution_strategy,
     } = plan;
+    let join_key_indices = if execution_strategy == ColumnarJoinExecutionStrategy::IncrementalInner
+    {
+        Some(
+            resolve_join_key_indices(&left.schema, &right.schema, &join_key_pairs)
+                .context("resolve columnar join index keys")?,
+        )
+    } else {
+        None
+    };
     let shared_source_input =
         left.is_source() && right.is_source() && left.source_name() == right.source_name();
     let (left_namespace, right_namespace) = if shared_source_input {
@@ -406,7 +534,7 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
     let left_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&left);
     let right_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&right);
 
-    let left = build_join_input_state(
+    let left = Box::pin(build_join_input_state(
         Arc::clone(&table),
         &mv_namespace,
         "left",
@@ -415,10 +543,13 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         sources,
         udfs,
         output_initialized,
-    )
+        join_key_indices
+            .as_ref()
+            .map(|indices| indices.left.as_slice()),
+    ))
     .await
     .context("build SlateDB-backed left join input state")?;
-    let right = build_join_input_state(
+    let right = Box::pin(build_join_input_state(
         table,
         &mv_namespace,
         "right",
@@ -427,7 +558,10 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         sources,
         udfs,
         output_initialized,
-    )
+        join_key_indices
+            .as_ref()
+            .map(|indices| indices.right.as_slice()),
+    ))
     .await
     .context("build SlateDB-backed right join input state")?;
 
@@ -484,6 +618,7 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         left,
         right,
         output_zset,
+        join_key_indices,
         left_delta_right_state,
         left_state_right_delta,
         left_delta_right_delta,
@@ -555,9 +690,11 @@ async fn build_join_input_state(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
     output_initialized: bool,
+    index_key_indices: Option<&[usize]>,
 ) -> Result<ColumnarJoinSourceState> {
     match input.kind {
         ColumnarJoinInputPlanKind::Source { source_name } => {
+            let index_namespace = format!("{namespace}/index");
             let input_zset = Box::pin(build_join_side_input_zset(
                 Arc::clone(&table),
                 namespace,
@@ -569,18 +706,45 @@ async fn build_join_input_state(
             let source = sources
                 .get(&source_name)
                 .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
-            let snapshot = snapshot_batches_from_zset(
-                &input_zset
-                    .materialize_columnar()
+            let snapshot_zset = input_zset
+                .materialize_columnar()
+                .await
+                .with_context(|| format!("load {side} join input snapshot"))?;
+            let snapshot = snapshot_batches_from_zset(&snapshot_zset)?;
+            let input_index = if let Some(key_indices) = index_key_indices {
+                let mut index = SlateBackedColumnarIndexedZSet::new(
+                    Arc::clone(&table),
+                    index_namespace,
+                    Arc::clone(&source.schema),
+                    key_indices.to_vec(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "initialize SlateDB-backed {side} join input index for '{}'",
+                        input.input_name
+                    )
+                })?;
+                index
+                    .rebuild_from_zset(&snapshot_zset)
                     .await
-                    .with_context(|| format!("load {side} join input snapshot"))?,
-            )?;
+                    .with_context(|| {
+                        format!(
+                            "rebuild SlateDB-backed {side} join input index for '{}'",
+                            input.input_name
+                        )
+                    })?;
+                Some(Box::new(index))
+            } else {
+                None
+            };
             Ok(ColumnarJoinSourceState {
                 input_name: input.input_name,
                 source_name: Some(source_name),
                 schema: Arc::clone(&source.schema),
                 snapshot,
                 input_zset: Some(input_zset),
+                input_index,
                 constant: None,
                 topn: None,
                 join_topn: None,
@@ -641,6 +805,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: Some(input_zset),
+                input_index: None,
                 snapshot,
                 constant: Some(ColumnarJoinConstantState {
                     state_table: table,
@@ -714,6 +879,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: Some(input_zset),
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: Some(ColumnarJoinTopNInputState {
@@ -760,6 +926,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -796,6 +963,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -834,6 +1002,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -870,6 +1039,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -906,6 +1076,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -942,6 +1113,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -978,6 +1150,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -1014,6 +1187,7 @@ async fn build_join_input_state(
                 source_name: None,
                 schema: input.schema,
                 input_zset: None,
+                input_index: None,
                 snapshot,
                 constant: None,
                 topn: None,
@@ -1039,13 +1213,15 @@ async fn build_boxed_grouped_max_join_input_state(
     udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarGroupedMaxMaterializedViewState>> {
     Ok(Box::new(
-        build_columnar_grouped_max_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
+        Box::pin(
+            build_columnar_grouped_max_materialized_view_state_in_namespace(
+                table,
+                namespace,
+                output_schema,
+                plan,
+                sources,
+                udfs,
+            ),
         )
         .await?,
     ))
@@ -1060,13 +1236,15 @@ async fn build_boxed_grouped_count_join_input_state(
     udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarGroupedCountMaterializedViewState>> {
     Ok(Box::new(
-        build_columnar_grouped_count_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
+        Box::pin(
+            build_columnar_grouped_count_materialized_view_state_in_namespace(
+                table,
+                namespace,
+                output_schema,
+                plan,
+                sources,
+                udfs,
+            ),
         )
         .await?,
     ))
@@ -1081,13 +1259,15 @@ async fn build_boxed_grouped_stats_join_input_state(
     udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarGroupedStatsMaterializedViewState>> {
     Ok(Box::new(
-        build_columnar_grouped_stats_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
+        Box::pin(
+            build_columnar_grouped_stats_materialized_view_state_in_namespace(
+                table,
+                namespace,
+                output_schema,
+                plan,
+                sources,
+                udfs,
+            ),
         )
         .await?,
     ))
@@ -1102,13 +1282,15 @@ async fn build_boxed_join_aggregate_join_input_state(
     udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarComposedMaterializedViewState>> {
     Ok(Box::new(
-        build_columnar_join_aggregate_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
+        Box::pin(
+            build_columnar_join_aggregate_materialized_view_state_in_namespace(
+                table,
+                namespace,
+                output_schema,
+                plan,
+                sources,
+                udfs,
+            ),
         )
         .await?,
     ))
@@ -1149,13 +1331,13 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
         return Ok(false);
     };
     let plan_start = Instant::now();
-    let tick = run_columnar_join_state_tick(
+    let tick = Box::pin(run_columnar_join_state_tick(
         columnar,
         insert_batches,
         weighted_delta_batches,
         &mv.output_schema,
         &mv.previous_snapshot,
-    )
+    ))
     .await?;
 
     let delta_batches = tick.delta.batches().to_vec();
@@ -1184,13 +1366,13 @@ pub(super) async fn run_columnar_join_state_tick(
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarJoinTick> {
     if columnar.execution_strategy == ColumnarJoinExecutionStrategy::SnapshotDiff {
-        return run_columnar_snapshot_diff_join_state_tick(
+        return Box::pin(run_columnar_snapshot_diff_join_state_tick(
             columnar,
             insert_batches,
             weighted_delta_batches,
             output_schema,
             previous_snapshot,
-        )
+        ))
         .await;
     }
 
@@ -1216,13 +1398,41 @@ pub(super) async fn run_columnar_join_state_tick(
     };
     let left_signed = signed_source_delta(&columnar.left.schema, left_delta.batches())?;
     let right_signed = signed_source_delta(&columnar.right.schema, right_delta.batches())?;
+    let join_key_indices = columnar
+        .join_key_indices
+        .as_ref()
+        .context("incremental join key indices missing")?;
+    let right_state_for_left_delta = lookup_indexed_join_state_for_delta(
+        columnar
+            .right
+            .input_index
+            .as_deref()
+            .context("incremental join right source index missing")?,
+        left_delta.batches(),
+        &join_key_indices.left,
+        &columnar.right.schema,
+        "right",
+    )
+    .await?;
+    let left_state_for_right_delta = lookup_indexed_join_state_for_delta(
+        columnar
+            .left
+            .input_index
+            .as_deref()
+            .context("incremental join left source index missing")?,
+        right_delta.batches(),
+        &join_key_indices.right,
+        &columnar.left.schema,
+        "left",
+    )
+    .await?;
 
     let mut output_delta_batches = Vec::new();
     collect_join_outputs(
         columnar,
         &mut output_delta_batches,
         &left_signed.positive,
-        &columnar.right.snapshot,
+        &right_state_for_left_delta,
         1,
         JoinEvaluatorKind::LeftDeltaRightState,
     )
@@ -1231,7 +1441,7 @@ pub(super) async fn run_columnar_join_state_tick(
         columnar,
         &mut output_delta_batches,
         &left_signed.negative,
-        &columnar.right.snapshot,
+        &right_state_for_left_delta,
         -1,
         JoinEvaluatorKind::LeftDeltaRightState,
     )
@@ -1239,7 +1449,7 @@ pub(super) async fn run_columnar_join_state_tick(
     collect_join_outputs(
         columnar,
         &mut output_delta_batches,
-        &columnar.left.snapshot,
+        &left_state_for_right_delta,
         &right_signed.positive,
         1,
         JoinEvaluatorKind::LeftStateRightDelta,
@@ -1248,7 +1458,7 @@ pub(super) async fn run_columnar_join_state_tick(
     collect_join_outputs(
         columnar,
         &mut output_delta_batches,
-        &columnar.left.snapshot,
+        &left_state_for_right_delta,
         &right_signed.negative,
         -1,
         JoinEvaluatorKind::LeftStateRightDelta,
@@ -1286,6 +1496,18 @@ pub(super) async fn run_columnar_join_state_tick(
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
             .await
             .context("apply Slate-backed join columnar snapshot delta")?;
+    if let Some(index) = columnar.left.input_index.as_deref_mut() {
+        index
+            .apply_delta(&left_delta)
+            .await
+            .context("apply left join delta to SlateDB-backed columnar index")?;
+    }
+    if let Some(index) = columnar.right.input_index.as_deref_mut() {
+        index
+            .apply_delta(&right_delta)
+            .await
+            .context("apply right join delta to SlateDB-backed columnar index")?;
+    }
     columnar.left.snapshot =
         apply_source_snapshot_delta(&columnar.left.schema, &columnar.left.snapshot, &left_delta)
             .await?;
@@ -1310,11 +1532,18 @@ async fn run_columnar_snapshot_diff_join_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarJoinTick> {
-    let left_tick =
-        prepare_join_input_tick(&mut columnar.left, insert_batches, weighted_delta_batches).await?;
-    let right_tick =
-        prepare_join_input_tick(&mut columnar.right, insert_batches, weighted_delta_batches)
-            .await?;
+    let left_tick = Box::pin(prepare_join_input_tick(
+        &mut columnar.left,
+        insert_batches,
+        weighted_delta_batches,
+    ))
+    .await?;
+    let right_tick = Box::pin(prepare_join_input_tick(
+        &mut columnar.right,
+        insert_batches,
+        weighted_delta_batches,
+    ))
+    .await?;
     let has_input_change = left_tick.changed || right_tick.changed;
     let (next_left_snapshot, next_right_snapshot) = if has_input_change {
         if columnar.left.shares_source_with(&columnar.right) {
@@ -1493,58 +1722,79 @@ async fn prepare_join_input_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<JoinInputTick> {
     if source.join.is_some() {
-        return prepare_nested_join_input_tick(source, insert_batches, weighted_delta_batches)
-            .await;
-    }
-    if source.multijoin.is_some() {
-        return prepare_nested_multijoin_input_tick(source, insert_batches, weighted_delta_batches)
-            .await;
-    }
-    if source.union.is_some() {
-        return prepare_nested_union_input_tick(source, insert_batches, weighted_delta_batches)
-            .await;
-    }
-    if source.grouped_max.is_some() {
-        return prepare_nested_grouped_max_input_tick(
+        return Box::pin(prepare_nested_join_input_tick(
             source,
             insert_batches,
             weighted_delta_batches,
-        )
+        ))
+        .await;
+    }
+    if source.multijoin.is_some() {
+        return Box::pin(prepare_nested_multijoin_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        ))
+        .await;
+    }
+    if source.union.is_some() {
+        return Box::pin(prepare_nested_union_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        ))
+        .await;
+    }
+    if source.grouped_max.is_some() {
+        return Box::pin(prepare_nested_grouped_max_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        ))
         .await;
     }
     if source.grouped_count.is_some() {
-        return prepare_nested_grouped_count_input_tick(
+        return Box::pin(prepare_nested_grouped_count_input_tick(
             source,
             insert_batches,
             weighted_delta_batches,
-        )
+        ))
         .await;
     }
     if source.grouped_stats.is_some() {
-        return prepare_nested_grouped_stats_input_tick(
+        return Box::pin(prepare_nested_grouped_stats_input_tick(
             source,
             insert_batches,
             weighted_delta_batches,
-        )
+        ))
         .await;
     }
     if source.join_aggregate.is_some() {
-        return prepare_nested_join_aggregate_input_tick(
+        return Box::pin(prepare_nested_join_aggregate_input_tick(
             source,
             insert_batches,
             weighted_delta_batches,
-        )
+        ))
         .await;
     }
     if source.join_topn.is_some() {
-        return prepare_join_topn_join_input_tick(source, insert_batches, weighted_delta_batches)
-            .await;
+        return Box::pin(prepare_join_topn_join_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        ))
+        .await;
     }
     if source.topn.is_some() {
-        return prepare_topn_join_input_tick(source, insert_batches, weighted_delta_batches).await;
+        return Box::pin(prepare_topn_join_input_tick(
+            source,
+            insert_batches,
+            weighted_delta_batches,
+        ))
+        .await;
     }
     if source.constant.is_some() {
-        return prepare_constant_join_input_tick(source).await;
+        return Box::pin(prepare_constant_join_input_tick(source)).await;
     }
 
     let input_delta = source_input_delta(source, insert_batches, weighted_delta_batches)?;
@@ -1573,13 +1823,13 @@ async fn prepare_nested_union_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_union_state_tick(
+    let tick = Box::pin(run_columnar_union_state_tick(
         &mut union.state,
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| format!("evaluate nested union input '{}'", source.input_name))?;
     let changed = !tick.delta.batches().is_empty();
@@ -1617,13 +1867,13 @@ async fn prepare_nested_grouped_max_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_grouped_max_state_tick(
+    let tick = Box::pin(run_columnar_grouped_max_state_tick(
         grouped_max.state.as_mut(),
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| format!("evaluate nested grouped-max input '{}'", source.input_name))?;
     let changed = !tick.delta.batches().is_empty();
@@ -1661,13 +1911,13 @@ async fn prepare_nested_grouped_count_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_grouped_count_state_tick(
+    let tick = Box::pin(run_columnar_grouped_count_state_tick(
         grouped_count.state.as_mut(),
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| {
         format!(
@@ -1710,13 +1960,13 @@ async fn prepare_nested_grouped_stats_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_grouped_stats_state_tick(
+    let tick = Box::pin(run_columnar_grouped_stats_state_tick(
         grouped_stats.state.as_mut(),
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| {
         format!(
@@ -1759,13 +2009,13 @@ async fn prepare_nested_join_aggregate_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_composed_state_tick(
+    let tick = Box::pin(run_columnar_composed_state_tick(
         join_aggregate.state.as_mut(),
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| {
         format!(
@@ -1808,13 +2058,13 @@ async fn prepare_nested_multijoin_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_multijoin_state_tick(
+    let tick = Box::pin(run_columnar_multijoin_state_tick(
         &mut multijoin.state,
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| format!("evaluate nested multijoin input '{}'", source.input_name))?;
     let changed = !tick.delta.batches().is_empty();
@@ -1896,13 +2146,13 @@ async fn prepare_join_topn_join_input_tick(
             next_snapshot: None,
         });
     };
-    let tick = run_columnar_join_topn_state_tick(
+    let tick = Box::pin(run_columnar_join_topn_state_tick(
         &mut join_topn.state,
         insert_batches,
         weighted_delta_batches,
         &source.schema,
         &source.snapshot,
-    )
+    ))
     .await
     .with_context(|| format!("evaluate join join-topn input '{}'", source.input_name))?;
     let changed = !tick.delta.batches().is_empty();
@@ -2162,6 +2412,58 @@ fn signed_source_delta(
         negative.extend(unit_delta.negative);
     }
     Ok(JoinSignedDelta { positive, negative })
+}
+
+async fn lookup_indexed_join_state_for_delta(
+    state_index: &SlateBackedColumnarIndexedZSet,
+    delta_batches: &[RecordBatch],
+    delta_key_indices: &[usize],
+    state_schema: &SchemaRef,
+    side: &str,
+) -> Result<Vec<RecordBatch>> {
+    let key_batches =
+        lookup_key_batches_from_delta(delta_batches, delta_key_indices, &state_index.key_schema())
+            .with_context(|| format!("build {side} join state lookup keys"))?;
+    let weighted_lookup = state_index
+        .lookup_key_batches(&key_batches)
+        .await
+        .with_context(|| format!("lookup {side} join state by indexed keys"))?;
+    if weighted_lookup.is_empty() {
+        return Ok(Vec::new());
+    }
+    apply_weighted_snapshot_delta(state_schema, &[], weighted_lookup.batches().to_vec())
+        .await
+        .with_context(|| format!("materialize {side} indexed join state lookup"))
+}
+
+fn lookup_key_batches_from_delta(
+    delta_batches: &[RecordBatch],
+    delta_key_indices: &[usize],
+    lookup_key_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    if delta_key_indices.len() != lookup_key_schema.fields().len() {
+        bail!("join lookup key count does not match indexed key schema");
+    }
+    let mut key_batches = Vec::new();
+    for batch in delta_batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let columns = delta_key_indices
+            .iter()
+            .map(|idx| {
+                if *idx >= batch.num_columns() {
+                    bail!("join delta key column {idx} out of bounds");
+                }
+                Ok(Arc::clone(batch.column(*idx)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        key_batches.push(
+            RecordBatch::try_new(Arc::clone(lookup_key_schema), columns)
+                .context("build join lookup key batch")?,
+        );
+    }
+    Ok(key_batches)
 }
 
 async fn apply_source_snapshot_delta(
