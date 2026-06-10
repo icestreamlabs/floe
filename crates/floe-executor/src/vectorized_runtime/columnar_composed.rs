@@ -38,7 +38,7 @@ use crate::vectorized_runtime::source_state::{
 
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches,
+    normalize_batches, profile,
 };
 
 pub(super) struct ColumnarComposedPlan {
@@ -1722,6 +1722,8 @@ pub(super) async fn run_columnar_composed_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarComposedTick> {
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let mut persisted_deltas = HashMap::new();
     let mut has_input_change = false;
     for source in &mut columnar.sources {
@@ -1730,7 +1732,9 @@ pub(super) async fn run_columnar_composed_state_tick(
         has_input_change |= !delta.batches().is_empty();
         persisted_deltas.insert(source.source_name.clone(), delta);
     }
+    profile::record_since("composed.prepare_source_deltas", phase_start);
 
+    let phase_start = profile::start();
     let mut next_source_snapshots = HashMap::new();
     for source in &columnar.sources {
         let delta = persisted_deltas.get(&source.source_name).ok_or_else(|| {
@@ -1743,25 +1747,35 @@ pub(super) async fn run_columnar_composed_state_tick(
         };
         next_source_snapshots.insert(source.source_name.clone(), snapshot);
     }
+    profile::record_since("composed.materialize_sources", phase_start);
 
     let output_delta_batches = if has_input_change {
+        let phase_start = profile::start();
         let next_output = columnar
             .evaluator
             .evaluate(&next_source_snapshots)
             .await
             .context("evaluate next snapshot-diff composed output")?;
-        diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
-            .await
-            .context("diff snapshot-diff composed output")?
-            .batches
+        profile::record_since("composed.evaluate", phase_start);
+        let phase_start = profile::start();
+        let diff =
+            diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
+                .await
+                .context("diff snapshot-diff composed output")?
+                .batches;
+        profile::record_since("composed.diff_output", phase_start);
+        diff
     } else {
         Vec::new()
     };
 
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build snapshot-diff composed output zset delta")?;
-    let persisted_output_delta = if let Some(handle) = columnar
+    profile::record_since("composed.build_output_zset", phase_start);
+    let phase_start = profile::start();
+    columnar
         .output_zset
         .create_version(
             &output_delta,
@@ -1770,14 +1784,12 @@ pub(super) async fn run_columnar_composed_state_tick(
                 .current_handle()
                 .map(|handle| handle.version),
         )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
+        .await?;
+    profile::record_since("composed.output_create_version", phase_start);
+    let persisted_output_delta = output_delta;
 
     let delta_batches = persisted_output_delta.batches().to_vec();
+    let phase_start = profile::start();
     let next_snapshot =
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
             .await
@@ -1787,11 +1799,15 @@ pub(super) async fn run_columnar_composed_state_tick(
                     columnar.operator_label
                 )
             })?;
+    profile::record_since("composed.output_snapshot_delta", phase_start);
+    let phase_start = profile::start();
     for source in &mut columnar.sources {
         source.snapshot = next_source_snapshots
             .remove(&source.source_name)
             .ok_or_else(|| anyhow::anyhow!("missing next snapshot for '{}'", source.source_name))?;
     }
+    profile::record_since("composed.update_source_snapshots", phase_start);
+    profile::record_since("composed.total", total_start);
 
     Ok(ColumnarComposedTick {
         delta: persisted_output_delta,
@@ -1831,11 +1847,8 @@ async fn persisted_source_delta(
     input_delta: ColumnarZSet,
 ) -> Result<ColumnarZSet> {
     let base = zset.current_handle().map(|handle| handle.version);
-    if let Some(handle) = zset.create_version(&input_delta, base).await? {
-        zset.read_delta(&handle).await
-    } else {
-        Ok(input_delta)
-    }
+    zset.create_version(&input_delta, base).await?;
+    Ok(input_delta)
 }
 
 async fn materialize_source_snapshot(

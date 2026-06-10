@@ -1,7 +1,8 @@
 use std::collections::{BTreeSet, HashMap, hash_map::Entry};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{
     Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, UInt32Array,
@@ -18,6 +19,7 @@ use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 
 use crate::delta_consolidation::weighted_snapshot_schema;
 use crate::mv::registry::MaterializedViewRegistry;
@@ -29,7 +31,7 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
-    collect_incremental_output,
+    collect_incremental_output, profile,
 };
 
 pub(super) struct ColumnarGroupedCountPlan {
@@ -76,6 +78,10 @@ impl ColumnarGroupedCountMaterializedViewState {
 struct SlateGroupedCountState {
     table: Arc<dyn KeyValueTable>,
     key_prefix: Vec<u8>,
+    count_log_prefix: Vec<u8>,
+    count_sequence_key: Vec<u8>,
+    next_count_segment_id: Mutex<u64>,
+    counts: Mutex<AHashMap<Vec<u8>, i64>>,
 }
 
 struct PendingGroupDelta {
@@ -250,7 +256,9 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
         .await
         .context("initialize SlateDB-backed grouped-count input zset")?,
         output_zset,
-        count_state: SlateGroupedCountState::new(table, &state_namespace),
+        count_state: SlateGroupedCountState::new(table, &state_namespace)
+            .await
+            .context("initialize SlateDB-backed grouped-count state")?,
         aggregate_delta,
         hop_group_projection_delta,
         aggregate_schema: plan.aggregate_schema,
@@ -311,6 +319,8 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedCountTick> {
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let input_delta =
         if let Some(weighted_batches) = weighted_delta_batches.get(columnar.source_name.as_str()) {
             ColumnarZSet::try_new_weighted(
@@ -338,23 +348,27 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
         } else {
             ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
         };
-
-    let persisted_input_delta = if let Some(handle) = columnar
+    profile::record_since("grouped_count.prepare_input", phase_start);
+    let phase_start = profile::start();
+    columnar
         .input_zset
         .create_version(&input_delta, None)
-        .await?
-    {
-        columnar.input_zset.read_delta(&handle).await?
-    } else {
-        input_delta
-    };
-    let input_changed = !persisted_input_delta.batches().is_empty();
-    let pending = grouped_count_pending_delta(columnar, persisted_input_delta.batches()).await?;
+        .await?;
+    profile::record_since("grouped_count.input_create_version", phase_start);
+    let input_changed = !input_delta.batches().is_empty();
+    let phase_start = profile::start();
+    let pending = grouped_count_pending_delta(columnar, input_delta.batches()).await?;
+    profile::record_since("grouped_count.pending_delta", phase_start);
+    let phase_start = profile::start();
     let output_delta_batches = apply_grouped_count_delta(columnar, pending).await?;
+    profile::record_since("grouped_count.apply_delta", phase_start);
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-count output zset delta")?;
-    let persisted_output_delta = if let Some(handle) = columnar
+    profile::record_since("grouped_count.build_output_zset", phase_start);
+    let phase_start = profile::start();
+    columnar
         .output_zset
         .create_version(
             &output_delta,
@@ -363,21 +377,20 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
                 .current_handle()
                 .map(|handle| handle.version),
         )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
+        .await?;
+    profile::record_since("grouped_count.output_create_version", phase_start);
 
-    let delta_batches = persisted_output_delta.batches().to_vec();
+    let phase_start = profile::start();
+    let delta_batches = output_delta.batches().to_vec();
     let next_snapshot =
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
             .await
             .context("apply Slate-backed grouped-count columnar snapshot delta")?;
+    profile::record_since("grouped_count.output_snapshot_delta", phase_start);
+    profile::record_since("grouped_count.total", total_start);
 
     Ok(ColumnarGroupedCountTick {
-        delta: persisted_output_delta,
+        delta: output_delta,
         next_snapshot,
         input_changed,
     })
@@ -386,8 +399,8 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
 async fn grouped_count_pending_delta(
     columnar: &ColumnarGroupedCountMaterializedViewState,
     input_batches: &[RecordBatch],
-) -> Result<HashMap<Vec<u8>, PendingGroupDelta>> {
-    let mut pending = HashMap::new();
+) -> Result<AHashMap<Vec<u8>, PendingGroupDelta>> {
+    let mut pending = AHashMap::new();
     if input_batches.is_empty() {
         return Ok(pending);
     }
@@ -453,7 +466,7 @@ fn add_hop_group_batches_to_pending(
     columnar: &ColumnarGroupedCountMaterializedViewState,
     batches: &[RecordBatch],
     sign: i64,
-    pending: &mut HashMap<Vec<u8>, PendingGroupDelta>,
+    pending: &mut AHashMap<Vec<u8>, PendingGroupDelta>,
 ) -> Result<()> {
     let aggregate_batches = expand_hop_group_batches(columnar, batches)?;
     add_aggregate_batches_to_pending(columnar, &aggregate_batches, sign, pending)
@@ -607,7 +620,7 @@ fn add_aggregate_batches_to_pending(
     columnar: &ColumnarGroupedCountMaterializedViewState,
     batches: &[RecordBatch],
     sign: i64,
-    pending: &mut HashMap<Vec<u8>, PendingGroupDelta>,
+    pending: &mut AHashMap<Vec<u8>, PendingGroupDelta>,
 ) -> Result<()> {
     if batches.is_empty() {
         return Ok(());
@@ -662,26 +675,39 @@ fn add_aggregate_batches_to_pending(
 
 async fn apply_grouped_count_delta(
     columnar: &ColumnarGroupedCountMaterializedViewState,
-    pending: HashMap<Vec<u8>, PendingGroupDelta>,
+    pending: AHashMap<Vec<u8>, PendingGroupDelta>,
 ) -> Result<Vec<RecordBatch>> {
+    let total_start = profile::start();
     let mut builder = WeightedOutputBuilder::new(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
     )?;
     if pending.is_empty() {
-        return builder.finish();
+        let phase_start = profile::start();
+        let output = builder.finish();
+        profile::record_since("grouped_count.apply_finish_output", phase_start);
+        profile::record_since("grouped_count.apply_total_inner", total_start);
+        return output;
     }
 
-    let mut writes = WriteBatch::new();
-    let mut wrote_state = false;
+    let pending = pending.into_iter().collect::<Vec<_>>();
+    let phase_start = profile::start();
+    let old_counts = columnar
+        .count_state
+        .load_counts(pending.iter().map(|(group_key, _)| group_key.as_slice()))?;
+    profile::record_since("grouped_count.apply_state_lookup", phase_start);
+    let mut count_updates = Vec::with_capacity(pending.len());
     let output_includes_count = columnar.output_mapping.contains(&columnar.count_idx);
-    for (group_key, delta) in pending {
-        let old_count = columnar.count_state.load_count(&group_key).await?;
+    let phase_start = profile::start();
+    for ((group_key, delta), old_count) in pending.into_iter().zip(old_counts) {
         let new_count = old_count
             .checked_add(delta.delta)
             .ok_or_else(|| anyhow::anyhow!("grouped-count state overflow"))?;
         if new_count < 0 {
             bail!("grouped-count state removed more rows than were present");
+        }
+        if new_count == old_count {
+            continue;
         }
         if output_includes_count && old_count > 0 {
             builder.append(
@@ -719,55 +745,185 @@ async fn apply_grouped_count_delta(
                 1,
             )?;
         }
+        count_updates.push((group_key, new_count));
+    }
+    profile::record_since("grouped_count.apply_update_loop", phase_start);
+    if !count_updates.is_empty() {
+        let mut writes = WriteBatch::new();
         columnar
             .count_state
-            .write_count(&mut writes, &group_key, new_count);
-        wrote_state = true;
-    }
-    if wrote_state {
+            .write_count_updates(&mut writes, &count_updates)?;
+        let phase_start = profile::start();
         columnar
             .count_state
             .table
             .write_batch(writes)
             .await
             .context("persist grouped-count state updates")?;
+        profile::record_since("grouped_count.apply_write_batch", phase_start);
+        let phase_start = profile::start();
+        columnar.count_state.apply_count_updates(count_updates)?;
+        profile::record_since("grouped_count.apply_cache_update", phase_start);
     }
-    builder.finish()
+    let phase_start = profile::start();
+    let output = builder.finish();
+    profile::record_since("grouped_count.apply_finish_output", phase_start);
+    profile::record_since("grouped_count.apply_total_inner", total_start);
+    output
 }
 
 impl SlateGroupedCountState {
-    fn new(table: Arc<dyn KeyValueTable>, namespace: &str) -> Self {
-        Self {
+    async fn new(table: Arc<dyn KeyValueTable>, namespace: &str) -> Result<Self> {
+        let key_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace);
+        let count_log_namespace = format!("{namespace}__count_log");
+        let count_meta_namespace = format!("{namespace}__count_meta");
+        let count_log_prefix =
+            keyspace::namespace_prefix(keyspace::prefix::INDEX, &count_log_namespace);
+        let mut count_sequence_key =
+            keyspace::namespace_prefix(keyspace::prefix::INDEX, &count_meta_namespace);
+        count_sequence_key.extend_from_slice(b"sequence");
+        let next_count_segment_id =
+            read_count_sequence(table.as_ref(), &count_sequence_key).await?;
+        let state = Self {
             table,
-            key_prefix: keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace),
-        }
-    }
-
-    async fn load_count(&self, group_key: &[u8]) -> Result<i64> {
-        let Some(bytes) = self
-            .table
-            .get_bytes(&self.state_key(group_key))
-            .await
-            .context("read grouped-count state")?
-        else {
-            return Ok(0);
+            key_prefix,
+            count_log_prefix,
+            count_sequence_key,
+            next_count_segment_id: Mutex::new(next_count_segment_id),
+            counts: Mutex::new(AHashMap::new()),
         };
-        decode_i64(bytes.as_ref())
+        let counts = state
+            .load_all_counts()
+            .await
+            .context("load grouped-count state head")?;
+        *state
+            .counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-count state head poisoned"))? = counts;
+        Ok(state)
     }
 
-    fn write_count(&self, batch: &mut WriteBatch, group_key: &[u8], count: i64) {
-        let key = self.state_key(group_key);
-        if count == 0 {
-            batch.delete(key);
-        } else {
-            batch.put(key, count.to_be_bytes());
+    async fn load_all_counts(&self) -> Result<AHashMap<Vec<u8>, i64>> {
+        let mut counts = AHashMap::new();
+        for (key, value) in self
+            .table
+            .scan_prefix(&self.key_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-count legacy state")?
+        {
+            if key.as_slice() == self.count_sequence_key.as_slice()
+                || key.starts_with(&self.count_log_prefix)
+            {
+                continue;
+            }
+            let group_key = self.group_key_from_legacy_state_key(&key)?;
+            let count = decode_i64(&value)?;
+            if count != 0 {
+                counts.insert(group_key.to_vec(), count);
+            }
         }
+        let mut log_entries = Vec::new();
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&self.count_log_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-count state log")?
+        {
+            log_entries.push((self.count_log_segment_id(&key)?, value_bytes));
+        }
+        log_entries.sort_by_key(|(segment_id, _)| *segment_id);
+        for (_, value_bytes) in log_entries {
+            for (group_key, count) in decode_count_log_updates(&value_bytes)? {
+                if count == 0 {
+                    counts.remove(group_key.as_slice());
+                } else {
+                    counts.insert(group_key, count);
+                }
+            }
+        }
+        Ok(counts)
     }
 
-    fn state_key(&self, group_key: &[u8]) -> Vec<u8> {
+    fn load_counts<'a>(&self, group_keys: impl IntoIterator<Item = &'a [u8]>) -> Result<Vec<i64>> {
+        let counts = self
+            .counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-count state head poisoned"))?;
+        Ok(group_keys
+            .into_iter()
+            .map(|group_key| counts.get(group_key).copied().unwrap_or(0))
+            .collect())
+    }
+
+    fn apply_count_updates(&self, updates: Vec<(Vec<u8>, i64)>) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-count state head poisoned"))?;
+        for (group_key, count) in updates {
+            if count == 0 {
+                counts.remove(&group_key);
+            } else {
+                counts.insert(group_key, count);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_count_updates(
+        &self,
+        batch: &mut WriteBatch,
+        updates: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut next_segment_id = self
+            .next_count_segment_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-count sequence poisoned"))?;
+        let segment_id = *next_segment_id;
+        *next_segment_id = next_segment_id.saturating_add(1);
+        batch.put(
+            self.count_log_key(segment_id),
+            encode_count_log_updates(updates)?,
+        );
+        batch.put(
+            self.count_sequence_key.clone(),
+            (*next_segment_id).to_be_bytes(),
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn legacy_state_key(&self, group_key: &[u8]) -> Vec<u8> {
         let mut key = self.key_prefix.clone();
         key.extend_from_slice(group_key);
         key
+    }
+
+    fn count_log_key(&self, segment_id: u64) -> Vec<u8> {
+        let mut key = self.count_log_prefix.clone();
+        key.extend_from_slice(&segment_id.to_be_bytes());
+        key
+    }
+
+    fn count_log_segment_id(&self, key: &[u8]) -> Result<u64> {
+        if !key.starts_with(&self.count_log_prefix) {
+            bail!("grouped-count log key prefix mismatch");
+        }
+        let suffix = &key[self.count_log_prefix.len()..];
+        let bytes: [u8; 8] = suffix
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("grouped-count log segment id must be 8 bytes"))?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn group_key_from_legacy_state_key<'a>(&self, key: &'a [u8]) -> Result<&'a [u8]> {
+        if !key.starts_with(&self.key_prefix) {
+            bail!("grouped-count state key prefix mismatch");
+        }
+        Ok(&key[self.key_prefix.len()..])
     }
 }
 
@@ -1093,9 +1249,180 @@ fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
+async fn read_count_sequence(table: &dyn KeyValueTable, key: &[u8]) -> Result<u64> {
+    let Some(bytes) = table
+        .get_bytes(key)
+        .await
+        .context("read grouped-count sequence")?
+    else {
+        return Ok(1);
+    };
+    let bytes: [u8; 8] = bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("grouped-count sequence must be 8 bytes"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn encode_count_log_updates(updates: &[(Vec<u8>, i64)]) -> Result<Vec<u8>> {
+    let mut capacity = 4;
+    for (group_key, _) in updates {
+        capacity += 4 + group_key.len() + 8;
+    }
+    let mut out = Vec::with_capacity(capacity);
+    let update_count =
+        u32::try_from(updates.len()).context("grouped-count log update count too large")?;
+    out.extend_from_slice(&update_count.to_be_bytes());
+    for (group_key, count) in updates {
+        let group_key_len =
+            u32::try_from(group_key.len()).context("grouped-count group key too large")?;
+        out.extend_from_slice(&group_key_len.to_be_bytes());
+        out.extend_from_slice(group_key);
+        out.extend_from_slice(&count.to_be_bytes());
+    }
+    Ok(out)
+}
+
+fn decode_count_log_updates(bytes: &[u8]) -> Result<Vec<(Vec<u8>, i64)>> {
+    let mut cursor = 0;
+    let update_count = read_u32_at(bytes, &mut cursor)?;
+    let mut updates = Vec::with_capacity(update_count as usize);
+    for _ in 0..update_count {
+        let group_key_len = read_u32_at(bytes, &mut cursor)? as usize;
+        let group_key = read_bytes_at(
+            bytes,
+            &mut cursor,
+            group_key_len,
+            "grouped-count log group key",
+        )?
+        .to_vec();
+        let count = decode_i64(read_bytes_at(
+            bytes,
+            &mut cursor,
+            8,
+            "grouped-count log count",
+        )?)?;
+        updates.push((group_key, count));
+    }
+    if cursor != bytes.len() {
+        bail!("grouped-count log payload has trailing bytes");
+    }
+    Ok(updates)
+}
+
+fn read_u32_at(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
+    let chunk = read_bytes_at(bytes, cursor, 4, "grouped-count u32")?;
+    let value = <[u8; 4]>::try_from(chunk)
+        .map(u32::from_be_bytes)
+        .map_err(|_| anyhow::anyhow!("grouped-count u32 expected 4 bytes"))?;
+    Ok(value)
+}
+
+fn read_bytes_at<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+    label: &str,
+) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("{label} overflow"))?;
+    let chunk = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow::anyhow!("{label} truncated"))?;
+    *cursor = end;
+    Ok(chunk)
+}
+
 fn decode_i64(bytes: &[u8]) -> Result<i64> {
     let bytes: [u8; 8] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("grouped-count state value must be 8 bytes"))?;
     Ok(i64::from_be_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use object_store::memory::InMemory;
+    use slatedb::Db;
+
+    async fn build_table(name: &str) -> Arc<dyn KeyValueTable> {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(Db::open(name, store).await.expect("open SlateDB"));
+        Arc::new(dbsp::storage::SlateTable::new(db))
+    }
+
+    #[tokio::test]
+    async fn grouped_count_state_replays_logged_updates() {
+        let table = build_table("grouped-count-log-replay").await;
+        let state = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
+            .await
+            .expect("state");
+
+        let mut batch = WriteBatch::new();
+        let updates = vec![(b"a".to_vec(), 2), (b"b".to_vec(), 5)];
+        state
+            .write_count_updates(&mut batch, &updates)
+            .expect("write count updates");
+        table.write_batch(batch).await.expect("persist updates");
+        state
+            .apply_count_updates(updates)
+            .expect("apply count updates");
+
+        let reopened = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
+            .await
+            .expect("reopen state");
+        assert_eq!(
+            reopened
+                .load_counts([b"a".as_slice(), b"b".as_slice(), b"c".as_slice()])
+                .expect("load counts"),
+            vec![2, 5, 0]
+        );
+
+        let mut batch = WriteBatch::new();
+        let updates = vec![(b"a".to_vec(), 0), (b"b".to_vec(), 7)];
+        reopened
+            .write_count_updates(&mut batch, &updates)
+            .expect("write second count updates");
+        table
+            .write_batch(batch)
+            .await
+            .expect("persist second updates");
+
+        let replayed = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
+            .await
+            .expect("replay state");
+        assert_eq!(
+            replayed
+                .load_counts([b"a".as_slice(), b"b".as_slice(), b"c".as_slice()])
+                .expect("load replayed counts"),
+            vec![0, 7, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn grouped_count_state_reads_legacy_raw_count_keys() {
+        let table = build_table("grouped-count-legacy-state").await;
+        let state = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
+            .await
+            .expect("state");
+        let mut batch = WriteBatch::new();
+        batch.put(state.legacy_state_key(b"legacy"), 11_i64.to_be_bytes());
+        table
+            .write_batch(batch)
+            .await
+            .expect("persist legacy count");
+
+        let reopened = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
+            .await
+            .expect("reopen state");
+        assert_eq!(
+            reopened
+                .load_counts([b"legacy".as_slice(), b"missing".as_slice()])
+                .expect("load legacy count"),
+            vec![11, 0]
+        );
+    }
 }

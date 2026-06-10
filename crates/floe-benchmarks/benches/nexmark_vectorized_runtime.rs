@@ -1105,6 +1105,8 @@ async fn run_runtime_case(
     registry: Arc<MaterializedViewRegistry>,
     source_batches: Vec<NexmarkRuntimeSourceBatches>,
 ) -> Result<()> {
+    reset_columnar_phase_profile();
+    reset_runtime_phase_profile();
     for tick in 0..TICKS {
         for source in &source_batches {
             execution
@@ -1125,6 +1127,8 @@ async fn run_runtime_case(
         .ok_or_else(|| anyhow::anyhow!("missing final snapshot for {}", case.view_name))?;
     let rows = snapshot.iter().map(RecordBatch::num_rows).sum::<usize>();
     black_box(rows);
+    print_columnar_phase_profile(case.id);
+    print_runtime_phase_profile(case.id);
     Ok(())
 }
 
