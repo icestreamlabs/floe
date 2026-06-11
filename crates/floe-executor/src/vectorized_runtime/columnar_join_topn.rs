@@ -11,6 +11,7 @@ use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
+use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -31,7 +32,7 @@ use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_tab
 
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches,
+    normalize_batches, profile,
 };
 
 pub(super) struct ColumnarJoinTopNPlan {
@@ -44,12 +45,21 @@ impl ColumnarJoinTopNPlan {
     pub(super) fn source_names(&self) -> [String; 2] {
         [self.left_source.clone(), self.right_source.clone()]
     }
+
+    pub(super) fn is_partitioned_best_bid(&self) -> bool {
+        matches!(
+            self.kind,
+            ColumnarJoinTopNPlanKind::PartitionedBestBid { .. }
+        )
+    }
 }
 
 enum ColumnarJoinTopNPlanKind {
     PartitionedBestBid {
         left_key_column: String,
         right_key_column: String,
+        left_partition_columns: Vec<String>,
+        output_mapping: Option<Vec<JoinTopNOutputMappingPlan>>,
     },
     GlobalSnapshotDiff {
         logical_plan: LogicalPlan,
@@ -94,6 +104,7 @@ struct JoinTopNBestBidEvaluator {
     output_schema: SchemaRef,
     left: JoinTopNLeftIndices,
     right: JoinTopNRightIndices,
+    partition_left_indices: Vec<usize>,
     output_mapping: Vec<JoinTopNOutputSource>,
 }
 
@@ -135,6 +146,13 @@ struct JoinTopNRightIndices {
 enum JoinTopNOutputSource {
     Left(usize),
     Right(usize),
+    RowNumberOne,
+}
+
+enum JoinTopNOutputMappingPlan {
+    Left(String),
+    Right(String),
+    RowNumberOne,
 }
 
 struct JoinTopNBestBid {
@@ -148,11 +166,14 @@ struct JoinTopNBestBid {
     bid_extra: Option<String>,
 }
 
+type JoinTopNPartitionKey = Vec<Option<EncodedRowScalar>>;
+
 struct JoinTopNLeftRow {
     batch_idx: usize,
     row_idx: usize,
     auction_start: i64,
     auction_expires: i64,
+    partition_key: JoinTopNPartitionKey,
 }
 
 pub(super) fn columnar_join_topn_plan_for_plan(
@@ -172,11 +193,10 @@ fn partitioned_best_bid_join_topn_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarJoinTopNPlan>> {
-    let Some((_rank_column, filter)) = row_number_filter_for_plan(plan) else {
+    let Some((rank_column, filter)) = row_number_filter_for_plan(plan) else {
         return Ok(None);
     };
-    let Some((window, _projection_without_rank)) = extract_window_plan(filter.input.as_ref())
-    else {
+    let Some((window, projection)) = extract_window_plan(filter.input.as_ref()) else {
         return Ok(None);
     };
     if window.window_expr.len() != 1 {
@@ -214,9 +234,29 @@ fn partitioned_best_bid_join_topn_plan_for_plan(
     else {
         return Ok(None);
     };
-    if !window_partitions_by_join_key(window, &left_key_column) {
+    let Some(left_source_state) = sources.get(&left_source) else {
         return Ok(None);
-    }
+    };
+    let Some(right_source_state) = sources.get(&right_source) else {
+        return Ok(None);
+    };
+    let Some(left_partition_columns) = left_partition_columns_by_join_key(
+        window,
+        &left_source_state.schema,
+        &right_source_state.schema,
+        &left_key_column,
+    ) else {
+        return Ok(None);
+    };
+    let output_mapping = projection.as_ref().and_then(|projection| {
+        output_mapping_for_projection(
+            projection,
+            &rank_column,
+            join,
+            &left_source_state.schema,
+            &right_source_state.schema,
+        )
+    });
 
     Ok(Some(ColumnarJoinTopNPlan {
         left_source,
@@ -224,6 +264,8 @@ fn partitioned_best_bid_join_topn_plan_for_plan(
         kind: ColumnarJoinTopNPlanKind::PartitionedBestBid {
             left_key_column,
             right_key_column,
+            left_partition_columns,
+            output_mapping,
         },
     }))
 }
@@ -351,6 +393,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         ColumnarJoinTopNPlanKind::PartitionedBestBid {
             left_key_column,
             right_key_column,
+            ..
         } => (
             Some(
                 left_source
@@ -447,16 +490,20 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
     let left_name = plan.left_source;
     let right_name = plan.right_source;
     let evaluator = match plan.kind {
-        ColumnarJoinTopNPlanKind::PartitionedBestBid { .. } => {
-            JoinTopNEvaluator::PartitionedBestBid(
-                JoinTopNBestBidEvaluator::build(
-                    &left_source.schema,
-                    &right_source.schema,
-                    output_schema,
-                )
-                .context("build join-topn vectorized evaluator")?,
+        ColumnarJoinTopNPlanKind::PartitionedBestBid {
+            left_partition_columns,
+            output_mapping,
+            ..
+        } => JoinTopNEvaluator::PartitionedBestBid(
+            JoinTopNBestBidEvaluator::build(
+                &left_source.schema,
+                &right_source.schema,
+                output_schema,
+                &left_partition_columns,
+                output_mapping.as_deref(),
             )
-        }
+            .context("build join-topn vectorized evaluator")?,
+        ),
         ColumnarJoinTopNPlanKind::GlobalSnapshotDiff { logical_plan } => {
             JoinTopNEvaluator::GlobalSnapshotDiff(
                 GlobalJoinTopNEvaluator::build(
@@ -537,19 +584,25 @@ pub(super) async fn run_columnar_join_topn_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarJoinTopNTick> {
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let left_input_delta =
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
     let right_input_delta =
         source_input_delta(&columnar.right, insert_batches, weighted_delta_batches)?;
+    profile::record_since("join_topn.source_input_delta", phase_start);
+    let phase_start = profile::start();
     let left_delta =
         persisted_source_delta(&mut columnar.left.input_zset, left_input_delta).await?;
     let right_delta =
         persisted_source_delta(&mut columnar.right.input_zset, right_input_delta).await?;
+    profile::record_since("join_topn.persist_source_delta", phase_start);
     let input_changed = !left_delta.batches().is_empty() || !right_delta.batches().is_empty();
 
     let mut global_next_snapshots = None;
     let output_delta_batches = match &columnar.evaluator {
         JoinTopNEvaluator::PartitionedBestBid(evaluator) => {
+            let phase_start = profile::start();
             let left_key_idx = columnar
                 .left
                 .key_idx
@@ -561,7 +614,9 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             let mut touched_keys = HashSet::new();
             collect_i64_keys_from_delta(&left_delta, left_key_idx, &mut touched_keys)?;
             collect_i64_keys_from_delta(&right_delta, right_key_idx, &mut touched_keys)?;
+            profile::record_since("join_topn.collect_touched_keys", phase_start);
 
+            let phase_start = profile::start();
             let previous_left = lookup_indexed_join_topn_state_for_i64_keys(
                 columnar
                     .left
@@ -573,6 +628,8 @@ pub(super) async fn run_columnar_join_topn_state_tick(
                 "left",
             )
             .await?;
+            profile::record_since("join_topn.lookup_previous_left", phase_start);
+            let phase_start = profile::start();
             let previous_right = lookup_indexed_join_topn_state_for_i64_keys(
                 columnar
                     .right
@@ -584,31 +641,40 @@ pub(super) async fn run_columnar_join_topn_state_tick(
                 "right",
             )
             .await?;
+            profile::record_since("join_topn.lookup_previous_right", phase_start);
+            let phase_start = profile::start();
             let next_left =
                 apply_source_snapshot_delta(&columnar.left.schema, &previous_left, &left_delta)
                     .await?;
             let next_right =
                 apply_source_snapshot_delta(&columnar.right.schema, &previous_right, &right_delta)
                     .await?;
+            profile::record_since("join_topn.apply_input_delta", phase_start);
 
             let (previous_output, next_output) = if touched_keys.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
-                (
-                    evaluator
-                        .evaluate(&previous_left, &previous_right)
-                        .await
-                        .context("evaluate previous join-topn partition outputs")?,
-                    evaluator
-                        .evaluate(&next_left, &next_right)
-                        .await
-                        .context("evaluate next join-topn partition outputs")?,
-                )
+                let phase_start = profile::start();
+                let previous_output = evaluator
+                    .evaluate(&previous_left, &previous_right)
+                    .await
+                    .context("evaluate previous join-topn partition outputs")?;
+                profile::record_since("join_topn.evaluate_previous", phase_start);
+                let phase_start = profile::start();
+                let next_output = evaluator
+                    .evaluate(&next_left, &next_right)
+                    .await
+                    .context("evaluate next join-topn partition outputs")?;
+                profile::record_since("join_topn.evaluate_next", phase_start);
+                (previous_output, next_output)
             };
-            diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
-                .await
-                .context("diff join-topn partition outputs")?
-                .batches
+            let phase_start = profile::start();
+            let diff =
+                diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
+                    .await
+                    .context("diff join-topn partition outputs")?;
+            profile::record_since("join_topn.diff_output", phase_start);
+            diff.batches
         }
         JoinTopNEvaluator::GlobalSnapshotDiff(evaluator) => {
             if !input_changed {
@@ -649,9 +715,12 @@ pub(super) async fn run_columnar_join_topn_state_tick(
         }
     };
 
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build join-topn output zset delta")?;
+    profile::record_since("join_topn.build_output_zset", phase_start);
+    let phase_start = profile::start();
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(
@@ -667,13 +736,17 @@ pub(super) async fn run_columnar_join_topn_state_tick(
     } else {
         output_delta
     };
+    profile::record_since("join_topn.output_create_version", phase_start);
 
+    let phase_start = profile::start();
     let delta_batches = persisted_output_delta.batches().to_vec();
     let next_snapshot =
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
             .await
             .context("apply Slate-backed join-topn columnar snapshot delta")?;
+    profile::record_since("join_topn.output_snapshot_delta", phase_start);
 
+    let phase_start = profile::start();
     match global_next_snapshots {
         Some((next_left_snapshot, next_right_snapshot)) => {
             columnar.left.snapshot = next_left_snapshot;
@@ -694,6 +767,8 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             }
         }
     }
+    profile::record_since("join_topn.update_indexes", phase_start);
+    profile::record_since("join_topn.total", total_start);
     Ok(ColumnarJoinTopNTick {
         delta: persisted_output_delta,
         next_snapshot,
@@ -821,6 +896,8 @@ impl JoinTopNBestBidEvaluator {
         left_schema: &SchemaRef,
         right_schema: &SchemaRef,
         output_schema: &SchemaRef,
+        left_partition_columns: &[String],
+        output_mapping_plan: Option<&[JoinTopNOutputMappingPlan]>,
     ) -> Result<Self> {
         let left = JoinTopNLeftIndices {
             id: field_index(left_schema, &["id"])?,
@@ -841,32 +918,26 @@ impl JoinTopNBestBidEvaluator {
             date_time: field_index(right_schema, &["dateTime", "date_time"])?,
             extra: field_index(right_schema, &["extra"])?,
         };
-        let output_mapping = output_schema
-            .fields()
+        let partition_left_indices = left_partition_columns
             .iter()
-            .map(|field| match field.name().as_str() {
-                "id" => Ok(JoinTopNOutputSource::Left(left.id)),
-                "itemName" => Ok(JoinTopNOutputSource::Left(left.item_name)),
-                "description" => Ok(JoinTopNOutputSource::Left(left.description)),
-                "initialBid" => Ok(JoinTopNOutputSource::Left(left.initial_bid)),
-                "reserve" => Ok(JoinTopNOutputSource::Left(left.reserve)),
-                "dateTime" => Ok(JoinTopNOutputSource::Left(left.date_time)),
-                "expires" => Ok(JoinTopNOutputSource::Left(left.expires)),
-                "seller" => Ok(JoinTopNOutputSource::Left(left.seller)),
-                "category" => Ok(JoinTopNOutputSource::Left(left.category)),
-                "extra" => Ok(JoinTopNOutputSource::Left(left.extra)),
-                "auction" => Ok(JoinTopNOutputSource::Right(right.auction)),
-                "bidder" => Ok(JoinTopNOutputSource::Right(right.bidder)),
-                "price" => Ok(JoinTopNOutputSource::Right(right.price)),
-                "bidTime" => Ok(JoinTopNOutputSource::Right(right.date_time)),
-                "bidExtra" => Ok(JoinTopNOutputSource::Right(right.extra)),
-                other => bail!("unsupported join-topn output field '{other}'"),
+            .map(|column| {
+                left_schema
+                    .index_of(column)
+                    .with_context(|| format!("find join-topn partition column '{column}'"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let output_mapping = match output_mapping_plan {
+            Some(mapping_plan) if mapping_plan.len() == output_schema.fields().len() => {
+                output_mapping_from_plan(mapping_plan, left_schema, right_schema)
+                    .or_else(|_| name_based_output_mapping(output_schema, &left, &right))?
+            }
+            _ => name_based_output_mapping(output_schema, &left, &right)?,
+        };
         Ok(Self {
             output_schema: Arc::clone(output_schema),
             left,
             right,
+            partition_left_indices,
             output_mapping,
         })
     }
@@ -880,8 +951,8 @@ impl JoinTopNBestBidEvaluator {
         if left_rows.is_empty() {
             return Ok(Vec::new());
         }
-        let best_by_auction = self.best_bids_by_auction(&left_rows, right_batches)?;
-        if best_by_auction.is_empty() {
+        let best_by_partition = self.best_bids_by_partition(&left_rows, right_batches)?;
+        if best_by_partition.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -889,15 +960,15 @@ impl JoinTopNBestBidEvaluator {
             .output_schema
             .fields()
             .iter()
-            .map(|field| ScalarColumnBuilder::new(field.data_type(), best_by_auction.len()))
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), best_by_partition.len()))
             .collect::<Result<Vec<_>>>()?;
 
-        let mut auction_ids = best_by_auction.keys().copied().collect::<Vec<_>>();
-        auction_ids.sort_unstable();
-        for auction_id in auction_ids {
-            let best = best_by_auction
-                .get(&auction_id)
-                .expect("best bid missing for auction id");
+        let mut partition_keys = best_by_partition.keys().cloned().collect::<Vec<_>>();
+        partition_keys.sort();
+        for partition_key in partition_keys {
+            let best = best_by_partition
+                .get(&partition_key)
+                .expect("best bid missing for partition key");
             self.append_output_row(&mut builders, left_batches, right_batches, best)?;
         }
 
@@ -916,7 +987,7 @@ impl JoinTopNBestBidEvaluator {
     fn left_rows_by_auction(
         &self,
         left_batches: &[RecordBatch],
-    ) -> Result<HashMap<i64, JoinTopNLeftRow>> {
+    ) -> Result<HashMap<i64, Vec<JoinTopNLeftRow>>> {
         let mut left_rows = HashMap::new();
         for (left_batch_idx, left_batch) in left_batches.iter().enumerate() {
             let left_ids = int64_column(left_batch, self.left.id)?;
@@ -929,23 +1000,39 @@ impl JoinTopNBestBidEvaluator {
                     i64_or_timestamp_value(left_batch, self.left.date_time, left_row_idx)?;
                 let auction_expires =
                     i64_or_timestamp_value(left_batch, self.left.expires, left_row_idx)?;
-                left_rows.entry(auction_id).or_insert(JoinTopNLeftRow {
-                    batch_idx: left_batch_idx,
-                    row_idx: left_row_idx,
-                    auction_start,
-                    auction_expires,
-                });
+                let partition_key = self.left_partition_key(left_batch, left_row_idx)?;
+                left_rows
+                    .entry(auction_id)
+                    .or_insert_with(Vec::new)
+                    .push(JoinTopNLeftRow {
+                        batch_idx: left_batch_idx,
+                        row_idx: left_row_idx,
+                        auction_start,
+                        auction_expires,
+                        partition_key,
+                    });
             }
         }
         Ok(left_rows)
     }
 
-    fn best_bids_by_auction(
+    fn left_partition_key(
         &self,
-        left_rows: &HashMap<i64, JoinTopNLeftRow>,
+        left_batch: &RecordBatch,
+        left_row_idx: usize,
+    ) -> Result<JoinTopNPartitionKey> {
+        self.partition_left_indices
+            .iter()
+            .map(|idx| encoded_scalar(left_batch, *idx, left_row_idx))
+            .collect()
+    }
+
+    fn best_bids_by_partition(
+        &self,
+        left_rows: &HashMap<i64, Vec<JoinTopNLeftRow>>,
         right_batches: &[RecordBatch],
-    ) -> Result<HashMap<i64, JoinTopNBestBid>> {
-        let mut best_by_auction = HashMap::with_capacity(left_rows.len());
+    ) -> Result<HashMap<JoinTopNPartitionKey, JoinTopNBestBid>> {
+        let mut best_by_partition = HashMap::with_capacity(left_rows.len());
         for (right_batch_idx, right_batch) in right_batches.iter().enumerate() {
             let right_auctions = int64_column(right_batch, self.right.auction)?;
             let right_bidders = int64_column(right_batch, self.right.bidder)?;
@@ -959,14 +1046,11 @@ impl JoinTopNBestBidEvaluator {
                     continue;
                 }
                 let auction_id = right_auctions.value(right_row_idx);
-                let Some(left) = left_rows.get(&auction_id) else {
+                let Some(left_matches) = left_rows.get(&auction_id) else {
                     continue;
                 };
                 let bid_time =
                     i64_or_timestamp_value(right_batch, self.right.date_time, right_row_idx)?;
-                if bid_time < left.auction_start || bid_time > left.auction_expires {
-                    continue;
-                }
                 let price = right_prices.value(right_row_idx);
                 let bidder = right_bidders.value(right_row_idx);
                 let bid_extra = if right_extras.is_null(right_row_idx) {
@@ -974,27 +1058,35 @@ impl JoinTopNBestBidEvaluator {
                 } else {
                     Some(right_extras.value(right_row_idx))
                 };
-                let replace = best_by_auction.get(&auction_id).is_none_or(|current| {
-                    bid_orders_before(price, bid_time, bidder, bid_extra, current)
-                });
-                if replace {
-                    best_by_auction.insert(
-                        auction_id,
-                        JoinTopNBestBid {
-                            left_batch_idx: left.batch_idx,
-                            left_row_idx: left.row_idx,
-                            right_batch_idx,
-                            right_row_idx,
-                            price,
-                            bid_time,
-                            bidder,
-                            bid_extra: bid_extra.map(str::to_owned),
-                        },
-                    );
+                for left in left_matches {
+                    if bid_time < left.auction_start || bid_time > left.auction_expires {
+                        continue;
+                    }
+                    let replace =
+                        best_by_partition
+                            .get(&left.partition_key)
+                            .is_none_or(|current| {
+                                bid_orders_before(price, bid_time, bidder, bid_extra, current)
+                            });
+                    if replace {
+                        best_by_partition.insert(
+                            left.partition_key.clone(),
+                            JoinTopNBestBid {
+                                left_batch_idx: left.batch_idx,
+                                left_row_idx: left.row_idx,
+                                right_batch_idx,
+                                right_row_idx,
+                                price,
+                                bid_time,
+                                bidder,
+                                bid_extra: bid_extra.map(str::to_owned),
+                            },
+                        );
+                    }
                 }
             }
         }
-        Ok(best_by_auction)
+        Ok(best_by_partition)
     }
 
     fn append_output_row(
@@ -1012,11 +1104,66 @@ impl JoinTopNBestBidEvaluator {
                 JoinTopNOutputSource::Right(idx) => {
                     encoded_scalar(right, *idx, best.right_row_idx)?
                 }
+                JoinTopNOutputSource::RowNumberOne => {
+                    builder.append_u64_value(1)?;
+                    continue;
+                }
             };
             builder.append_encoded_scalar(value.as_ref())?;
         }
         Ok(())
     }
+}
+
+fn output_mapping_from_plan(
+    mapping_plan: &[JoinTopNOutputMappingPlan],
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+) -> Result<Vec<JoinTopNOutputSource>> {
+    mapping_plan
+        .iter()
+        .map(|source| match source {
+            JoinTopNOutputMappingPlan::Left(column) => left_schema
+                .index_of(column)
+                .map(JoinTopNOutputSource::Left)
+                .with_context(|| format!("find join-topn left output column '{column}'")),
+            JoinTopNOutputMappingPlan::Right(column) => right_schema
+                .index_of(column)
+                .map(JoinTopNOutputSource::Right)
+                .with_context(|| format!("find join-topn right output column '{column}'")),
+            JoinTopNOutputMappingPlan::RowNumberOne => Ok(JoinTopNOutputSource::RowNumberOne),
+        })
+        .collect()
+}
+
+fn name_based_output_mapping(
+    output_schema: &SchemaRef,
+    left: &JoinTopNLeftIndices,
+    right: &JoinTopNRightIndices,
+) -> Result<Vec<JoinTopNOutputSource>> {
+    output_schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "id" => Ok(JoinTopNOutputSource::Left(left.id)),
+            "itemName" => Ok(JoinTopNOutputSource::Left(left.item_name)),
+            "description" => Ok(JoinTopNOutputSource::Left(left.description)),
+            "initialBid" => Ok(JoinTopNOutputSource::Left(left.initial_bid)),
+            "reserve" => Ok(JoinTopNOutputSource::Left(left.reserve)),
+            "dateTime" => Ok(JoinTopNOutputSource::Left(left.date_time)),
+            "expires" => Ok(JoinTopNOutputSource::Left(left.expires)),
+            "seller" => Ok(JoinTopNOutputSource::Left(left.seller)),
+            "category" => Ok(JoinTopNOutputSource::Left(left.category)),
+            "extra" => Ok(JoinTopNOutputSource::Left(left.extra)),
+            "auction" => Ok(JoinTopNOutputSource::Right(right.auction)),
+            "bidder" => Ok(JoinTopNOutputSource::Right(right.bidder)),
+            "price" => Ok(JoinTopNOutputSource::Right(right.price)),
+            "bidTime" => Ok(JoinTopNOutputSource::Right(right.date_time)),
+            "bidExtra" => Ok(JoinTopNOutputSource::Right(right.extra)),
+            "rownum" | "rn" | "rank_number" => Ok(JoinTopNOutputSource::RowNumberOne),
+            other => bail!("unsupported join-topn output field '{other}'"),
+        })
+        .collect()
 }
 
 fn bid_orders_before(
@@ -1297,9 +1444,49 @@ fn extract_row_number_limit_column(predicate: &Expr) -> Option<String> {
         return None;
     };
     match (&*binary.left, binary.op, &*binary.right) {
-        (Expr::Column(column), Operator::LtEq | Operator::Lt, Expr::Literal(_, _)) => {
+        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _))
+            if literal_to_i128(literal) == Some(1) =>
+        {
             Some(column.name.clone())
         }
+        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _))
+            if literal_to_i128(literal) == Some(2) =>
+        {
+            Some(column.name.clone())
+        }
+        (literal @ Expr::Literal(_, _), Operator::GtEq, Expr::Column(column))
+            if literal_to_i128(literal) == Some(1) =>
+        {
+            Some(column.name.clone())
+        }
+        (literal @ Expr::Literal(_, _), Operator::Gt, Expr::Column(column))
+            if literal_to_i128(literal) == Some(0) =>
+        {
+            Some(column.name.clone())
+        }
+        (Expr::Column(column), Operator::Eq, literal @ Expr::Literal(_, _))
+        | (literal @ Expr::Literal(_, _), Operator::Eq, Expr::Column(column))
+            if literal_to_i128(literal) == Some(1) =>
+        {
+            Some(column.name.clone())
+        }
+        _ => None,
+    }
+}
+
+fn literal_to_i128(expr: &Expr) -> Option<i128> {
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    match value {
+        ScalarValue::Int8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::Int64(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt8(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt16(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt32(Some(value)) => Some(i128::from(*value)),
+        ScalarValue::UInt64(Some(value)) => Some(i128::from(*value)),
         _ => None,
     }
 }
@@ -1319,6 +1506,106 @@ fn extract_window_plan(input: &LogicalPlan) -> Option<(&Window, Option<Vec<Expr>
         _ => return None,
     };
     Some((window, Some(projection.expr.clone())))
+}
+
+fn output_mapping_for_projection(
+    projection: &[Expr],
+    rank_column: &str,
+    join: &Join,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+) -> Option<Vec<JoinTopNOutputMappingPlan>> {
+    let left_relations = relation_names_for_plan(join.left.as_ref());
+    let right_relations = relation_names_for_plan(join.right.as_ref());
+    projection
+        .iter()
+        .map(|expr| {
+            output_mapping_for_projection_expr(
+                expr,
+                rank_column,
+                left_schema,
+                right_schema,
+                &left_relations,
+                &right_relations,
+            )
+        })
+        .collect()
+}
+
+fn output_mapping_for_projection_expr(
+    expr: &Expr,
+    rank_column: &str,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    left_relations: &BTreeSet<String>,
+    right_relations: &BTreeSet<String>,
+) -> Option<JoinTopNOutputMappingPlan> {
+    match expr {
+        Expr::Column(column) if column.name == rank_column => {
+            Some(JoinTopNOutputMappingPlan::RowNumberOne)
+        }
+        Expr::Column(column) => {
+            if let Some(relation) = column.relation.as_ref().map(ToString::to_string) {
+                let in_left = left_relations.contains(&relation);
+                let in_right = right_relations.contains(&relation);
+                return match (in_left, in_right) {
+                    (true, false) => Some(JoinTopNOutputMappingPlan::Left(column.name.clone())),
+                    (false, true) => Some(JoinTopNOutputMappingPlan::Right(column.name.clone())),
+                    _ => None,
+                };
+            }
+            let in_left = left_schema.index_of(&column.name).is_ok();
+            let in_right = right_schema.index_of(&column.name).is_ok();
+            match (in_left, in_right) {
+                (true, false) => Some(JoinTopNOutputMappingPlan::Left(column.name.clone())),
+                (false, true) => Some(JoinTopNOutputMappingPlan::Right(column.name.clone())),
+                _ => None,
+            }
+        }
+        Expr::Alias(alias) if alias.name == rank_column => {
+            Some(JoinTopNOutputMappingPlan::RowNumberOne)
+        }
+        Expr::Alias(alias) => output_mapping_for_projection_expr(
+            alias.expr.as_ref(),
+            rank_column,
+            left_schema,
+            right_schema,
+            left_relations,
+            right_relations,
+        ),
+        _ => None,
+    }
+}
+
+fn relation_names_for_plan(plan: &LogicalPlan) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    collect_relation_names(plan, &mut out);
+    out
+}
+
+fn collect_relation_names(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    match plan {
+        LogicalPlan::TableScan(scan) => {
+            out.insert(scan.table_name.to_string());
+            out.insert(scan.table_name.table().to_string());
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            out.insert(alias.alias.to_string());
+            out.insert(alias.alias.table().to_string());
+            collect_relation_names(alias.input.as_ref(), out);
+        }
+        LogicalPlan::Projection(projection) => {
+            collect_relation_names(projection.input.as_ref(), out)
+        }
+        LogicalPlan::Filter(filter) => collect_relation_names(filter.input.as_ref(), out),
+        LogicalPlan::Repartition(repartition) => {
+            collect_relation_names(repartition.input.as_ref(), out)
+        }
+        LogicalPlan::Window(window) => collect_relation_names(window.input.as_ref(), out),
+        LogicalPlan::Sort(sort) => collect_relation_names(sort.input.as_ref(), out),
+        LogicalPlan::Limit(limit) => collect_relation_names(limit.input.as_ref(), out),
+        _ => {}
+    }
 }
 
 fn strip_passthrough_wrappers(mut plan: &LogicalPlan) -> &LogicalPlan {
@@ -1414,17 +1701,39 @@ fn column_name(expr: &Expr) -> Option<String> {
     }
 }
 
-fn window_partitions_by_join_key(window: &Window, left_key_column: &str) -> bool {
-    window.window_expr.iter().all(|expr| {
+fn left_partition_columns_by_join_key(
+    window: &Window,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    left_key_column: &str,
+) -> Option<Vec<String>> {
+    let mut accepted = None;
+    for expr in &window.window_expr {
         let Expr::WindowFunction(window) = strip_alias(expr) else {
-            return false;
+            return None;
         };
-        window.params.partition_by.len() == 1
-            && matches!(
-                strip_alias(&window.params.partition_by[0]),
-                Expr::Column(column) if column.name == left_key_column
-            )
-    })
+        let mut columns = Vec::with_capacity(window.params.partition_by.len());
+        for partition_expr in &window.params.partition_by {
+            let Expr::Column(column) = strip_alias(partition_expr) else {
+                return None;
+            };
+            let in_left = left_schema.index_of(&column.name).is_ok();
+            let in_right = right_schema.index_of(&column.name).is_ok();
+            if !in_left || in_right {
+                return None;
+            }
+            columns.push(column.name.clone());
+        }
+        if !columns.iter().any(|column| column == left_key_column) {
+            return None;
+        }
+        match accepted.as_ref() {
+            Some(accepted) if accepted != &columns => return None,
+            Some(_) => {}
+            None => accepted = Some(columns),
+        }
+    }
+    accepted
 }
 
 fn strip_alias(expr: &Expr) -> &Expr {

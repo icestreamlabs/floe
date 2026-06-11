@@ -370,6 +370,9 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         } else if let Some(join_topn) =
             columnar_join_topn_plan_for_plan(aggregate.input.as_ref(), sources)?
         {
+            if join_topn.is_partitioned_best_bid() {
+                return Ok(None);
+            }
             let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
             let projection_input_schema = derived_projection_input_schema(&source_schema);
             let input_name = derived_relation_name(aggregate.input.as_ref())
