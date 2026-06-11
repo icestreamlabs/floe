@@ -1320,6 +1320,7 @@ async fn build_boxed_grouped_stats_join_input_state(
                 plan,
                 sources,
                 udfs,
+                true,
             ),
         )
         .await?,

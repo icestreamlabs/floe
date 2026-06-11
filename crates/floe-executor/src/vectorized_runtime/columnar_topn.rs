@@ -466,6 +466,7 @@ async fn build_boxed_grouped_stats_topn_input_state(
             plan,
             sources,
             udfs,
+            true,
         )
         .await?,
     ))

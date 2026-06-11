@@ -1,4 +1,5 @@
 pub mod checkpoint;
+mod columnar_snapshot;
 mod context;
 pub mod dbsp_bridge;
 pub mod dbsp_plan;

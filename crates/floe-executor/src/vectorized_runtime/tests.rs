@@ -154,6 +154,23 @@ fn id_count_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     rows
 }
 
+fn id_count_sum_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let ids = int64_values(batch, 0);
+        let counts = int64_values(batch, 1);
+        let sums = int64_values(batch, 2);
+        rows.extend(
+            ids.into_iter()
+                .zip(counts)
+                .zip(sums)
+                .map(|((id, count), sum)| (id, count, sum)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn bool_count_rows(batches: &[RecordBatch]) -> Vec<(bool, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -3055,6 +3072,214 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
         grouped_stats_rows(&snapshot),
         vec![(1, 2, 2, 10, 30, 20.0, 40), (2, 1, 0, 100, 100, 100.0, 100),]
     );
+}
+
+#[tokio::test]
+async fn grouped_stats_can_publish_columnar_versions_without_arrow_snapshots() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 30, 100])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-stats-no-arrow").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("sum_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT auction, COUNT(*) AS total_bids, SUM(price) AS sum_price \
+        FROM bids GROUP BY auction";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_operator_state_table(table)
+            .without_grouped_stats_arrow_snapshots(),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_bid_stats").expect("materialized view");
+    assert!(handle.arrow_snapshot_for(1).is_none());
+    assert_eq!(handle.authoritative_row_count_for(1), Some(2));
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&registry),
+        "mv_bid_stats",
+        Arc::clone(&output_schema),
+        "SELECT auction, total_bids, sum_price FROM mv_bid_stats",
+    )
+    .await;
+    assert_eq!(id_count_sum_rows(&snapshot), vec![(1, 2, 40), (2, 1, 100)]);
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![50])),
+        ],
+    )
+    .expect("source insert rows");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append source rows");
+    runtime.run_tick(2).await.expect("insert tick");
+
+    assert!(handle.arrow_snapshot_for(2).is_none());
+    assert_eq!(handle.authoritative_row_count_for(2), Some(2));
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&registry),
+        "mv_bid_stats",
+        output_schema,
+        "SELECT auction, total_bids, sum_price FROM mv_bid_stats",
+    )
+    .await;
+    assert_eq!(id_count_sum_rows(&snapshot), vec![(1, 3, 90), (2, 1, 100)]);
+    let delta = handle.arrow_delta_for(2).expect("mv delta");
+    assert_eq!(weighted_id_count_rows(&delta), vec![(1, 2, -1), (1, 3, 1)]);
+}
+
+#[tokio::test]
+async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition")
+    .with_property(SOURCE_APPEND_ONLY_PROPERTY, "true");
+    let schema = definition.to_arrow_schema();
+    let group_count = 1024_i64;
+    let auctions = (0..group_count).collect::<Vec<_>>();
+    let prices = auctions
+        .iter()
+        .map(|auction| auction * 10)
+        .collect::<Vec<_>>();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(auctions.clone())),
+            Arc::new(Int64Array::from(prices)),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table =
+        build_operator_state_table("vectorized-columnar-grouped-stats-dense-compact-snapshot")
+            .await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("sum_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT auction, COUNT(*) AS total_bids, SUM(price) AS sum_price \
+        FROM bids GROUP BY auction";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_operator_state_table(Arc::clone(&table))
+            .without_grouped_stats_arrow_snapshots(),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_bid_stats").expect("materialized view");
+    assert!(handle.arrow_snapshot_for(1).is_none());
+    assert_eq!(
+        handle.authoritative_row_count_for(1),
+        Some(group_count as usize)
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_operator_state_table(table)
+            .without_grouped_stats_arrow_snapshots(),
+    )
+    .await
+    .expect("recovered runtime");
+
+    let insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![7])),
+            Arc::new(Int64Array::from(vec![7000])),
+        ],
+    )
+    .expect("recovered source insert batch");
+    recovered
+        .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
+        .await
+        .expect("append recovered source rows");
+    recovered.run_tick(2).await.expect("recovered tick");
+
+    let snapshot = scan_materialized_view_table(
+        Arc::clone(&recovery_registry),
+        "mv_bid_stats",
+        output_schema,
+        "SELECT auction, total_bids, sum_price FROM mv_bid_stats WHERE auction = 7",
+    )
+    .await;
+    assert_eq!(id_count_sum_rows(&snapshot), vec![(7, 2, 7070)]);
 }
 
 #[tokio::test]

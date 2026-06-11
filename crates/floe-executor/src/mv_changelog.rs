@@ -363,6 +363,12 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     if let Some(snapshot) = mv.arrow_snapshot_for(version) {
         return arrow_snapshot_batches_to_changelog(snapshot, schema, version, version_time);
     }
+    if let Some(snapshot) = mv
+        .columnar_snapshot_for(Arc::clone(&schema), version)
+        .await?
+    {
+        return arrow_snapshot_batches_to_changelog(snapshot, schema, version, version_time);
+    }
     let snapshot = mv.snapshot_for(version).await?;
     let batches = encoded_snapshot_to_arrow_batches(&snapshot, Arc::clone(&schema), None)?;
     snapshot_batches_to_changelog(batches, schema, version, version_time)

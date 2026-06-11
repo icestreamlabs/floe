@@ -539,7 +539,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         durable_table_source_names.clone()
     };
     let mut vectorized_runtime_options = VectorizedExecutionRuntimeOptions::default()
-        .with_operator_state_table(checkpoint_manager.store().table());
+        .with_operator_state_table(checkpoint_manager.store().table())
+        .without_grouped_stats_arrow_snapshots();
     if !source_query_table_names.is_empty() {
         vectorized_runtime_options = vectorized_runtime_options
             .with_source_query_tables_for(source_query_table_names.clone());

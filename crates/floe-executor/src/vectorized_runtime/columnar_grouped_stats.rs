@@ -28,9 +28,10 @@ use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
 use crate::encoding::EncodedRowScalar;
-use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
@@ -82,6 +83,9 @@ const COMPACT_AGG_I64_TAG: u8 = 1;
 const COMPACT_AGG_PAIR_TAG: u8 = 2;
 const COMPACT_AGG_MINMAX_NONE_TAG: u8 = 3;
 const COMPACT_AGG_MINMAX_I64_TAG: u8 = 4;
+const COMPACT_SNAPSHOT_MAGIC: &[u8; 4] = b"cgss";
+const COMPACT_SNAPSHOT_VERSION: u8 = 1;
+const COMPACT_SNAPSHOT_DENSE_WRITE_MIN_GROUPS: usize = 1024;
 
 pub(super) struct ColumnarGroupedStatsPlan {
     input: ColumnarGroupedStatsInputPlan,
@@ -170,6 +174,8 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     input_snapshot: Vec<RecordBatch>,
     output_zset: SlateBackedColumnarZSet,
     stats_state: SlateGroupedStatsState,
+    publish_arrow_snapshots: bool,
+    row_count: i64,
     projection_delta: GroupedStatsProjectionState,
     projection_schema: SchemaRef,
     aggregate_schema: SchemaRef,
@@ -253,6 +259,7 @@ fn compact_grouped_stats_specs(specs: &[AggregateSpec]) -> Option<Vec<AggregateS
 struct SlateGroupedStatsState {
     table: Arc<dyn KeyValueTable>,
     key_prefix: Vec<u8>,
+    compact_snapshot_key: Vec<u8>,
     assume_empty: bool,
     compact_specs: Option<Vec<AggregateSpec>>,
     group_counts: Mutex<HashMap<Vec<u8>, i64>>,
@@ -265,8 +272,13 @@ struct SlateGroupedStatsState {
     i128_value_counts: Mutex<HashMap<(Vec<u8>, usize, i128), i64>>,
     string_minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<String>>>,
     string_value_counts: Mutex<HashMap<(Vec<u8>, usize, String), i64>>,
-    compact_values: Mutex<HashMap<Vec<u8>, CompactGroupState>>,
+    compact_values: Mutex<CompactGroupStateMap>,
+    compact_snapshot_loaded: Mutex<bool>,
+    compact_snapshot_active: Mutex<bool>,
 }
+
+type PendingStatsGroupDeltas = HashMap<Vec<u8>, PendingStatsGroupDelta>;
+type CompactGroupStateMap = HashMap<Vec<u8>, CompactGroupState>;
 
 #[derive(Clone)]
 struct CompactGroupState {
@@ -304,6 +316,7 @@ struct PendingStatsGroupDelta {
 pub(super) struct ColumnarGroupedStatsTick {
     pub(super) delta: ColumnarZSet,
     pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) row_count_delta: i64,
     pub(super) input_changed: bool,
 }
 
@@ -658,6 +671,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state(
     plan: ColumnarGroupedStatsPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
+    publish_arrow_snapshots: bool,
 ) -> Result<ColumnarGroupedStatsMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
     build_columnar_grouped_stats_materialized_view_state_in_namespace(
@@ -667,6 +681,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state(
         plan,
         sources,
         udfs,
+        publish_arrow_snapshots,
     )
     .await
 }
@@ -678,6 +693,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
     plan: ColumnarGroupedStatsPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
+    publish_arrow_snapshots: bool,
 ) -> Result<ColumnarGroupedStatsMaterializedViewState> {
     let output_namespace = format!("{mv_namespace}/columnar/grouped_stats/output");
     let state_namespace = format!("{mv_namespace}/columnar/grouped_stats/state");
@@ -688,12 +704,12 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
     )
     .await
     .context("initialize SlateDB-backed grouped-stats output zset")?;
-    let initial_snapshot = snapshot_batches_from_zset(
-        &output_zset
-            .materialize_columnar()
-            .await
-            .context("load grouped-stats output snapshot")?,
-    )?;
+    let initial_output = output_zset
+        .materialize_columnar()
+        .await
+        .context("load grouped-stats output snapshot")?;
+    let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
+    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
     let append_only_input = plan.append_only_input;
     let (
         input_name,
@@ -1081,6 +1097,8 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         ),
         output_zset,
         projection_delta,
+        publish_arrow_snapshots,
+        row_count: initial_row_count,
         projection_schema: plan.projection_schema,
         aggregate_schema: plan.aggregate_schema,
         post_aggregate,
@@ -1200,6 +1218,7 @@ async fn build_boxed_grouped_stats_grouped_stats_input_state(
                 plan,
                 sources,
                 udfs,
+                true,
             ),
         )
         .await?,
@@ -1298,15 +1317,38 @@ pub(super) async fn run_columnar_grouped_stats_materialized_view_tick(
         .iter()
         .map(RecordBatch::num_rows)
         .sum::<usize>();
-    let snapshot_rows = tick
-        .next_snapshot
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum::<usize>();
     let input_changed = tick.input_changed;
+    columnar.row_count = columnar.row_count.saturating_add(tick.row_count_delta);
+    if columnar.row_count < 0 {
+        bail!(
+            "grouped-stats columnar materialized view '{}' row count became negative",
+            mv.view_name
+        );
+    }
+    let snapshot_rows =
+        usize::try_from(columnar.row_count).context("grouped-stats row count exceeds usize")?;
     let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = tick.next_snapshot;
+    if columnar.publish_arrow_snapshots {
+        handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+        mv.previous_snapshot = tick.next_snapshot;
+    } else if let Some(zset_handle) = columnar.output_zset.current_handle() {
+        handle.publish_columnar_version(
+            version,
+            zset_handle,
+            ColumnarMaterializedViewStorage::new(
+                Arc::clone(&columnar.stats_state.table),
+                Arc::clone(&mv.output_schema),
+            ),
+            snapshot_rows,
+            delta_batches,
+        );
+    } else {
+        handle.publish_arrow_version(
+            version,
+            vec![RecordBatch::new_empty(Arc::clone(&mv.output_schema))],
+            delta_batches,
+        );
+    }
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -1359,17 +1401,25 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
     let persisted_output_delta = output_delta;
 
     let delta_batches = persisted_output_delta.batches().to_vec();
-    let phase_start = profile::start();
-    let next_snapshot =
-        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
-            .await
-            .context("apply Slate-backed grouped-stats columnar snapshot delta")?;
-    profile::record_since("grouped_stats.output_snapshot_delta", phase_start);
+    let row_count_delta = columnar_zset_weight_sum(&persisted_output_delta)
+        .context("compute grouped-stats output row-count delta")?;
+    let next_snapshot = if columnar.publish_arrow_snapshots {
+        let phase_start = profile::start();
+        let next_snapshot =
+            apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
+                .await
+                .context("apply Slate-backed grouped-stats columnar snapshot delta")?;
+        profile::record_since("grouped_stats.output_snapshot_delta", phase_start);
+        next_snapshot
+    } else {
+        Vec::new()
+    };
 
     profile::record_since("grouped_stats.total", total_start);
     Ok(ColumnarGroupedStatsTick {
         delta: persisted_output_delta,
         next_snapshot,
+        row_count_delta,
         input_changed,
     })
 }
@@ -1638,8 +1688,9 @@ async fn prepare_topn_grouped_stats_input_delta(
 async fn grouped_stats_pending_delta(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     input_batches: &[RecordBatch],
-) -> Result<HashMap<Vec<u8>, PendingStatsGroupDelta>> {
-    let mut pending = HashMap::new();
+) -> Result<PendingStatsGroupDeltas> {
+    let input_row_count = input_batches.iter().map(RecordBatch::num_rows).sum();
+    let mut pending = PendingStatsGroupDeltas::with_capacity(input_row_count);
     if input_batches.is_empty() {
         return Ok(pending);
     }
@@ -1708,7 +1759,7 @@ fn add_projected_stats_batches_to_pending(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     batches: &[RecordBatch],
     sign: i64,
-    pending: &mut HashMap<Vec<u8>, PendingStatsGroupDelta>,
+    pending: &mut PendingStatsGroupDeltas,
 ) -> Result<()> {
     if batches.is_empty() {
         return Ok(());
@@ -1775,7 +1826,7 @@ fn add_projected_stats_row_to_pending(
     value_arrays: &[ProjectedValueArray<'_>],
     filter_arrays: &[Option<&BooleanArray>],
     sign: i64,
-    pending: &mut HashMap<Vec<u8>, PendingStatsGroupDelta>,
+    pending: &mut PendingStatsGroupDeltas,
 ) -> Result<()> {
     let group = pending
         .entry(key)
@@ -1905,7 +1956,7 @@ fn add_projected_stats_row_to_pending(
 
 async fn apply_grouped_stats_delta(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
-    pending: HashMap<Vec<u8>, PendingStatsGroupDelta>,
+    pending: PendingStatsGroupDeltas,
 ) -> Result<Vec<RecordBatch>> {
     let mut direct_builder = WeightedStatsOutputBuilder::new(
         columnar.output_zset.value_schema(),
@@ -2020,12 +2071,19 @@ async fn apply_grouped_stats_delta(
 
 async fn apply_append_only_compact_grouped_stats_delta(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
-    pending: HashMap<Vec<u8>, PendingStatsGroupDelta>,
+    pending: PendingStatsGroupDeltas,
     mut direct_builder: WeightedStatsOutputBuilder,
     mut old_aggregate_builder: AggregateStatsOutputBuilder,
     mut new_aggregate_builder: AggregateStatsOutputBuilder,
 ) -> Result<Vec<RecordBatch>> {
     let mut writes = WriteBatch::new();
+    columnar
+        .stats_state
+        .load_compact_snapshot_if_needed()
+        .await?;
+    let write_compact_snapshot = columnar
+        .stats_state
+        .should_write_compact_snapshot(pending.len())?;
     for (group_key, delta) in pending {
         let phase_start = profile::start();
         let old_state = load_compact_or_legacy_group_state(columnar, &group_key).await?;
@@ -2046,9 +2104,15 @@ async fn apply_append_only_compact_grouped_stats_delta(
             &mut new_state,
             &delta.agg_deltas,
         )?;
-        columnar
-            .stats_state
-            .write_compact_state(&mut writes, &group_key, new_state.clone())?;
+        if write_compact_snapshot {
+            columnar
+                .stats_state
+                .cache_compact_state(&group_key, new_state.clone())?;
+        } else {
+            columnar
+                .stats_state
+                .write_compact_state(&mut writes, &group_key, new_state.clone())?;
+        }
         profile::record_since("grouped_stats.apply_update_state", phase_start);
 
         let phase_start = profile::start();
@@ -2095,6 +2159,12 @@ async fn apply_append_only_compact_grouped_stats_delta(
     };
     profile::record_since("grouped_stats.apply_finish_output", phase_start);
 
+    if write_compact_snapshot {
+        let phase_start = profile::start();
+        columnar.stats_state.write_compact_snapshot(&mut writes)?;
+        profile::record_since("grouped_stats.apply_snapshot_state", phase_start);
+    }
+
     let phase_start = profile::start();
     columnar
         .stats_state
@@ -2112,6 +2182,9 @@ async fn load_compact_or_legacy_group_state(
 ) -> Result<CompactGroupState> {
     if let Some(state) = columnar.stats_state.load_compact_state(group_key).await? {
         return Ok(state);
+    }
+    if columnar.stats_state.compact_snapshot_active()? {
+        return empty_compact_group_state(columnar);
     }
     if columnar.stats_state.assume_empty {
         return empty_compact_group_state(columnar);
@@ -3039,9 +3112,13 @@ impl SlateGroupedStatsState {
         assume_empty: bool,
         compact_specs: Option<Vec<AggregateSpec>>,
     ) -> Self {
+        let key_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace);
+        let mut compact_snapshot_key = key_prefix.clone();
+        compact_snapshot_key.extend_from_slice(b"compact_snapshot/current");
         Self {
             table,
-            key_prefix: keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace),
+            key_prefix,
+            compact_snapshot_key,
             assume_empty,
             compact_specs,
             group_counts: Mutex::new(HashMap::new()),
@@ -3054,12 +3131,86 @@ impl SlateGroupedStatsState {
             i128_value_counts: Mutex::new(HashMap::new()),
             string_minmax_values: Mutex::new(HashMap::new()),
             string_value_counts: Mutex::new(HashMap::new()),
-            compact_values: Mutex::new(HashMap::new()),
+            compact_values: Mutex::new(CompactGroupStateMap::new()),
+            compact_snapshot_loaded: Mutex::new(false),
+            compact_snapshot_active: Mutex::new(false),
         }
     }
 
     fn compact_enabled(&self) -> bool {
         self.compact_specs.is_some()
+    }
+
+    async fn load_compact_snapshot_if_needed(&self) -> Result<bool> {
+        let Some(specs) = self.compact_specs.as_ref() else {
+            return Ok(false);
+        };
+        if *self
+            .compact_snapshot_loaded
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats compact snapshot loaded flag poisoned"))?
+        {
+            return self.compact_snapshot_active();
+        }
+        if self.assume_empty {
+            *self.compact_snapshot_loaded.lock().map_err(|_| {
+                anyhow::anyhow!("grouped-stats compact snapshot loaded flag poisoned")
+            })? = true;
+            return Ok(false);
+        }
+
+        let snapshot = self
+            .table
+            .get_bytes(&self.compact_snapshot_key)
+            .await
+            .context("read grouped-stats compact state snapshot")?;
+        let active = if let Some(bytes) = snapshot {
+            let values = decode_compact_group_snapshot(specs, bytes.as_ref())?;
+            *self
+                .compact_values
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))? =
+                values;
+            true
+        } else {
+            false
+        };
+        *self.compact_snapshot_loaded.lock().map_err(|_| {
+            anyhow::anyhow!("grouped-stats compact snapshot loaded flag poisoned")
+        })? = true;
+        *self.compact_snapshot_active.lock().map_err(|_| {
+            anyhow::anyhow!("grouped-stats compact snapshot active flag poisoned")
+        })? = active;
+        Ok(active)
+    }
+
+    fn compact_snapshot_active(&self) -> Result<bool> {
+        self.compact_snapshot_active
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats compact snapshot active flag poisoned"))
+            .map(|active| *active)
+    }
+
+    fn should_write_compact_snapshot(&self, dirty_groups: usize) -> Result<bool> {
+        if self.compact_specs.is_none() {
+            return Ok(false);
+        }
+        if self.compact_snapshot_active()? {
+            return Ok(true);
+        }
+        if !self.assume_empty {
+            return Ok(false);
+        }
+        if dirty_groups < COMPACT_SNAPSHOT_DENSE_WRITE_MIN_GROUPS {
+            return Ok(false);
+        }
+        let cached_groups = self
+            .compact_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?
+            .len();
+        let state_groups = cached_groups.max(dirty_groups);
+        Ok(dirty_groups.saturating_mul(2) >= state_groups)
     }
 
     async fn load_compact_state(&self, group_key: &[u8]) -> Result<Option<CompactGroupState>> {
@@ -3076,6 +3227,19 @@ impl SlateGroupedStatsState {
         let Some(specs) = self.compact_specs.as_ref() else {
             return Ok(None);
         };
+        let snapshot_active = self.load_compact_snapshot_if_needed().await?;
+        if let Some(value) = self
+            .compact_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(Some(value));
+        }
+        if snapshot_active {
+            return Ok(None);
+        }
         if self.assume_empty {
             return Ok(None);
         }
@@ -3093,6 +3257,38 @@ impl SlateGroupedStatsState {
             .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?
             .insert(cache_key, value.clone());
         Ok(Some(value))
+    }
+
+    fn cache_compact_state(&self, group_key: &[u8], state: CompactGroupState) -> Result<()> {
+        let mut values = self
+            .compact_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?;
+        if state.row_count == 0 {
+            values.remove(group_key);
+        } else {
+            values.insert(group_key.to_vec(), state);
+        }
+        Ok(())
+    }
+
+    fn write_compact_snapshot(&self, batch: &mut WriteBatch) -> Result<()> {
+        let values = self
+            .compact_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?
+            .clone();
+        batch.put_bytes(
+            Bytes::from(self.compact_snapshot_key.clone()),
+            Bytes::from(encode_compact_group_snapshot(&values)?),
+        );
+        *self.compact_snapshot_loaded.lock().map_err(|_| {
+            anyhow::anyhow!("grouped-stats compact snapshot loaded flag poisoned")
+        })? = true;
+        *self.compact_snapshot_active.lock().map_err(|_| {
+            anyhow::anyhow!("grouped-stats compact snapshot active flag poisoned")
+        })? = true;
+        Ok(())
     }
 
     fn write_compact_state(
@@ -3192,7 +3388,7 @@ impl SlateGroupedStatsState {
             self.cache_group_count(group_key, state.row_count)?;
             return Ok(state.row_count);
         }
-        if self.assume_empty {
+        if self.assume_empty || self.compact_snapshot_active()? {
             return Ok(0);
         }
         let value = self
@@ -3236,7 +3432,7 @@ impl SlateGroupedStatsState {
             self.cache_i64(group_key, agg_idx, *value)?;
             return Ok(*value);
         }
-        if self.assume_empty {
+        if self.assume_empty || self.compact_snapshot_active()? {
             return Ok(0);
         }
         let value = self
@@ -3328,7 +3524,7 @@ impl SlateGroupedStatsState {
             self.cache_pair(group_key, agg_idx, *sum, *count)?;
             return Ok((*sum, *count));
         }
-        if self.assume_empty {
+        if self.assume_empty || self.compact_snapshot_active()? {
             return Ok((0, 0));
         }
         let Some(bytes) = self
@@ -3388,7 +3584,7 @@ impl SlateGroupedStatsState {
             self.cache_minmax(group_key, agg_idx, *value)?;
             return Ok(*value);
         }
-        if self.assume_empty {
+        if self.assume_empty || self.compact_snapshot_active()? {
             return Ok(None);
         }
         let Some(bytes) = self
@@ -5023,6 +5219,67 @@ fn decode_compact_group_state(specs: &[AggregateSpec], bytes: &[u8]) -> Result<C
     })
 }
 
+fn encode_compact_group_snapshot(values: &CompactGroupStateMap) -> Result<Vec<u8>> {
+    let mut entries = values
+        .iter()
+        .filter(|(_, state)| state.row_count != 0)
+        .collect::<Vec<_>>();
+    let entry_count = u32::try_from(entries.len())
+        .context("grouped-stats compact snapshot entry count exceeds u32")?;
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut bytes = Vec::with_capacity(COMPACT_SNAPSHOT_MAGIC.len() + 1 + 4 + values.len() * 32);
+    bytes.extend_from_slice(COMPACT_SNAPSHOT_MAGIC);
+    bytes.push(COMPACT_SNAPSHOT_VERSION);
+    bytes.extend_from_slice(&entry_count.to_be_bytes());
+    for (group_key, state) in entries {
+        if state.row_count == 0 {
+            continue;
+        }
+        let group_key_len = u32::try_from(group_key.len())
+            .context("grouped-stats compact snapshot group key length exceeds u32")?;
+        let state_bytes = encode_compact_group_state(state)?;
+        let state_len = u32::try_from(state_bytes.len())
+            .context("grouped-stats compact snapshot state length exceeds u32")?;
+        bytes.extend_from_slice(&group_key_len.to_be_bytes());
+        bytes.extend_from_slice(group_key);
+        bytes.extend_from_slice(&state_len.to_be_bytes());
+        bytes.extend_from_slice(&state_bytes);
+    }
+    Ok(bytes)
+}
+
+fn decode_compact_group_snapshot(
+    specs: &[AggregateSpec],
+    bytes: &[u8],
+) -> Result<CompactGroupStateMap> {
+    let mut offset = 0;
+    let magic = compact_take(bytes, &mut offset, COMPACT_SNAPSHOT_MAGIC.len())?;
+    if magic != COMPACT_SNAPSHOT_MAGIC {
+        bail!("invalid grouped-stats compact snapshot magic");
+    }
+    let version = compact_read_u8(bytes, &mut offset)?;
+    if version != COMPACT_SNAPSHOT_VERSION {
+        bail!("unsupported grouped-stats compact snapshot version {version}");
+    }
+    let entry_count = compact_read_u32(bytes, &mut offset)? as usize;
+    let mut values = CompactGroupStateMap::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let group_key_len = compact_read_u32(bytes, &mut offset)? as usize;
+        let group_key = compact_take(bytes, &mut offset, group_key_len)?.to_vec();
+        let state_len = compact_read_u32(bytes, &mut offset)? as usize;
+        let state =
+            decode_compact_group_state(specs, compact_take(bytes, &mut offset, state_len)?)?;
+        if state.row_count != 0 && values.insert(group_key, state).is_some() {
+            bail!("duplicate grouped-stats compact snapshot group key");
+        }
+    }
+    if offset != bytes.len() {
+        bail!("grouped-stats compact snapshot has trailing bytes");
+    }
+    Ok(values)
+}
+
 fn compact_aggregate_state_matches_spec(
     state: &CompactAggregateState,
     spec: &AggregateSpec,
@@ -5061,6 +5318,13 @@ fn compact_read_u16(bytes: &[u8], offset: &mut usize) -> Result<u16> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("grouped-stats compact state expected u16"))?;
     Ok(u16::from_be_bytes(value))
+}
+
+fn compact_read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    let value: [u8; 4] = compact_take(bytes, offset, 4)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("grouped-stats compact state expected u32"))?;
+    Ok(u32::from_be_bytes(value))
 }
 
 fn compact_read_i64(bytes: &[u8], offset: &mut usize) -> Result<i64> {

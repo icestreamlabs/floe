@@ -2,20 +2,18 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::Context;
-use datafusion::arrow::array::{Array, Int64Array};
 #[cfg(test)]
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
+use dbsp::collections::SlateBackedColumnarZSet;
 
+use crate::columnar_snapshot::{columnar_zset_positive_row_count, columnar_zset_to_arrow_snapshot};
 use crate::encoded_batch::{encoded_snapshot_row_count, encoded_snapshot_to_arrow_batches};
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::mv::runtime::MaterializedView;
-use crate::scalar_array_builder::ScalarColumnBuilder;
 
 use super::MV_VERSION_COLUMN;
 use super::SnapshotScanExec;
@@ -24,8 +22,6 @@ use super::helpers::{
     append_mv_version_field, build_batches_from_arrow_snapshot,
     build_constant_u64_projection_batches,
 };
-
-const COLUMNAR_SCAN_BATCH_ROW_LIMIT: usize = 4096;
 
 #[derive(Clone)]
 pub struct MaterializedViewTableProvider {
@@ -321,116 +317,6 @@ impl MaterializedViewTableProvider {
         }
         Ok(None)
     }
-}
-
-fn columnar_zset_positive_row_count(zset: &ColumnarZSet) -> anyhow::Result<usize> {
-    let mut row_count = 0usize;
-    for batch in zset.batches() {
-        let weights = batch
-            .column(zset.value_column_count())
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-        for row_idx in 0..weights.len() {
-            let weight = weights.value(row_idx);
-            if weight < 0 {
-                anyhow::bail!("columnar zset materialized snapshot contains negative weight");
-            }
-            row_count = row_count.saturating_add(
-                usize::try_from(weight).context("columnar zset row weight exceeds usize")?,
-            );
-        }
-    }
-    Ok(row_count)
-}
-
-fn columnar_zset_to_arrow_snapshot(
-    zset: &ColumnarZSet,
-    schema: datafusion::arrow::datatypes::SchemaRef,
-    limit: Option<usize>,
-) -> anyhow::Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
-    let mut output = Vec::new();
-    let mut builders = snapshot_output_builders(&schema)?;
-    let mut buffered_rows = 0usize;
-    let mut emitted_rows = 0usize;
-    let max_rows = limit.unwrap_or(usize::MAX);
-
-    'batches: for batch in zset.batches() {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let weights = batch
-            .column(zset.value_column_count())
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-        for row_idx in 0..batch.num_rows() {
-            let weight = weights.value(row_idx);
-            if weight < 0 {
-                anyhow::bail!("columnar zset materialized snapshot contains negative weight");
-            }
-            let repeat =
-                usize::try_from(weight).context("columnar zset row weight exceeds usize")?;
-            for _ in 0..repeat {
-                if emitted_rows == max_rows {
-                    break 'batches;
-                }
-                append_snapshot_row(&mut builders, batch, row_idx, zset.value_column_count())?;
-                buffered_rows = buffered_rows.saturating_add(1);
-                emitted_rows = emitted_rows.saturating_add(1);
-                if buffered_rows == COLUMNAR_SCAN_BATCH_ROW_LIMIT {
-                    output.push(finish_snapshot_batch(&schema, &mut builders)?);
-                    buffered_rows = 0;
-                }
-            }
-        }
-    }
-
-    if buffered_rows > 0 {
-        output.push(finish_snapshot_batch(&schema, &mut builders)?);
-    }
-    if output.is_empty() {
-        output.push(datafusion::arrow::record_batch::RecordBatch::new_empty(
-            schema,
-        ));
-    }
-    Ok(output)
-}
-
-fn snapshot_output_builders(
-    schema: &datafusion::arrow::datatypes::SchemaRef,
-) -> anyhow::Result<Vec<ScalarColumnBuilder>> {
-    schema
-        .fields()
-        .iter()
-        .map(|field| ScalarColumnBuilder::new(field.data_type(), COLUMNAR_SCAN_BATCH_ROW_LIMIT))
-        .collect()
-}
-
-fn append_snapshot_row(
-    builders: &mut [ScalarColumnBuilder],
-    batch: &datafusion::arrow::record_batch::RecordBatch,
-    row_idx: usize,
-    value_column_count: usize,
-) -> anyhow::Result<()> {
-    for column_idx in 0..value_column_count {
-        builders[column_idx].append_array_value(batch.column(column_idx).as_ref(), row_idx)?;
-    }
-    Ok(())
-}
-
-fn finish_snapshot_batch(
-    schema: &datafusion::arrow::datatypes::SchemaRef,
-    builders: &mut [ScalarColumnBuilder],
-) -> anyhow::Result<datafusion::arrow::record_batch::RecordBatch> {
-    let arrays = builders
-        .iter_mut()
-        .map(ScalarColumnBuilder::finish_array)
-        .collect::<Vec<_>>();
-    Ok(datafusion::arrow::record_batch::RecordBatch::try_new(
-        Arc::clone(schema),
-        arrays,
-    )?)
 }
 
 impl fmt::Debug for MaterializedViewTableProvider {

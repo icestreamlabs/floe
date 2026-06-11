@@ -180,11 +180,23 @@ pub enum VectorizedMaterializedViewExecutionPolicy {
     AllowFullRefresh,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct VectorizedExecutionRuntimeOptions {
     pub maintain_source_query_tables: bool,
     pub source_query_table_names: Option<BTreeSet<String>>,
     pub operator_state_table: Option<Arc<dyn KeyValueTable>>,
+    pub publish_grouped_stats_arrow_snapshots: bool,
+}
+
+impl Default for VectorizedExecutionRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            maintain_source_query_tables: false,
+            source_query_table_names: None,
+            operator_state_table: None,
+            publish_grouped_stats_arrow_snapshots: true,
+        }
+    }
 }
 
 impl VectorizedExecutionRuntimeOptions {
@@ -206,6 +218,11 @@ impl VectorizedExecutionRuntimeOptions {
 
     pub fn with_operator_state_table(mut self, table: Arc<dyn KeyValueTable>) -> Self {
         self.operator_state_table = Some(table);
+        self
+    }
+
+    pub fn without_grouped_stats_arrow_snapshots(mut self) -> Self {
+        self.publish_grouped_stats_arrow_snapshots = false;
         self
     }
 
@@ -234,6 +251,10 @@ impl std::fmt::Debug for VectorizedExecutionRuntimeOptions {
             .field(
                 "operator_state_table",
                 &self.operator_state_table.as_ref().map(|_| "SlateDB"),
+            )
+            .field(
+                "publish_grouped_stats_arrow_snapshots",
+                &self.publish_grouped_stats_arrow_snapshots,
             )
             .finish()
     }
@@ -713,6 +734,7 @@ impl VectorizedExecutionRuntime {
                         plan,
                         &source_states,
                         &udfs,
+                        options.publish_grouped_stats_arrow_snapshots,
                     )
                     .await
                     .with_context(|| {

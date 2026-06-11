@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{LogicalPlan, ScalarUDF};
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
 use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
@@ -240,22 +240,4 @@ async fn stateless_append_only_output_delta_batches(
         &weighted_schema,
         1,
     )?)
-}
-
-fn columnar_zset_weight_sum(zset: &ColumnarZSet) -> Result<i64> {
-    let mut sum = 0_i64;
-    for batch in zset.batches() {
-        let weights = batch
-            .column(zset.value_column_count())
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-        for row_idx in 0..weights.len() {
-            if weights.is_null(row_idx) {
-                anyhow::bail!("columnar zset weight cannot be NULL");
-            }
-            sum = sum.saturating_add(weights.value(row_idx));
-        }
-    }
-    Ok(sum)
 }
