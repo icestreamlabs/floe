@@ -864,6 +864,18 @@ struct DirectTopNRowRef {
     row_idx: usize,
 }
 
+enum DirectTopNOrderArray<'a> {
+    Int64(&'a Int64Array),
+    Utf8(&'a StringArray),
+    TimestampMillis(&'a TimestampMillisecondArray),
+    Boolean(&'a BooleanArray),
+    Date32(&'a Date32Array),
+    Decimal128(&'a Decimal128Array),
+    Float64(&'a Float64Array),
+    UInt64(&'a UInt64Array),
+    Null,
+}
+
 fn merge_append_only_direct_topn(
     output_schema: &SchemaRef,
     partition_converter: &RowConverter,
@@ -896,6 +908,8 @@ fn merge_append_only_direct_topn(
     profile::record_since("topn.append_only_direct_accumulate_delta", phase_start);
 
     let phase_start = profile::start();
+    let previous_order_columns = direct_topn_order_columns(direct, previous)?;
+    let delta_order_columns = direct_topn_order_columns(direct, delta)?;
     let mut previous_selected = previous
         .iter()
         .map(|batch| vec![false; batch.num_rows()])
@@ -909,11 +923,15 @@ fn merge_append_only_direct_topn(
     groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     for (_partition_key, mut rows) in groups {
         rows.sort_unstable_by(|left, right| {
-            compare_direct_topn_candidates(direct, previous, delta, left, right)
-                .then_with(|| {
-                    direct_topn_side_rank(left.side).cmp(&direct_topn_side_rank(right.side))
-                })
-                .then_with(|| left.ordinal.cmp(&right.ordinal))
+            compare_direct_topn_candidates(
+                direct,
+                &previous_order_columns,
+                &delta_order_columns,
+                left,
+                right,
+            )
+            .then_with(|| direct_topn_side_rank(left.side).cmp(&direct_topn_side_rank(right.side)))
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
         });
         for row in rows.into_iter().take(direct.limit) {
             let selected_ref = DirectTopNRowRef {
@@ -1023,20 +1041,93 @@ fn accumulate_direct_topn_candidates(
     Ok(())
 }
 
+fn direct_topn_order_columns<'a>(
+    direct: &AppendOnlyDirectTopNState,
+    batches: &'a [RecordBatch],
+) -> Result<Vec<Vec<DirectTopNOrderArray<'a>>>> {
+    batches
+        .iter()
+        .map(|batch| {
+            direct
+                .orderings
+                .iter()
+                .map(|ordering| direct_topn_order_array(batch.column(ordering.index).as_ref()))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect()
+}
+
+fn direct_topn_order_array(array: &dyn Array) -> Result<DirectTopNOrderArray<'_>> {
+    match array.data_type() {
+        DataType::Int64 => Ok(DirectTopNOrderArray::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("direct topn Int64 order column")?,
+        )),
+        DataType::Utf8 => Ok(DirectTopNOrderArray::Utf8(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("direct topn Utf8 order column")?,
+        )),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(DirectTopNOrderArray::TimestampMillis(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .context("direct topn Timestamp(Millisecond) order column")?,
+        )),
+        DataType::Boolean => Ok(DirectTopNOrderArray::Boolean(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("direct topn Boolean order column")?,
+        )),
+        DataType::Date32 => Ok(DirectTopNOrderArray::Date32(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .context("direct topn Date32 order column")?,
+        )),
+        DataType::Decimal128(_, _) => Ok(DirectTopNOrderArray::Decimal128(
+            array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .context("direct topn Decimal128 order column")?,
+        )),
+        DataType::Float64 => Ok(DirectTopNOrderArray::Float64(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .context("direct topn Float64 order column")?,
+        )),
+        DataType::UInt64 => Ok(DirectTopNOrderArray::UInt64(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context("direct topn UInt64 order column")?,
+        )),
+        DataType::Null => Ok(DirectTopNOrderArray::Null),
+        other => bail!("unsupported direct topn order column type: {other:?}"),
+    }
+}
+
 fn compare_direct_topn_candidates(
     direct: &AppendOnlyDirectTopNState,
-    previous: &[RecordBatch],
-    delta: &[RecordBatch],
+    previous_order_columns: &[Vec<DirectTopNOrderArray<'_>>],
+    delta_order_columns: &[Vec<DirectTopNOrderArray<'_>>],
     left: &DirectTopNCandidate,
     right: &DirectTopNCandidate,
 ) -> Ordering {
-    let left_batch = direct_topn_candidate_batch(previous, delta, left);
-    let right_batch = direct_topn_candidate_batch(previous, delta, right);
-    for ordering in &direct.orderings {
+    let left_columns =
+        direct_topn_candidate_order_columns(previous_order_columns, delta_order_columns, left);
+    let right_columns =
+        direct_topn_candidate_order_columns(previous_order_columns, delta_order_columns, right);
+    for (ordering_idx, ordering) in direct.orderings.iter().enumerate() {
         let order = compare_direct_topn_array_values(
-            left_batch.column(ordering.index).as_ref(),
+            &left_columns[ordering_idx],
             left.row_idx,
-            right_batch.column(ordering.index).as_ref(),
+            &right_columns[ordering_idx],
             right.row_idx,
             ordering.asc,
             ordering.nulls_first,
@@ -1048,11 +1139,11 @@ fn compare_direct_topn_candidates(
     Ordering::Equal
 }
 
-fn direct_topn_candidate_batch<'a>(
-    previous: &'a [RecordBatch],
-    delta: &'a [RecordBatch],
+fn direct_topn_candidate_order_columns<'a>(
+    previous: &'a [Vec<DirectTopNOrderArray<'a>>],
+    delta: &'a [Vec<DirectTopNOrderArray<'a>>],
     candidate: &DirectTopNCandidate,
-) -> &'a RecordBatch {
+) -> &'a [DirectTopNOrderArray<'a>] {
     match candidate.side {
         DirectTopNRowSide::Previous => &previous[candidate.batch_idx],
         DirectTopNRowSide::Delta => &delta[candidate.batch_idx],
@@ -1060,14 +1151,17 @@ fn direct_topn_candidate_batch<'a>(
 }
 
 fn compare_direct_topn_array_values(
-    left: &dyn Array,
+    left: &DirectTopNOrderArray<'_>,
     left_idx: usize,
-    right: &dyn Array,
+    right: &DirectTopNOrderArray<'_>,
     right_idx: usize,
     asc: bool,
     nulls_first: bool,
 ) -> Ordering {
-    match (left.is_null(left_idx), right.is_null(right_idx)) {
+    match (
+        direct_topn_order_array_is_null(left, left_idx),
+        direct_topn_order_array_is_null(right, right_idx),
+    ) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
             return if nulls_first {
@@ -1086,75 +1180,50 @@ fn compare_direct_topn_array_values(
         (false, false) => {}
     }
 
-    let order = match left.data_type() {
-        DataType::Int64 => {
-            let left = left.as_any().downcast_ref::<Int64Array>().expect("Int64");
-            let right = right.as_any().downcast_ref::<Int64Array>().expect("Int64");
+    let order = match (left, right) {
+        (DirectTopNOrderArray::Int64(left), DirectTopNOrderArray::Int64(right)) => {
             left.value(left_idx).cmp(&right.value(right_idx))
         }
-        DataType::Utf8 => {
-            let left = left.as_any().downcast_ref::<StringArray>().expect("Utf8");
-            let right = right.as_any().downcast_ref::<StringArray>().expect("Utf8");
+        (DirectTopNOrderArray::Utf8(left), DirectTopNOrderArray::Utf8(right)) => {
             left.value(left_idx).cmp(right.value(right_idx))
         }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let left = left
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .expect("Timestamp(Millisecond)");
-            let right = right
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .expect("Timestamp(Millisecond)");
+        (
+            DirectTopNOrderArray::TimestampMillis(left),
+            DirectTopNOrderArray::TimestampMillis(right),
+        ) => left.value(left_idx).cmp(&right.value(right_idx)),
+        (DirectTopNOrderArray::Boolean(left), DirectTopNOrderArray::Boolean(right)) => {
             left.value(left_idx).cmp(&right.value(right_idx))
         }
-        DataType::Boolean => {
-            let left = left.as_any().downcast_ref::<BooleanArray>().expect("Bool");
-            let right = right.as_any().downcast_ref::<BooleanArray>().expect("Bool");
+        (DirectTopNOrderArray::Date32(left), DirectTopNOrderArray::Date32(right)) => {
             left.value(left_idx).cmp(&right.value(right_idx))
         }
-        DataType::Date32 => {
-            let left = left.as_any().downcast_ref::<Date32Array>().expect("Date32");
-            let right = right
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .expect("Date32");
+        (DirectTopNOrderArray::Decimal128(left), DirectTopNOrderArray::Decimal128(right)) => {
             left.value(left_idx).cmp(&right.value(right_idx))
         }
-        DataType::Decimal128(_, _) => {
-            let left = left
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("Decimal128");
-            let right = right
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("Decimal128");
-            left.value(left_idx).cmp(&right.value(right_idx))
-        }
-        DataType::Float64 => {
-            let left = left
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("Float64");
-            let right = right
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("Float64");
+        (DirectTopNOrderArray::Float64(left), DirectTopNOrderArray::Float64(right)) => {
             left.value(left_idx).total_cmp(&right.value(right_idx))
         }
-        DataType::UInt64 => {
-            let left = left.as_any().downcast_ref::<UInt64Array>().expect("UInt64");
-            let right = right
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("UInt64");
+        (DirectTopNOrderArray::UInt64(left), DirectTopNOrderArray::UInt64(right)) => {
             left.value(left_idx).cmp(&right.value(right_idx))
         }
-        DataType::Null => Ordering::Equal,
-        other => unreachable!("unsupported direct topn order column type: {other:?}"),
+        (DirectTopNOrderArray::Null, DirectTopNOrderArray::Null) => Ordering::Equal,
+        _ => unreachable!("direct topn order column type mismatch"),
     };
     if asc { order } else { order.reverse() }
+}
+
+fn direct_topn_order_array_is_null(array: &DirectTopNOrderArray<'_>, row_idx: usize) -> bool {
+    match array {
+        DirectTopNOrderArray::Int64(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::Utf8(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::TimestampMillis(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::Boolean(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::Date32(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::Decimal128(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::Float64(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::UInt64(array) => array.is_null(row_idx),
+        DirectTopNOrderArray::Null => true,
+    }
 }
 
 fn direct_topn_side_rank(side: DirectTopNRowSide) -> u8 {
