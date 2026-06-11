@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::Hasher;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -10,10 +9,12 @@ use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
+use bytes::Bytes;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use slatedb::WriteBatch;
 
 use crate::handles::ZSetHandle;
+use crate::profile;
 use crate::storage::KeyValueTable;
 use crate::storage::encoding;
 use crate::storage::keyspace;
@@ -412,30 +413,42 @@ impl SlateBackedColumnarZSet {
         delta: &ColumnarZSet,
         base: Option<u64>,
     ) -> Result<Option<ZSetHandle>> {
+        let total_start = profile::start();
+        let phase_start = profile::start();
         self.validate_delta(delta)?;
         if delta.is_empty() {
+            profile::record_since("columnar_zset.create_version.total", total_start);
             return Ok(None);
         }
+        profile::record_since("columnar_zset.create_version.validate", phase_start);
 
         let segment_id = self.next_segment_id;
         self.next_segment_id = self.next_segment_id.saturating_add(1);
+        let phase_start = profile::start();
         let stats = segment_stats_arrow(delta)?;
+        profile::record_since("columnar_zset.create_version.segment_stats", phase_start);
+        let phase_start = profile::start();
         let (segment_bytes, _) =
             encode_segment_envelope(Arc::clone(&self.weighted_schema), delta.batches(), stats)
                 .context("encode Arrow columnar zset segment")?;
+        profile::record_since("columnar_zset.create_version.encode_segment", phase_start);
 
+        let phase_start = profile::start();
         let mut batch = WriteBatch::new();
-        batch.put(
-            self.segment_store.key_for_segment(segment_id),
-            segment_bytes,
+        batch.put_bytes(
+            Bytes::from(self.segment_store.key_for_segment(segment_id)),
+            Bytes::from(segment_bytes),
         );
 
         if let Some(base_version) = base {
             let mut base_manifest = self.base_manifest_for_write(base_version).await?;
             base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
-            batch.put(
-                self.manifest_key(base_version),
-                encoding::encode(&base_manifest).context("encode Arrow columnar base manifest")?,
+            batch.put_bytes(
+                Bytes::from(self.manifest_key(base_version)),
+                Bytes::from(
+                    encoding::encode(&base_manifest)
+                        .context("encode Arrow columnar base manifest")?,
+                ),
             );
         }
 
@@ -445,25 +458,32 @@ impl SlateBackedColumnarZSet {
             segments: vec![segment_id],
             reference_count: 1,
         };
-        batch.put(
-            self.manifest_key(next_version),
-            encoding::encode(&manifest).context("encode Arrow columnar manifest")?,
+        batch.put_bytes(
+            Bytes::from(self.manifest_key(next_version)),
+            Bytes::from(encoding::encode(&manifest).context("encode Arrow columnar manifest")?),
         );
         let state = ColumnarVersionState {
             persisted_version: next_version,
             next_segment_id: self.next_segment_id,
         };
-        batch.put(
-            self.state_key.clone(),
-            encoding::encode(&state).context("encode Arrow columnar version state")?,
+        batch.put_bytes(
+            Bytes::from(self.state_key.clone()),
+            Bytes::from(encoding::encode(&state).context("encode Arrow columnar version state")?),
         );
+        profile::record_since(
+            "columnar_zset.create_version.build_write_batch",
+            phase_start,
+        );
+        let phase_start = profile::start();
         self.table
             .write_batch(batch)
             .await
             .context("write Arrow columnar zset version")?;
+        profile::record_since("columnar_zset.create_version.write_batch", phase_start);
         self.current_version = next_version;
         self.persisted_version = next_version;
         self.manifest = Some(manifest);
+        profile::record_since("columnar_zset.create_version.total", total_start);
         Ok(Some(self.handle_for_version(next_version)))
     }
 
@@ -649,30 +669,47 @@ impl SlateBackedColumnarI64ZSet {
         delta: &ColumnarI64ZSet,
         base: Option<u64>,
     ) -> Result<Option<ZSetHandle>> {
+        let total_start = profile::start();
+        let phase_start = profile::start();
         self.validate_delta(delta)?;
         if delta.is_empty() {
+            profile::record_since("columnar_i64_zset.create_version.total", total_start);
             return Ok(None);
         }
+        profile::record_since("columnar_i64_zset.create_version.validate", phase_start);
 
         let segment_id = self.next_segment_id;
         self.next_segment_id = self.next_segment_id.saturating_add(1);
+        let phase_start = profile::start();
         let stats = segment_stats(delta)?;
+        profile::record_since(
+            "columnar_i64_zset.create_version.segment_stats",
+            phase_start,
+        );
+        let phase_start = profile::start();
         let (segment_bytes, _) =
             encode_segment_envelope(Arc::clone(&self.schema), delta.batches(), stats)
                 .context("encode columnar zset segment")?;
+        profile::record_since(
+            "columnar_i64_zset.create_version.encode_segment",
+            phase_start,
+        );
 
+        let phase_start = profile::start();
         let mut batch = WriteBatch::new();
-        batch.put(
-            self.segment_store.key_for_segment(segment_id),
-            segment_bytes,
+        batch.put_bytes(
+            Bytes::from(self.segment_store.key_for_segment(segment_id)),
+            Bytes::from(segment_bytes),
         );
 
         if let Some(base_version) = base {
             let mut base_manifest = self.base_manifest_for_write(base_version).await?;
             base_manifest.reference_count = base_manifest.reference_count.saturating_add(1);
-            batch.put(
-                self.manifest_key(base_version),
-                encoding::encode(&base_manifest).context("encode columnar base manifest")?,
+            batch.put_bytes(
+                Bytes::from(self.manifest_key(base_version)),
+                Bytes::from(
+                    encoding::encode(&base_manifest).context("encode columnar base manifest")?,
+                ),
             );
         }
 
@@ -682,25 +719,32 @@ impl SlateBackedColumnarI64ZSet {
             segments: vec![segment_id],
             reference_count: 1,
         };
-        batch.put(
-            self.manifest_key(next_version),
-            encoding::encode(&manifest).context("encode columnar manifest")?,
+        batch.put_bytes(
+            Bytes::from(self.manifest_key(next_version)),
+            Bytes::from(encoding::encode(&manifest).context("encode columnar manifest")?),
         );
         let state = ColumnarVersionState {
             persisted_version: next_version,
             next_segment_id: self.next_segment_id,
         };
-        batch.put(
-            self.state_key.clone(),
-            encoding::encode(&state).context("encode columnar version state")?,
+        batch.put_bytes(
+            Bytes::from(self.state_key.clone()),
+            Bytes::from(encoding::encode(&state).context("encode columnar version state")?),
         );
+        profile::record_since(
+            "columnar_i64_zset.create_version.build_write_batch",
+            phase_start,
+        );
+        let phase_start = profile::start();
         self.table
             .write_batch(batch)
             .await
             .context("write columnar zset version")?;
+        profile::record_since("columnar_i64_zset.create_version.write_batch", phase_start);
         self.current_version = next_version;
         self.persisted_version = next_version;
         self.manifest = Some(manifest);
+        profile::record_since("columnar_i64_zset.create_version.total", total_start);
         Ok(Some(self.handle_for_version(next_version)))
     }
 
@@ -995,24 +1039,20 @@ pub(super) fn row_converter_for_schema(value_schema: &SchemaRef) -> Result<RowCo
 }
 
 pub(super) fn segment_stats_arrow(delta: &ColumnarZSet) -> Result<SegmentWriteStats> {
-    let converter = row_converter_for_schema(&delta.value_schema)?;
-    let mut min_key_hash = u64::MAX;
-    let mut max_key_hash = 0_u64;
+    relaxed_segment_stats(delta.batches(), delta.value_column_count)
+}
+
+fn relaxed_segment_stats(
+    batches: &[RecordBatch],
+    value_column_count: usize,
+) -> Result<SegmentWriteStats> {
     let mut tombstones = 0_usize;
     let mut rows = 0_usize;
 
-    for batch in delta.batches() {
-        let weights = weight_column(batch, delta.value_column_count)?;
-        let row_values = converter
-            .convert_columns(&value_array_refs(batch, delta.value_column_count))
-            .context("encode Arrow columnar zset rows for stats")?;
+    for batch in batches {
+        let weights = weight_column(batch, value_column_count)?;
         for row_idx in 0..batch.num_rows() {
             rows = rows.saturating_add(1);
-            let mut hasher = ahash::AHasher::default();
-            hasher.write(row_values.row(row_idx).data());
-            let hash = hasher.finish();
-            min_key_hash = min_key_hash.min(hash);
-            max_key_hash = max_key_hash.max(hash);
             if weights.value(row_idx) < 0 {
                 tombstones = tombstones.saturating_add(1);
             }
@@ -1022,7 +1062,10 @@ pub(super) fn segment_stats_arrow(delta: &ColumnarZSet) -> Result<SegmentWriteSt
     if rows == 0 {
         return SegmentWriteStats::new(0, 0, 0.0);
     }
-    SegmentWriteStats::new(min_key_hash, max_key_hash, tombstones as f64 / rows as f64)
+    // Columnar zset readers do not prune by key hash bounds today. Keep the
+    // tombstone ratio exact for compaction while avoiding a second row-encoding
+    // pass just to compute advisory hash metadata.
+    SegmentWriteStats::new(0, u64::MAX, tombstones as f64 / rows as f64)
 }
 
 fn consolidate_columnar_zset(delta: ColumnarZSet) -> Result<ColumnarZSet> {
@@ -1122,33 +1165,7 @@ fn append_arrow_group(
 }
 
 fn segment_stats(delta: &ColumnarI64ZSet) -> Result<SegmentWriteStats> {
-    let mut min_key_hash = u64::MAX;
-    let mut max_key_hash = 0_u64;
-    let mut tombstones = 0_usize;
-    let mut rows = 0_usize;
-
-    for batch in delta.batches() {
-        let weights = weight_column(batch, delta.value_column_count)?;
-        let value_columns = value_columns(batch, delta.value_column_count)?;
-        for row_idx in 0..batch.num_rows() {
-            rows = rows.saturating_add(1);
-            let mut hasher = ahash::AHasher::default();
-            for column in &value_columns {
-                hasher.write_i64(column.value(row_idx));
-            }
-            let hash = hasher.finish();
-            min_key_hash = min_key_hash.min(hash);
-            max_key_hash = max_key_hash.max(hash);
-            if weights.value(row_idx) < 0 {
-                tombstones = tombstones.saturating_add(1);
-            }
-        }
-    }
-
-    if rows == 0 {
-        return SegmentWriteStats::new(0, 0, 0.0);
-    }
-    SegmentWriteStats::new(min_key_hash, max_key_hash, tombstones as f64 / rows as f64)
+    relaxed_segment_stats(delta.batches(), delta.value_column_count)
 }
 
 fn consolidate_columnar_i64_zset(delta: ColumnarI64ZSet) -> Result<ColumnarI64ZSet> {

@@ -107,6 +107,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
     let executor_cancel = runtime_cancel.clone();
     let executor_handle: JoinHandle<()> = tokio::spawn(async move {
         reset_columnar_phase_profile();
+        reset_runtime_phase_profile();
         let mut connector_queues = connector_queues;
         let mut cdc_transaction_queue = VecDeque::new();
         let mut checkpoint_manager = checkpoint_manager;
@@ -1200,6 +1201,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
         })
         .await;
         print_columnar_phase_profile("floe-node");
+        print_runtime_phase_profile("floe-node");
         executor_running_for_task.store(false, Ordering::Relaxed);
     });
 

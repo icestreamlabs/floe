@@ -14,7 +14,10 @@ use datafusion::common::DFSchemaRef;
 use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::{KeyValueTable, SlateTable};
-use dbsp::{CircuitPlan, CompactionSchedulerConfig};
+use dbsp::{
+    CircuitPlan, CompactionSchedulerConfig, print_runtime_phase_profile,
+    reset_runtime_phase_profile,
+};
 use floe_cdc::CdcTableStore;
 use floe_cdc_core::{
     CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, ChangeBatch,

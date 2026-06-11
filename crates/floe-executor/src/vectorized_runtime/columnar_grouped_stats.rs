@@ -2614,10 +2614,10 @@ async fn compact_state_initial_for_mutation(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     group_key: &[u8],
 ) -> Result<Option<CompactGroupState>> {
-    if columnar.stats_state.has_compact_state(group_key)?
-        || columnar.stats_state.compact_snapshot_active()?
-        || columnar.stats_state.assume_empty
-    {
+    if columnar.stats_state.assume_empty || columnar.stats_state.compact_snapshot_active()? {
+        return Ok(None);
+    }
+    if columnar.stats_state.has_compact_state(group_key)? {
         return Ok(None);
     }
     load_compact_or_legacy_group_state(columnar, group_key)
