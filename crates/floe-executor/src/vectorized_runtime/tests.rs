@@ -290,6 +290,25 @@ fn join_topn_rows_with_extra(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, Str
     rows
 }
 
+fn weighted_join_topn_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let ids = int64_values(batch, 0);
+        let bidders = int64_values(batch, 11);
+        let prices = int64_values(batch, 12);
+        let weights = int64_values(batch, batch.num_columns() - 1);
+        rows.extend(
+            ids.into_iter()
+                .zip(bidders)
+                .zip(prices)
+                .zip(weights)
+                .map(|(((id, bidder), price), weight)| (id, bidder, price, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn grouped_stats_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64, f64, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -8285,6 +8304,11 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
 
     let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
     assert_eq!(join_topn_rows(&snapshot), vec![(1, 13, 300), (2, 12, 50)]);
+    let delta = handle.arrow_delta_for(2).expect("better bid delta");
+    assert_eq!(
+        weighted_join_topn_rows(&delta),
+        vec![(1, 9, 200, -1), (1, 13, 300, 1)]
+    );
 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
@@ -8341,6 +8365,13 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
         .arrow_snapshot_for(4)
         .expect("post-retract snapshot");
     assert_eq!(join_topn_rows(&snapshot), vec![(1, 9, 200), (2, 12, 50)]);
+    let delta = recovered_handle
+        .arrow_delta_for(4)
+        .expect("post-retract delta");
+    assert_eq!(
+        weighted_join_topn_rows(&delta),
+        vec![(1, 9, 200, 1), (1, 13, 300, -1)]
+    );
     assert_eq!(
         join_topn_rows_with_extra(&snapshot),
         vec![
