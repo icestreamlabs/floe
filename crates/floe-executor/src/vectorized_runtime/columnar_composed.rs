@@ -1905,6 +1905,7 @@ impl ComposedEvaluator {
         &self,
         source_snapshots: &HashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>> {
+        let phase_start = profile::start();
         for (source_name, input) in &self.inputs {
             let batches = source_snapshots
                 .get(source_name)
@@ -1913,22 +1914,39 @@ impl ComposedEvaluator {
                 .set_batches(source_name, batches)
                 .with_context(|| format!("set composed evaluator input for '{source_name}'"))?;
         }
+        profile::record_since("composed.evaluate.set_inputs", phase_start);
+
+        let phase_start = profile::start();
         for asof_join in &self.asof_joins {
             asof_join.evaluate(&self.ctx).await.with_context(|| {
                 format!("evaluate composed ASOF input {}", asof_join.table_name)
             })?;
         }
+        profile::record_since("composed.evaluate.asof", phase_start);
+
+        let phase_start = profile::start();
         let plan = self
             .ctx
             .state()
             .create_physical_plan(&self.logical_plan)
             .await?;
+        profile::record_since("composed.evaluate.create_physical_plan", phase_start);
+
+        let phase_start = profile::start();
         let collected = collect(plan, self.ctx.task_ctx()).await;
+        profile::record_since("composed.evaluate.collect", phase_start);
+
+        let phase_start = profile::start();
         self.clear_inputs()?;
-        normalize_batches(
+        profile::record_since("composed.evaluate.clear_inputs", phase_start);
+
+        let phase_start = profile::start();
+        let normalized = normalize_batches(
             collected.context("execute vectorized composed evaluator")?,
             &self.output_schema,
-        )
+        );
+        profile::record_since("composed.evaluate.normalize", phase_start);
+        normalized
     }
 
     fn clear_inputs(&self) -> Result<()> {
