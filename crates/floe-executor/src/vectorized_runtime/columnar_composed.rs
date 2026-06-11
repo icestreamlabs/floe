@@ -1743,7 +1743,18 @@ pub(super) async fn run_columnar_composed_state_tick(
         let snapshot = if delta.batches().is_empty() {
             source.snapshot.clone()
         } else {
-            materialize_source_snapshot(source).await?
+            apply_weighted_snapshot_delta(
+                &source.schema,
+                &source.snapshot,
+                delta.batches().to_vec(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "apply persisted composed input delta for '{}'",
+                    source.source_name
+                )
+            })?
         };
         next_source_snapshots.insert(source.source_name.clone(), snapshot);
     }
@@ -1849,23 +1860,6 @@ async fn persisted_source_delta(
     let base = zset.current_handle().map(|handle| handle.version);
     zset.create_version(&input_delta, base).await?;
     Ok(input_delta)
-}
-
-async fn materialize_source_snapshot(
-    source: &ColumnarComposedSourceState,
-) -> Result<Vec<RecordBatch>> {
-    snapshot_batches_from_zset(
-        &source
-            .input_zset
-            .materialize_columnar()
-            .await
-            .with_context(|| {
-                format!(
-                    "materialize composed input zset for '{}'",
-                    source.source_name
-                )
-            })?,
-    )
 }
 
 impl ComposedEvaluator {

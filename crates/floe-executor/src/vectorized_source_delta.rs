@@ -129,6 +129,20 @@ pub(super) async fn apply_weighted_snapshot_delta(
     weighted_delta: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
     let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
+    if weighted_delta_is_append_only(&weighted_schema, &weighted_delta)? {
+        let mut next = previous
+            .iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut appended = positive_weighted_snapshot(schema, &weighted_schema, weighted_delta)?;
+        next.append(&mut appended);
+        if next.is_empty() {
+            next.push(RecordBatch::new_empty(Arc::clone(schema)));
+        }
+        return Ok(next);
+    }
+
     let mut weighted = add_weight_column_to_batches(previous, &weighted_schema, 1)?;
     for batch in weighted_delta {
         if batch.schema().as_ref() != weighted_schema.as_ref() {
@@ -146,6 +160,35 @@ pub(super) async fn apply_weighted_snapshot_delta(
         next.push(RecordBatch::new_empty(Arc::clone(schema)));
     }
     Ok(next)
+}
+
+fn weighted_delta_is_append_only(
+    weighted_schema: &SchemaRef,
+    weighted_delta: &[RecordBatch],
+) -> Result<bool> {
+    let weight_idx = weighted_schema.index_of(WEIGHT_COLUMN_NAME)?;
+    for batch in weighted_delta {
+        if batch.schema().as_ref() != weighted_schema.as_ref() {
+            bail!("snapshot delta schema does not match weighted snapshot schema");
+        }
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow!("snapshot delta weight column must be Int64"))?;
+        for row_idx in 0..weights.len() {
+            if weights.is_null(row_idx) {
+                bail!("snapshot delta weight column cannot contain NULL");
+            }
+            if weights.value(row_idx) < 0 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn positive_weighted_snapshot(
@@ -563,5 +606,53 @@ mod tests {
             .expect("apply source delta");
 
         assert!(next.is_empty());
+    }
+
+    #[tokio::test]
+    async fn weighted_snapshot_delta_appends_positive_deltas_and_consolidates_retractions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let previous = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .expect("previous snapshot");
+        let weighted_schema =
+            crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+        let positive_delta = RecordBatch::try_new(
+            Arc::clone(&weighted_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 3])),
+                Arc::new(Int64Array::from(vec![2, 1])),
+            ],
+        )
+        .expect("positive delta");
+
+        let appended =
+            apply_weighted_snapshot_delta(&schema, &[previous.clone()], vec![positive_delta])
+                .await
+                .expect("append positive delta");
+        let appended_values = appended
+            .iter()
+            .flat_map(|batch| int64_values(batch, 0))
+            .collect::<Vec<_>>();
+        assert_eq!(appended_values, vec![1, 2, 1, 1, 3]);
+
+        let negative_delta = RecordBatch::try_new(
+            weighted_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![-1])),
+            ],
+        )
+        .expect("negative delta");
+        let consolidated =
+            apply_weighted_snapshot_delta(&schema, &[previous], vec![negative_delta])
+                .await
+                .expect("consolidate negative delta");
+        let consolidated_values = consolidated
+            .iter()
+            .flat_map(|batch| int64_values(batch, 0))
+            .collect::<Vec<_>>();
+        assert_eq!(consolidated_values, vec![2]);
     }
 }

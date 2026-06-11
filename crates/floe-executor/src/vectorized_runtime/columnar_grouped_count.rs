@@ -5,7 +5,7 @@ use std::time::Instant;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{
-    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, UInt32Array,
+    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, TimestampMillisecondArray, UInt32Array,
 };
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -479,6 +479,10 @@ fn expand_hop_group_batches(
     if batches.is_empty() {
         return Ok(Vec::new());
     }
+    if columnar.hop_groups.len() == 1 {
+        return expand_single_hop_group_batches(columnar, batches);
+    }
+
     let mut out = Vec::new();
     for batch in batches {
         if batch.num_rows() == 0 {
@@ -512,22 +516,102 @@ fn expand_hop_group_batches(
             .map(ScalarColumnBuilder::finish_array)
             .collect::<Vec<_>>();
         columns.push(Arc::new(counts.finish()) as ArrayRef);
-        let aggregate_schema = Arc::new(Schema::new(
-            columnar
-                .group_schema
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
-                .chain(std::iter::once(Field::new(
-                    columnar.aggregate_schema.field(columnar.count_idx).name(),
-                    DataType::Int64,
-                    false,
-                )))
-                .collect::<Vec<_>>(),
-        ));
-        out.push(RecordBatch::try_new(aggregate_schema, columns)?);
+        out.push(RecordBatch::try_new(
+            aggregate_batch_schema(columnar),
+            columns,
+        )?);
     }
     Ok(out)
+}
+
+fn expand_single_hop_group_batches(
+    columnar: &ColumnarGroupedCountMaterializedViewState,
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    let hop = columnar
+        .hop_groups
+        .first()
+        .context("single HOP expansion requires one HOP group")?;
+    if hop.group_idx >= columnar.count_idx {
+        bail!("HOP group index exceeds grouped-count group column count");
+    }
+    let window_capacity = hop_window_count_upper_bound(hop)?;
+    let aggregate_schema = aggregate_batch_schema(columnar);
+    let mut out = Vec::new();
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let capacity = batch.num_rows().saturating_mul(window_capacity);
+        let mut builders = columnar
+            .group_schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), capacity))
+            .collect::<Result<Vec<_>>>()?;
+        let mut counts = Int64Builder::with_capacity(capacity);
+        let hop_times = batch
+            .column(hop.group_idx)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("HOP group expression must produce timestamp(ms)"))?;
+
+        for row_idx in 0..batch.num_rows() {
+            if hop_times.is_null(row_idx) {
+                continue;
+            }
+            let emitted = append_hop_window_starts_from_time(
+                hop_times.value(row_idx),
+                hop,
+                &mut builders[hop.group_idx],
+                &mut counts,
+            )?;
+            if emitted == 0 {
+                continue;
+            }
+            for group_idx in 0..columnar.count_idx {
+                if group_idx == hop.group_idx {
+                    continue;
+                }
+                builders[group_idx].append_array_value_repeated(
+                    batch.column(group_idx).as_ref(),
+                    row_idx,
+                    emitted,
+                )?;
+            }
+        }
+
+        let expanded_rows = counts.len();
+        if expanded_rows == 0 {
+            continue;
+        }
+        let mut columns = builders
+            .iter_mut()
+            .map(ScalarColumnBuilder::finish_array)
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(counts.finish()) as ArrayRef);
+        out.push(RecordBatch::try_new(
+            Arc::clone(&aggregate_schema),
+            columns,
+        )?);
+    }
+    Ok(out)
+}
+
+fn aggregate_batch_schema(columnar: &ColumnarGroupedCountMaterializedViewState) -> SchemaRef {
+    Arc::new(Schema::new(
+        columnar
+            .group_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .chain(std::iter::once(Field::new(
+                columnar.aggregate_schema.field(columnar.count_idx).name(),
+                DataType::Int64,
+                false,
+            )))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn append_hop_group_combinations(
@@ -614,6 +698,48 @@ fn hop_window_starts(array: &dyn Array, row_idx: usize, hop: &HopGroup) -> Resul
             .ok_or_else(|| anyhow::anyhow!("HOP window offset overflow"))?;
     }
     Ok(starts)
+}
+
+fn hop_window_count_upper_bound(hop: &HopGroup) -> Result<usize> {
+    if hop.slide_ms <= 0 || hop.size_ms <= 0 {
+        bail!("HOP window slide and size must be positive");
+    }
+    let numerator = hop
+        .size_ms
+        .checked_add(hop.slide_ms - 1)
+        .ok_or_else(|| anyhow::anyhow!("HOP window count overflow"))?;
+    usize::try_from(numerator / hop.slide_ms).context("HOP window count exceeds usize")
+}
+
+fn append_hop_window_starts_from_time(
+    time_ms: i64,
+    hop: &HopGroup,
+    builder: &mut ScalarColumnBuilder,
+    counts: &mut Int64Builder,
+) -> Result<usize> {
+    if hop.slide_ms <= 0 || hop.size_ms <= 0 {
+        bail!("HOP window slide and size must be positive");
+    }
+    let last_start = time_ms.div_euclid(hop.slide_ms) * hop.slide_ms;
+    let mut emitted = 0usize;
+    let mut offset = 0_i64;
+    while offset < hop.size_ms {
+        let start = last_start
+            .checked_sub(offset)
+            .ok_or_else(|| anyhow::anyhow!("HOP window start overflow"))?;
+        let end = start
+            .checked_add(hop.size_ms)
+            .ok_or_else(|| anyhow::anyhow!("HOP window end overflow"))?;
+        if time_ms >= start && time_ms < end {
+            builder.append_timestamp_millis_value(start)?;
+            counts.append_value(1);
+            emitted = emitted.saturating_add(1);
+        }
+        offset = offset
+            .checked_add(hop.slide_ms)
+            .ok_or_else(|| anyhow::anyhow!("HOP window offset overflow"))?;
+    }
+    Ok(emitted)
 }
 
 fn add_aggregate_batches_to_pending(

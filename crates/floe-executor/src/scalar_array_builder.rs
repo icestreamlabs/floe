@@ -308,6 +308,119 @@ impl ScalarColumnBuilder {
         Ok(())
     }
 
+    pub(crate) fn append_array_value_repeated(
+        &mut self,
+        array: &dyn Array,
+        row_idx: usize,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        if row_idx >= array.len() {
+            return Err(anyhow!("row index {row_idx} is outside Arrow array"));
+        }
+        if array.is_null(row_idx) {
+            return self.append_encoded_scalar_repeated(None, count);
+        }
+        match self {
+            Self::Int64(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| anyhow!("expected Int64 Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::Float64(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| anyhow!("expected Float64 Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::Utf8(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow!("expected Utf8 Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::TimestampMillis { builder, .. } => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| anyhow!("expected timestamp(ms) Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::DateDays(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| anyhow!("expected Date32 Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::Decimal128(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| anyhow!("expected Decimal128 Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::Bool(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| anyhow!("expected Boolean Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::Binary(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| anyhow!("expected Binary Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::UInt64(builder) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| anyhow!("expected UInt64 Arrow array"))?;
+                let value = values.value(row_idx);
+                for _ in 0..count {
+                    builder.append_value(value);
+                }
+            }
+            Self::Null { len } => {
+                *len += count;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn append_encoded_scalar(&mut self, value: Option<&EncodedRowScalar>) -> Result<()> {
         match self {
             Self::Int64(builder) => match value {
