@@ -1,11 +1,15 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+    StringArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
+};
 use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
@@ -23,9 +27,12 @@ use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
-use crate::delta_consolidation::diff_snapshot_batches;
+use crate::delta_consolidation::{
+    diff_snapshot_batches, diff_snapshot_batches_by_row, weighted_snapshot_schema,
+};
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
+use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 
@@ -41,7 +48,7 @@ use super::columnar_grouped_stats::{
 };
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches,
+    normalize_batches, profile,
 };
 
 pub(super) struct ColumnarTopNPlan {
@@ -49,6 +56,19 @@ pub(super) struct ColumnarTopNPlan {
     input: ColumnarTopNInputPlan,
     partition_columns: Vec<String>,
     full_snapshot_diff: bool,
+    append_only_fast_path: bool,
+    append_only_direct_plan: Option<AppendOnlyDirectTopNPlan>,
+}
+
+struct AppendOnlyDirectTopNPlan {
+    limit: usize,
+    orderings: Vec<AppendOnlyDirectTopNOrdering>,
+}
+
+struct AppendOnlyDirectTopNOrdering {
+    column: String,
+    asc: bool,
+    nulls_first: bool,
 }
 
 enum ColumnarTopNInputPlan {
@@ -100,12 +120,26 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     source_snapshot: Vec<RecordBatch>,
     initial_snapshot: Vec<RecordBatch>,
     full_snapshot_diff: bool,
+    append_only_fast_path: bool,
+    append_only_direct: Option<AppendOnlyDirectTopNState>,
+}
+
+struct AppendOnlyDirectTopNState {
+    limit: usize,
+    orderings: Vec<AppendOnlyDirectTopNOrderingState>,
+}
+
+struct AppendOnlyDirectTopNOrderingState {
+    index: usize,
+    asc: bool,
+    nulls_first: bool,
 }
 
 struct TopNInputTick {
     delta: ColumnarZSet,
     input_changed: bool,
     next_source_snapshot: Option<Vec<RecordBatch>>,
+    append_only_source_delta: bool,
 }
 
 pub(super) struct ColumnarTopNTick {
@@ -133,7 +167,11 @@ pub(super) fn columnar_topn_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarTopNPlan>> {
+    let mut append_only_fast_path = false;
+    let mut append_only_direct_plan = None;
     let partition_columns = if let Some((rank_column, filter)) = row_number_filter_for_plan(plan) {
+        let upper_bound = extract_standalone_row_number_upper_bound_limit(&filter.predicate);
+        append_only_fast_path = upper_bound.is_some();
         let Some((window, _projection_without_rank)) =
             extract_window_plan(filter.input.as_ref(), &rank_column)
         else {
@@ -146,6 +184,9 @@ pub(super) fn columnar_topn_plan_for_plan(
         else {
             return Ok(None);
         };
+        if let Some((_rank_column, limit)) = upper_bound {
+            append_only_direct_plan = append_only_direct_topn_plan(window_function, limit);
+        }
         let partition_columns = window_function
             .params
             .partition_by
@@ -194,6 +235,8 @@ pub(super) fn columnar_topn_plan_for_plan(
 
     Ok(Some(ColumnarTopNPlan {
         full_snapshot_diff,
+        append_only_fast_path,
+        append_only_direct_plan,
         logical_plan: plan.clone(),
         input,
         partition_columns,
@@ -254,6 +297,10 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 .collect::<Result<Vec<_>>>()?;
             let partition_converter =
                 row_converter_for_indices(&source.schema, &partition_indices)?;
+            let append_only_direct = append_only_direct_topn_state_for_source(
+                source,
+                plan.append_only_direct_plan.as_ref(),
+            )?;
             let input_namespace = format!("{mv_namespace}/columnar/topn/input");
             let input_zset = SlateBackedColumnarZSet::new(
                 Arc::clone(&table),
@@ -286,6 +333,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_snapshot,
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
+                append_only_fast_path: plan.append_only_fast_path,
+                append_only_direct,
             })
         }
         ColumnarTopNInputPlan::GroupedStats {
@@ -339,6 +388,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_snapshot,
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
+                append_only_fast_path: plan.append_only_fast_path,
+                append_only_direct: None,
             })
         }
         ColumnarTopNInputPlan::AggregateJoin {
@@ -392,6 +443,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_snapshot,
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
+                append_only_fast_path: plan.append_only_fast_path,
+                append_only_direct: None,
             })
         }
     }
@@ -486,9 +539,12 @@ pub(super) async fn run_columnar_topn_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarTopNTick> {
+    let total_start = profile::start();
+    let phase_start = profile::start();
     let input_tick = prepare_topn_input_tick(columnar, insert_batches, weighted_delta_batches)
         .await
         .context("prepare SlateDB-backed topn input tick")?;
+    profile::record_since("topn.prepare_input", phase_start);
     if columnar.full_snapshot_diff {
         return run_columnar_topn_full_snapshot_diff_state_tick(
             columnar,
@@ -503,11 +559,29 @@ pub(super) async fn run_columnar_topn_state_tick(
     }
     let input_changed = input_tick.input_changed;
     let persisted_input_delta = input_tick.delta;
+    let phase_start = profile::start();
     let touched_partitions = touched_partition_keys(
         &columnar.partition_converter,
         &columnar.partition_indices,
         persisted_input_delta.batches(),
     )?;
+    profile::record_since("topn.touched_partitions", phase_start);
+    if columnar.append_only_fast_path
+        && input_tick.append_only_source_delta
+        && let Some(tick) = run_columnar_topn_append_only_source_state_tick(
+            columnar,
+            &persisted_input_delta,
+            &touched_partitions,
+            output_schema,
+            previous_snapshot,
+            input_changed,
+        )
+        .await?
+    {
+        profile::record_since("topn.total", total_start);
+        return Ok(tick);
+    }
+    let phase_start = profile::start();
     let previous_source_for_keys = filter_batches_to_partition_keys(
         &columnar.source_schema,
         &columnar.partition_converter,
@@ -515,12 +589,16 @@ pub(super) async fn run_columnar_topn_state_tick(
         &columnar.source_snapshot,
         &touched_partitions,
     )?;
+    profile::record_since("topn.previous_source_for_keys", phase_start);
+    let phase_start = profile::start();
     let next_source_snapshot = apply_source_snapshot_delta(
         &columnar.source_schema,
         &columnar.source_snapshot,
         &persisted_input_delta,
     )
     .await?;
+    profile::record_since("topn.source_snapshot_delta", phase_start);
+    let phase_start = profile::start();
     let next_source_for_keys = filter_batches_to_partition_keys(
         &columnar.source_schema,
         &columnar.partition_converter,
@@ -528,24 +606,34 @@ pub(super) async fn run_columnar_topn_state_tick(
         &next_source_snapshot,
         &touched_partitions,
     )?;
+    profile::record_since("topn.next_source_for_keys", phase_start);
 
+    let phase_start = profile::start();
     let previous_output = columnar
         .evaluator
         .evaluate(&previous_source_for_keys)
         .await
         .context("evaluate previous topn partition outputs")?;
+    profile::record_since("topn.evaluate_previous", phase_start);
+    let phase_start = profile::start();
     let next_output = columnar
         .evaluator
         .evaluate(&next_source_for_keys)
         .await
         .context("evaluate next topn partition outputs")?;
+    profile::record_since("topn.evaluate_next", phase_start);
+    let phase_start = profile::start();
     let diff = diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
         .await
         .context("diff topn partition outputs")?;
+    profile::record_since("topn.diff_output", phase_start);
 
+    let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
             .context("build topn output zset delta")?;
+    profile::record_since("topn.build_output_zset", phase_start);
+    let phase_start = profile::start();
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(
@@ -561,19 +649,662 @@ pub(super) async fn run_columnar_topn_state_tick(
     } else {
         output_delta
     };
+    profile::record_since("topn.output_create_version", phase_start);
 
     let delta_batches = persisted_output_delta.batches().to_vec();
+    let phase_start = profile::start();
     let next_snapshot =
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
             .await
             .context("apply Slate-backed topn columnar snapshot delta")?;
+    profile::record_since("topn.output_snapshot_delta", phase_start);
 
     columnar.source_snapshot = next_source_snapshot;
+    profile::record_since("topn.total", total_start);
     Ok(ColumnarTopNTick {
         delta: persisted_output_delta,
         next_snapshot,
         input_changed,
     })
+}
+
+async fn run_columnar_topn_append_only_source_state_tick(
+    columnar: &mut ColumnarTopNMaterializedViewState,
+    input_delta: &ColumnarZSet,
+    touched_partitions: &HashSet<Vec<u8>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+    input_changed: bool,
+) -> Result<Option<ColumnarTopNTick>> {
+    if columnar.input_zset.is_none()
+        || !schemas_match_by_position(&columnar.source_schema, output_schema)
+    {
+        return Ok(None);
+    }
+    let Some(delta_value_batches) =
+        unit_positive_delta_value_batches(&columnar.source_schema, input_delta.batches())?
+    else {
+        return Ok(None);
+    };
+
+    let phase_start = profile::start();
+    let (previous_output_for_keys, untouched_previous_output) = split_batches_by_partition_keys(
+        output_schema,
+        &columnar.partition_converter,
+        &columnar.partition_indices,
+        previous_snapshot,
+        touched_partitions,
+    )?;
+    profile::record_since("topn.append_only_previous_output_for_keys", phase_start);
+
+    if let Some(direct) = columnar.append_only_direct.as_ref() {
+        let phase_start = profile::start();
+        let merge = merge_append_only_direct_topn(
+            output_schema,
+            &columnar.partition_converter,
+            &columnar.partition_indices,
+            direct,
+            &previous_output_for_keys,
+            &delta_value_batches,
+        )?;
+        profile::record_since("topn.append_only_direct_merge", phase_start);
+
+        let phase_start = profile::start();
+        let output_delta = ColumnarZSet::try_new_weighted(
+            columnar.output_zset.value_schema(),
+            merge.delta_batches,
+        )
+        .context("build direct append-only topn output zset delta")?;
+        profile::record_since("topn.append_only_build_output_zset", phase_start);
+
+        let phase_start = profile::start();
+        let persisted_output_delta = if let Some(handle) = columnar
+            .output_zset
+            .create_version(
+                &output_delta,
+                columnar
+                    .output_zset
+                    .current_handle()
+                    .map(|handle| handle.version),
+            )
+            .await?
+        {
+            columnar.output_zset.read_delta(&handle).await?
+        } else {
+            output_delta
+        };
+        profile::record_since("topn.append_only_output_create_version", phase_start);
+
+        let phase_start = profile::start();
+        let mut next_snapshot = untouched_previous_output;
+        next_snapshot.extend(
+            merge
+                .next_output
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0),
+        );
+        if next_snapshot.is_empty() {
+            next_snapshot.push(RecordBatch::new_empty(Arc::clone(output_schema)));
+        }
+        profile::record_since("topn.append_only_output_snapshot_replace", phase_start);
+
+        let phase_start = profile::start();
+        columnar.source_snapshot = apply_source_snapshot_delta(
+            &columnar.source_schema,
+            &columnar.source_snapshot,
+            input_delta,
+        )
+        .await?;
+        profile::record_since("topn.append_only_source_snapshot_delta", phase_start);
+
+        return Ok(Some(ColumnarTopNTick {
+            delta: persisted_output_delta,
+            next_snapshot,
+            input_changed,
+        }));
+    }
+
+    let phase_start = profile::start();
+    let mut candidate_batches =
+        rewrap_record_batches_with_schema(&previous_output_for_keys, &columnar.source_schema)?;
+    candidate_batches.extend(delta_value_batches);
+    profile::record_since("topn.append_only_candidate_batches", phase_start);
+
+    let phase_start = profile::start();
+    let next_output = columnar
+        .evaluator
+        .evaluate(&candidate_batches)
+        .await
+        .context("evaluate append-only topn candidate output")?;
+    profile::record_since("topn.append_only_evaluate_next", phase_start);
+
+    let phase_start = profile::start();
+    let diff = diff_snapshot_batches_by_row(
+        Arc::clone(output_schema),
+        &previous_output_for_keys,
+        &next_output,
+    )
+    .context("diff append-only topn output")?;
+    profile::record_since("topn.append_only_diff_output", phase_start);
+
+    let phase_start = profile::start();
+    let output_delta =
+        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
+            .context("build append-only topn output zset delta")?;
+    profile::record_since("topn.append_only_build_output_zset", phase_start);
+
+    let phase_start = profile::start();
+    let persisted_output_delta = if let Some(handle) = columnar
+        .output_zset
+        .create_version(
+            &output_delta,
+            columnar
+                .output_zset
+                .current_handle()
+                .map(|handle| handle.version),
+        )
+        .await?
+    {
+        columnar.output_zset.read_delta(&handle).await?
+    } else {
+        output_delta
+    };
+    profile::record_since("topn.append_only_output_create_version", phase_start);
+
+    let phase_start = profile::start();
+    let mut next_snapshot = untouched_previous_output;
+    next_snapshot.extend(next_output.into_iter().filter(|batch| batch.num_rows() > 0));
+    if next_snapshot.is_empty() {
+        next_snapshot.push(RecordBatch::new_empty(Arc::clone(output_schema)));
+    }
+    profile::record_since("topn.append_only_output_snapshot_replace", phase_start);
+
+    let phase_start = profile::start();
+    columnar.source_snapshot = apply_source_snapshot_delta(
+        &columnar.source_schema,
+        &columnar.source_snapshot,
+        input_delta,
+    )
+    .await?;
+    profile::record_since("topn.append_only_source_snapshot_delta", phase_start);
+
+    Ok(Some(ColumnarTopNTick {
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    }))
+}
+
+const DIRECT_TOPN_OUTPUT_BATCH_ROWS: usize = 4096;
+
+struct DirectTopNMergeOutput {
+    next_output: Vec<RecordBatch>,
+    delta_batches: Vec<RecordBatch>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectTopNRowSide {
+    Previous,
+    Delta,
+}
+
+#[derive(Clone)]
+struct DirectTopNCandidate {
+    side: DirectTopNRowSide,
+    batch_idx: usize,
+    row_idx: usize,
+    ordinal: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DirectTopNRowRef {
+    side: DirectTopNRowSide,
+    batch_idx: usize,
+    row_idx: usize,
+}
+
+fn merge_append_only_direct_topn(
+    output_schema: &SchemaRef,
+    partition_converter: &RowConverter,
+    partition_indices: &[usize],
+    direct: &AppendOnlyDirectTopNState,
+    previous: &[RecordBatch],
+    delta: &[RecordBatch],
+) -> Result<DirectTopNMergeOutput> {
+    let mut groups: HashMap<Vec<u8>, Vec<DirectTopNCandidate>> = HashMap::new();
+    let mut ordinal = 0usize;
+    let phase_start = profile::start();
+    accumulate_direct_topn_candidates(
+        partition_converter,
+        partition_indices,
+        previous,
+        DirectTopNRowSide::Previous,
+        &mut ordinal,
+        &mut groups,
+    )?;
+    profile::record_since("topn.append_only_direct_accumulate_previous", phase_start);
+    let phase_start = profile::start();
+    accumulate_direct_topn_candidates(
+        partition_converter,
+        partition_indices,
+        delta,
+        DirectTopNRowSide::Delta,
+        &mut ordinal,
+        &mut groups,
+    )?;
+    profile::record_since("topn.append_only_direct_accumulate_delta", phase_start);
+
+    let phase_start = profile::start();
+    let mut previous_selected = previous
+        .iter()
+        .map(|batch| vec![false; batch.num_rows()])
+        .collect::<Vec<_>>();
+    let mut delta_selected = delta
+        .iter()
+        .map(|batch| vec![false; batch.num_rows()])
+        .collect::<Vec<_>>();
+    let mut positives = Vec::new();
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (_partition_key, mut rows) in groups {
+        rows.sort_unstable_by(|left, right| {
+            compare_direct_topn_candidates(direct, previous, delta, left, right)
+                .then_with(|| {
+                    direct_topn_side_rank(left.side).cmp(&direct_topn_side_rank(right.side))
+                })
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+        });
+        for row in rows.into_iter().take(direct.limit) {
+            let selected_ref = DirectTopNRowRef {
+                side: row.side,
+                batch_idx: row.batch_idx,
+                row_idx: row.row_idx,
+            };
+            if row.side == DirectTopNRowSide::Previous {
+                if let Some(batch_selected) = previous_selected.get_mut(row.batch_idx)
+                    && let Some(selected) = batch_selected.get_mut(row.row_idx)
+                {
+                    *selected = true;
+                }
+            } else {
+                if let Some(batch_selected) = delta_selected.get_mut(row.batch_idx)
+                    && let Some(selected) = batch_selected.get_mut(row.row_idx)
+                {
+                    *selected = true;
+                }
+                positives.push(selected_ref);
+            }
+        }
+    }
+    profile::record_since("topn.append_only_direct_select", phase_start);
+
+    let phase_start = profile::start();
+    let mut negatives = Vec::new();
+    for (batch_idx, batch_selected) in previous_selected.iter().enumerate() {
+        for (row_idx, selected) in batch_selected.iter().enumerate() {
+            if !selected {
+                negatives.push(DirectTopNRowRef {
+                    side: DirectTopNRowSide::Previous,
+                    batch_idx,
+                    row_idx,
+                });
+            }
+        }
+    }
+    profile::record_since("topn.append_only_direct_negatives", phase_start);
+
+    let phase_start = profile::start();
+    let next_output = build_direct_topn_selected_batches(
+        output_schema,
+        previous,
+        delta,
+        &previous_selected,
+        &delta_selected,
+    )
+    .context("build direct append-only topn next output")?;
+    profile::record_since("topn.append_only_direct_build_next", phase_start);
+    let phase_start = profile::start();
+    let weighted_schema = weighted_snapshot_schema(output_schema)?;
+    let delta_batches = build_direct_topn_weighted_batches(
+        &weighted_schema,
+        previous,
+        delta,
+        &negatives,
+        &positives,
+    )
+    .context("build direct append-only topn delta")?;
+    profile::record_since("topn.append_only_direct_build_delta", phase_start);
+
+    Ok(DirectTopNMergeOutput {
+        next_output,
+        delta_batches,
+    })
+}
+
+fn accumulate_direct_topn_candidates(
+    partition_converter: &RowConverter,
+    partition_indices: &[usize],
+    batches: &[RecordBatch],
+    side: DirectTopNRowSide,
+    ordinal: &mut usize,
+    groups: &mut HashMap<Vec<u8>, Vec<DirectTopNCandidate>>,
+) -> Result<()> {
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let partition_rows = if partition_indices.is_empty() {
+            None
+        } else {
+            Some(
+                partition_converter
+                    .convert_columns(&project_columns(batch, partition_indices))
+                    .context("encode direct topn partition keys")?,
+            )
+        };
+        for row_idx in 0..batch.num_rows() {
+            let partition_key = partition_rows
+                .as_ref()
+                .map(|rows| rows.row(row_idx).data().to_vec())
+                .unwrap_or_default();
+            groups
+                .entry(partition_key)
+                .or_default()
+                .push(DirectTopNCandidate {
+                    side,
+                    batch_idx,
+                    row_idx,
+                    ordinal: *ordinal,
+                });
+            *ordinal = ordinal.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+fn compare_direct_topn_candidates(
+    direct: &AppendOnlyDirectTopNState,
+    previous: &[RecordBatch],
+    delta: &[RecordBatch],
+    left: &DirectTopNCandidate,
+    right: &DirectTopNCandidate,
+) -> Ordering {
+    let left_batch = direct_topn_candidate_batch(previous, delta, left);
+    let right_batch = direct_topn_candidate_batch(previous, delta, right);
+    for ordering in &direct.orderings {
+        let order = compare_direct_topn_array_values(
+            left_batch.column(ordering.index).as_ref(),
+            left.row_idx,
+            right_batch.column(ordering.index).as_ref(),
+            right.row_idx,
+            ordering.asc,
+            ordering.nulls_first,
+        );
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    Ordering::Equal
+}
+
+fn direct_topn_candidate_batch<'a>(
+    previous: &'a [RecordBatch],
+    delta: &'a [RecordBatch],
+    candidate: &DirectTopNCandidate,
+) -> &'a RecordBatch {
+    match candidate.side {
+        DirectTopNRowSide::Previous => &previous[candidate.batch_idx],
+        DirectTopNRowSide::Delta => &delta[candidate.batch_idx],
+    }
+}
+
+fn compare_direct_topn_array_values(
+    left: &dyn Array,
+    left_idx: usize,
+    right: &dyn Array,
+    right_idx: usize,
+    asc: bool,
+    nulls_first: bool,
+) -> Ordering {
+    match (left.is_null(left_idx), right.is_null(right_idx)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => {
+            return if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (false, true) => {
+            return if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        (false, false) => {}
+    }
+
+    let order = match left.data_type() {
+        DataType::Int64 => {
+            let left = left.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            let right = right.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            left.value(left_idx).cmp(&right.value(right_idx))
+        }
+        DataType::Utf8 => {
+            let left = left.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            let right = right.as_any().downcast_ref::<StringArray>().expect("Utf8");
+            left.value(left_idx).cmp(right.value(right_idx))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let left = left
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("Timestamp(Millisecond)");
+            let right = right
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("Timestamp(Millisecond)");
+            left.value(left_idx).cmp(&right.value(right_idx))
+        }
+        DataType::Boolean => {
+            let left = left.as_any().downcast_ref::<BooleanArray>().expect("Bool");
+            let right = right.as_any().downcast_ref::<BooleanArray>().expect("Bool");
+            left.value(left_idx).cmp(&right.value(right_idx))
+        }
+        DataType::Date32 => {
+            let left = left.as_any().downcast_ref::<Date32Array>().expect("Date32");
+            let right = right
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32");
+            left.value(left_idx).cmp(&right.value(right_idx))
+        }
+        DataType::Decimal128(_, _) => {
+            let left = left
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128");
+            let right = right
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128");
+            left.value(left_idx).cmp(&right.value(right_idx))
+        }
+        DataType::Float64 => {
+            let left = left
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64");
+            let right = right
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64");
+            left.value(left_idx).total_cmp(&right.value(right_idx))
+        }
+        DataType::UInt64 => {
+            let left = left.as_any().downcast_ref::<UInt64Array>().expect("UInt64");
+            let right = right
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("UInt64");
+            left.value(left_idx).cmp(&right.value(right_idx))
+        }
+        DataType::Null => Ordering::Equal,
+        other => unreachable!("unsupported direct topn order column type: {other:?}"),
+    };
+    if asc { order } else { order.reverse() }
+}
+
+fn direct_topn_side_rank(side: DirectTopNRowSide) -> u8 {
+    match side {
+        DirectTopNRowSide::Previous => 0,
+        DirectTopNRowSide::Delta => 1,
+    }
+}
+
+fn build_direct_topn_selected_batches(
+    schema: &SchemaRef,
+    previous: &[RecordBatch],
+    delta: &[RecordBatch],
+    previous_selected: &[Vec<bool>],
+    delta_selected: &[Vec<bool>],
+) -> Result<Vec<RecordBatch>> {
+    let mut output = Vec::new();
+    append_direct_topn_selected_batches(schema, previous, previous_selected, &mut output)?;
+    append_direct_topn_selected_batches(schema, delta, delta_selected, &mut output)?;
+    if output.is_empty() {
+        output.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(output)
+}
+
+fn append_direct_topn_selected_batches(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    selected: &[Vec<bool>],
+    output: &mut Vec<RecordBatch>,
+) -> Result<()> {
+    for (batch, selected) in batches.iter().zip(selected) {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let indices = selected
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, selected)| {
+                selected.then(|| u32::try_from(idx).context("direct topn batch exceeds u32 rows"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if indices.is_empty() {
+            continue;
+        }
+        if indices.len() == batch.num_rows() {
+            output.push(RecordBatch::try_new(
+                Arc::clone(schema),
+                batch.columns().to_vec(),
+            )?);
+        } else {
+            output.push(take_batch_rows(schema, batch, indices)?);
+        }
+    }
+    Ok(())
+}
+
+fn build_direct_topn_weighted_batches(
+    schema: &SchemaRef,
+    previous: &[RecordBatch],
+    delta: &[RecordBatch],
+    negatives: &[DirectTopNRowRef],
+    positives: &[DirectTopNRowRef],
+) -> Result<Vec<RecordBatch>> {
+    let mut output = Vec::new();
+    let mut builders = direct_topn_builders(schema)?;
+    let value_column_count = schema.fields().len().saturating_sub(1);
+    let mut buffered_rows = 0usize;
+
+    for row in negatives {
+        append_direct_topn_row(
+            &mut builders,
+            value_column_count,
+            previous,
+            delta,
+            *row,
+            Some(-1),
+        )?;
+        buffered_rows += 1;
+        if buffered_rows == DIRECT_TOPN_OUTPUT_BATCH_ROWS {
+            output.push(finish_direct_topn_batch(schema, &mut builders)?);
+            buffered_rows = 0;
+        }
+    }
+    for row in positives {
+        append_direct_topn_row(
+            &mut builders,
+            value_column_count,
+            previous,
+            delta,
+            *row,
+            Some(1),
+        )?;
+        buffered_rows += 1;
+        if buffered_rows == DIRECT_TOPN_OUTPUT_BATCH_ROWS {
+            output.push(finish_direct_topn_batch(schema, &mut builders)?);
+            buffered_rows = 0;
+        }
+    }
+
+    if buffered_rows > 0 {
+        output.push(finish_direct_topn_batch(schema, &mut builders)?);
+    }
+    if output.is_empty() {
+        output.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(output)
+}
+
+fn direct_topn_builders(schema: &SchemaRef) -> Result<Vec<ScalarColumnBuilder>> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| ScalarColumnBuilder::new(field.data_type(), DIRECT_TOPN_OUTPUT_BATCH_ROWS))
+        .collect()
+}
+
+fn append_direct_topn_row(
+    builders: &mut [ScalarColumnBuilder],
+    value_column_count: usize,
+    previous: &[RecordBatch],
+    delta: &[RecordBatch],
+    row: DirectTopNRowRef,
+    weight: Option<i64>,
+) -> Result<()> {
+    let source_batches = match row.side {
+        DirectTopNRowSide::Previous => previous,
+        DirectTopNRowSide::Delta => delta,
+    };
+    let source_batch = source_batches
+        .get(row.batch_idx)
+        .context("direct topn source batch index out of bounds")?;
+    for (column_idx, builder) in builders.iter_mut().enumerate() {
+        if column_idx == value_column_count {
+            builder.append_i64_value(weight.context("direct topn missing row weight")?)?;
+        } else {
+            builder.append_array_value(source_batch.column(column_idx).as_ref(), row.row_idx)?;
+        }
+    }
+    Ok(())
+}
+
+fn finish_direct_topn_batch(
+    schema: &SchemaRef,
+    builders: &mut [ScalarColumnBuilder],
+) -> Result<RecordBatch> {
+    let columns = builders
+        .iter_mut()
+        .map(ScalarColumnBuilder::finish_array)
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 async fn run_columnar_topn_full_snapshot_diff_state_tick(
@@ -648,6 +1379,7 @@ async fn prepare_topn_input_tick(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<TopNInputTick> {
+    let total_start = profile::start();
     if columnar.grouped_stats.is_some() {
         return prepare_grouped_stats_topn_input_tick(
             columnar,
@@ -664,17 +1396,29 @@ async fn prepare_topn_input_tick(
         )
         .await;
     }
+    let phase_start = profile::start();
+    let append_only_source_delta = weighted_delta_batches
+        .get(columnar.input_name.as_str())
+        .is_none()
+        && insert_batches
+            .get(columnar.input_name.as_str())
+            .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() > 0));
     let input_delta = source_input_delta(columnar, insert_batches, weighted_delta_batches)?;
+    profile::record_since("topn.source_input_delta", phase_start);
     let input_zset = columnar
         .input_zset
         .as_mut()
         .context("topn source input zset missing")?;
+    let phase_start = profile::start();
     let delta = persisted_source_delta(input_zset, input_delta).await?;
+    profile::record_since("topn.persist_source_delta", phase_start);
     let input_changed = !delta.batches().is_empty();
+    profile::record_since("topn.prepare_input_total", total_start);
     Ok(TopNInputTick {
         delta,
         input_changed,
         next_source_snapshot: None,
+        append_only_source_delta,
     })
 }
 
@@ -688,6 +1432,7 @@ async fn prepare_grouped_stats_topn_input_tick(
             delta: ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?,
             input_changed: false,
             next_source_snapshot: None,
+            append_only_source_delta: false,
         });
     };
     let tick = run_columnar_grouped_stats_state_tick(
@@ -711,12 +1456,14 @@ async fn prepare_grouped_stats_topn_input_tick(
             delta: tick.delta,
             input_changed: false,
             next_source_snapshot: None,
+            append_only_source_delta: false,
         });
     }
     Ok(TopNInputTick {
         delta: tick.delta,
         input_changed,
         next_source_snapshot: input_changed.then_some(tick.next_snapshot),
+        append_only_source_delta: false,
     })
 }
 
@@ -730,6 +1477,7 @@ async fn prepare_aggregate_join_topn_input_tick(
             delta: ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?,
             input_changed: false,
             next_source_snapshot: None,
+            append_only_source_delta: false,
         });
     };
     let tick = run_columnar_composed_state_tick(
@@ -753,12 +1501,14 @@ async fn prepare_aggregate_join_topn_input_tick(
             delta: tick.delta,
             input_changed: false,
             next_source_snapshot: None,
+            append_only_source_delta: false,
         });
     }
     Ok(TopNInputTick {
         delta: tick.delta,
         input_changed,
         next_source_snapshot: input_changed.then_some(tick.next_snapshot),
+        append_only_source_delta: false,
     })
 }
 
@@ -816,6 +1566,85 @@ async fn apply_source_snapshot_delta(
         return Ok(previous.to_vec());
     }
     apply_weighted_snapshot_delta(schema, previous, delta.batches().to_vec()).await
+}
+
+fn schemas_match_by_position(input_schema: &SchemaRef, output_schema: &SchemaRef) -> bool {
+    input_schema.fields().len() == output_schema.fields().len()
+        && input_schema
+            .fields()
+            .iter()
+            .zip(output_schema.fields())
+            .all(|(input, output)| input.data_type() == output.data_type())
+}
+
+fn unit_positive_delta_value_batches(
+    value_schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<Option<Vec<RecordBatch>>> {
+    let mut output = Vec::with_capacity(batches.len());
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let Ok(weight_idx) = batch.schema().index_of(WEIGHT_COLUMN_NAME) else {
+            return Ok(None);
+        };
+        let Some(weights) = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+        else {
+            return Ok(None);
+        };
+        for row_idx in 0..weights.len() {
+            if weights.is_null(row_idx) || weights.value(row_idx) != 1 {
+                return Ok(None);
+            }
+        }
+        let columns = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, column)| (idx != weight_idx).then(|| Arc::clone(column)))
+            .collect::<Vec<_>>();
+        if columns.len() != value_schema.fields().len() {
+            return Ok(None);
+        }
+        for (idx, field) in value_schema.fields().iter().enumerate() {
+            if columns[idx].data_type() != field.data_type() {
+                return Ok(None);
+            }
+        }
+        output.push(RecordBatch::try_new(Arc::clone(value_schema), columns)?);
+    }
+    Ok(Some(output))
+}
+
+fn rewrap_record_batches_with_schema(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| {
+            if batch.num_columns() != schema.fields().len() {
+                bail!(
+                    "topn append-only candidate batch width {} does not match schema width {}",
+                    batch.num_columns(),
+                    schema.fields().len()
+                );
+            }
+            for (idx, field) in schema.fields().iter().enumerate() {
+                let actual_type = batch.column(idx).data_type();
+                if actual_type != field.data_type() {
+                    bail!(
+                        "topn append-only candidate column {} type {:?} does not match expected {:?}",
+                        idx,
+                        actual_type,
+                        field.data_type()
+                    );
+                }
+            }
+            RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec()).map_err(Into::into)
+        })
+        .collect()
 }
 
 impl TopNEvaluator {
@@ -969,6 +1798,63 @@ fn filter_batches_to_partition_keys(
     Ok(output)
 }
 
+fn split_batches_by_partition_keys(
+    schema: &SchemaRef,
+    converter: &RowConverter,
+    partition_indices: &[usize],
+    batches: &[RecordBatch],
+    keys: &HashSet<Vec<u8>>,
+) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    if keys.is_empty() {
+        return Ok((Vec::new(), batches.to_vec()));
+    }
+    if partition_indices.is_empty() {
+        return Ok((batches.to_vec(), Vec::new()));
+    }
+    let mut matching = Vec::new();
+    let mut remaining = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let rows = converter
+            .convert_columns(&project_columns(batch, partition_indices))
+            .context("encode topn snapshot partition keys")?;
+        let mut matching_indices = Vec::new();
+        let mut remaining_indices = Vec::new();
+        for row_idx in 0..batch.num_rows() {
+            let row_idx = u32::try_from(row_idx).context("topn batch exceeds u32 rows")?;
+            if keys.contains(rows.row(row_idx as usize).data()) {
+                matching_indices.push(row_idx);
+            } else {
+                remaining_indices.push(row_idx);
+            }
+        }
+        if matching_indices.len() == batch.num_rows() {
+            matching.push(batch.clone());
+        } else if !matching_indices.is_empty() {
+            matching.push(take_batch_rows(schema, batch, matching_indices)?);
+        }
+        if remaining_indices.len() == batch.num_rows() {
+            remaining.push(batch.clone());
+        } else if !remaining_indices.is_empty() {
+            remaining.push(take_batch_rows(schema, batch, remaining_indices)?);
+        }
+    }
+    Ok((matching, remaining))
+}
+
+fn take_batch_rows(
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+    indices: Vec<u32>,
+) -> Result<RecordBatch> {
+    let indices = UInt32Array::from(indices);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
+
 fn project_columns(batch: &RecordBatch, indices: &[usize]) -> Vec<ArrayRef> {
     indices
         .iter()
@@ -982,6 +1868,52 @@ fn row_converter_for_indices(schema: &SchemaRef, indices: &[usize]) -> Result<Ro
         .map(|idx| SortField::new(schema.field(*idx).data_type().clone()))
         .collect::<Vec<_>>();
     RowConverter::new(fields).context("build topn partition Arrow row converter")
+}
+
+fn append_only_direct_topn_state_for_source(
+    source: &VectorizedSourceState,
+    plan: Option<&AppendOnlyDirectTopNPlan>,
+) -> Result<Option<AppendOnlyDirectTopNState>> {
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    let mut orderings = Vec::with_capacity(plan.orderings.len());
+    for ordering in &plan.orderings {
+        let Ok(idx) = partition_column_index(source, &ordering.column) else {
+            return Ok(None);
+        };
+        let data_type = source.schema.field(idx).data_type();
+        if !direct_topn_order_type_supported(data_type) {
+            return Ok(None);
+        }
+        orderings.push(AppendOnlyDirectTopNOrderingState {
+            index: idx,
+            asc: ordering.asc,
+            nulls_first: ordering.nulls_first,
+        });
+    }
+    if orderings.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AppendOnlyDirectTopNState {
+        limit: plan.limit,
+        orderings,
+    }))
+}
+
+fn direct_topn_order_type_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int64
+            | DataType::Utf8
+            | DataType::Timestamp(TimeUnit::Millisecond, _)
+            | DataType::Boolean
+            | DataType::Date32
+            | DataType::Decimal128(_, _)
+            | DataType::Float64
+            | DataType::UInt64
+            | DataType::Null
+    )
 }
 
 fn partition_column_index(source: &VectorizedSourceState, column: &str) -> Result<usize> {
@@ -1331,6 +2263,86 @@ fn extract_row_number_limit(predicate: &Expr) -> Option<(String, usize)> {
             value - 1
         }
         RowNumberPredicateKind::Equality => 1,
+    };
+    (limit > 0).then_some((column, limit))
+}
+
+fn append_only_direct_topn_plan(
+    window_function: &WindowFunction,
+    limit: usize,
+) -> Option<AppendOnlyDirectTopNPlan> {
+    if window_function.params.order_by.is_empty() {
+        return None;
+    }
+    let orderings = window_function
+        .params
+        .order_by
+        .iter()
+        .map(|sort| {
+            Some(AppendOnlyDirectTopNOrdering {
+                column: partition_column_name(&sort.expr)?,
+                asc: sort.asc,
+                nulls_first: sort.nulls_first,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(AppendOnlyDirectTopNPlan { limit, orderings })
+}
+
+fn extract_standalone_row_number_upper_bound_limit(predicate: &Expr) -> Option<(String, usize)> {
+    if let Expr::BinaryExpr(binary) = predicate
+        && binary.op == Operator::And
+    {
+        return None;
+    }
+    extract_row_number_upper_bound_limit(predicate)
+}
+
+fn extract_row_number_upper_bound_limit(predicate: &Expr) -> Option<(String, usize)> {
+    let Expr::BinaryExpr(binary) = predicate else {
+        return None;
+    };
+    if binary.op == Operator::And {
+        let left = extract_row_number_upper_bound_limit(binary.left.as_ref());
+        let right = extract_row_number_upper_bound_limit(binary.right.as_ref());
+        return match (left, right) {
+            (Some(found), None) | (None, Some(found)) => Some(found),
+            _ => None,
+        };
+    }
+    let (column, literal, kind) = match (&*binary.left, binary.op, &*binary.right) {
+        (Expr::Column(column), Operator::LtEq, literal @ Expr::Literal(_, _)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::InclusiveUpper,
+        ),
+        (Expr::Column(column), Operator::Lt, literal @ Expr::Literal(_, _)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::ExclusiveUpper,
+        ),
+        (literal @ Expr::Literal(_, _), Operator::GtEq, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::InclusiveUpper,
+        ),
+        (literal @ Expr::Literal(_, _), Operator::Gt, Expr::Column(column)) => (
+            column.name.clone(),
+            literal,
+            RowNumberPredicateKind::ExclusiveUpper,
+        ),
+        _ => return None,
+    };
+    let value = literal_to_positive_usize(literal)?;
+    let limit = match kind {
+        RowNumberPredicateKind::InclusiveUpper => value,
+        RowNumberPredicateKind::ExclusiveUpper => {
+            if value <= 1 {
+                return None;
+            }
+            value - 1
+        }
+        RowNumberPredicateKind::Equality => return None,
     };
     (limit > 0).then_some((column, limit))
 }

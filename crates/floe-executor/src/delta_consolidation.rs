@@ -8,6 +8,7 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::common::{Result as DFResult, internal_err};
 use datafusion::error::DataFusionError;
 
@@ -181,6 +182,177 @@ pub async fn diff_snapshot_batches(
     DeltaConsolidator::new(weighted_schema)?
         .consolidate_with_stats(weighted_batches)
         .await
+}
+
+pub fn diff_snapshot_batches_by_row(
+    base_schema: SchemaRef,
+    previous: &[RecordBatch],
+    next: &[RecordBatch],
+) -> DFResult<ConsolidationOutput> {
+    for batch in previous.iter().chain(next.iter()) {
+        if batch.schema().as_ref() != base_schema.as_ref() {
+            return internal_err!("snapshot batch schema does not match diff schema");
+        }
+    }
+
+    let weighted_schema = weighted_snapshot_schema(&base_schema)?;
+    let converter = row_converter_for_schema(&base_schema)?;
+    let mut groups: HashMap<Vec<u8>, DiffRowGroup> = HashMap::new();
+    accumulate_diff_rows(&converter, previous, DiffSide::Previous, -1, &mut groups)?;
+    accumulate_diff_rows(&converter, next, DiffSide::Next, 1, &mut groups)?;
+
+    let grouped_rows = groups.len();
+    let rows = groups
+        .into_values()
+        .filter_map(|group| {
+            if group.weight == 0 {
+                return None;
+            }
+            let side = if group.weight > 0 {
+                DiffSide::Next
+            } else {
+                DiffSide::Previous
+            };
+            let source = match side {
+                DiffSide::Previous => group.previous,
+                DiffSide::Next => group.next,
+            }?;
+            Some(DiffOutputRow {
+                source,
+                side,
+                weight: group.weight,
+            })
+        })
+        .collect::<Vec<_>>();
+    let output_rows = rows.len();
+    let batches = build_diff_batches(&weighted_schema, previous, next, &rows)?;
+
+    Ok(ConsolidationOutput {
+        batches,
+        stats: ConsolidationStats {
+            input_rows: previous
+                .iter()
+                .chain(next.iter())
+                .map(RecordBatch::num_rows)
+                .sum(),
+            grouped_rows,
+            output_rows,
+            zero_weight_dropped_rows: grouped_rows.saturating_sub(output_rows),
+        },
+    })
+}
+
+#[derive(Clone, Copy)]
+enum DiffSide {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy)]
+struct DiffRowGroup {
+    previous: Option<SourceRowRef>,
+    next: Option<SourceRowRef>,
+    weight: i64,
+}
+
+#[derive(Clone, Copy)]
+struct DiffOutputRow {
+    source: SourceRowRef,
+    side: DiffSide,
+    weight: i64,
+}
+
+fn row_converter_for_schema(schema: &SchemaRef) -> DFResult<RowConverter> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| SortField::new(field.data_type().clone()))
+        .collect::<Vec<_>>();
+    RowConverter::new(fields).map_err(|err| DataFusionError::Execution(err.to_string()))
+}
+
+fn accumulate_diff_rows(
+    converter: &RowConverter,
+    batches: &[RecordBatch],
+    side: DiffSide,
+    weight: i64,
+    groups: &mut HashMap<Vec<u8>, DiffRowGroup>,
+) -> DFResult<()> {
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let rows = converter.convert_columns(batch.columns())?;
+        for row_idx in 0..batch.num_rows() {
+            let entry = groups
+                .entry(rows.row(row_idx).data().to_vec())
+                .or_insert(DiffRowGroup {
+                    previous: None,
+                    next: None,
+                    weight: 0,
+                });
+            let source = SourceRowRef { batch_idx, row_idx };
+            match side {
+                DiffSide::Previous => entry.previous = Some(source),
+                DiffSide::Next => entry.next = Some(source),
+            }
+            entry.weight = entry.weight.saturating_add(weight);
+        }
+    }
+    Ok(())
+}
+
+fn build_diff_batches(
+    schema: &SchemaRef,
+    previous: &[RecordBatch],
+    next: &[RecordBatch],
+    rows: &[DiffOutputRow],
+) -> DFResult<Vec<RecordBatch>> {
+    let mut output = Vec::new();
+    let mut builders = new_output_builders(schema)?;
+    let weight_idx = schema
+        .fields()
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| DataFusionError::Internal("weighted diff schema is empty".into()))?;
+    let mut buffered_rows = 0usize;
+
+    for row in rows {
+        let source_batches = match row.side {
+            DiffSide::Previous => previous,
+            DiffSide::Next => next,
+        };
+        let source_batch = source_batches.get(row.source.batch_idx).ok_or_else(|| {
+            DataFusionError::Internal("diff source batch index out of bounds".into())
+        })?;
+        for (column_idx, builder) in builders.iter_mut().enumerate() {
+            if column_idx == weight_idx {
+                builder
+                    .append_i64_value(row.weight)
+                    .map_err(to_execution_error)?;
+            } else {
+                builder
+                    .append_array_value(
+                        source_batch.column(column_idx).as_ref(),
+                        row.source.row_idx,
+                    )
+                    .map_err(to_execution_error)?;
+            }
+        }
+        buffered_rows += 1;
+        if buffered_rows == CONSOLIDATED_BATCH_ROW_LIMIT {
+            output.push(finish_consolidated_batch(schema, &mut builders)?);
+            buffered_rows = 0;
+        }
+    }
+
+    if buffered_rows > 0 {
+        output.push(finish_consolidated_batch(schema, &mut builders)?);
+    }
+    if output.is_empty() {
+        output.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(output)
 }
 
 fn validate_key_payload_consistency(batches: &[RecordBatch], schema: &SchemaRef) -> DFResult<()> {
