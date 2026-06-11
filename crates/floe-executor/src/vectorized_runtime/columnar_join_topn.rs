@@ -41,6 +41,12 @@ pub(super) struct ColumnarJoinTopNPlan {
     kind: ColumnarJoinTopNPlanKind,
 }
 
+pub(super) struct PartitionedJoinTop1ValueInput {
+    pub(super) input: LogicalPlan,
+    pub(super) partition_by: Vec<Expr>,
+    pub(super) value_expr: Expr,
+}
+
 impl ColumnarJoinTopNPlan {
     pub(super) fn source_names(&self) -> [String; 2] {
         [self.left_source.clone(), self.right_source.clone()]
@@ -187,6 +193,42 @@ pub(super) fn columnar_join_topn_plan_for_plan(
         return Ok(Some(plan));
     }
     global_join_topn_plan_for_plan(plan, sources)
+}
+
+pub(super) fn partitioned_join_top1_value_input_for_plan(
+    plan: &LogicalPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<PartitionedJoinTop1ValueInput>> {
+    let Some((_, filter)) = row_number_filter_for_plan(plan) else {
+        return Ok(None);
+    };
+    let Some((window, _)) = extract_window_plan(filter.input.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(ColumnarJoinTopNPlan {
+        kind: ColumnarJoinTopNPlanKind::PartitionedBestBid { .. },
+        ..
+    }) = partitioned_best_bid_join_topn_plan_for_plan(plan, sources)?
+    else {
+        return Ok(None);
+    };
+    let [window_expr] = window.window_expr.as_slice() else {
+        return Ok(None);
+    };
+    let Expr::WindowFunction(window_function) = strip_alias(window_expr) else {
+        return Ok(None);
+    };
+    let [first_order, ..] = window_function.params.order_by.as_slice() else {
+        return Ok(None);
+    };
+    if first_order.asc {
+        return Ok(None);
+    }
+    Ok(Some(PartitionedJoinTop1ValueInput {
+        input: window.input.as_ref().clone(),
+        partition_by: window_function.params.partition_by.clone(),
+        value_expr: first_order.expr.clone(),
+    }))
 }
 
 fn partitioned_best_bid_join_topn_plan_for_plan(

@@ -17,6 +17,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::functions_aggregate::expr_fn::max;
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::physical_plan::{ExecutionPlan, collect};
@@ -48,7 +49,8 @@ use super::columnar_join::{
 use super::columnar_join_topn::{
     ColumnarJoinTopNMaterializedViewState, ColumnarJoinTopNPlan,
     build_columnar_join_topn_materialized_view_state_in_namespaces,
-    columnar_join_topn_plan_for_plan, run_columnar_join_topn_state_tick,
+    columnar_join_topn_plan_for_plan, partitioned_join_top1_value_input_for_plan,
+    run_columnar_join_topn_state_tick,
 };
 use super::columnar_multijoin::{
     ColumnarMultiJoinMaterializedViewState, ColumnarMultiJoinPlan,
@@ -313,6 +315,16 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let input =
         if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
             ColumnarGroupedStatsInputPlan::Source { source_name }
+        } else if let Some((grouped_max, source_schema)) =
+            grouped_stats_top1_value_grouped_max_input_for_aggregate(aggregate, sources)?
+        {
+            let projection_input_schema = derived_projection_input_schema(&source_schema);
+            ColumnarGroupedStatsInputPlan::GroupedMax {
+                input_name: "__floe_grouped_stats_top1_value_grouped_max_input".to_string(),
+                source_schema,
+                projection_input_schema,
+                plan: Box::new(grouped_max),
+            }
         } else if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(
             aggregate.input.as_ref(),
             sources,
@@ -3533,6 +3545,138 @@ impl PostAggregateTransformState {
             collected.context("execute grouped-stats post-aggregate transform")?,
             output_schema,
         )
+    }
+}
+
+fn grouped_stats_top1_value_grouped_max_input_for_aggregate(
+    aggregate: &Aggregate,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> Result<Option<(ColumnarGroupedMaxPlan, SchemaRef)>> {
+    // AVG(x) over ROW_NUMBER() <= 1 ordered by x DESC is AVG(MAX(x) per
+    // full row-number partition); secondary tie breakers do not change x.
+    let [avg_expr] = aggregate.aggr_expr.as_slice() else {
+        return Ok(None);
+    };
+    let Some(avg_value_expr) = avg_value_expr_for_top1_value_rewrite(avg_expr) else {
+        return Ok(None);
+    };
+    let Some(top1_input) =
+        partitioned_join_top1_value_input_for_plan(aggregate.input.as_ref(), sources)?
+    else {
+        return Ok(None);
+    };
+    if !column_exprs_match(avg_value_expr, &top1_input.value_expr) {
+        return Ok(None);
+    }
+    if !aggregate.group_expr.iter().all(|expr| {
+        column_expr_name(expr)
+            .map(|name| {
+                top1_input
+                    .partition_by
+                    .iter()
+                    .any(|partition_expr| column_expr_name(partition_expr) == Some(name))
+            })
+            .unwrap_or(false)
+    }) {
+        return Ok(None);
+    }
+
+    let value_idx = match aggregate_input_column_index(aggregate, avg_value_expr) {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+    if value_idx != aggregate.group_expr.len() {
+        return Ok(None);
+    }
+    for (expected_idx, group_expr) in aggregate.group_expr.iter().enumerate() {
+        if aggregate_input_column_index(aggregate, group_expr) != Some(expected_idx) {
+            return Ok(None);
+        }
+    }
+
+    let grouped_max_value_alias = "__floe_top1_value";
+    let grouped_max_aggregate = LogicalPlanBuilder::from(top1_input.input)
+        .aggregate(
+            top1_input.partition_by.clone(),
+            vec![max(top1_input.value_expr.clone()).alias(grouped_max_value_alias)],
+        )?
+        .build()?;
+    let grouped_max_schema = grouped_max_aggregate.schema();
+    let mut projected_exprs = Vec::with_capacity(aggregate.group_expr.len() + 1);
+    for (group_idx, group_expr) in aggregate.group_expr.iter().enumerate() {
+        let Some(group_name) = column_expr_name(group_expr) else {
+            return Ok(None);
+        };
+        let Some(partition_idx) = top1_input
+            .partition_by
+            .iter()
+            .position(|partition_expr| column_expr_name(partition_expr) == Some(group_name))
+        else {
+            return Ok(None);
+        };
+        let field = grouped_max_schema.field(partition_idx);
+        let output_field = aggregate.input.schema().field(group_idx);
+        projected_exprs.push(
+            Expr::Column(Column::new_unqualified(field.name().clone()))
+                .alias(output_field.name().clone()),
+        );
+    }
+    let value_field = aggregate.input.schema().field(value_idx);
+    projected_exprs.push(
+        Expr::Column(Column::new_unqualified(grouped_max_value_alias))
+            .alias(value_field.name().clone()),
+    );
+
+    let synthetic_grouped_max_plan = LogicalPlanBuilder::from(grouped_max_aggregate)
+        .project(projected_exprs)?
+        .build()?;
+    let source_schema = df_schema_to_arrow(synthetic_grouped_max_plan.schema())?;
+    let Some(grouped_max) =
+        columnar_grouped_max_plan_for_plan(&synthetic_grouped_max_plan, sources, &source_schema)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((grouped_max, source_schema)))
+}
+
+fn avg_value_expr_for_top1_value_rewrite(expr: &Expr) -> Option<&Expr> {
+    let Expr::AggregateFunction(aggregate) = strip_alias(expr) else {
+        return None;
+    };
+    let params = &aggregate.params;
+    if params.distinct
+        || !params.order_by.is_empty()
+        || params.filter.is_some()
+        || params.null_treatment.is_some()
+        || !aggregate.func.name().eq_ignore_ascii_case("avg")
+    {
+        return None;
+    }
+    let [value_expr] = params.args.as_slice() else {
+        return None;
+    };
+    Some(value_expr)
+}
+
+fn aggregate_input_column_index(aggregate: &Aggregate, expr: &Expr) -> Option<usize> {
+    let Expr::Column(column) = strip_alias(expr) else {
+        return None;
+    };
+    aggregate.input.schema().index_of_column(column).ok()
+}
+
+fn column_exprs_match(left: &Expr, right: &Expr) -> bool {
+    strip_alias(left) == strip_alias(right)
+        || match (column_expr_name(left), column_expr_name(right)) {
+            (Some(left), Some(right)) => left == right,
+            _ => false,
+        }
+}
+
+fn column_expr_name(expr: &Expr) -> Option<&str> {
+    match strip_alias(expr) {
+        Expr::Column(column) => Some(column.name.as_str()),
+        _ => None,
     }
 }
 
