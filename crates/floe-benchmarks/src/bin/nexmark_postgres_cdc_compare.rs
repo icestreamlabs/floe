@@ -123,6 +123,7 @@ struct Config {
     floe_object_store_db_name_prefix: Option<String>,
     cloud_provider: Option<String>,
     live_cdc_ops: u64,
+    slot_catchup_max_lag_bytes: i64,
     bid_initial_rows: u64,
     auction_initial_rows: u64,
     person_initial_rows: u64,
@@ -194,6 +195,7 @@ impl Config {
             floe_object_store_db_name_prefix: env_nonempty("FLOE_OBJECT_STORE_DB_NAME_PREFIX"),
             cloud_provider: env_nonempty("CLOUD_PROVIDER"),
             live_cdc_ops: env_parse("CDC_OPS", DEFAULT_LIVE_CDC_OPS)?,
+            slot_catchup_max_lag_bytes: env_parse("CDC_SLOT_CATCHUP_MAX_LAG_BYTES", 1_048_576)?,
             bid_initial_rows: env_parse("BID_INITIAL_ROWS", DEFAULT_BID_ROWS)?,
             auction_initial_rows: env_parse("AUCTION_INITIAL_ROWS", DEFAULT_AUCTION_ROWS)?,
             person_initial_rows: env_parse("PERSON_INITIAL_ROWS", DEFAULT_PERSON_ROWS)?,
@@ -501,6 +503,8 @@ impl Harness {
         self.wait_for_postgres_slot_active(query_id, engine, artifact_dir)?;
         let live_started = Instant::now();
         let live_write_ms = self.write_live_mutations(sources, profile, artifact_dir)?;
+        let slot_catchup_ms =
+            self.wait_for_postgres_slot_caught_up(query_id, engine, artifact_dir)?;
         let final_expected = self.compute_expected_fingerprint(
             source_target,
             &expected_baseline_sql,
@@ -532,7 +536,7 @@ impl Harness {
                 "cdc_updates_deletes_inserts;baseline_rows={};final_content_sha256={};{}",
                 baseline.row_count,
                 final_observed.short_hash(),
-                profile.notes()
+                format!("slot_catchup_ms={slot_catchup_ms};{}", profile.notes())
             ),
         })?;
         Ok(())
@@ -778,6 +782,57 @@ impl Harness {
             .unwrap_or_default();
         fs::write(artifact_dir.join("postgres_slots.txt"), slots)?;
         bail!("Postgres CDC slot {slot} did not become active")
+    }
+
+    fn wait_for_postgres_slot_caught_up(
+        &self,
+        query_id: &str,
+        engine: Engine,
+        artifact_dir: &Path,
+    ) -> Result<u128> {
+        let started = Instant::now();
+        let slot = slot_name(&self.config.run_id, engine, query_id);
+        let sql = format!(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::BIGINT, confirmed_flush_lsn::TEXT, pg_current_wal_lsn()::TEXT FROM pg_replication_slots WHERE slot_name = '{}'",
+            escape_sql_literal(&slot)
+        );
+        let deadline = Instant::now() + self.config.poll_timeout;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let output = self
+                .fetch_pg_table(
+                    self.config.source_pg_target(),
+                    &sql,
+                    self.config.pg_query_timeout_seconds,
+                )
+                .unwrap_or_default();
+            last = output.clone();
+            let lag = output
+                .split('\t')
+                .next()
+                .and_then(|value| value.parse::<i64>().ok());
+            if let Some(lag) = lag
+                && lag <= self.config.slot_catchup_max_lag_bytes
+            {
+                fs::write(
+                    artifact_dir.join("slot_catchup.txt"),
+                    format!(
+                        "slot={slot}\nlag_bytes={lag}\nelapsed_ms={}\nraw={output}\n",
+                        started.elapsed().as_millis()
+                    ),
+                )?;
+                return Ok(started.elapsed().as_millis());
+            }
+            wait_before_retry(deadline, self.config.poll_interval);
+        }
+        fs::write(
+            artifact_dir.join("slot_catchup.error"),
+            format!(
+                "slot={slot}\nmax_lag_bytes={}\nlast={last}\n",
+                self.config.slot_catchup_max_lag_bytes
+            ),
+        )?;
+        bail!("Postgres CDC slot {slot} did not catch up before timeout")
     }
 
     fn write_live_mutations(
@@ -1164,6 +1219,7 @@ impl Harness {
             "engine_selector": self.config.engine_selector,
             "query_selector": self.config.query_selector,
             "live_cdc_ops": self.config.live_cdc_ops,
+            "slot_catchup_max_lag_bytes": self.config.slot_catchup_max_lag_bytes,
             "initial_rows": {
                 "bid": self.config.bid_initial_rows,
                 "auction": self.config.auction_initial_rows,
