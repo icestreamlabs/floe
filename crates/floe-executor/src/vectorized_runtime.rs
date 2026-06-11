@@ -31,6 +31,7 @@ use source_state::{
 };
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
+const SOURCE_APPEND_ONLY_PROPERTY: &str = "append_only";
 
 mod columnar_composed;
 mod columnar_constant;
@@ -244,6 +245,7 @@ struct VectorizedSourceState {
     provider: Arc<DynamicStateTableProvider>,
     query_provider: Option<Arc<DynamicStateTableProvider>>,
     maintain_execution_state: bool,
+    append_only: bool,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
     query_alias_provider: Option<Arc<DynamicStateTableProvider>>,
@@ -455,6 +457,9 @@ impl VectorizedExecutionRuntime {
         for definition in sources.definitions() {
             let schema = definition.to_arrow_schema();
             let primary_key_columns = source_primary_key_columns(definition);
+            let append_only = definition
+                .property(SOURCE_APPEND_ONLY_PROPERTY)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
             let key_indices = source_key_indices(&schema, &primary_key_columns)?;
             let provider = Arc::new(dynamic_state_provider(
                 Arc::clone(&schema),
@@ -508,6 +513,7 @@ impl VectorizedExecutionRuntime {
                     provider,
                     query_provider,
                     maintain_execution_state: false,
+                    append_only,
                     alias_schema,
                     alias_provider,
                     query_alias_provider,

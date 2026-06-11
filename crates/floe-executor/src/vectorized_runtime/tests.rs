@@ -3058,6 +3058,83 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
 }
 
 #[tokio::test]
+async fn append_only_grouped_stats_rejects_negative_source_delta() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+        ],
+    )
+    .expect("source definition")
+    .with_property(SOURCE_APPEND_ONLY_PROPERTY, "true");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-stats-append-only").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("total_bids", DataType::Int64, false),
+        Field::new("min_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT auction, COUNT(*) AS total_bids, MIN(price) AS min_price \
+        FROM bids GROUP BY auction";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_stats",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        registry,
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("runtime");
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let retract_rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .expect("retract source rows");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted = weighted_batch_from_diffs(&retract_rows, &weighted_schema, &[-1])
+        .expect("weighted retract rows");
+    runtime
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted retract");
+    let err = runtime
+        .run_tick(2)
+        .await
+        .expect_err("append-only grouped-stats should reject retractions");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("append-only grouped-stats"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
 async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let definition = SourceDefinition::new(
         "orders",

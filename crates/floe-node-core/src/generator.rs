@@ -17,6 +17,7 @@ use crate::source::send_event;
 const CONNECTOR_NAME: &str = "nexmark";
 const CONNECTOR_PROPERTY: &str = "connector";
 const ENTITY_PROPERTY: &str = "entity";
+const APPEND_ONLY_PROPERTY: &str = "append_only";
 
 pub const PERSON_SOURCE_NAME: &str = "nexmark_person";
 pub const AUCTION_SOURCE_NAME: &str = "nexmark_auction";
@@ -109,13 +110,16 @@ impl Connector for NexmarkConnector {
 pub fn definitions() -> Result<Vec<SourceDefinition>> {
     let person = SourceDefinition::new(PERSON_SOURCE_NAME, person_columns())?
         .with_property(CONNECTOR_PROPERTY, CONNECTOR_NAME)
-        .with_property(ENTITY_PROPERTY, "person");
+        .with_property(ENTITY_PROPERTY, "person")
+        .with_property(APPEND_ONLY_PROPERTY, "true");
     let auction = SourceDefinition::new(AUCTION_SOURCE_NAME, auction_columns())?
         .with_property(CONNECTOR_PROPERTY, CONNECTOR_NAME)
-        .with_property(ENTITY_PROPERTY, "auction");
+        .with_property(ENTITY_PROPERTY, "auction")
+        .with_property(APPEND_ONLY_PROPERTY, "true");
     let bid = SourceDefinition::new(BID_SOURCE_NAME, bid_columns())?
         .with_property(CONNECTOR_PROPERTY, CONNECTOR_NAME)
-        .with_property(ENTITY_PROPERTY, "bid");
+        .with_property(ENTITY_PROPERTY, "bid")
+        .with_property(APPEND_ONLY_PROPERTY, "true");
 
     Ok(vec![person, auction, bid])
 }
@@ -222,6 +226,7 @@ mod tests {
         for def in defs {
             assert_eq!(def.property(CONNECTOR_PROPERTY), Some(CONNECTOR_NAME));
             assert!(def.property(ENTITY_PROPERTY).is_some());
+            assert_eq!(def.property(APPEND_ONLY_PROPERTY), Some("true"));
             assert!(!def.columns().is_empty());
         }
     }
