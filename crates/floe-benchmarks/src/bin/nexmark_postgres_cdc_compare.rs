@@ -195,7 +195,7 @@ impl Config {
             floe_object_store_db_name_prefix: env_nonempty("FLOE_OBJECT_STORE_DB_NAME_PREFIX"),
             cloud_provider: env_nonempty("CLOUD_PROVIDER"),
             live_cdc_ops: env_parse("CDC_OPS", DEFAULT_LIVE_CDC_OPS)?,
-            slot_catchup_max_lag_bytes: env_parse("CDC_SLOT_CATCHUP_MAX_LAG_BYTES", 1_048_576)?,
+            slot_catchup_max_lag_bytes: env_parse("CDC_SLOT_CATCHUP_MAX_LAG_BYTES", 16_777_216)?,
             bid_initial_rows: env_parse("BID_INITIAL_ROWS", DEFAULT_BID_ROWS)?,
             auction_initial_rows: env_parse("AUCTION_INITIAL_ROWS", DEFAULT_AUCTION_ROWS)?,
             person_initial_rows: env_parse("PERSON_INITIAL_ROWS", DEFAULT_PERSON_ROWS)?,
