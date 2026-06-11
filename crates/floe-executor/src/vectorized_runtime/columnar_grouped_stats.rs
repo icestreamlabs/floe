@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -77,7 +77,12 @@ const SCALAR_TAG: u8 = b'a';
 const MINMAX_TAG: u8 = b'm';
 const VALUE_TAG: u8 = b'v';
 const COMPACT_TAG: u8 = b'c';
+const APPEND_ONLY_DISTINCT_SEGMENT_TAG: u8 = b'd';
 const COMPACT_STATE_VERSION: u8 = 1;
+const APPEND_ONLY_DISTINCT_SEGMENT_VERSION: u8 = 1;
+const APPEND_ONLY_DISTINCT_I64_TAG: u8 = 1;
+const APPEND_ONLY_DISTINCT_I128_TAG: u8 = 2;
+const APPEND_ONLY_DISTINCT_STRING_TAG: u8 = 3;
 const COMPACT_AGG_UNSUPPORTED_TAG: u8 = 0;
 const COMPACT_AGG_I64_TAG: u8 = 1;
 const COMPACT_AGG_PAIR_TAG: u8 = 2;
@@ -272,6 +277,9 @@ struct SlateGroupedStatsState {
     i128_value_counts: Mutex<HashMap<(Vec<u8>, usize, i128), i64>>,
     string_minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<String>>>,
     string_value_counts: Mutex<HashMap<(Vec<u8>, usize, String), i64>>,
+    append_only_value_presences: Mutex<AppendOnlyDistinctPresenceMap<i64>>,
+    append_only_i128_value_presences: Mutex<AppendOnlyDistinctPresenceMap<i128>>,
+    append_only_string_value_presences: Mutex<AppendOnlyDistinctPresenceMap<String>>,
     compact_values: Mutex<CompactGroupStateMap>,
     compact_snapshot_loaded: Mutex<bool>,
     compact_snapshot_active: Mutex<bool>,
@@ -279,6 +287,14 @@ struct SlateGroupedStatsState {
 
 type PendingStatsGroupDeltas = HashMap<Vec<u8>, PendingStatsGroupDelta>;
 type CompactGroupStateMap = HashMap<Vec<u8>, CompactGroupState>;
+type GroupAggregateKey = (Vec<u8>, usize);
+type AppendOnlyDistinctPresenceMap<T> =
+    HashMap<GroupAggregateKey, AppendOnlyDistinctPresenceState<T>>;
+
+struct AppendOnlyDistinctPresenceState<T> {
+    values: HashSet<T>,
+    next_segment_id: u64,
+}
 
 #[derive(Clone)]
 struct CompactGroupState {
@@ -2990,110 +3006,179 @@ async fn apply_aggregate_deltas(
             (AggregateKind::DistinctCount, AggregateDelta::DistinctCountI64 { value_deltas }) => {
                 let old = columnar.stats_state.load_i64(group_key, idx).await?;
                 let mut new = old;
-                for (value, value_delta) in value_deltas {
-                    let old_count = columnar
+                if columnar.append_only_input {
+                    let mut values = Vec::with_capacity(value_deltas.len());
+                    for (value, value_delta) in value_deltas {
+                        if *value_delta < 0 {
+                            bail!(
+                                "append-only grouped-stats distinct count received a negative delta"
+                            );
+                        }
+                        if *value_delta > 0 {
+                            values.push(*value);
+                        }
+                    }
+                    let added = columnar
                         .stats_state
-                        .load_value_count(group_key, idx, *value)
+                        .write_append_only_value_presences(writes, group_key, idx, values)
                         .await?;
-                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
-                        anyhow::anyhow!("grouped-stats distinct value count overflow")
-                    })?;
-                    if new_count < 0 {
-                        bail!("grouped-stats distinct removed more values than were present");
+                    new = new
+                        .checked_add(added)
+                        .ok_or_else(|| anyhow::anyhow!("grouped-stats distinct overflow"))?;
+                } else {
+                    for (value, value_delta) in value_deltas {
+                        let old_count = columnar
+                            .stats_state
+                            .load_value_count(group_key, idx, *value)
+                            .await?;
+                        let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats distinct value count overflow")
+                        })?;
+                        if new_count < 0 {
+                            bail!("grouped-stats distinct removed more values than were present");
+                        }
+                        if old_count == 0 && new_count > 0 {
+                            new = new.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("grouped-stats distinct overflow")
+                            })?;
+                        } else if old_count > 0 && new_count == 0 {
+                            new = new.checked_sub(1).ok_or_else(|| {
+                                anyhow::anyhow!("grouped-stats distinct underflow")
+                            })?;
+                        }
+                        columnar.stats_state.write_value_count(
+                            writes, group_key, idx, *value, new_count,
+                        )?;
                     }
-                    if old_count == 0 && new_count > 0 {
-                        new = new
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("grouped-stats distinct overflow"))?;
-                    } else if old_count > 0 && new_count == 0 {
-                        new = new
-                            .checked_sub(1)
-                            .ok_or_else(|| anyhow::anyhow!("grouped-stats distinct underflow"))?;
-                    }
-                    columnar
-                        .stats_state
-                        .write_value_count(writes, group_key, idx, *value, new_count)?;
                 }
                 if new < 0 {
                     bail!("grouped-stats distinct count became negative");
                 }
-                columnar
-                    .stats_state
-                    .write_i64(writes, group_key, idx, new)?;
+                if new != old {
+                    columnar
+                        .stats_state
+                        .write_i64(writes, group_key, idx, new)?;
+                }
                 AggregateValue::Int64(new)
             }
             (AggregateKind::DistinctCount, AggregateDelta::DistinctCountUtf8 { value_deltas }) => {
                 let old = columnar.stats_state.load_i64(group_key, idx).await?;
                 let mut new = old;
-                for (value, value_delta) in value_deltas {
-                    let old_count = columnar
+                if columnar.append_only_input {
+                    let mut values = Vec::with_capacity(value_deltas.len());
+                    for (value, value_delta) in value_deltas {
+                        if *value_delta < 0 {
+                            bail!(
+                                "append-only grouped-stats string distinct count received a negative delta"
+                            );
+                        }
+                        if *value_delta > 0 {
+                            values.push(value.as_str());
+                        }
+                    }
+                    let added = columnar
                         .stats_state
-                        .load_string_value_count(group_key, idx, value)
+                        .write_append_only_string_value_presences(writes, group_key, idx, values)
                         .await?;
-                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
-                        anyhow::anyhow!("grouped-stats string distinct value count overflow")
+                    new = new.checked_add(added).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats string distinct overflow")
                     })?;
-                    if new_count < 0 {
-                        bail!(
-                            "grouped-stats string distinct removed more values than were present"
-                        );
-                    }
-                    if old_count == 0 && new_count > 0 {
-                        new = new.checked_add(1).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats string distinct overflow")
+                } else {
+                    for (value, value_delta) in value_deltas {
+                        let old_count = columnar
+                            .stats_state
+                            .load_string_value_count(group_key, idx, value)
+                            .await?;
+                        let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats string distinct value count overflow")
                         })?;
-                    } else if old_count > 0 && new_count == 0 {
-                        new = new.checked_sub(1).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats string distinct underflow")
-                        })?;
+                        if new_count < 0 {
+                            bail!(
+                                "grouped-stats string distinct removed more values than were present"
+                            );
+                        }
+                        if old_count == 0 && new_count > 0 {
+                            new = new.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("grouped-stats string distinct overflow")
+                            })?;
+                        } else if old_count > 0 && new_count == 0 {
+                            new = new.checked_sub(1).ok_or_else(|| {
+                                anyhow::anyhow!("grouped-stats string distinct underflow")
+                            })?;
+                        }
+                        columnar.stats_state.write_string_value_count(
+                            writes, group_key, idx, value, new_count,
+                        )?;
                     }
-                    columnar
-                        .stats_state
-                        .write_string_value_count(writes, group_key, idx, value, new_count)?;
                 }
                 if new < 0 {
                     bail!("grouped-stats string distinct count became negative");
                 }
-                columnar
-                    .stats_state
-                    .write_i64(writes, group_key, idx, new)?;
+                if new != old {
+                    columnar
+                        .stats_state
+                        .write_i64(writes, group_key, idx, new)?;
+                }
                 AggregateValue::Int64(new)
             }
             (AggregateKind::DistinctCount, AggregateDelta::DistinctCountI128 { value_deltas }) => {
                 let old = columnar.stats_state.load_i64(group_key, idx).await?;
                 let mut new = old;
-                for (value, value_delta) in value_deltas {
-                    let old_count = columnar
+                if columnar.append_only_input {
+                    let mut values = Vec::with_capacity(value_deltas.len());
+                    for (value, value_delta) in value_deltas {
+                        if *value_delta < 0 {
+                            bail!(
+                                "append-only grouped-stats decimal distinct count received a negative delta"
+                            );
+                        }
+                        if *value_delta > 0 {
+                            values.push(*value);
+                        }
+                    }
+                    let added = columnar
                         .stats_state
-                        .load_i128_value_count(group_key, idx, *value)
+                        .write_append_only_i128_value_presences(writes, group_key, idx, values)
                         .await?;
-                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
-                        anyhow::anyhow!("grouped-stats decimal distinct value count overflow")
+                    new = new.checked_add(added).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats decimal distinct overflow")
                     })?;
-                    if new_count < 0 {
-                        bail!(
-                            "grouped-stats decimal distinct removed more values than were present"
-                        );
-                    }
-                    if old_count == 0 && new_count > 0 {
-                        new = new.checked_add(1).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats decimal distinct overflow")
+                } else {
+                    for (value, value_delta) in value_deltas {
+                        let old_count = columnar
+                            .stats_state
+                            .load_i128_value_count(group_key, idx, *value)
+                            .await?;
+                        let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats decimal distinct value count overflow")
                         })?;
-                    } else if old_count > 0 && new_count == 0 {
-                        new = new.checked_sub(1).ok_or_else(|| {
-                            anyhow::anyhow!("grouped-stats decimal distinct underflow")
-                        })?;
+                        if new_count < 0 {
+                            bail!(
+                                "grouped-stats decimal distinct removed more values than were present"
+                            );
+                        }
+                        if old_count == 0 && new_count > 0 {
+                            new = new.checked_add(1).ok_or_else(|| {
+                                anyhow::anyhow!("grouped-stats decimal distinct overflow")
+                            })?;
+                        } else if old_count > 0 && new_count == 0 {
+                            new = new.checked_sub(1).ok_or_else(|| {
+                                anyhow::anyhow!("grouped-stats decimal distinct underflow")
+                            })?;
+                        }
+                        columnar.stats_state.write_i128_value_count(
+                            writes, group_key, idx, *value, new_count,
+                        )?;
                     }
-                    columnar
-                        .stats_state
-                        .write_i128_value_count(writes, group_key, idx, *value, new_count)?;
                 }
                 if new < 0 {
                     bail!("grouped-stats decimal distinct count became negative");
                 }
-                columnar
-                    .stats_state
-                    .write_i64(writes, group_key, idx, new)?;
+                if new != old {
+                    columnar
+                        .stats_state
+                        .write_i64(writes, group_key, idx, new)?;
+                }
                 AggregateValue::Int64(new)
             }
             (AggregateKind::Sum, AggregateDelta::Sum { sum_delta }) => {
@@ -3680,6 +3765,9 @@ impl SlateGroupedStatsState {
             i128_value_counts: Mutex::new(HashMap::new()),
             string_minmax_values: Mutex::new(HashMap::new()),
             string_value_counts: Mutex::new(HashMap::new()),
+            append_only_value_presences: Mutex::new(HashMap::new()),
+            append_only_i128_value_presences: Mutex::new(HashMap::new()),
+            append_only_string_value_presences: Mutex::new(HashMap::new()),
             compact_values: Mutex::new(CompactGroupStateMap::new()),
             compact_snapshot_loaded: Mutex::new(false),
             compact_snapshot_active: Mutex::new(false),
@@ -4141,7 +4229,7 @@ impl SlateGroupedStatsState {
             let mut bytes = Vec::with_capacity(16);
             bytes.extend_from_slice(&sum.to_be_bytes());
             bytes.extend_from_slice(&count.to_be_bytes());
-            batch.put(key, bytes);
+            batch.put_bytes(Bytes::from(key), Bytes::from(bytes));
         }
         self.pairs
             .lock()
@@ -4195,7 +4283,10 @@ impl SlateGroupedStatsState {
     ) -> Result<()> {
         let key = self.aggregate_key(MINMAX_TAG, group_key, agg_idx)?;
         if let Some(value) = value {
-            batch.put(key, value.to_be_bytes());
+            batch.put_bytes(
+                Bytes::from(key),
+                Bytes::copy_from_slice(&value.to_be_bytes()),
+            );
         } else {
             batch.delete(key);
         }
@@ -4245,7 +4336,10 @@ impl SlateGroupedStatsState {
     ) -> Result<()> {
         let key = self.aggregate_key(MINMAX_TAG, group_key, agg_idx)?;
         if let Some(value) = value {
-            batch.put(key, value.to_be_bytes());
+            batch.put_bytes(
+                Bytes::from(key),
+                Bytes::copy_from_slice(&value.to_be_bytes()),
+            );
         } else {
             batch.delete(key);
         }
@@ -4295,7 +4389,7 @@ impl SlateGroupedStatsState {
     ) -> Result<()> {
         let key = self.aggregate_key(MINMAX_TAG, group_key, agg_idx)?;
         if let Some(value) = value {
-            batch.put(key, value.as_bytes());
+            batch.put_bytes(Bytes::from(key), Bytes::copy_from_slice(value.as_bytes()));
         } else {
             batch.delete(key);
         }
@@ -4347,6 +4441,337 @@ impl SlateGroupedStatsState {
             .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?
             .insert((group_key.to_vec(), agg_idx, value), count);
         Ok(())
+    }
+
+    async fn write_append_only_value_presences<I>(
+        &self,
+        batch: &mut WriteBatch,
+        group_key: &[u8],
+        agg_idx: usize,
+        values: I,
+    ) -> Result<i64>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let cache_key = (group_key.to_vec(), agg_idx);
+        let needs_load = !self.assume_empty
+            && !self
+                .append_only_value_presences
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats append-only value cache poisoned"))?
+                .contains_key(&cache_key);
+        let loaded = if needs_load {
+            Some(
+                self.load_append_only_value_presence_state(group_key, agg_idx)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut new_values = Vec::new();
+        let segment_id = {
+            let mut presences = self
+                .append_only_value_presences
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats append-only value cache poisoned"))?;
+            let state = presences.entry(cache_key).or_insert_with(|| {
+                loaded.unwrap_or_else(|| AppendOnlyDistinctPresenceState {
+                    values: HashSet::new(),
+                    next_segment_id: 0,
+                })
+            });
+            let segment_id = state.next_segment_id;
+            for value in values {
+                if state.values.insert(value) {
+                    new_values.push(value);
+                }
+            }
+            if !new_values.is_empty() {
+                state.next_segment_id = state.next_segment_id.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats append-only distinct segment id overflow")
+                })?;
+            }
+            segment_id
+        };
+        if new_values.is_empty() {
+            return Ok(0);
+        }
+        new_values.sort_unstable();
+        let added =
+            i64::try_from(new_values.len()).context("grouped-stats distinct count exceeds i64")?;
+        self.write_append_only_distinct_segment(
+            batch,
+            group_key,
+            agg_idx,
+            segment_id,
+            encode_append_only_i64_distinct_segment(&new_values)?,
+        )?;
+        Ok(added)
+    }
+
+    async fn load_append_only_value_presence_state(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+    ) -> Result<AppendOnlyDistinctPresenceState<i64>> {
+        let mut values = HashSet::new();
+        let mut next_segment_id = 0_u64;
+        let segment_prefix = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
+        for (key, bytes) in self
+            .table
+            .scan_prefix(&segment_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats append-only distinct value segments")?
+        {
+            let segment_id = decode_append_only_distinct_segment_id(&segment_prefix, &key)?;
+            next_segment_id = next_segment_id.max(segment_id.saturating_add(1));
+            for value in decode_append_only_i64_distinct_segment(&bytes)? {
+                values.insert(value);
+            }
+        }
+        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&value_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats legacy append-only distinct value state")?
+        {
+            if decode_i64(&value_bytes)? <= 0 {
+                continue;
+            }
+            let value = decode_i64_sortable(
+                key.get(value_prefix.len()..)
+                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats value key"))?,
+            )?;
+            values.insert(value);
+        }
+        Ok(AppendOnlyDistinctPresenceState {
+            values,
+            next_segment_id,
+        })
+    }
+
+    async fn write_append_only_i128_value_presences<I>(
+        &self,
+        batch: &mut WriteBatch,
+        group_key: &[u8],
+        agg_idx: usize,
+        values: I,
+    ) -> Result<i64>
+    where
+        I: IntoIterator<Item = i128>,
+    {
+        let cache_key = (group_key.to_vec(), agg_idx);
+        let needs_load = !self.assume_empty
+            && !self
+                .append_only_i128_value_presences
+                .lock()
+                .map_err(|_| {
+                    anyhow::anyhow!("grouped-stats append-only i128 value cache poisoned")
+                })?
+                .contains_key(&cache_key);
+        let loaded = if needs_load {
+            Some(
+                self.load_append_only_i128_value_presence_state(group_key, agg_idx)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut new_values = Vec::new();
+        let segment_id = {
+            let mut presences = self.append_only_i128_value_presences.lock().map_err(|_| {
+                anyhow::anyhow!("grouped-stats append-only i128 value cache poisoned")
+            })?;
+            let state = presences.entry(cache_key).or_insert_with(|| {
+                loaded.unwrap_or_else(|| AppendOnlyDistinctPresenceState {
+                    values: HashSet::new(),
+                    next_segment_id: 0,
+                })
+            });
+            let segment_id = state.next_segment_id;
+            for value in values {
+                if state.values.insert(value) {
+                    new_values.push(value);
+                }
+            }
+            if !new_values.is_empty() {
+                state.next_segment_id = state.next_segment_id.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats append-only distinct segment id overflow")
+                })?;
+            }
+            segment_id
+        };
+        if new_values.is_empty() {
+            return Ok(0);
+        }
+        new_values.sort_unstable();
+        let added = i64::try_from(new_values.len())
+            .context("grouped-stats decimal distinct count exceeds i64")?;
+        self.write_append_only_distinct_segment(
+            batch,
+            group_key,
+            agg_idx,
+            segment_id,
+            encode_append_only_i128_distinct_segment(&new_values)?,
+        )?;
+        Ok(added)
+    }
+
+    async fn load_append_only_i128_value_presence_state(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+    ) -> Result<AppendOnlyDistinctPresenceState<i128>> {
+        let mut values = HashSet::new();
+        let mut next_segment_id = 0_u64;
+        let segment_prefix = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
+        for (key, bytes) in self
+            .table
+            .scan_prefix(&segment_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats append-only decimal distinct value segments")?
+        {
+            let segment_id = decode_append_only_distinct_segment_id(&segment_prefix, &key)?;
+            next_segment_id = next_segment_id.max(segment_id.saturating_add(1));
+            for value in decode_append_only_i128_distinct_segment(&bytes)? {
+                values.insert(value);
+            }
+        }
+        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&value_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats legacy append-only decimal distinct value state")?
+        {
+            if decode_i64(&value_bytes)? <= 0 {
+                continue;
+            }
+            let value = decode_i128_sortable(
+                key.get(value_prefix.len()..)
+                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats i128 value key"))?,
+            )?;
+            values.insert(value);
+        }
+        Ok(AppendOnlyDistinctPresenceState {
+            values,
+            next_segment_id,
+        })
+    }
+
+    async fn write_append_only_string_value_presences<'a, I>(
+        &self,
+        batch: &mut WriteBatch,
+        group_key: &[u8],
+        agg_idx: usize,
+        values: I,
+    ) -> Result<i64>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let cache_key = (group_key.to_vec(), agg_idx);
+        let needs_load = !self.assume_empty
+            && !self
+                .append_only_string_value_presences
+                .lock()
+                .map_err(|_| {
+                    anyhow::anyhow!("grouped-stats append-only string value cache poisoned")
+                })?
+                .contains_key(&cache_key);
+        let loaded = if needs_load {
+            Some(
+                self.load_append_only_string_value_presence_state(group_key, agg_idx)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut new_values = Vec::new();
+        let segment_id = {
+            let mut presences = self
+                .append_only_string_value_presences
+                .lock()
+                .map_err(|_| {
+                    anyhow::anyhow!("grouped-stats append-only string value cache poisoned")
+                })?;
+            let state = presences.entry(cache_key).or_insert_with(|| {
+                loaded.unwrap_or_else(|| AppendOnlyDistinctPresenceState {
+                    values: HashSet::new(),
+                    next_segment_id: 0,
+                })
+            });
+            let segment_id = state.next_segment_id;
+            for value in values {
+                if state.values.insert(value.to_string()) {
+                    new_values.push(value.to_string());
+                }
+            }
+            if !new_values.is_empty() {
+                state.next_segment_id = state.next_segment_id.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats append-only distinct segment id overflow")
+                })?;
+            }
+            segment_id
+        };
+        if new_values.is_empty() {
+            return Ok(0);
+        }
+        new_values.sort_unstable();
+        let added = i64::try_from(new_values.len())
+            .context("grouped-stats string distinct count exceeds i64")?;
+        self.write_append_only_distinct_segment(
+            batch,
+            group_key,
+            agg_idx,
+            segment_id,
+            encode_append_only_string_distinct_segment(&new_values)?,
+        )?;
+        Ok(added)
+    }
+
+    async fn load_append_only_string_value_presence_state(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+    ) -> Result<AppendOnlyDistinctPresenceState<String>> {
+        let mut values = HashSet::new();
+        let mut next_segment_id = 0_u64;
+        let segment_prefix = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
+        for (key, bytes) in self
+            .table
+            .scan_prefix(&segment_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats append-only string distinct value segments")?
+        {
+            let segment_id = decode_append_only_distinct_segment_id(&segment_prefix, &key)?;
+            next_segment_id = next_segment_id.max(segment_id.saturating_add(1));
+            for value in decode_append_only_string_distinct_segment(&bytes)? {
+                values.insert(value);
+            }
+        }
+        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&value_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats legacy append-only string distinct value state")?
+        {
+            if decode_i64(&value_bytes)? <= 0 {
+                continue;
+            }
+            let value = String::from_utf8(
+                key.get(value_prefix.len()..)
+                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats string value key"))?
+                    .to_vec(),
+            )
+            .context("decode grouped-stats string value key")?;
+            values.insert(value);
+        }
+        Ok(AppendOnlyDistinctPresenceState {
+            values,
+            next_segment_id,
+        })
     }
 
     async fn load_i128_value_count(
@@ -4702,7 +5127,10 @@ impl SlateGroupedStatsState {
         if value == 0 {
             batch.delete(key);
         } else {
-            batch.put(key, value.to_be_bytes());
+            batch.put_bytes(
+                Bytes::from(key),
+                Bytes::copy_from_slice(&value.to_be_bytes()),
+            );
         }
     }
 
@@ -4710,8 +5138,26 @@ impl SlateGroupedStatsState {
         if value == 0 {
             batch.delete(key);
         } else {
-            batch.put(key, value.to_be_bytes());
+            batch.put_bytes(
+                Bytes::from(key),
+                Bytes::copy_from_slice(&value.to_be_bytes()),
+            );
         }
+    }
+
+    fn write_append_only_distinct_segment(
+        &self,
+        batch: &mut WriteBatch,
+        group_key: &[u8],
+        agg_idx: usize,
+        segment_id: u64,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        batch.put_bytes(
+            Bytes::from(self.append_only_distinct_segment_key(group_key, agg_idx, segment_id)?),
+            Bytes::from(bytes),
+        );
+        Ok(())
     }
 
     fn value_key(&self, group_key: &[u8], agg_idx: usize, value: i64) -> Result<Vec<u8>> {
@@ -4734,6 +5180,25 @@ impl SlateGroupedStatsState {
 
     fn value_key_prefix(&self, group_key: &[u8], agg_idx: usize) -> Result<Vec<u8>> {
         self.aggregate_key(VALUE_TAG, group_key, agg_idx)
+    }
+
+    fn append_only_distinct_segment_prefix(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+    ) -> Result<Vec<u8>> {
+        self.aggregate_key(APPEND_ONLY_DISTINCT_SEGMENT_TAG, group_key, agg_idx)
+    }
+
+    fn append_only_distinct_segment_key(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+        segment_id: u64,
+    ) -> Result<Vec<u8>> {
+        let mut key = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
+        key.extend_from_slice(&segment_id.to_be_bytes());
+        Ok(key)
     }
 
     fn aggregate_key(&self, tag: u8, group_key: &[u8], agg_idx: usize) -> Result<Vec<u8>> {
@@ -5805,6 +6270,143 @@ fn decode_i128_sortable(bytes: &[u8]) -> Result<i128> {
     Ok((u128::from_be_bytes(bytes) ^ (1 << 127)) as i128)
 }
 
+fn encode_append_only_i64_distinct_segment(values: &[i64]) -> Result<Vec<u8>> {
+    let value_count =
+        u32::try_from(values.len()).context("append-only distinct segment exceeds u32 values")?;
+    let mut bytes = Vec::with_capacity(2 + 4 + values.len() * 8);
+    bytes.push(APPEND_ONLY_DISTINCT_SEGMENT_VERSION);
+    bytes.push(APPEND_ONLY_DISTINCT_I64_TAG);
+    bytes.extend_from_slice(&value_count.to_be_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(bytes)
+}
+
+fn decode_append_only_i64_distinct_segment(bytes: &[u8]) -> Result<Vec<i64>> {
+    let mut offset =
+        append_only_distinct_segment_values_offset(bytes, APPEND_ONLY_DISTINCT_I64_TAG, 8)?;
+    let value_count = append_only_distinct_segment_value_count(bytes)?;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(compact_read_i64(bytes, &mut offset)?);
+    }
+    if offset != bytes.len() {
+        bail!("append-only i64 distinct segment has trailing bytes");
+    }
+    Ok(values)
+}
+
+fn encode_append_only_i128_distinct_segment(values: &[i128]) -> Result<Vec<u8>> {
+    let value_count =
+        u32::try_from(values.len()).context("append-only distinct segment exceeds u32 values")?;
+    let mut bytes = Vec::with_capacity(2 + 4 + values.len() * 16);
+    bytes.push(APPEND_ONLY_DISTINCT_SEGMENT_VERSION);
+    bytes.push(APPEND_ONLY_DISTINCT_I128_TAG);
+    bytes.extend_from_slice(&value_count.to_be_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(bytes)
+}
+
+fn decode_append_only_i128_distinct_segment(bytes: &[u8]) -> Result<Vec<i128>> {
+    let mut offset =
+        append_only_distinct_segment_values_offset(bytes, APPEND_ONLY_DISTINCT_I128_TAG, 16)?;
+    let value_count = append_only_distinct_segment_value_count(bytes)?;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(compact_read_i128(bytes, &mut offset)?);
+    }
+    if offset != bytes.len() {
+        bail!("append-only decimal distinct segment has trailing bytes");
+    }
+    Ok(values)
+}
+
+fn encode_append_only_string_distinct_segment(values: &[String]) -> Result<Vec<u8>> {
+    let value_count =
+        u32::try_from(values.len()).context("append-only distinct segment exceeds u32 values")?;
+    let value_bytes = values
+        .iter()
+        .map(|value| 4usize.saturating_add(value.len()))
+        .sum::<usize>();
+    let mut bytes = Vec::with_capacity(2 + 4 + value_bytes);
+    bytes.push(APPEND_ONLY_DISTINCT_SEGMENT_VERSION);
+    bytes.push(APPEND_ONLY_DISTINCT_STRING_TAG);
+    bytes.extend_from_slice(&value_count.to_be_bytes());
+    for value in values {
+        let len = u32::try_from(value.len())
+            .context("append-only string distinct value exceeds u32 bytes")?;
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    Ok(bytes)
+}
+
+fn decode_append_only_string_distinct_segment(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut offset =
+        append_only_distinct_segment_values_offset(bytes, APPEND_ONLY_DISTINCT_STRING_TAG, 0)?;
+    let value_count = append_only_distinct_segment_value_count(bytes)?;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        let len = compact_read_u32(bytes, &mut offset)? as usize;
+        let value = String::from_utf8(compact_take(bytes, &mut offset, len)?.to_vec())
+            .context("decode append-only string distinct value")?;
+        values.push(value);
+    }
+    if offset != bytes.len() {
+        bail!("append-only string distinct segment has trailing bytes");
+    }
+    Ok(values)
+}
+
+fn append_only_distinct_segment_values_offset(
+    bytes: &[u8],
+    expected_type: u8,
+    fixed_value_width: usize,
+) -> Result<usize> {
+    if bytes.len() < 6 {
+        bail!("append-only distinct segment is too short");
+    }
+    if bytes[0] != APPEND_ONLY_DISTINCT_SEGMENT_VERSION {
+        bail!(
+            "unsupported append-only distinct segment version {}",
+            bytes[0]
+        );
+    }
+    if bytes[1] != expected_type {
+        bail!("append-only distinct segment type mismatch");
+    }
+    let value_count = append_only_distinct_segment_value_count(bytes)?;
+    if fixed_value_width > 0
+        && bytes.len() != 6usize.saturating_add(value_count.saturating_mul(fixed_value_width))
+    {
+        bail!("append-only fixed-width distinct segment length mismatch");
+    }
+    Ok(6)
+}
+
+fn append_only_distinct_segment_value_count(bytes: &[u8]) -> Result<usize> {
+    if bytes.len() < 6 {
+        bail!("append-only distinct segment is too short");
+    }
+    let count: [u8; 4] = bytes[2..6]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("append-only distinct segment count must be u32"))?;
+    Ok(u32::from_be_bytes(count) as usize)
+}
+
+fn decode_append_only_distinct_segment_id(prefix: &[u8], key: &[u8]) -> Result<u64> {
+    let suffix = key
+        .get(prefix.len()..)
+        .ok_or_else(|| anyhow::anyhow!("invalid append-only distinct segment key"))?;
+    let suffix: [u8; 8] = suffix
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("append-only distinct segment key suffix must be u64"))?;
+    Ok(u64::from_be_bytes(suffix))
+}
+
 fn decode_i64(bytes: &[u8]) -> Result<i64> {
     let bytes: [u8; 8] = bytes
         .try_into()
@@ -6028,6 +6630,13 @@ fn compact_read_i64(bytes: &[u8], offset: &mut usize) -> Result<i64> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("grouped-stats compact state expected i64"))?;
     Ok(i64::from_be_bytes(value))
+}
+
+fn compact_read_i128(bytes: &[u8], offset: &mut usize) -> Result<i128> {
+    let value: [u8; 16] = compact_take(bytes, offset, 16)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("grouped-stats compact state expected i128"))?;
+    Ok(i128::from_be_bytes(value))
 }
 
 fn compact_take<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
