@@ -117,7 +117,8 @@ pub fn replication_config_from_connection_string(
     PostgresCdcConfig::new(host, user, password, database, slot, publication)?
         .with_port(port)?
         .with_start_lsn(start_lsn)
-        .with_status_interval(Duration::from_millis(100))
+        .with_status_interval(Duration::from_millis(100))?
+        .with_idle_wakeup_interval(Duration::from_millis(100))
 }
 
 pub fn default_postgres_publication() -> String {
@@ -172,5 +173,6 @@ mod tests {
         assert_eq!(config.slot(), "slot");
         assert_eq!(config.publication(), "publication");
         assert_eq!(config.start_lsn(), Some(PostgresLsn::from_u64(0x50)));
+        assert_eq!(config.idle_wakeup_interval(), Duration::from_millis(100));
     }
 }
