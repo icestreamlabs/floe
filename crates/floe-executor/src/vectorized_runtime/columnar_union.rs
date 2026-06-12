@@ -408,26 +408,8 @@ pub(super) async fn run_columnar_union_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarUnionTick> {
-    let mut positive_by_source = HashMap::new();
-    let mut negative_by_source = HashMap::new();
-    let mut input_changed = false;
-    for source in &mut columnar.sources {
-        let signed = prepare_union_input_tick(source, insert_batches, weighted_delta_batches)
-            .await
-            .with_context(|| format!("prepare union input tick for '{}'", source.input_name))?;
-        input_changed |= !signed.positive.is_empty() || !signed.negative.is_empty();
-        positive_by_source.insert(source.input_name.clone(), signed.positive);
-        negative_by_source.insert(source.input_name.clone(), signed.negative);
-    }
-
-    let mut output_delta_batches = Vec::new();
-    collect_union_outputs(columnar, &positive_by_source, &mut output_delta_batches, 1).await?;
-    collect_union_outputs(columnar, &negative_by_source, &mut output_delta_batches, -1).await?;
-    let output_delta_batches = union_output_delta_batches(columnar, output_delta_batches).await?;
-
-    let output_delta =
-        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
-            .context("build union output zset delta")?;
+    let (output_delta, input_changed) =
+        prepare_union_delta_tick(columnar, insert_batches, weighted_delta_batches).await?;
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(
@@ -458,6 +440,47 @@ pub(super) async fn run_columnar_union_state_tick(
         next_snapshot,
         input_changed,
     })
+}
+
+pub(super) async fn run_columnar_union_delta_tick(
+    columnar: &mut ColumnarUnionMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<ColumnarZSet> {
+    let (output_delta, _) =
+        prepare_union_delta_tick(columnar, insert_batches, weighted_delta_batches).await?;
+    for source in &mut columnar.sources {
+        mark_union_constant_initialized(source).await?;
+    }
+    Ok(output_delta)
+}
+
+async fn prepare_union_delta_tick(
+    columnar: &mut ColumnarUnionMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+) -> Result<(ColumnarZSet, bool)> {
+    let mut positive_by_source = HashMap::new();
+    let mut negative_by_source = HashMap::new();
+    let mut input_changed = false;
+    for source in &mut columnar.sources {
+        let signed = prepare_union_input_tick(source, insert_batches, weighted_delta_batches)
+            .await
+            .with_context(|| format!("prepare union input tick for '{}'", source.input_name))?;
+        input_changed |= !signed.positive.is_empty() || !signed.negative.is_empty();
+        positive_by_source.insert(source.input_name.clone(), signed.positive);
+        negative_by_source.insert(source.input_name.clone(), signed.negative);
+    }
+
+    let mut output_delta_batches = Vec::new();
+    collect_union_outputs(columnar, &positive_by_source, &mut output_delta_batches, 1).await?;
+    collect_union_outputs(columnar, &negative_by_source, &mut output_delta_batches, -1).await?;
+    let output_delta_batches = union_output_delta_batches(columnar, output_delta_batches).await?;
+
+    let output_delta =
+        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
+            .context("build union output zset delta")?;
+    Ok((output_delta, input_changed))
 }
 
 async fn collect_union_outputs(

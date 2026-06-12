@@ -12508,7 +12508,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     .expect("runtime");
     assert_eq!(
         runtime.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarUnionAggregate
+        MaterializedViewExecutionMode::ColumnarUnionGroupedCount
     );
 
     runtime
@@ -12573,7 +12573,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     .expect("recovered runtime");
     assert_eq!(
         recovered.materialized_views[0].execution_mode,
-        MaterializedViewExecutionMode::ColumnarUnionAggregate
+        MaterializedViewExecutionMode::ColumnarUnionGroupedCount
     );
     recovered.run_tick(3).await.expect("recovered tick");
 
