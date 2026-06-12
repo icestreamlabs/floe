@@ -173,7 +173,7 @@ pub(super) fn query_sql(query_id: &str) -> Option<&'static str> {
             r#"SELECT b.auction, b.bidder, b.price, b.channel, b.url, b."dateTime", b.extra, a."itemName", a.description, a."initialBid", a.reserve, a."dateTime" AS auction_time, a.expires, a.seller, a.category, a.extra AS auction_extra FROM bid AS b JOIN auction AS a ON b.auction = a.id WHERE a.category = 10"#
         }
         "q21" => {
-            r#"SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) END AS channel_id FROM bid WHERE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')"#
+            r#"SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, 'channel_id=([^&]*)', 1) END AS channel_id FROM bid WHERE REGEXP_EXTRACT(url, 'channel_id=([^&]*)', 1) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')"#
         }
         "q22" => {
             r#"SELECT auction, bidder, price, channel, SPLIT_INDEX(url, '/', 3) AS dir1, SPLIT_INDEX(url, '/', 4) AS dir2, SPLIT_INDEX(url, '/', 5) AS dir3 FROM bid"#
@@ -296,7 +296,7 @@ pub(super) fn query_sql_floe(query_id: &str) -> Option<&'static str> {
             r#"SELECT b.auction, b.bidder, b.price, b.channel, b.url, b.date_time AS "dateTime", b.extra, a.item_name AS "itemName", a.description, a.initial_bid AS "initialBid", a.reserve, a.date_time AS auction_time, a.expires, a.seller, a.category, a.extra AS auction_extra FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id WHERE a.category = 10"#
         }
         "q21" => {
-            r#"SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) END AS channel_id FROM nexmark_bid WHERE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')"#
+            r#"SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, 'channel_id=([^&]*)', 1) END AS channel_id FROM nexmark_bid WHERE REGEXP_EXTRACT(url, 'channel_id=([^&]*)', 1) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')"#
         }
         "q22" => {
             r#"SELECT auction, bidder, price, channel, SPLIT_INDEX(url, '/', 3) AS dir1, SPLIT_INDEX(url, '/', 4) AS dir2, SPLIT_INDEX(url, '/', 5) AS dir3 FROM nexmark_bid"#

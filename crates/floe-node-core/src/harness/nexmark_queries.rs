@@ -128,7 +128,7 @@ pub const CANONICAL_NEXMARK_QUERIES: &[NexmarkQuerySpec] = &[
     },
     NexmarkQuerySpec {
         id: "q21",
-        sql: "SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) END AS channel_id FROM bid WHERE REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')",
+        sql: "SELECT auction, bidder, price, channel, CASE WHEN lower(channel) = 'apple' THEN '0' WHEN lower(channel) = 'google' THEN '1' WHEN lower(channel) = 'facebook' THEN '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url, 'channel_id=([^&]*)', 1) END AS channel_id FROM bid WHERE REGEXP_EXTRACT(url, 'channel_id=([^&]*)', 1) IS NOT NULL OR lower(channel) IN ('apple', 'google', 'facebook', 'baidu')",
         features: &["case_when", "regexp_extract", "lower"],
         blocker_crates: &["floe-executor"],
     },
