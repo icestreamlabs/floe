@@ -1469,6 +1469,7 @@ async fn run_columnar_join_state_tick_inner(
 
     let total_start = profile::start();
     let phase_start = profile::start();
+    let prepare_source_delta_start = Instant::now();
     let left_input_delta =
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
     let right_input_delta =
@@ -1490,16 +1491,20 @@ async fn run_columnar_join_state_tick_inner(
             .context("incremental join right source zset missing")?;
         prepare_join_source_delta(right_zset, right_input_delta, persist_source_delta).await?
     };
+    let prepare_source_delta_ms = prepare_source_delta_start.elapsed().as_millis() as u64;
     profile::record_since("join.prepare_source_delta", phase_start);
     let phase_start = profile::start();
+    let signed_delta_start = Instant::now();
     let left_signed = signed_source_delta(&columnar.left.schema, left_delta.batches())?;
     let right_signed = signed_source_delta(&columnar.right.schema, right_delta.batches())?;
+    let signed_delta_ms = signed_delta_start.elapsed().as_millis() as u64;
     profile::record_since("join.signed_delta", phase_start);
     let join_key_indices = columnar
         .join_key_indices
         .as_ref()
         .context("incremental join key indices missing")?;
     let phase_start = profile::start();
+    let lookup_right_start = Instant::now();
     let right_state_for_left_delta = lookup_indexed_join_state_for_delta(
         columnar
             .right
@@ -1512,8 +1517,10 @@ async fn run_columnar_join_state_tick_inner(
         "right",
     )
     .await?;
+    let lookup_right_ms = lookup_right_start.elapsed().as_millis() as u64;
     profile::record_since("join.lookup_right_total", phase_start);
     let phase_start = profile::start();
+    let lookup_left_start = Instant::now();
     let left_state_for_right_delta = lookup_indexed_join_state_for_delta(
         columnar
             .left
@@ -1526,9 +1533,11 @@ async fn run_columnar_join_state_tick_inner(
         "left",
     )
     .await?;
+    let lookup_left_ms = lookup_left_start.elapsed().as_millis() as u64;
     profile::record_since("join.lookup_left_total", phase_start);
 
     let phase_start = profile::start();
+    let collect_outputs_start = Instant::now();
     let mut output_delta_batches = Vec::new();
     collect_join_outputs(
         columnar,
@@ -1573,42 +1582,43 @@ async fn run_columnar_join_state_tick_inner(
         &right_signed,
     )
     .await?;
+    let collect_outputs_ms = collect_outputs_start.elapsed().as_millis() as u64;
     profile::record_since("join.collect_outputs", phase_start);
 
     let phase_start = profile::start();
+    let build_output_start = Instant::now();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build join output zset delta")?;
+    let build_output_ms = build_output_start.elapsed().as_millis() as u64;
     profile::record_since("join.build_output_zset", phase_start);
-    tracing::debug!(
-        left_delta_rows = left_delta
-            .batches()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        right_delta_rows = right_delta
-            .batches()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        right_state_rows = right_state_for_left_delta
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        left_state_rows = left_state_for_right_delta
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        output_delta_rows = output_delta
-            .batches()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        mode = "columnar_join_incremental",
-        "SlateDB-backed join columnar DBSP state tick completed"
-    );
+    let left_delta_rows = left_delta
+        .batches()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let right_delta_rows = right_delta
+        .batches()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let right_state_rows = right_state_for_left_delta
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let left_state_rows = left_state_for_right_delta
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let output_delta_rows = output_delta
+        .batches()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let mut output_create_ms = 0_u64;
     if maintain_output_snapshot {
         let phase_start = profile::start();
+        let output_create_start = Instant::now();
         columnar
             .output_zset
             .create_version(
@@ -1619,12 +1629,15 @@ async fn run_columnar_join_state_tick_inner(
                     .map(|handle| handle.version),
             )
             .await?;
+        output_create_ms = output_create_start.elapsed().as_millis() as u64;
         profile::record_since("join.output_create_version", phase_start);
     }
     let persisted_output_delta = output_delta;
 
+    let mut output_snapshot_ms = 0_u64;
     let next_snapshot = if maintain_output_snapshot {
         let phase_start = profile::start();
+        let output_snapshot_start = Instant::now();
         let next_snapshot = apply_weighted_snapshot_delta(
             output_schema,
             previous_snapshot,
@@ -1632,29 +1645,38 @@ async fn run_columnar_join_state_tick_inner(
         )
         .await
         .context("apply Slate-backed join columnar snapshot delta")?;
+        output_snapshot_ms = output_snapshot_start.elapsed().as_millis() as u64;
         profile::record_since("join.output_snapshot_delta", phase_start);
         next_snapshot
     } else {
         Vec::new()
     };
+    let mut apply_left_index_ms = 0_u64;
     if let Some(index) = columnar.left.input_index.as_deref_mut() {
         let phase_start = profile::start();
+        let apply_left_index_start = Instant::now();
         index
             .apply_delta(&left_delta)
             .await
             .context("apply left join delta to SlateDB-backed columnar index")?;
+        apply_left_index_ms = apply_left_index_start.elapsed().as_millis() as u64;
         profile::record_since("join.apply_left_index", phase_start);
     }
+    let mut apply_right_index_ms = 0_u64;
     if let Some(index) = columnar.right.input_index.as_deref_mut() {
         let phase_start = profile::start();
+        let apply_right_index_start = Instant::now();
         index
             .apply_delta(&right_delta)
             .await
             .context("apply right join delta to SlateDB-backed columnar index")?;
+        apply_right_index_ms = apply_right_index_start.elapsed().as_millis() as u64;
         profile::record_since("join.apply_right_index", phase_start);
     }
+    let mut source_snapshot_delta_ms = 0_u64;
     if maintain_output_snapshot {
         let phase_start = profile::start();
+        let source_snapshot_delta_start = Instant::now();
         columnar.left.snapshot = apply_source_snapshot_delta(
             &columnar.left.schema,
             &columnar.left.snapshot,
@@ -1667,8 +1689,30 @@ async fn run_columnar_join_state_tick_inner(
             &right_delta,
         )
         .await?;
+        source_snapshot_delta_ms = source_snapshot_delta_start.elapsed().as_millis() as u64;
         profile::record_since("join.source_snapshot_delta", phase_start);
     }
+
+    tracing::debug!(
+        left_delta_rows,
+        right_delta_rows,
+        right_state_rows,
+        left_state_rows,
+        output_delta_rows,
+        prepare_source_delta_ms,
+        signed_delta_ms,
+        lookup_right_ms,
+        lookup_left_ms,
+        collect_outputs_ms,
+        build_output_ms,
+        output_create_ms,
+        output_snapshot_ms,
+        apply_left_index_ms,
+        apply_right_index_ms,
+        source_snapshot_delta_ms,
+        mode = "columnar_join_incremental",
+        "SlateDB-backed join columnar DBSP state tick completed"
+    );
 
     profile::record_since("join.total", total_start);
     Ok(ColumnarJoinTick {

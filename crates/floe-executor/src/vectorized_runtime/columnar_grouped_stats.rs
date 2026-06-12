@@ -1404,51 +1404,69 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
 ) -> Result<ColumnarGroupedStatsTick> {
     let total_start = profile::start();
     let phase_start = profile::start();
+    let prepare_start = Instant::now();
     let persisted_input_delta =
         prepare_grouped_stats_input_delta(columnar, insert_batches, weighted_delta_batches).await?;
+    let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_stats.prepare_input", phase_start);
     let input_changed = !persisted_input_delta.batches().is_empty();
+    let pending_ms: u64;
+    let apply_ms: u64;
     let output_delta_batches = if columnar.append_only_input
         && columnar.stats_state.compact_enabled()
     {
         let phase_start = profile::start();
+        let pending_start = Instant::now();
         if let Some(pending) = grouped_stats_append_only_compact_pending_delta(
             columnar,
             persisted_input_delta.batches(),
         )
         .await?
         {
+            pending_ms = pending_start.elapsed().as_millis() as u64;
             profile::record_since("grouped_stats.pending_delta", phase_start);
             let phase_start = profile::start();
+            let apply_start = Instant::now();
             let output_delta_batches =
                 apply_append_only_compact_grouped_stats_compact_delta(columnar, pending).await?;
+            apply_ms = apply_start.elapsed().as_millis() as u64;
             profile::record_since("grouped_stats.apply_delta", phase_start);
             output_delta_batches
         } else {
             let pending =
                 grouped_stats_pending_delta(columnar, persisted_input_delta.batches()).await?;
+            pending_ms = pending_start.elapsed().as_millis() as u64;
             profile::record_since("grouped_stats.pending_delta", phase_start);
             let phase_start = profile::start();
+            let apply_start = Instant::now();
             let output_delta_batches = apply_grouped_stats_delta(columnar, pending).await?;
+            apply_ms = apply_start.elapsed().as_millis() as u64;
             profile::record_since("grouped_stats.apply_delta", phase_start);
             output_delta_batches
         }
     } else {
         let phase_start = profile::start();
+        let pending_start = Instant::now();
         let pending =
             grouped_stats_pending_delta(columnar, persisted_input_delta.batches()).await?;
+        pending_ms = pending_start.elapsed().as_millis() as u64;
         profile::record_since("grouped_stats.pending_delta", phase_start);
         let phase_start = profile::start();
+        let apply_start = Instant::now();
         let output_delta_batches = apply_grouped_stats_delta(columnar, pending).await?;
+        apply_ms = apply_start.elapsed().as_millis() as u64;
         profile::record_since("grouped_stats.apply_delta", phase_start);
         output_delta_batches
     };
     let phase_start = profile::start();
+    let build_output_start = Instant::now();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-stats output zset delta")?;
+    let build_output_ms = build_output_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_stats.build_output_zset", phase_start);
     let phase_start = profile::start();
+    let output_create_start = Instant::now();
     columnar
         .output_zset
         .create_version(
@@ -1459,6 +1477,7 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
                 .map(|handle| handle.version),
         )
         .await?;
+    let output_create_ms = output_create_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_stats.output_create_version", phase_start);
     let persisted_output_delta = output_delta;
 
@@ -1467,13 +1486,33 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
         .context("compute grouped-stats output row-count delta")?;
     let next_snapshot = if columnar.publish_arrow_snapshots {
         let phase_start = profile::start();
+        let output_snapshot_start = Instant::now();
         let next_snapshot =
             apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
                 .await
                 .context("apply Slate-backed grouped-stats columnar snapshot delta")?;
+        let output_snapshot_ms = output_snapshot_start.elapsed().as_millis() as u64;
         profile::record_since("grouped_stats.output_snapshot_delta", phase_start);
+        tracing::debug!(
+            prepare_ms,
+            pending_ms,
+            apply_ms,
+            build_output_ms,
+            output_create_ms,
+            output_snapshot_ms,
+            "grouped-stats state tick phase timings"
+        );
         next_snapshot
     } else {
+        tracing::debug!(
+            prepare_ms,
+            pending_ms,
+            apply_ms,
+            build_output_ms,
+            output_create_ms,
+            output_snapshot_ms = 0_u64,
+            "grouped-stats state tick phase timings"
+        );
         Vec::new()
     };
 
@@ -1587,6 +1626,7 @@ async fn prepare_join_grouped_stats_input_delta(
     let Some(join) = columnar.join.as_mut() else {
         return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
     };
+    let join_start = Instant::now();
     let tick = Box::pin(run_columnar_join_state_tick_delta_only(
         join.as_mut(),
         insert_batches,
@@ -1601,6 +1641,16 @@ async fn prepare_join_grouped_stats_input_delta(
             columnar.input_name
         )
     })?;
+    tracing::debug!(
+        join_ms = join_start.elapsed().as_millis() as u64,
+        delta_rows = tick
+            .delta
+            .batches()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        "grouped-stats nested join input prepared"
+    );
     if tick.input_changed && !tick.next_snapshot.is_empty() {
         columnar.input_snapshot = tick.next_snapshot;
     }
