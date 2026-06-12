@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -215,6 +215,7 @@ impl ColumnarGroupedStatsMaterializedViewState {
 struct AggregateSpec {
     kind: AggregateKind,
     value_idx: Option<usize>,
+    value_count_idx: Option<usize>,
     filter_idx: Option<usize>,
     value_type: Option<AggregateValueType>,
 }
@@ -229,7 +230,7 @@ enum AggregateKind {
     Max,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AggregateValueType {
     Any,
     Int64,
@@ -658,6 +659,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
             return Ok(None);
         }
     }
+    assign_shared_minmax_value_count_indices(&mut specs);
     let group_fields = projection_schema
         .fields()
         .iter()
@@ -2396,16 +2398,28 @@ async fn apply_compact_grouped_stats_delta(
     mut new_aggregate_builder: AggregateStatsOutputBuilder,
 ) -> Result<Vec<RecordBatch>> {
     let mut writes = WriteBatch::new();
+    let emit_apply_timings = tracing::enabled!(tracing::Level::DEBUG);
+    let mut group_count = 0usize;
+    let mut output_changed_count = 0usize;
+    let mut load_old = Duration::ZERO;
+    let mut update_state = Duration::ZERO;
+    let mut build_rows = Duration::ZERO;
+    let mut cache_state = Duration::ZERO;
     columnar
         .stats_state
         .load_compact_snapshot_if_needed()
         .await?;
     for (group_key, delta) in pending {
         let phase_start = profile::start();
+        let timing_start = emit_apply_timings.then(Instant::now);
         let mut state = load_compact_or_legacy_group_state(columnar, &group_key).await?;
+        if let Some(timing_start) = timing_start {
+            load_old += timing_start.elapsed();
+        }
         profile::record_since("grouped_stats.apply_load_old", phase_start);
 
         let phase_start = profile::start();
+        let timing_start = emit_apply_timings.then(Instant::now);
         let old_state = state.clone();
         let old_row_count = old_state.row_count;
         state.row_count = old_row_count
@@ -2425,9 +2439,13 @@ async fn apply_compact_grouped_stats_delta(
         let output_changed = old_row_count == 0
             || state.row_count == 0
             || !compact_group_state_outputs_equal(&columnar.specs, &old_state, &state)?;
+        if let Some(timing_start) = timing_start {
+            update_state += timing_start.elapsed();
+        }
         profile::record_since("grouped_stats.apply_update_state", phase_start);
 
         let phase_start = profile::start();
+        let timing_start = emit_apply_timings.then(Instant::now);
         if old_row_count > 0 && output_changed {
             if columnar.post_aggregate.is_some() {
                 old_aggregate_builder.append_compact_state(
@@ -2466,16 +2484,30 @@ async fn apply_compact_grouped_stats_delta(
                 )?;
             }
         }
+        if emit_apply_timings && output_changed {
+            output_changed_count = output_changed_count.saturating_add(1);
+        }
+        if let Some(timing_start) = timing_start {
+            build_rows += timing_start.elapsed();
+        }
         profile::record_since("grouped_stats.apply_build_rows", phase_start);
 
         let phase_start = profile::start();
+        let timing_start = emit_apply_timings.then(Instant::now);
         columnar
             .stats_state
             .write_compact_state(&mut writes, &group_key, state)?;
+        if let Some(timing_start) = timing_start {
+            cache_state += timing_start.elapsed();
+        }
         profile::record_since("grouped_stats.apply_cache_state", phase_start);
+        if emit_apply_timings {
+            group_count = group_count.saturating_add(1);
+        }
     }
 
     let phase_start = profile::start();
+    let finish_output_start = emit_apply_timings.then(Instant::now);
     let output_delta_batches = if let Some(post_aggregate) = columnar.post_aggregate.as_ref() {
         post_aggregate_delta_batches(
             post_aggregate,
@@ -2487,16 +2519,41 @@ async fn apply_compact_grouped_stats_delta(
     } else {
         direct_builder.finish()?
     };
+    let finish_output_ms = finish_output_start
+        .map(|start| start.elapsed().as_millis() as u64)
+        .unwrap_or(0);
     profile::record_since("grouped_stats.apply_finish_output", phase_start);
 
     let phase_start = profile::start();
+    let write_batch_start = emit_apply_timings.then(Instant::now);
     columnar
         .stats_state
         .table
         .write_batch(writes)
         .await
         .context("persist compact grouped-stats state updates")?;
+    let write_batch_ms = write_batch_start
+        .map(|start| start.elapsed().as_millis() as u64)
+        .unwrap_or(0);
     profile::record_since("grouped_stats.apply_write_batch", phase_start);
+    if emit_apply_timings {
+        let load_old_us = load_old.as_micros() as u64;
+        let update_state_us = update_state.as_micros() as u64;
+        let build_rows_us = build_rows.as_micros() as u64;
+        let cache_state_us = cache_state.as_micros() as u64;
+        tracing::debug!(
+            mode = "compact",
+            group_count,
+            output_changed_count,
+            load_old_us,
+            update_state_us,
+            build_rows_us,
+            cache_state_us,
+            finish_output_ms,
+            write_batch_ms,
+            "grouped-stats apply phase timings"
+        );
+    }
     Ok(output_delta_batches)
 }
 
@@ -3044,6 +3101,7 @@ async fn apply_compact_aggregate_deltas(
     deltas: &[AggregateDelta],
     writes: &mut WriteBatch,
 ) -> Result<()> {
+    let mut shared_i64_value_counts: HashMap<usize, HashMap<i64, i64>> = HashMap::new();
     for (idx, (spec, delta)) in columnar.specs.iter().zip(deltas.iter()).enumerate() {
         let aggregate = state
             .aggregates
@@ -3095,30 +3153,46 @@ async fn apply_compact_aggregate_deltas(
                 CompactAggregateState::MinMaxI64(value),
             ) => {
                 let old = *value;
-                let mut updated_counts = HashMap::with_capacity(value_deltas.len());
-                for (delta_value, value_delta) in value_deltas {
-                    let old_count = columnar
-                        .stats_state
-                        .load_value_count(group_key, idx, *delta_value)
-                        .await?;
-                    let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
-                        anyhow::anyhow!("grouped-stats min/max value count overflow")
-                    })?;
-                    if new_count < 0 {
-                        bail!("grouped-stats min/max removed more values than were present");
+                let value_count_idx = spec.value_count_idx.unwrap_or(idx);
+                if !shared_i64_value_counts.contains_key(&value_count_idx) {
+                    let mut updated_counts = HashMap::with_capacity(value_deltas.len());
+                    for (delta_value, value_delta) in value_deltas {
+                        let old_count = columnar
+                            .stats_state
+                            .load_value_count(group_key, value_count_idx, *delta_value)
+                            .await?;
+                        let new_count = old_count.checked_add(*value_delta).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats min/max value count overflow")
+                        })?;
+                        if new_count < 0 {
+                            bail!("grouped-stats min/max removed more values than were present");
+                        }
+                        updated_counts.insert(*delta_value, new_count);
+                        columnar.stats_state.write_value_count(
+                            writes,
+                            group_key,
+                            value_count_idx,
+                            *delta_value,
+                            new_count,
+                        )?;
                     }
-                    updated_counts.insert(*delta_value, new_count);
-                    columnar.stats_state.write_value_count(
-                        writes,
-                        group_key,
-                        idx,
-                        *delta_value,
-                        new_count,
-                    )?;
+                    shared_i64_value_counts.insert(value_count_idx, updated_counts);
                 }
+                let updated_counts =
+                    shared_i64_value_counts
+                        .get(&value_count_idx)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats shared min/max counts missing")
+                        })?;
                 *value = columnar
                     .stats_state
-                    .new_minmax_after_delta(group_key, idx, spec.kind, old, &updated_counts)
+                    .new_minmax_after_delta(
+                        group_key,
+                        value_count_idx,
+                        spec.kind,
+                        old,
+                        updated_counts,
+                    )
                     .await?;
             }
             (AggregateKind::DistinctCount, _, _) => {
@@ -5911,6 +5985,38 @@ fn avg_value_expr_for_top1_value_rewrite(expr: &Expr) -> Option<&Expr> {
     Some(value_expr)
 }
 
+fn projection_expr_index_or_push(
+    projection_expr: &mut Vec<Expr>,
+    expr: &Expr,
+    alias_prefix: &str,
+) -> usize {
+    if let Some(idx) = projection_expr
+        .iter()
+        .position(|existing| strip_alias(existing) == strip_alias(expr))
+    {
+        return idx;
+    }
+    let idx = projection_expr.len();
+    projection_expr.push(expr.clone().alias(format!("{alias_prefix}_{idx}")));
+    idx
+}
+
+fn assign_shared_minmax_value_count_indices(specs: &mut [AggregateSpec]) {
+    let mut count_idx_by_value: HashMap<(usize, Option<usize>, Option<AggregateValueType>), usize> =
+        HashMap::new();
+    for (agg_idx, spec) in specs.iter_mut().enumerate() {
+        if !matches!(spec.kind, AggregateKind::Min | AggregateKind::Max) {
+            continue;
+        }
+        let Some(value_idx) = spec.value_idx else {
+            continue;
+        };
+        let key = (value_idx, spec.filter_idx, spec.value_type);
+        let value_count_idx = *count_idx_by_value.entry(key).or_insert(agg_idx);
+        spec.value_count_idx = Some(value_count_idx);
+    }
+}
+
 fn aggregate_input_column_index(aggregate: &Aggregate, expr: &Expr) -> Option<usize> {
     let Expr::Column(column) = strip_alias(expr) else {
         return None;
@@ -5964,15 +6070,15 @@ fn aggregate_spec_for_expr(
             let [value_expr] = params.args.as_slice() else {
                 return None;
             };
-            let value_idx = projection_expr.len();
-            projection_expr.push(
-                value_expr
-                    .clone()
-                    .alias(format!("__floe_grouped_stats_value_{value_idx}")),
+            let value_idx = projection_expr_index_or_push(
+                projection_expr,
+                value_expr,
+                "__floe_grouped_stats_value",
             );
             return Some(AggregateSpec {
                 kind: AggregateKind::DistinctCount,
                 value_idx: Some(value_idx),
+                value_count_idx: None,
                 filter_idx,
                 value_type: Some(AggregateValueType::Any),
             });
@@ -5981,15 +6087,15 @@ fn aggregate_spec_for_expr(
             let [value_expr] = params.args.as_slice() else {
                 return None;
             };
-            let value_idx = projection_expr.len();
-            projection_expr.push(
-                value_expr
-                    .clone()
-                    .alias(format!("__floe_grouped_stats_count_value_{value_idx}")),
+            let value_idx = projection_expr_index_or_push(
+                projection_expr,
+                value_expr,
+                "__floe_grouped_stats_count_value",
             );
             return Some(AggregateSpec {
                 kind: AggregateKind::Count,
                 value_idx: Some(value_idx),
+                value_count_idx: None,
                 filter_idx,
                 value_type: Some(AggregateValueType::Any),
             });
@@ -5997,6 +6103,7 @@ fn aggregate_spec_for_expr(
         return Some(AggregateSpec {
             kind: AggregateKind::Count,
             value_idx: None,
+            value_count_idx: None,
             filter_idx,
             value_type: None,
         });
@@ -6007,12 +6114,8 @@ fn aggregate_spec_for_expr(
     let [value_expr] = params.args.as_slice() else {
         return None;
     };
-    let value_idx = projection_expr.len();
-    projection_expr.push(
-        value_expr
-            .clone()
-            .alias(format!("__floe_grouped_stats_value_{value_idx}")),
-    );
+    let value_idx =
+        projection_expr_index_or_push(projection_expr, value_expr, "__floe_grouped_stats_value");
     let (kind, value_type) = if name.eq_ignore_ascii_case("sum")
         && matches!(output_type, DataType::Int64 | DataType::Decimal128(_, _))
     {
@@ -6056,6 +6159,7 @@ fn aggregate_spec_for_expr(
     Some(AggregateSpec {
         kind,
         value_idx: Some(value_idx),
+        value_count_idx: None,
         filter_idx,
         value_type: Some(value_type),
     })
