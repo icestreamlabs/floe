@@ -47,8 +47,8 @@ use super::columnar_grouped_stats::{
     columnar_grouped_stats_plan_for_plan, run_columnar_grouped_stats_state_tick,
 };
 use super::{
-    VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    direct_project_record_batches, normalize_batches, profile,
+    VectorizedMaterializedViewState, VectorizedSourceState, apply_keyed_source_snapshot_delta,
+    apply_weighted_snapshot_delta, direct_project_record_batches, normalize_batches, profile,
 };
 
 pub(super) struct ColumnarTopNPlan {
@@ -118,6 +118,7 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     evaluator: TopNEvaluator,
     partition_indices: Vec<usize>,
     partition_converter: RowConverter,
+    source_primary_key_columns: Vec<String>,
     source_snapshot: Vec<RecordBatch>,
     initial_snapshot: Vec<RecordBatch>,
     full_snapshot_diff: bool,
@@ -341,6 +342,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 evaluator,
                 partition_indices,
                 partition_converter,
+                source_primary_key_columns: source.primary_key_columns.clone(),
                 source_snapshot,
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
@@ -398,6 +400,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 evaluator,
                 partition_indices,
                 partition_converter,
+                source_primary_key_columns: Vec::new(),
                 source_snapshot,
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
@@ -455,6 +458,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 evaluator,
                 partition_indices,
                 partition_converter,
+                source_primary_key_columns: Vec::new(),
                 source_snapshot,
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
@@ -607,6 +611,7 @@ pub(super) async fn run_columnar_topn_state_tick(
     let source_snapshot_start = Instant::now();
     let next_source_snapshot = apply_source_snapshot_delta(
         &columnar.source_schema,
+        &columnar.source_primary_key_columns,
         &columnar.source_snapshot,
         &persisted_input_delta,
     )
@@ -893,6 +898,7 @@ async fn run_columnar_topn_append_only_source_state_tick(
         let phase_start = profile::start();
         columnar.source_snapshot = apply_source_snapshot_delta(
             &columnar.source_schema,
+            &columnar.source_primary_key_columns,
             &columnar.source_snapshot,
             input_delta,
         )
@@ -964,6 +970,7 @@ async fn run_columnar_topn_append_only_source_state_tick(
     let phase_start = profile::start();
     columnar.source_snapshot = apply_source_snapshot_delta(
         &columnar.source_schema,
+        &columnar.source_primary_key_columns,
         &columnar.source_snapshot,
         input_delta,
     )
@@ -1530,6 +1537,7 @@ async fn run_columnar_topn_full_snapshot_diff_state_tick(
     } else if has_input_change {
         apply_source_snapshot_delta(
             &columnar.source_schema,
+            &columnar.source_primary_key_columns,
             &columnar.source_snapshot,
             &input_tick.delta,
         )
@@ -1902,13 +1910,20 @@ async fn persisted_source_delta(
 
 async fn apply_source_snapshot_delta(
     schema: &SchemaRef,
+    primary_key_columns: &[String],
     previous: &[RecordBatch],
     delta: &ColumnarZSet,
 ) -> Result<Vec<RecordBatch>> {
     if delta.batches().is_empty() {
         return Ok(previous.to_vec());
     }
-    apply_weighted_snapshot_delta(schema, previous, delta.batches().to_vec()).await
+    apply_keyed_source_snapshot_delta(
+        schema,
+        primary_key_columns,
+        previous,
+        delta.batches().to_vec(),
+    )
+    .await
 }
 
 fn schemas_match_by_position(input_schema: &SchemaRef, output_schema: &SchemaRef) -> bool {

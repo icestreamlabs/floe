@@ -67,8 +67,8 @@ use super::columnar_union::{
 };
 use super::profile;
 use super::{
-    VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches,
+    VectorizedMaterializedViewState, VectorizedSourceState, apply_keyed_source_snapshot_delta,
+    apply_weighted_snapshot_delta, normalize_batches,
 };
 
 pub(super) struct ColumnarJoinPlan {
@@ -137,6 +137,7 @@ struct ColumnarJoinSourceState {
     input_name: String,
     source_name: Option<String>,
     schema: SchemaRef,
+    primary_key_columns: Vec<String>,
     input_zset: Option<SlateBackedColumnarZSet>,
     input_index: Option<Box<SlateBackedColumnarIndexedZSet>>,
     snapshot: Vec<RecordBatch>,
@@ -162,6 +163,7 @@ struct ColumnarJoinConstantState {
 struct ColumnarJoinTopNInputState {
     source_name: String,
     source_schema: SchemaRef,
+    source_primary_key_columns: Vec<String>,
     source_input_zset: SlateBackedColumnarZSet,
     source_snapshot: Vec<RecordBatch>,
     evaluator: TopNEvaluator,
@@ -792,6 +794,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: Some(source_name),
                 schema: Arc::clone(&source.schema),
+                primary_key_columns: source.primary_key_columns.clone(),
                 snapshot,
                 input_zset: Some(input_zset),
                 input_index,
@@ -854,6 +857,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: Some(input_zset),
                 input_index: None,
                 snapshot,
@@ -928,6 +932,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: Some(input_zset),
                 input_index: None,
                 snapshot,
@@ -935,6 +940,7 @@ async fn build_join_input_state(
                 topn: Some(ColumnarJoinTopNInputState {
                     source_name,
                     source_schema: Arc::clone(&source.schema),
+                    source_primary_key_columns: source.primary_key_columns.clone(),
                     source_input_zset,
                     source_snapshot,
                     evaluator,
@@ -975,6 +981,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1015,6 +1022,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1054,6 +1062,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1091,6 +1100,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1128,6 +1138,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1165,6 +1176,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1202,6 +1214,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1239,6 +1252,7 @@ async fn build_join_input_state(
                 input_name: input.input_name,
                 source_name: None,
                 schema: input.schema,
+                primary_key_columns: Vec::new(),
                 input_zset: None,
                 input_index: None,
                 snapshot,
@@ -1679,12 +1693,14 @@ async fn run_columnar_join_state_tick_inner(
         let source_snapshot_delta_start = Instant::now();
         columnar.left.snapshot = apply_source_snapshot_delta(
             &columnar.left.schema,
+            &columnar.left.primary_key_columns,
             &columnar.left.snapshot,
             &left_delta,
         )
         .await?;
         columnar.right.snapshot = apply_source_snapshot_delta(
             &columnar.right.schema,
+            &columnar.right.primary_key_columns,
             &columnar.right.snapshot,
             &right_delta,
         )
@@ -2394,8 +2410,13 @@ async fn prepare_topn_join_input_tick(
         });
     }
 
-    let next_source_snapshot =
-        apply_source_snapshot_delta(&topn.source_schema, &topn.source_snapshot, &raw_delta).await?;
+    let next_source_snapshot = apply_source_snapshot_delta(
+        &topn.source_schema,
+        &topn.source_primary_key_columns,
+        &topn.source_snapshot,
+        &raw_delta,
+    )
+    .await?;
     let next_topn_snapshot = topn
         .evaluator
         .evaluate(&next_source_snapshot)
@@ -2748,13 +2769,20 @@ fn lookup_key_batches_from_delta(
 
 async fn apply_source_snapshot_delta(
     schema: &SchemaRef,
+    primary_key_columns: &[String],
     previous: &[RecordBatch],
     delta: &ColumnarZSet,
 ) -> Result<Vec<RecordBatch>> {
     if delta.batches().is_empty() {
         return Ok(previous.to_vec());
     }
-    apply_weighted_snapshot_delta(schema, previous, delta.batches().to_vec()).await
+    apply_keyed_source_snapshot_delta(
+        schema,
+        primary_key_columns,
+        previous,
+        delta.batches().to_vec(),
+    )
+    .await
 }
 
 impl JoinDeltaEvaluator {

@@ -162,6 +162,51 @@ pub(super) async fn apply_weighted_snapshot_delta(
     Ok(next)
 }
 
+pub(super) async fn apply_keyed_source_snapshot_delta(
+    schema: &SchemaRef,
+    primary_key_columns: &[String],
+    previous: &[RecordBatch],
+    weighted_delta: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    if primary_key_columns.is_empty() {
+        return apply_weighted_snapshot_delta(schema, previous, weighted_delta).await;
+    }
+    let weighted_schema = crate::delta_consolidation::weighted_snapshot_schema(schema)?;
+    if weighted_delta_is_append_only(&weighted_schema, &weighted_delta)? {
+        return apply_weighted_snapshot_delta(schema, previous, weighted_delta).await;
+    }
+
+    let mut next = previous
+        .iter()
+        .filter(|batch| batch.num_rows() > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    for delta in weighted_delta {
+        if delta.num_rows() == 0 {
+            continue;
+        }
+        validate_unit_source_delta(schema, &delta)?;
+        let update = prepare_source_delta(schema, primary_key_columns, &delta)?;
+        if !update.touched_keys.is_empty() {
+            next = filter_touched_source_rows(
+                schema,
+                &update.key_indices,
+                &update.touched_keys,
+                &next,
+            )?;
+        }
+        if let Some(positive_batch) = update.final_positive_batch
+            && positive_batch.num_rows() > 0
+        {
+            next.push(positive_batch);
+        }
+    }
+    if next.is_empty() {
+        next.push(RecordBatch::new_empty(Arc::clone(schema)));
+    }
+    Ok(next)
+}
+
 fn weighted_delta_is_append_only(
     weighted_schema: &SchemaRef,
     weighted_delta: &[RecordBatch],
@@ -654,5 +699,52 @@ mod tests {
             .flat_map(|batch| int64_values(batch, 0))
             .collect::<Vec<_>>();
         assert_eq!(consolidated_values, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn keyed_source_snapshot_delta_replaces_touched_primary_key_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let previous = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("previous snapshot");
+        let weighted_schema =
+            crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+        let delta = RecordBatch::try_new(
+            weighted_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int64Array::from(vec![10, 15])),
+                Arc::new(Int64Array::from(vec![-1, 1])),
+            ],
+        )
+        .expect("weighted delta");
+
+        let next = apply_keyed_source_snapshot_delta(
+            &schema,
+            &["id".to_string()],
+            &[previous],
+            vec![delta],
+        )
+        .await
+        .expect("apply keyed source snapshot delta");
+        let ids = next
+            .iter()
+            .flat_map(|batch| int64_values(batch, 0))
+            .collect::<Vec<_>>();
+        let amounts = next
+            .iter()
+            .flat_map(|batch| int64_values(batch, 1))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![2, 1]);
+        assert_eq!(amounts, vec![20, 15]);
     }
 }

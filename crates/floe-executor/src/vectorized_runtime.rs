@@ -22,8 +22,8 @@ use crate::metrics;
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_source_delta::{
-    apply_source_delta, apply_weighted_snapshot_delta, insert_only_source_delta_batch,
-    prepare_source_delta, validate_unit_source_delta,
+    apply_keyed_source_snapshot_delta, apply_source_delta, apply_weighted_snapshot_delta,
+    insert_only_source_delta_batch, prepare_source_delta, validate_unit_source_delta,
 };
 use source_state::{
     camel_case_schema, dynamic_state_provider, rename_batches, source_key_indices,

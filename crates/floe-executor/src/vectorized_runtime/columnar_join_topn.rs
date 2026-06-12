@@ -31,8 +31,8 @@ use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 
 use super::{
-    VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches, profile,
+    VectorizedMaterializedViewState, VectorizedSourceState, apply_keyed_source_snapshot_delta,
+    apply_weighted_snapshot_delta, normalize_batches, profile,
 };
 
 pub(super) struct ColumnarJoinTopNPlan {
@@ -95,6 +95,7 @@ pub(super) struct ColumnarJoinTopNTick {
 struct JoinTopNSourceState {
     source_name: String,
     schema: SchemaRef,
+    primary_key_columns: Vec<String>,
     key_idx: Option<usize>,
     input_zset: SlateBackedColumnarZSet,
     input_index: Option<Box<SlateBackedColumnarIndexedZSet>>,
@@ -583,6 +584,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         left: JoinTopNSourceState {
             source_name: left_name,
             schema: Arc::clone(&left_source.schema),
+            primary_key_columns: left_source.primary_key_columns.clone(),
             key_idx: left_key_idx,
             input_index: left_index,
             snapshot: left_snapshot,
@@ -591,6 +593,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         right: JoinTopNSourceState {
             source_name: right_name,
             schema: Arc::clone(&right_source.schema),
+            primary_key_columns: right_source.primary_key_columns.clone(),
             key_idx: right_key_idx,
             input_index: right_index,
             snapshot: right_snapshot,
@@ -732,11 +735,16 @@ pub(super) async fn run_columnar_join_topn_state_tick(
                 .await?;
                 profile::record_since("join_topn.lookup_previous_right", phase_start);
                 let phase_start = profile::start();
-                let next_left =
-                    apply_source_snapshot_delta(&columnar.left.schema, &previous_left, &left_delta)
-                        .await?;
+                let next_left = apply_source_snapshot_delta(
+                    &columnar.left.schema,
+                    &columnar.left.primary_key_columns,
+                    &previous_left,
+                    &left_delta,
+                )
+                .await?;
                 let next_right = apply_source_snapshot_delta(
                     &columnar.right.schema,
+                    &columnar.right.primary_key_columns,
                     &previous_right,
                     &right_delta,
                 )
@@ -778,12 +786,14 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             } else {
                 let next_left_snapshot = apply_source_snapshot_delta(
                     &columnar.left.schema,
+                    &columnar.left.primary_key_columns,
                     &columnar.left.snapshot,
                     &left_delta,
                 )
                 .await?;
                 let next_right_snapshot = apply_source_snapshot_delta(
                     &columnar.right.schema,
+                    &columnar.right.primary_key_columns,
                     &columnar.right.snapshot,
                     &right_delta,
                 )
@@ -912,13 +922,20 @@ async fn persisted_source_delta(
 
 async fn apply_source_snapshot_delta(
     schema: &SchemaRef,
+    primary_key_columns: &[String],
     previous: &[RecordBatch],
     delta: &ColumnarZSet,
 ) -> Result<Vec<RecordBatch>> {
     if delta.batches().is_empty() {
         return Ok(previous.to_vec());
     }
-    apply_weighted_snapshot_delta(schema, previous, delta.batches().to_vec()).await
+    apply_keyed_source_snapshot_delta(
+        schema,
+        primary_key_columns,
+        previous,
+        delta.batches().to_vec(),
+    )
+    .await
 }
 
 fn collect_i64_keys_from_delta(
