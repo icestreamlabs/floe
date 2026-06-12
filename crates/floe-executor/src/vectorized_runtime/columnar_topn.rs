@@ -48,7 +48,7 @@ use super::columnar_grouped_stats::{
 };
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches, profile,
+    direct_project_record_batches, normalize_batches, profile,
 };
 
 pub(super) struct ColumnarTopNPlan {
@@ -57,6 +57,7 @@ pub(super) struct ColumnarTopNPlan {
     partition_columns: Vec<String>,
     full_snapshot_diff: bool,
     append_only_fast_path: bool,
+    row_number_limit: Option<usize>,
     append_only_direct_plan: Option<AppendOnlyDirectTopNPlan>,
 }
 
@@ -121,6 +122,8 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     initial_snapshot: Vec<RecordBatch>,
     full_snapshot_diff: bool,
     append_only_fast_path: bool,
+    row_number_limit: Option<usize>,
+    source_output_projection: Option<Vec<usize>>,
     append_only_direct: Option<AppendOnlyDirectTopNState>,
 }
 
@@ -168,6 +171,7 @@ pub(super) fn columnar_topn_plan_for_plan(
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Result<Option<ColumnarTopNPlan>> {
     let mut append_only_fast_path = false;
+    let mut row_number_limit = None;
     let mut append_only_direct_plan = None;
     let partition_columns = if let Some((rank_column, filter)) = row_number_filter_for_plan(plan) {
         let upper_bound = extract_standalone_row_number_upper_bound_limit(&filter.predicate);
@@ -185,6 +189,7 @@ pub(super) fn columnar_topn_plan_for_plan(
             return Ok(None);
         };
         if let Some((_rank_column, limit)) = upper_bound {
+            row_number_limit = Some(limit);
             append_only_direct_plan = append_only_direct_topn_plan(window_function, limit);
         }
         let partition_columns = window_function
@@ -236,6 +241,7 @@ pub(super) fn columnar_topn_plan_for_plan(
     Ok(Some(ColumnarTopNPlan {
         full_snapshot_diff,
         append_only_fast_path,
+        row_number_limit,
         append_only_direct_plan,
         logical_plan: plan.clone(),
         input,
@@ -301,6 +307,11 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source,
                 plan.append_only_direct_plan.as_ref(),
             )?;
+            let source_output_projection = direct_topn_source_output_projection_indices(
+                &plan.logical_plan,
+                &source.schema,
+                output_schema,
+            );
             let input_namespace = format!("{mv_namespace}/columnar/topn/input");
             let input_zset = SlateBackedColumnarZSet::new(
                 Arc::clone(&table),
@@ -334,6 +345,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
                 append_only_fast_path: plan.append_only_fast_path,
+                row_number_limit: plan.row_number_limit,
+                source_output_projection,
                 append_only_direct,
             })
         }
@@ -389,6 +402,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
                 append_only_fast_path: plan.append_only_fast_path,
+                row_number_limit: plan.row_number_limit,
+                source_output_projection: None,
                 append_only_direct: None,
             })
         }
@@ -444,6 +459,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 initial_snapshot,
                 full_snapshot_diff: plan.full_snapshot_diff,
                 append_only_fast_path: plan.append_only_fast_path,
+                row_number_limit: plan.row_number_limit,
+                source_output_projection: None,
                 append_only_direct: None,
             })
         }
@@ -542,9 +559,11 @@ pub(super) async fn run_columnar_topn_state_tick(
 ) -> Result<ColumnarTopNTick> {
     let total_start = profile::start();
     let phase_start = profile::start();
+    let prepare_start = Instant::now();
     let input_tick = prepare_topn_input_tick(columnar, insert_batches, weighted_delta_batches)
         .await
         .context("prepare SlateDB-backed topn input tick")?;
+    let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("topn.prepare_input", phase_start);
     if columnar.full_snapshot_diff {
         return run_columnar_topn_full_snapshot_diff_state_tick(
@@ -561,11 +580,13 @@ pub(super) async fn run_columnar_topn_state_tick(
     let input_changed = input_tick.input_changed;
     let persisted_input_delta = input_tick.delta;
     let phase_start = profile::start();
+    let touched_start = Instant::now();
     let touched_partitions = touched_partition_keys(
         &columnar.partition_converter,
         &columnar.partition_indices,
         persisted_input_delta.batches(),
     )?;
+    let touched_ms = touched_start.elapsed().as_millis() as u64;
     profile::record_since("topn.touched_partitions", phase_start);
     if columnar.append_only_fast_path
         && input_tick.append_only_source_delta
@@ -583,6 +604,94 @@ pub(super) async fn run_columnar_topn_state_tick(
         return Ok(tick);
     }
     let phase_start = profile::start();
+    let source_snapshot_start = Instant::now();
+    let next_source_snapshot = apply_source_snapshot_delta(
+        &columnar.source_schema,
+        &columnar.source_snapshot,
+        &persisted_input_delta,
+    )
+    .await?;
+    let source_snapshot_ms = source_snapshot_start.elapsed().as_millis() as u64;
+    profile::record_since("topn.source_snapshot_delta", phase_start);
+
+    let identity_check_start = Instant::now();
+    let under_limit_identity = if let Some(limit) = columnar.row_number_limit {
+        topn_source_is_under_limit_identity(columnar, output_schema, &next_source_snapshot, limit)?
+    } else {
+        false
+    };
+    let identity_check_ms = identity_check_start.elapsed().as_millis() as u64;
+    if under_limit_identity {
+        let phase_start = profile::start();
+        let build_output_start = Instant::now();
+        let projection = columnar
+            .source_output_projection
+            .as_ref()
+            .context("under-limit identity topn source projection missing")?;
+        let output_delta = direct_project_weighted_columnar_zset(
+            &persisted_input_delta,
+            output_schema,
+            projection,
+        )
+        .context("build under-limit identity topn output zset delta")?;
+        let build_output_ms = build_output_start.elapsed().as_millis() as u64;
+        profile::record_since("topn.identity_build_output_zset", phase_start);
+
+        let phase_start = profile::start();
+        let output_create_start = Instant::now();
+        let persisted_output_delta = if let Some(handle) = columnar
+            .output_zset
+            .create_version(
+                &output_delta,
+                columnar
+                    .output_zset
+                    .current_handle()
+                    .map(|handle| handle.version),
+            )
+            .await?
+        {
+            columnar.output_zset.read_delta(&handle).await?
+        } else {
+            output_delta
+        };
+        let output_create_ms = output_create_start.elapsed().as_millis() as u64;
+        profile::record_since("topn.identity_output_create_version", phase_start);
+
+        let next_snapshot =
+            direct_project_record_batches(&next_source_snapshot, output_schema, projection, "topn")
+                .context("build under-limit identity topn output snapshot")?;
+
+        tracing::debug!(
+            input = %columnar.input_name,
+            path = "under_limit_identity",
+            input_delta_rows = persisted_input_delta.num_rows(),
+            touched_partition_count = touched_partitions.len(),
+            previous_source_rows = record_batch_row_count(&columnar.source_snapshot),
+            next_source_rows = record_batch_row_count(&next_source_snapshot),
+            previous_output_rows = record_batch_row_count(previous_snapshot),
+            next_output_rows = record_batch_row_count(&next_snapshot),
+            output_delta_rows = persisted_output_delta.num_rows(),
+            next_snapshot_rows = record_batch_row_count(&next_snapshot),
+            prepare_ms,
+            touched_ms,
+            source_snapshot_ms,
+            identity_check_ms,
+            build_output_ms,
+            output_create_ms,
+            "topn state tick phase timings"
+        );
+
+        columnar.source_snapshot = next_source_snapshot;
+        profile::record_since("topn.total", total_start);
+        return Ok(ColumnarTopNTick {
+            delta: persisted_output_delta,
+            next_snapshot,
+            input_changed,
+        });
+    }
+
+    let phase_start = profile::start();
+    let previous_filter_start = Instant::now();
     let previous_source_for_keys = filter_batches_to_partition_keys(
         &columnar.source_schema,
         &columnar.partition_converter,
@@ -590,16 +699,10 @@ pub(super) async fn run_columnar_topn_state_tick(
         &columnar.source_snapshot,
         &touched_partitions,
     )?;
+    let previous_filter_ms = previous_filter_start.elapsed().as_millis() as u64;
     profile::record_since("topn.previous_source_for_keys", phase_start);
     let phase_start = profile::start();
-    let next_source_snapshot = apply_source_snapshot_delta(
-        &columnar.source_schema,
-        &columnar.source_snapshot,
-        &persisted_input_delta,
-    )
-    .await?;
-    profile::record_since("topn.source_snapshot_delta", phase_start);
-    let phase_start = profile::start();
+    let next_filter_start = Instant::now();
     let next_source_for_keys = filter_batches_to_partition_keys(
         &columnar.source_schema,
         &columnar.partition_converter,
@@ -607,34 +710,44 @@ pub(super) async fn run_columnar_topn_state_tick(
         &next_source_snapshot,
         &touched_partitions,
     )?;
+    let next_filter_ms = next_filter_start.elapsed().as_millis() as u64;
     profile::record_since("topn.next_source_for_keys", phase_start);
 
     let phase_start = profile::start();
+    let evaluate_previous_start = Instant::now();
     let previous_output = columnar
         .evaluator
         .evaluate(&previous_source_for_keys)
         .await
         .context("evaluate previous topn partition outputs")?;
+    let evaluate_previous_ms = evaluate_previous_start.elapsed().as_millis() as u64;
     profile::record_since("topn.evaluate_previous", phase_start);
     let phase_start = profile::start();
+    let evaluate_next_start = Instant::now();
     let next_output = columnar
         .evaluator
         .evaluate(&next_source_for_keys)
         .await
         .context("evaluate next topn partition outputs")?;
+    let evaluate_next_ms = evaluate_next_start.elapsed().as_millis() as u64;
     profile::record_since("topn.evaluate_next", phase_start);
     let phase_start = profile::start();
+    let diff_start = Instant::now();
     let diff = diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
         .await
         .context("diff topn partition outputs")?;
+    let diff_ms = diff_start.elapsed().as_millis() as u64;
     profile::record_since("topn.diff_output", phase_start);
 
     let phase_start = profile::start();
+    let build_output_start = Instant::now();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
             .context("build topn output zset delta")?;
+    let build_output_ms = build_output_start.elapsed().as_millis() as u64;
     profile::record_since("topn.build_output_zset", phase_start);
     let phase_start = profile::start();
+    let output_create_start = Instant::now();
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(
@@ -650,15 +763,43 @@ pub(super) async fn run_columnar_topn_state_tick(
     } else {
         output_delta
     };
+    let output_create_ms = output_create_start.elapsed().as_millis() as u64;
     profile::record_since("topn.output_create_version", phase_start);
 
     let delta_batches = persisted_output_delta.batches().to_vec();
     let phase_start = profile::start();
+    let output_snapshot_start = Instant::now();
     let next_snapshot =
         apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
             .await
             .context("apply Slate-backed topn columnar snapshot delta")?;
+    let output_snapshot_ms = output_snapshot_start.elapsed().as_millis() as u64;
     profile::record_since("topn.output_snapshot_delta", phase_start);
+
+    tracing::debug!(
+        input = %columnar.input_name,
+        input_delta_rows = persisted_input_delta.num_rows(),
+        touched_partition_count = touched_partitions.len(),
+        previous_source_rows = record_batch_row_count(&previous_source_for_keys),
+        next_source_rows = record_batch_row_count(&next_source_for_keys),
+        previous_output_rows = record_batch_row_count(&previous_output),
+        next_output_rows = record_batch_row_count(&next_output),
+        output_delta_rows = persisted_output_delta.num_rows(),
+        next_snapshot_rows = record_batch_row_count(&next_snapshot),
+        prepare_ms,
+        touched_ms,
+        previous_filter_ms,
+        source_snapshot_ms,
+        identity_check_ms,
+        next_filter_ms,
+        evaluate_previous_ms,
+        evaluate_next_ms,
+        diff_ms,
+        build_output_ms,
+        output_create_ms,
+        output_snapshot_ms,
+        "topn state tick phase timings"
+    );
 
     columnar.source_snapshot = next_source_snapshot;
     profile::record_since("topn.total", total_start);
@@ -1613,6 +1754,138 @@ fn source_input_delta(
     } else {
         ColumnarZSet::empty(Arc::clone(&columnar.source_schema))
     }
+}
+
+fn record_batch_row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn topn_source_is_under_limit_identity(
+    columnar: &ColumnarTopNMaterializedViewState,
+    output_schema: &SchemaRef,
+    next_source_snapshot: &[RecordBatch],
+    limit: usize,
+) -> Result<bool> {
+    if columnar.source_output_projection.is_none() {
+        return Ok(false);
+    }
+    let projection = columnar
+        .source_output_projection
+        .as_ref()
+        .context("topn source output projection missing")?;
+    if projection.len() != output_schema.fields().len() {
+        return Ok(false);
+    }
+    if !partition_row_counts_within_limit(
+        &columnar.partition_converter,
+        &columnar.partition_indices,
+        &columnar.source_snapshot,
+        limit,
+    )? {
+        return Ok(false);
+    }
+    partition_row_counts_within_limit(
+        &columnar.partition_converter,
+        &columnar.partition_indices,
+        next_source_snapshot,
+        limit,
+    )
+}
+
+fn direct_topn_source_output_projection_indices(
+    logical_plan: &LogicalPlan,
+    source_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+) -> Option<Vec<usize>> {
+    let (rank_column, filter) = row_number_filter_for_plan(logical_plan)?;
+    let (_window, projection_without_rank) =
+        extract_window_plan(filter.input.as_ref(), &rank_column)?;
+    let projection_without_rank = projection_without_rank?;
+    direct_projection_indices_for_exprs(&projection_without_rank, source_schema, output_schema)
+}
+
+fn direct_projection_indices_for_exprs(
+    exprs: &[Expr],
+    input_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+) -> Option<Vec<usize>> {
+    if exprs.len() != output_schema.fields().len() {
+        return None;
+    }
+    exprs
+        .iter()
+        .enumerate()
+        .map(|(output_idx, expr)| {
+            let Expr::Column(column) = strip_alias(expr) else {
+                return None;
+            };
+            let input_idx = input_schema.index_of(&column.name).ok()?;
+            (input_schema.field(input_idx).data_type()
+                == output_schema.field(output_idx).data_type())
+            .then_some(input_idx)
+        })
+        .collect()
+}
+
+fn partition_row_counts_within_limit(
+    converter: &RowConverter,
+    partition_indices: &[usize],
+    batches: &[RecordBatch],
+    limit: usize,
+) -> Result<bool> {
+    if partition_indices.is_empty() {
+        return Ok(record_batch_row_count(batches) <= limit);
+    }
+    let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let rows = converter
+            .convert_columns(&project_columns(batch, partition_indices))
+            .context("encode topn under-limit partition keys")?;
+        for row_idx in 0..batch.num_rows() {
+            let count = counts.entry(rows.row(row_idx).data().to_vec()).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count > limit {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn direct_project_weighted_columnar_zset(
+    delta: &ColumnarZSet,
+    value_schema: &SchemaRef,
+    indices: &[usize],
+) -> Result<ColumnarZSet> {
+    if indices.len() != value_schema.fields().len() {
+        bail!(
+            "topn identity projection width {} does not match output width {}",
+            indices.len(),
+            value_schema.fields().len()
+        );
+    }
+    let weighted_schema = weighted_snapshot_schema(value_schema)?;
+    let mut batches = Vec::with_capacity(delta.batches().len());
+    for batch in delta.batches().iter().filter(|batch| batch.num_rows() > 0) {
+        let mut columns = Vec::with_capacity(weighted_schema.fields().len());
+        for (output_idx, input_idx) in indices.iter().copied().enumerate() {
+            let column = batch.column(input_idx);
+            let expected_type = value_schema.field(output_idx).data_type();
+            if column.data_type() != expected_type {
+                bail!(
+                    "topn identity delta column {} type {:?} does not match expected {:?}",
+                    output_idx,
+                    column.data_type(),
+                    expected_type
+                );
+            }
+            columns.push(Arc::clone(column));
+        }
+        let weight_idx = delta.value_column_count();
+        columns.push(Arc::clone(batch.column(weight_idx)));
+        batches.push(RecordBatch::try_new(Arc::clone(&weighted_schema), columns)?);
+    }
+    ColumnarZSet::try_new_weighted(Arc::clone(value_schema), batches)
 }
 
 async fn persisted_source_delta(

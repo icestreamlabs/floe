@@ -254,6 +254,26 @@ fn bid_topn_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     rows
 }
 
+fn bid_topn_timestamp_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let auctions = int64_values(batch, 0);
+        let bidders = int64_values(batch, 1);
+        let prices = int64_values(batch, 2);
+        let times = timestamp_millis_values(batch, 3);
+        rows.extend(
+            auctions
+                .into_iter()
+                .zip(bidders)
+                .zip(prices)
+                .zip(times)
+                .map(|(((auction, bidder), price), time)| (auction, bidder, price, time)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
 fn join_topn_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
@@ -796,6 +816,34 @@ fn weighted_bid_topn_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64)> 
                 .zip(prices)
                 .zip(weights)
                 .map(|(((auction, bidder), price), weight)| (auction, bidder, price, weight)),
+        );
+    }
+    rows.sort();
+    rows
+}
+
+fn weighted_bid_topn_timestamp_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let weight_idx = batch
+            .schema()
+            .index_of(WEIGHT_COLUMN_NAME)
+            .expect("weight column");
+        let auctions = int64_values(batch, 0);
+        let bidders = int64_values(batch, 1);
+        let prices = int64_values(batch, 2);
+        let times = timestamp_millis_values(batch, 3);
+        let weights = int64_values(batch, weight_idx);
+        rows.extend(
+            auctions
+                .into_iter()
+                .zip(bidders)
+                .zip(prices)
+                .zip(times)
+                .zip(weights)
+                .map(|((((auction, bidder), price), time), weight)| {
+                    (auction, bidder, price, time, weight)
+                }),
         );
     }
     rows.sort();
@@ -10841,6 +10889,113 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
     assert_eq!(
         weighted_bid_topn_rows(&delta),
         vec![(1, 20, 20, 1), (1, 30, 30, -1)]
+    );
+}
+
+#[tokio::test]
+async fn under_limit_topn_projection_uses_weighted_source_delta_semantics() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("source definition");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![101, 102, 103])),
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+            Arc::new(Int64Array::from(vec![10, 20, 30])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 1100, 1200])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-under-limit-topn").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("price", DataType::Int64, false),
+        Field::new(
+            "dateTime",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let query = "SELECT auction, bidder, price, \"dateTime\" FROM (\
+        SELECT auction, bidder, price, date_time AS \"dateTime\", \
+            ROW_NUMBER() OVER (PARTITION BY auction ORDER BY price DESC, date_time ASC) \
+                AS rank_number \
+        FROM bids) ranked WHERE rank_number <= 10";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_under_limit_top_bids",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarTopN
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry
+        .get("mv_under_limit_top_bids")
+        .expect("materialized view");
+    assert_eq!(
+        bid_topn_timestamp_rows(&handle.arrow_snapshot_for(1).expect("mv snapshot")),
+        vec![(1, 10, 10, 1000), (1, 20, 20, 1100), (2, 30, 30, 1200)]
+    );
+
+    let changes = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![102, 104])),
+            Arc::new(Int64Array::from(vec![1, 1])),
+            Arc::new(Int64Array::from(vec![20, 40])),
+            Arc::new(Int64Array::from(vec![20, 40])),
+            Arc::new(TimestampMillisecondArray::from(vec![1100, 900])),
+        ],
+    )
+    .expect("source changes");
+    let weighted_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&schema).expect("weighted schema");
+    let weighted =
+        weighted_batch_from_diffs(&changes, &weighted_schema, &[-1, 1]).expect("weighted changes");
+    runtime
+        .apply_weighted_source_delta("bids", weighted)
+        .await
+        .expect("apply weighted source delta");
+    runtime.run_tick(2).await.expect("weighted delta tick");
+
+    assert_eq!(
+        bid_topn_timestamp_rows(&handle.arrow_snapshot_for(2).expect("mv snapshot")),
+        vec![(1, 10, 10, 1000), (1, 40, 40, 900), (2, 30, 30, 1200)]
+    );
+    assert_eq!(
+        weighted_bid_topn_timestamp_rows(&handle.arrow_delta_for(2).expect("mv delta")),
+        vec![(1, 20, 20, 1100, -1), (1, 40, 40, 900, 1)]
     );
 }
 
