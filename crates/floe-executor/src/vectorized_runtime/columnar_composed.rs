@@ -37,8 +37,8 @@ use crate::vectorized_runtime::source_state::{
 };
 
 use super::{
-    VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches, profile,
+    VectorizedMaterializedViewState, VectorizedSourceState, apply_keyed_source_snapshot_delta,
+    apply_weighted_snapshot_delta, normalize_batches, profile,
 };
 
 pub(super) struct ColumnarComposedPlan {
@@ -76,6 +76,7 @@ pub(super) struct ColumnarComposedTick {
 struct ColumnarComposedSourceState {
     source_name: String,
     schema: SchemaRef,
+    primary_key_columns: Vec<String>,
     input_zset: SlateBackedColumnarZSet,
     snapshot: Vec<RecordBatch>,
 }
@@ -1263,6 +1264,7 @@ async fn build_columnar_snapshot_diff_materialized_view_state_in_namespace(
         source_states.push(ColumnarComposedSourceState {
             source_name: source_name.clone(),
             schema: Arc::clone(&source.schema),
+            primary_key_columns: source.primary_key_columns.clone(),
             input_zset,
             snapshot,
         });
@@ -1743,8 +1745,9 @@ pub(super) async fn run_columnar_composed_state_tick(
         let snapshot = if delta.batches().is_empty() {
             source.snapshot.clone()
         } else {
-            apply_weighted_snapshot_delta(
+            apply_keyed_source_snapshot_delta(
                 &source.schema,
+                &source.primary_key_columns,
                 &source.snapshot,
                 delta.batches().to_vec(),
             )
