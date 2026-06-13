@@ -1068,7 +1068,7 @@ fn relaxed_segment_stats(
     SegmentWriteStats::new(0, u64::MAX, tombstones as f64 / rows as f64)
 }
 
-fn consolidate_columnar_zset(delta: ColumnarZSet) -> Result<ColumnarZSet> {
+pub(super) fn consolidate_columnar_zset(delta: ColumnarZSet) -> Result<ColumnarZSet> {
     if delta.is_empty() {
         return Ok(delta);
     }

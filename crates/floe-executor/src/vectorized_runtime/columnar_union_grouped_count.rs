@@ -18,7 +18,8 @@ use crate::table_provider::DynamicStateTableProvider;
 use super::columnar_grouped_count::{
     ColumnarGroupedCountMaterializedViewState, ColumnarGroupedCountPlan,
     build_columnar_grouped_count_materialized_view_state_in_namespace,
-    columnar_grouped_count_plan_for_plan, run_columnar_grouped_count_state_tick,
+    columnar_grouped_count_plan_for_plan, publish_columnar_grouped_count_tick,
+    run_columnar_grouped_count_state_tick,
 };
 use super::columnar_union::{
     ColumnarUnionMaterializedViewState, ColumnarUnionPlan,
@@ -156,25 +157,21 @@ pub(super) async fn run_columnar_union_grouped_count_materialized_view_tick(
         &mut columnar.grouped_count,
         &HashMap::new(),
         &union_deltas,
-        &mv.output_schema,
-        &mv.previous_snapshot,
     )
     .await
     .context("evaluate grouped-count child for union grouped-count operator")?;
     let grouped_count_ms = grouped_count_start.elapsed().as_millis() as u64;
-    let grouped_delta_rows = grouped_tick
-        .delta
-        .batches()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum::<usize>();
     profile::record_since("union_grouped_count.grouped_count", phase_start);
     profile::record_since("union_grouped_count.total", total_start);
 
-    let delta_batches = grouped_tick.delta.batches().to_vec();
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, grouped_tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = grouped_tick.next_snapshot;
+    let publication = publish_columnar_grouped_count_tick(
+        registry,
+        &mv.view_name,
+        &mv.output_schema,
+        &mut columnar.grouped_count,
+        grouped_tick,
+        version,
+    )?;
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -182,7 +179,8 @@ pub(super) async fn run_columnar_union_grouped_count_materialized_view_tick(
         union_ms,
         union_delta_rows,
         grouped_count_ms,
-        grouped_delta_rows,
+        grouped_delta_rows = publication.delta_rows,
+        snapshot_rows = publication.snapshot_rows,
         mode = "columnar_union_grouped_count",
         "SlateDB-backed union grouped-count columnar DBSP materialized view tick completed"
     );

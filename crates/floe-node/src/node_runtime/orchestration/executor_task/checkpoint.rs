@@ -605,23 +605,38 @@ pub(super) async fn persist_tick_checkpoint(
         args.source_names_by_id,
         args.vectorized_source_journal_batches,
     );
+    let source_journal_rows = vectorized_source_journal_commit_batches
+        .iter()
+        .flat_map(|(_, _, batches)| batches)
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
     let mut staged_writes_for_checkpoint = args.cdc_staged_writes;
     let mut vectorized_journal_stage_error = None;
+    let source_journal_stage_start = Instant::now();
+    let mut source_journal_encoded_bytes = 0usize;
     if !vectorized_source_journal_commit_batches.is_empty() {
         let staged_writes = staged_writes_for_checkpoint.get_or_insert_with(WriteBatch::new);
         for (source, max_event_time_ms, batches) in &vectorized_source_journal_commit_batches {
-            if let Err(err) = append_vectorized_entry_to_batch(
+            match append_vectorized_entry_to_batch(
                 staged_writes,
                 source,
                 args.epoch,
                 *max_event_time_ms,
                 batches,
             ) {
-                vectorized_journal_stage_error = Some(err);
-                break;
+                Ok(encoded_len) => {
+                    source_journal_encoded_bytes =
+                        source_journal_encoded_bytes.saturating_add(encoded_len);
+                }
+                Err(err) => {
+                    vectorized_journal_stage_error = Some(err);
+                    break;
+                }
             }
         }
     }
+    let source_journal_stage_ms = source_journal_stage_start.elapsed().as_millis() as u64;
+    let has_staged_writes = staged_writes_for_checkpoint.is_some();
     let checkpoint_write_start = Instant::now();
     let checkpoint_result = if let Some(err) = vectorized_journal_stage_error {
         Err(err)
@@ -641,20 +656,30 @@ pub(super) async fn persist_tick_checkpoint(
             )
             .await
     };
+    let checkpoint_write_latency_ms = checkpoint_write_start.elapsed().as_millis() as u64;
     if let Err(err) = checkpoint_result {
-        metrics::observe_tick_phase_latency_ms(
-            "checkpoint_write",
-            checkpoint_write_start.elapsed().as_millis() as u64,
-        );
+        metrics::observe_tick_phase_latency_ms("checkpoint_write", checkpoint_write_latency_ms);
         return Err(err);
     }
-    metrics::observe_tick_phase_latency_ms(
-        "checkpoint_write",
-        checkpoint_write_start.elapsed().as_millis() as u64,
-    );
+    metrics::observe_tick_phase_latency_ms("checkpoint_write", checkpoint_write_latency_ms);
+    if source_journal_stage_ms >= SLOW_EXECUTOR_PHASE_LOG_MS
+        || checkpoint_write_latency_ms >= SLOW_EXECUTOR_PHASE_LOG_MS
+        || source_journal_rows >= 100_000
+    {
+        tracing::debug!(
+            epoch = args.epoch,
+            source_journal_entries = vectorized_source_journal_commit_batches.len(),
+            source_journal_rows,
+            source_journal_encoded_bytes,
+            source_journal_stage_ms,
+            has_staged_writes,
+            checkpoint_write_latency_ms,
+            "tick checkpoint persistence phases"
+        );
+    }
     Ok(PersistedTickCheckpoint {
         committed_at_ms,
-        checkpoint_write_latency_ms: checkpoint_write_start.elapsed().as_millis() as u64,
+        checkpoint_write_latency_ms,
     })
 }
 

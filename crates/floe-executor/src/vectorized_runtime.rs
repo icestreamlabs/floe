@@ -938,6 +938,17 @@ impl VectorizedExecutionRuntime {
                 && columnar_stateless.is_none()
                 && columnar_union_grouped_count.is_none()
             {
+                let source_schemas = source_states
+                    .iter()
+                    .map(|(name, state)| format!("{name}: {:?}", state.schema.fields()))
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    view = %mv.view_name,
+                    output_schema = ?mv.output_schema.fields(),
+                    sources = ?source_schemas,
+                    plan = %df.logical_plan().display_indent(),
+                    "materialized view did not match a SlateDB-backed columnar DBSP operator"
+                );
                 bail!(
                     "materialized view '{}' requires a supported SlateDB-backed columnar DBSP operator",
                     mv.view_name

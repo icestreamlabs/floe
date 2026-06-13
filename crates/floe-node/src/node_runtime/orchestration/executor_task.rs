@@ -21,6 +21,8 @@ pub(super) use context::{
 };
 use event_wait::wait_for_ready_events;
 
+const SLOW_EXECUTOR_PHASE_LOG_MS: u64 = 500;
+
 pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()> {
     let ExecutorTaskContext {
         runtime,
@@ -139,7 +141,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
             if connector_queues.is_empty() && cdc_transaction_queue.is_empty() {
                 break;
             }
-            if !wait_for_ready_events(
+            let ready_wait_start = Instant::now();
+            let ready = wait_for_ready_events(
                 &executor_cancel,
                 &mut connector_receiver_for_task,
                 &mut connector_queues,
@@ -147,8 +150,21 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 &mut cdc_transaction_receiver_for_task,
                 &mut cdc_transaction_queue,
             )
-            .await
-            {
+            .await;
+            let ready_wait_ms = ready_wait_start.elapsed().as_millis() as u64;
+            if ready_wait_ms >= SLOW_EXECUTOR_PHASE_LOG_MS {
+                tracing::debug!(
+                    ready_wait_ms,
+                    connector_receiver_len = connector_receiver_for_task.len(),
+                    connector_queue_rows = connector_queues
+                        .iter()
+                        .map(ConnectorQueue::pending_rows)
+                        .sum::<usize>(),
+                    cdc_transaction_queue_len = cdc_transaction_queue.len(),
+                    "executor ready-event wait completed"
+                );
+            }
+            if !ready {
                 break;
             }
 
@@ -183,16 +199,19 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
 
             if let Some(cdc_transaction) = cdc_transaction_queue.pop_front() {
                 batch_len = 1;
+                let cdc_phase_start = Instant::now();
+                let cdc_change_batches = cdc_transaction.transaction.change_batches().len();
+                let cdc_change_count = cdc_transaction
+                    .transaction
+                    .change_batches()
+                    .iter()
+                    .map(ChangeBatch::change_count)
+                    .sum::<usize>();
                 tracing::debug!(
                     source = %cdc_transaction.source_id.as_str(),
                     slot = %cdc_transaction.slot,
-                    change_batches = cdc_transaction.transaction.change_batches().len(),
-                    changes = cdc_transaction
-                        .transaction
-                        .change_batches()
-                        .iter()
-                        .map(ChangeBatch::change_count)
-                        .sum::<usize>(),
+                    change_batches = cdc_change_batches,
+                    changes = cdc_change_count,
                     commit_position = ?cdc_transaction.transaction.commit_position(),
                     "executor applying native CDC transaction"
                 );
@@ -208,6 +227,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     executor_cancel.cancel();
                     break 'executor;
                 };
+                let complete_toast_start = Instant::now();
                 let cdc_transaction_batch = match cdc_table_store_for_task
                     .complete_unchanged_toast(schemas, &cdc_transaction.transaction)
                     .await
@@ -224,10 +244,12 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                         break 'executor;
                     }
                 };
+                let complete_toast_ms = complete_toast_start.elapsed().as_millis() as u64;
                 let stateful_table_ids = cdc_stateful_table_ids_by_source_id_for_task
                     .get(&cdc_transaction.source_id)
                     .cloned()
                     .unwrap_or_default();
+                let materialize_start = Instant::now();
                 let stateful_transaction = match materialized_transaction(
                     &cdc_transaction.source_id,
                     &stateful_table_ids,
@@ -245,9 +267,12 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                         break 'executor;
                     }
                 };
+                let materialize_ms = materialize_start.elapsed().as_millis() as u64;
                 let mut staged_writes = WriteBatch::new();
                 let mut apply_result = None;
+                let mut stage_transaction_ms = 0;
                 if let Some(transaction) = stateful_transaction.as_ref() {
+                    let stage_transaction_start = Instant::now();
                     apply_result = match cdc_table_store_for_task
                         .stage_transaction(schemas, transaction, &mut staged_writes)
                         .await
@@ -264,7 +289,9 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                             break 'executor;
                         }
                     };
+                    stage_transaction_ms = stage_transaction_start.elapsed().as_millis() as u64;
                 }
+                let replication_pipeline_start = Instant::now();
                 let pipeline_records = if replication_pipeline_runtime_for_task
                     .has_pipelines_for_source(&cdc_transaction.source_id)
                 {
@@ -293,6 +320,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 } else {
                     0
                 };
+                let replication_pipeline_ms =
+                    replication_pipeline_start.elapsed().as_millis() as u64;
                 let feedback_position = apply_result
                     .as_ref()
                     .map(|result| result.checkpoint().position())
@@ -372,6 +401,8 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     executor_cancel.cancel();
                     break 'executor;
                 };
+                let arrow_delta_start = Instant::now();
+                let mut cdc_arrow_delta_rows = 0usize;
                 for table_deltas in apply_result.table_deltas() {
                     let source_name = table_deltas.table_id().as_str();
                     let Some(source_id) = source_id_by_name_for_task.get(source_name).copied()
@@ -419,6 +450,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                             decoded_counts[source_id] =
                                 decoded_counts[source_id].saturating_add(row_count);
                             decoded_rows_len = decoded_rows_len.saturating_add(row_count);
+                            cdc_arrow_delta_rows = cdc_arrow_delta_rows.saturating_add(row_count);
                             weighted_arrow_batches_by_source[source_id].push(batch);
                         }
                         Err(err) => {
@@ -434,6 +466,24 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 }
                 if !apply_result.already_committed() {
                     cdc_staged_writes = Some(staged_writes);
+                }
+                let arrow_delta_ms = arrow_delta_start.elapsed().as_millis() as u64;
+                let cdc_phase_total_ms = cdc_phase_start.elapsed().as_millis() as u64;
+                if cdc_phase_total_ms >= SLOW_EXECUTOR_PHASE_LOG_MS || cdc_change_count >= 100_000 {
+                    tracing::debug!(
+                        source = %cdc_transaction.source_id.as_str(),
+                        slot = %cdc_transaction.slot,
+                        change_batches = cdc_change_batches,
+                        changes = cdc_change_count,
+                        cdc_arrow_delta_rows,
+                        complete_toast_ms,
+                        materialize_ms,
+                        stage_transaction_ms,
+                        replication_pipeline_ms,
+                        arrow_delta_ms,
+                        total_ms = cdc_phase_total_ms,
+                        "executor native CDC transaction phases"
+                    );
                 }
             } else {
                 let selection = build_batch(BuildBatchRequest {
@@ -900,6 +950,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 }
                 continue;
             }
+            let apply_sources_start = Instant::now();
             let changed = match apply_decoded_source_batches(
                 &mut vectorized_runtime_for_task,
                 &source_names_by_id_for_task,
@@ -924,9 +975,19 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     break 'executor;
                 }
             };
+            let apply_sources_ms = apply_sources_start.elapsed().as_millis() as u64;
+            if apply_sources_ms >= SLOW_EXECUTOR_PHASE_LOG_MS {
+                tracing::debug!(
+                    epoch = pending_epoch,
+                    apply_sources_ms,
+                    decoded_rows = decoded_rows_len,
+                    "executor applied decoded source batches"
+                );
+            }
             if !changed {
                 continue;
             }
+            let source_journal_build_start = Instant::now();
             if let Err(err) = build_source_journal_batches(
                 SourceJournalBatchBuildInput {
                     source_names_by_id: &source_names_by_id_for_task,
@@ -949,6 +1010,24 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 )
                 .await;
                 break 'executor;
+            }
+            let source_journal_build_ms = source_journal_build_start.elapsed().as_millis() as u64;
+            let source_journal_rows = vectorized_source_journal_batches
+                .iter()
+                .flat_map(|(_, _, batches)| batches)
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            if source_journal_build_ms >= SLOW_EXECUTOR_PHASE_LOG_MS
+                || source_journal_rows >= 100_000
+            {
+                tracing::debug!(
+                    epoch = pending_epoch,
+                    source_journal_build_ms,
+                    source_journal_entries = vectorized_source_journal_batches.len(),
+                    source_journal_rows,
+                    required_source_journals = source_journal_required_sources_for_task.len(),
+                    "executor built source journal batches"
+                );
             }
             for acks in commit_acks_by_source.iter_mut() {
                 tick_commit_acks.append(acks);
@@ -1031,7 +1110,10 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 metrics::inc_ingest_tick("ok");
             }
             let state_write_latency_ms = tick_all_start.elapsed().as_millis() as u64;
-            if epoch <= 8 || epoch.is_multiple_of(128) {
+            if epoch <= 8
+                || epoch.is_multiple_of(128)
+                || state_write_latency_ms >= SLOW_EXECUTOR_PHASE_LOG_MS
+            {
                 tracing::info!(epoch, state_write_latency_ms, "tick state_write completed");
             }
 
@@ -1095,7 +1177,10 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 }
             };
             let checkpoint_write_latency_ms = persisted_checkpoint.checkpoint_write_latency_ms;
-            if epoch <= 8 || epoch.is_multiple_of(128) {
+            if epoch <= 8
+                || epoch.is_multiple_of(128)
+                || checkpoint_write_latency_ms >= SLOW_EXECUTOR_PHASE_LOG_MS
+            {
                 tracing::info!(
                     epoch,
                     checkpoint_write_latency_ms,

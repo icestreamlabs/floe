@@ -73,7 +73,7 @@ const MINMAX_TAG: u8 = b'm';
 const VALUE_TAG: u8 = b'v';
 const COMPACT_TAG: u8 = b'c';
 const APPEND_ONLY_DISTINCT_SEGMENT_TAG: u8 = b'd';
-const COMPACT_STATE_VERSION: u8 = 1;
+const COMPACT_STATE_VERSION: u8 = 2;
 const APPEND_ONLY_DISTINCT_SEGMENT_VERSION: u8 = 1;
 const APPEND_ONLY_DISTINCT_I64_TAG: u8 = 1;
 const APPEND_ONLY_DISTINCT_I128_TAG: u8 = 2;
@@ -86,6 +86,7 @@ const COMPACT_AGG_MINMAX_I64_TAG: u8 = 4;
 const COMPACT_SNAPSHOT_MAGIC: &[u8; 4] = b"cgss";
 const COMPACT_SNAPSHOT_VERSION: u8 = 1;
 const COMPACT_SNAPSHOT_DENSE_WRITE_MIN_GROUPS: usize = 1024;
+const COMPACT_MAX_CANDIDATE_LIMIT: usize = 32;
 
 pub(super) struct ColumnarGroupedStatsPlan {
     input: ColumnarGroupedStatsInputPlan,
@@ -271,6 +272,7 @@ struct AppendOnlyDistinctPresenceState<T> {
 struct CompactGroupState {
     row_count: i64,
     aggregates: Vec<CompactAggregateState>,
+    minmax_candidates: Vec<Vec<i64>>,
 }
 
 #[derive(Clone)]
@@ -1535,7 +1537,6 @@ async fn prepare_join_topn_grouped_stats_input_delta(
         insert_batches,
         weighted_delta_batches,
         &columnar.source_schema,
-        &columnar.input_snapshot,
     ))
     .await
     .with_context(|| {
@@ -1544,9 +1545,6 @@ async fn prepare_join_topn_grouped_stats_input_delta(
             columnar.input_name
         )
     })?;
-    if tick.input_changed {
-        columnar.input_snapshot = tick.next_snapshot;
-    }
     Ok(tick.delta)
 }
 
@@ -2244,6 +2242,9 @@ async fn apply_compact_grouped_stats_delta(
         .stats_state
         .load_compact_snapshot_if_needed()
         .await?;
+    let write_compact_snapshot = columnar
+        .stats_state
+        .should_write_compact_snapshot(pending.len())?;
     for (group_key, delta) in pending {
         let phase_start = profile::start();
         let timing_start = emit_apply_timings.then(Instant::now);
@@ -2329,9 +2330,15 @@ async fn apply_compact_grouped_stats_delta(
 
         let phase_start = profile::start();
         let timing_start = emit_apply_timings.then(Instant::now);
-        columnar
-            .stats_state
-            .write_compact_state(&mut writes, &group_key, state)?;
+        if write_compact_snapshot {
+            columnar
+                .stats_state
+                .cache_compact_state(&group_key, state)?;
+        } else {
+            columnar
+                .stats_state
+                .write_compact_state(&mut writes, &group_key, state)?;
+        }
         if let Some(timing_start) = timing_start {
             cache_state += timing_start.elapsed();
         }
@@ -2358,6 +2365,12 @@ async fn apply_compact_grouped_stats_delta(
         .map(|start| start.elapsed().as_millis() as u64)
         .unwrap_or(0);
     profile::record_since("grouped_stats.apply_finish_output", phase_start);
+
+    if write_compact_snapshot {
+        let phase_start = profile::start();
+        columnar.stats_state.write_compact_snapshot(&mut writes)?;
+        profile::record_since("grouped_stats.apply_snapshot_state", phase_start);
+    }
 
     let phase_start = profile::start();
     let write_batch_start = emit_apply_timings.then(Instant::now);
@@ -2726,6 +2739,7 @@ fn empty_compact_group_state(
         .collect::<Result<Vec<_>>>()?;
     Ok(CompactGroupState {
         row_count: 0,
+        minmax_candidates: vec![Vec::new(); aggregates.len()],
         aggregates,
     })
 }
@@ -2847,6 +2861,13 @@ fn apply_append_only_compact_aggregate_deltas(
                             Some(current) => minmax_value(spec.kind, current, *delta_value),
                             None => *delta_value,
                         });
+                        if matches!(spec.kind, AggregateKind::Min | AggregateKind::Max) {
+                            let candidates =
+                                state.minmax_candidates.get_mut(idx).ok_or_else(|| {
+                                    anyhow::anyhow!("grouped-stats compact candidate index missing")
+                                })?;
+                            push_minmax_candidate(spec.kind, candidates, *delta_value);
+                        }
                     }
                 }
             }
@@ -2917,6 +2938,12 @@ fn apply_append_only_compact_aggregate_compact_deltas(
                     Some(current) => minmax_value(spec.kind, current, *delta_value),
                     None => *delta_value,
                 });
+                if matches!(spec.kind, AggregateKind::Min | AggregateKind::Max) {
+                    let candidates = state.minmax_candidates.get_mut(idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact candidate index missing")
+                    })?;
+                    push_minmax_candidate(spec.kind, candidates, *delta_value);
+                }
             }
             (
                 AggregateKind::Min | AggregateKind::Max,
@@ -2938,16 +2965,15 @@ async fn apply_compact_aggregate_deltas(
 ) -> Result<()> {
     let mut shared_i64_value_counts: HashMap<usize, HashMap<i64, i64>> = HashMap::new();
     for (idx, (spec, delta)) in columnar.specs.iter().zip(deltas.iter()).enumerate() {
-        let aggregate = state
-            .aggregates
-            .get_mut(idx)
-            .ok_or_else(|| anyhow::anyhow!("grouped-stats compact aggregate index missing"))?;
-        match (spec.kind, delta, aggregate) {
-            (
-                AggregateKind::Count,
-                AggregateDelta::Count { count_delta },
-                CompactAggregateState::I64(value),
-            ) => {
+        match (spec.kind, delta) {
+            (AggregateKind::Count, AggregateDelta::Count { count_delta }) => {
+                let CompactAggregateState::I64(value) =
+                    state.aggregates.get_mut(idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
                 *value = value
                     .checked_add(*count_delta)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats count overflow"))?;
@@ -2955,11 +2981,14 @@ async fn apply_compact_aggregate_deltas(
                     bail!("grouped-stats count became negative");
                 }
             }
-            (
-                AggregateKind::Sum,
-                AggregateDelta::Sum { sum_delta },
-                CompactAggregateState::I64(value),
-            ) => {
+            (AggregateKind::Sum, AggregateDelta::Sum { sum_delta }) => {
+                let CompactAggregateState::I64(value) =
+                    state.aggregates.get_mut(idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
                 *value = value
                     .checked_add(*sum_delta)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats sum overflow"))?;
@@ -2970,8 +2999,14 @@ async fn apply_compact_aggregate_deltas(
                     sum_delta,
                     count_delta,
                 },
-                CompactAggregateState::Pair { sum, count },
             ) => {
+                let CompactAggregateState::Pair { sum, count } =
+                    state.aggregates.get_mut(idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
                 *sum = sum
                     .checked_add(*sum_delta)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats avg sum overflow"))?;
@@ -2985,9 +3020,12 @@ async fn apply_compact_aggregate_deltas(
             (
                 AggregateKind::Min | AggregateKind::Max,
                 AggregateDelta::MinMaxI64 { value_deltas },
-                CompactAggregateState::MinMaxI64(value),
             ) => {
-                let old = *value;
+                let old = match state.aggregates.get(idx) {
+                    Some(CompactAggregateState::MinMaxI64(value)) => *value,
+                    Some(_) => bail!("grouped-stats compact aggregate state kind mismatch"),
+                    None => bail!("grouped-stats compact aggregate index missing"),
+                };
                 let value_count_idx = spec.value_count_idx.unwrap_or(idx);
                 if !shared_i64_value_counts.contains_key(&value_count_idx) {
                     let mut updated_counts = HashMap::with_capacity(value_deltas.len());
@@ -3019,18 +3057,30 @@ async fn apply_compact_aggregate_deltas(
                         .ok_or_else(|| {
                             anyhow::anyhow!("grouped-stats shared min/max counts missing")
                         })?;
-                *value = columnar
+                let candidates = state.minmax_candidates.get_mut(idx).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats compact candidate index missing")
+                })?;
+                let new_value = columnar
                     .stats_state
-                    .new_minmax_after_delta(
+                    .new_minmax_after_delta_with_candidates(
                         group_key,
                         value_count_idx,
                         spec.kind,
                         old,
                         updated_counts,
+                        candidates,
                     )
                     .await?;
+                let CompactAggregateState::MinMaxI64(value) =
+                    state.aggregates.get_mut(idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *value = new_value;
             }
-            (AggregateKind::DistinctCount, _, _) => {
+            (AggregateKind::DistinctCount, _) => {
                 bail!("grouped-stats distinct count is not compactable")
             }
             _ => bail!("grouped-stats compact aggregate state kind mismatch"),
@@ -3146,6 +3196,7 @@ async fn compact_state_from_current(
     }
     Ok(CompactGroupState {
         row_count,
+        minmax_candidates: vec![Vec::new(); aggregates.len()],
         aggregates,
     })
 }
@@ -4144,6 +4195,21 @@ impl SlateGroupedStatsState {
         Ok(())
     }
 
+    fn cache_compact_state(&self, group_key: &[u8], state: CompactGroupState) -> Result<()> {
+        if state.row_count == 0 {
+            self.compact_values
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?
+                .remove(group_key);
+        } else {
+            self.compact_values
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats compact state cache poisoned"))?
+                .insert(group_key.to_vec(), state);
+        }
+        Ok(())
+    }
+
     fn write_compact_state_to_batch(
         &self,
         batch: &mut WriteBatch,
@@ -5080,6 +5146,80 @@ impl SlateGroupedStatsState {
                     .await
             }
         }
+    }
+
+    async fn new_minmax_after_delta_with_candidates(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+        kind: AggregateKind,
+        old: Option<i64>,
+        updated_counts: &HashMap<i64, i64>,
+        candidates: &mut Vec<i64>,
+    ) -> Result<Option<i64>> {
+        refresh_minmax_candidates(kind, candidates, updated_counts);
+        let added = minmax_added_i64(kind, updated_counts);
+        match old {
+            None => Ok(best_minmax_candidate(candidates, updated_counts).or(added)),
+            Some(old) => {
+                let old_still_present = match updated_counts.get(&old) {
+                    Some(count) => *count > 0,
+                    None => true,
+                };
+                if old_still_present {
+                    return Ok(Some(match added {
+                        Some(value) => minmax_value(kind, old, value),
+                        None => old,
+                    }));
+                }
+                if let Some(candidate) = best_minmax_candidate(candidates, updated_counts) {
+                    return Ok(Some(candidate));
+                }
+                let (value, rebuilt_candidates) = self
+                    .scan_minmax_with_overlay_and_candidates(
+                        group_key,
+                        agg_idx,
+                        kind,
+                        updated_counts,
+                    )
+                    .await?;
+                *candidates = rebuilt_candidates;
+                Ok(value)
+            }
+        }
+    }
+
+    async fn scan_minmax_with_overlay_and_candidates(
+        &self,
+        group_key: &[u8],
+        agg_idx: usize,
+        kind: AggregateKind,
+        updated_counts: &HashMap<i64, i64>,
+    ) -> Result<(Option<i64>, Vec<i64>)> {
+        let mut candidates = minmax_candidates_from_counts(kind, updated_counts);
+        let mut value_out = minmax_added_i64(kind, updated_counts);
+        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&value_prefix, &ScanOptions::default())
+            .await
+            .context("scan grouped-stats shared min/max value state")?
+        {
+            let value = decode_i64_sortable(
+                key.get(value_prefix.len()..)
+                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats value key"))?,
+            )?;
+            let old_count = decode_i64(&value_bytes)?;
+            let count = updated_counts.get(&value).copied().unwrap_or(old_count);
+            if count > 0 {
+                push_minmax_candidate(kind, &mut candidates, value);
+                value_out = Some(match value_out {
+                    Some(current) => minmax_value(kind, current, value),
+                    None => value,
+                });
+            }
+        }
+        Ok((value_out, candidates))
     }
 
     async fn scan_minmax_with_overlay(
@@ -6462,6 +6602,67 @@ fn minmax_added_i64(kind: AggregateKind, updated_counts: &HashMap<i64, i64>) -> 
         .reduce(|left, right| minmax_value(kind, left, right))
 }
 
+fn push_minmax_candidate(kind: AggregateKind, candidates: &mut Vec<i64>, value: i64) {
+    let insert_at = match kind {
+        AggregateKind::Min => candidates.partition_point(|candidate| *candidate < value),
+        AggregateKind::Max => candidates.partition_point(|candidate| *candidate > value),
+        _ => unreachable!("min/max candidate called for non-min/max aggregate"),
+    };
+    if candidates.get(insert_at).copied() == Some(value) {
+        return;
+    }
+    candidates.insert(insert_at, value);
+    candidates.truncate(COMPACT_MAX_CANDIDATE_LIMIT);
+}
+
+fn refresh_minmax_candidates(
+    kind: AggregateKind,
+    candidates: &mut Vec<i64>,
+    updated_counts: &HashMap<i64, i64>,
+) {
+    candidates.retain(|value| updated_counts.get(value).is_none_or(|count| *count > 0));
+    for (value, count) in updated_counts {
+        if *count <= 0 || candidates.contains(value) {
+            continue;
+        }
+        candidates.push(*value);
+    }
+    sort_minmax_candidates(kind, candidates);
+    candidates.dedup();
+    candidates.truncate(COMPACT_MAX_CANDIDATE_LIMIT);
+}
+
+fn best_minmax_candidate(candidates: &[i64], updated_counts: &HashMap<i64, i64>) -> Option<i64> {
+    candidates
+        .iter()
+        .copied()
+        .find(|value| updated_counts.get(value).is_none_or(|count| *count > 0))
+}
+
+fn minmax_candidates_from_counts(
+    kind: AggregateKind,
+    updated_counts: &HashMap<i64, i64>,
+) -> Vec<i64> {
+    let mut candidates = Vec::with_capacity(updated_counts.len().min(COMPACT_MAX_CANDIDATE_LIMIT));
+    for (value, count) in updated_counts {
+        if *count > 0 {
+            candidates.push(*value);
+        }
+    }
+    sort_minmax_candidates(kind, &mut candidates);
+    candidates.dedup();
+    candidates.truncate(COMPACT_MAX_CANDIDATE_LIMIT);
+    candidates
+}
+
+fn sort_minmax_candidates(kind: AggregateKind, candidates: &mut [i64]) {
+    match kind {
+        AggregateKind::Min => candidates.sort_unstable(),
+        AggregateKind::Max => candidates.sort_unstable_by(|left, right| right.cmp(left)),
+        _ => unreachable!("min/max candidate called for non-min/max aggregate"),
+    }
+}
+
 fn minmax_i128_value(kind: AggregateKind, left: i128, right: i128) -> i128 {
     match kind {
         AggregateKind::Min => left.min(right),
@@ -6675,6 +6876,13 @@ fn compact_group_state_encoded_len(state: &CompactGroupState) -> Result<usize> {
             CompactAggregateState::Pair { .. } => 1 + 16,
         });
     }
+    for candidates in &state.minmax_candidates {
+        let candidate_count = u16::try_from(candidates.len())
+            .context("grouped-stats compact candidate count exceeds u16")?;
+        len = len
+            .saturating_add(std::mem::size_of_val(&candidate_count))
+            .saturating_add(candidates.len().saturating_mul(8));
+    }
     Ok(len)
 }
 
@@ -6707,13 +6915,24 @@ fn append_compact_group_state_bytes(bytes: &mut Vec<u8>, state: &CompactGroupSta
             }
         }
     }
+    if state.minmax_candidates.len() != state.aggregates.len() {
+        bail!("grouped-stats compact candidate state length mismatch");
+    }
+    for candidates in &state.minmax_candidates {
+        let candidate_count = u16::try_from(candidates.len())
+            .context("grouped-stats compact candidate count exceeds u16")?;
+        bytes.extend_from_slice(&candidate_count.to_be_bytes());
+        for candidate in candidates {
+            bytes.extend_from_slice(&candidate.to_be_bytes());
+        }
+    }
     Ok(())
 }
 
 fn decode_compact_group_state(specs: &[AggregateSpec], bytes: &[u8]) -> Result<CompactGroupState> {
     let mut offset = 0;
     let version = compact_read_u8(bytes, &mut offset)?;
-    if version != COMPACT_STATE_VERSION {
+    if !matches!(version, 1 | COMPACT_STATE_VERSION) {
         bail!("unsupported grouped-stats compact state version {version}");
     }
     let row_count = compact_read_i64(bytes, &mut offset)?;
@@ -6745,11 +6964,26 @@ fn decode_compact_group_state(specs: &[AggregateSpec], bytes: &[u8]) -> Result<C
         }
         aggregates.push(aggregate);
     }
+    let minmax_candidates = if version == 1 {
+        vec![Vec::new(); aggregate_count]
+    } else {
+        let mut candidates = Vec::with_capacity(aggregate_count);
+        for _ in 0..aggregate_count {
+            let candidate_count = usize::from(compact_read_u16(bytes, &mut offset)?);
+            let mut aggregate_candidates = Vec::with_capacity(candidate_count);
+            for _ in 0..candidate_count {
+                aggregate_candidates.push(compact_read_i64(bytes, &mut offset)?);
+            }
+            candidates.push(aggregate_candidates);
+        }
+        candidates
+    };
     if offset != bytes.len() {
         bail!("grouped-stats compact state has trailing bytes");
     }
     Ok(CompactGroupState {
         row_count,
+        minmax_candidates,
         aggregates,
     })
 }

@@ -9,12 +9,11 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
-use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
+use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
@@ -66,6 +65,7 @@ enum ColumnarGroupedMaxInputPlan {
         source_schema: SchemaRef,
         projection_input_schema: SchemaRef,
         plan: Box<ColumnarJoinPlan>,
+        preprojected: bool,
     },
 }
 
@@ -94,6 +94,7 @@ impl ColumnarGroupedMaxMaterializedViewState {
 
 enum GroupedMaxProjectionState {
     Source(IncrementalMaterializedViewState),
+    Direct(Vec<usize>),
     Derived(GroupedMaxDerivedProjectionState),
 }
 
@@ -189,43 +190,42 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
         }
     }
 
-    let input =
-        if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
-            ColumnarGroupedMaxInputPlan::Source { source_name }
-        } else if let Some(join) = columnar_join_plan_for_plan(aggregate.input.as_ref(), sources)? {
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_max_join_input".to_string());
-            ColumnarGroupedMaxInputPlan::Join {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(join),
-            }
-        } else {
-            return Ok(None);
-        };
-
     let mut projection_expr = aggregate.group_expr.clone();
     projection_expr.push(max_value_expr);
-    let projection_input = match &input {
-        ColumnarGroupedMaxInputPlan::Source { .. } => aggregate.input.as_ref().clone(),
-        ColumnarGroupedMaxInputPlan::Join {
-            input_name,
-            projection_input_schema,
-            ..
-        } => {
-            projection_expr = rewrite_projection_exprs_for_derived_input(
-                projection_expr,
-                aggregate.input.schema(),
-                projection_input_schema,
-            )?;
-            scan_plan_for_derived_input(input_name, projection_input_schema)?
-        }
-    };
-    let value_projection = Projection::try_new(projection_expr, Arc::new(projection_input))
-        .context("build grouped-max value projection")?;
+    let (input, value_projection) =
+        if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
+            let projection_input = aggregate.input.as_ref().clone();
+            let value_projection = Projection::try_new(projection_expr, Arc::new(projection_input))
+                .context("build grouped-max value projection")?;
+            (
+                ColumnarGroupedMaxInputPlan::Source { source_name },
+                value_projection,
+            )
+        } else {
+            let projected_join = Projection::try_new(
+                projection_expr.clone(),
+                Arc::new(aggregate.input.as_ref().clone()),
+            )
+            .context("build grouped-max projected join input")?;
+            let projected_join_plan = LogicalPlan::Projection(projected_join.clone());
+            let Some(join) = columnar_join_plan_for_plan(&projected_join_plan, sources)? else {
+                return Ok(None);
+            };
+            let projection_schema = df_schema_to_arrow(&projected_join.schema)?;
+            let projection_input_schema = derived_projection_input_schema(&projection_schema);
+            let input_name = derived_relation_name(aggregate.input.as_ref())
+                .unwrap_or_else(|| "__floe_grouped_max_join_input".to_string());
+            (
+                ColumnarGroupedMaxInputPlan::Join {
+                    input_name,
+                    source_schema: Arc::clone(&projection_schema),
+                    projection_input_schema,
+                    plan: Box::new(join),
+                    preprojected: true,
+                },
+                projected_join,
+            )
+        };
     let projection_schema = df_schema_to_arrow(&value_projection.schema)?;
     if projection_schema.fields().len() != max_idx + 1
         || projection_schema.field(max_idx).data_type() != &DataType::Int64
@@ -330,6 +330,7 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
                 source_schema,
                 projection_input_schema,
                 plan: join_plan,
+                preprojected,
             } => {
                 let join_namespace = format!("{mv_namespace}/columnar/grouped_max/join_input");
                 let join = Box::pin(build_boxed_join_grouped_max_input_state(
@@ -348,26 +349,34 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
                     )
                 })?;
                 let input_snapshot = join.initial_snapshot();
-                let projection_delta = build_derived_projection_state(
-                    LogicalPlan::Projection(plan.projection.clone()),
-                    &input_name,
-                    &projection_input_schema,
-                    udfs,
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "build grouped-max derived projection delta plan for '{}'",
-                        input_name
+                let projection_delta = if preprojected {
+                    GroupedMaxProjectionState::Direct(
+                        (0..plan.projection_schema.fields().len()).collect(),
                     )
-                })?;
+                } else {
+                    GroupedMaxProjectionState::Derived(
+                        build_derived_projection_state(
+                            LogicalPlan::Projection(plan.projection.clone()),
+                            &input_name,
+                            &projection_input_schema,
+                            udfs,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "build grouped-max derived projection delta plan for '{}'",
+                                input_name
+                            )
+                        })?,
+                    )
+                };
                 (
                     input_name,
                     source_schema,
                     None,
                     Some(join),
                     input_snapshot,
-                    GroupedMaxProjectionState::Derived(projection_delta),
+                    projection_delta,
                 )
             }
         };
@@ -809,6 +818,12 @@ async fn collect_grouped_max_projection_output(
             collect_incremental_output(incremental, source_batches, &columnar.projection_schema)
                 .await
         }
+        GroupedMaxProjectionState::Direct(indices) => direct_project_record_batches(
+            source_batches,
+            &columnar.projection_schema,
+            indices,
+            "grouped-max",
+        ),
         GroupedMaxProjectionState::Derived(derived) => {
             if let Some(indices) = derived.direct_projection.as_ref() {
                 return direct_project_record_batches(
@@ -1546,49 +1561,6 @@ fn derived_projection_input_schema(source_schema: &SchemaRef) -> SchemaRef {
         })
         .collect::<Vec<_>>();
     Arc::new(Schema::new(fields))
-}
-
-fn rewrite_projection_exprs_for_derived_input(
-    exprs: Vec<Expr>,
-    input_schema: &datafusion::common::DFSchemaRef,
-    projection_input_schema: &SchemaRef,
-) -> Result<Vec<Expr>> {
-    exprs
-        .into_iter()
-        .map(|expr| {
-            rewrite_projection_expr_for_derived_input(expr, input_schema, projection_input_schema)
-        })
-        .collect()
-}
-
-fn rewrite_projection_expr_for_derived_input(
-    expr: Expr,
-    input_schema: &datafusion::common::DFSchemaRef,
-    projection_input_schema: &SchemaRef,
-) -> Result<Expr> {
-    expr.transform_up(|expr| match expr {
-        Expr::Column(column) => {
-            let idx = input_schema.index_of_column(&column)?;
-            let field = projection_input_schema.field(idx);
-            Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
-                field.name().clone(),
-            ))))
-        }
-        other => Ok(Transformed::no(other)),
-    })
-    .map(|result| result.data)
-    .map_err(anyhow::Error::new)
-}
-
-fn scan_plan_for_derived_input(input_name: &str, schema: &SchemaRef) -> Result<LogicalPlan> {
-    let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(schema)));
-    LogicalPlanBuilder::scan(
-        input_name,
-        provider_as_source(provider as Arc<dyn TableProvider>),
-        None,
-    )?
-    .build()
-    .map_err(Into::into)
 }
 
 fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {

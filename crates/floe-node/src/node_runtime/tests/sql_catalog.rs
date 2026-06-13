@@ -62,6 +62,7 @@ fn source_definition_from_sql_source_sets_columns_and_pk_property() {
     assert_eq!(source.columns().len(), 3);
     assert_eq!(source.columns()[0].name(), "id");
     assert_eq!(source.property(SOURCE_PRIMARY_KEY_PROPERTY), Some("id"));
+    assert_eq!(source.property("append_only"), Some("true"));
     assert!(!source.columns()[0].nullable());
     assert!(source.columns()[1].nullable());
 }

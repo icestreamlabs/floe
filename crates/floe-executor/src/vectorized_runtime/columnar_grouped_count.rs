@@ -21,8 +21,9 @@ use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::weighted_snapshot_schema;
-use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::vectorized_runtime::source_state::incremental_source_for_plan;
@@ -30,8 +31,8 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
-    apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
-    collect_incremental_output, profile,
+    build_incremental_materialized_view_state_from_logical_plan, collect_incremental_output,
+    profile,
 };
 
 pub(super) struct ColumnarGroupedCountPlan {
@@ -49,7 +50,6 @@ pub(super) struct ColumnarGroupedCountPlan {
 pub(super) struct ColumnarGroupedCountMaterializedViewState {
     source_name: String,
     source_schema: SchemaRef,
-    input_zset: SlateBackedColumnarZSet,
     output_zset: SlateBackedColumnarZSet,
     count_state: SlateGroupedCountState,
     aggregate_delta: Option<IncrementalMaterializedViewState>,
@@ -60,6 +60,7 @@ pub(super) struct ColumnarGroupedCountMaterializedViewState {
     hop_groups: Vec<HopGroup>,
     output_mapping: Vec<usize>,
     count_idx: usize,
+    row_count: i64,
     initial_snapshot: Vec<RecordBatch>,
 }
 
@@ -93,7 +94,12 @@ struct HopGroup {
 
 pub(super) struct ColumnarGroupedCountTick {
     pub(super) delta: ColumnarZSet,
-    pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) row_count_delta: i64,
+}
+
+pub(super) struct ColumnarGroupedCountPublication {
+    pub(super) delta_rows: usize,
+    pub(super) snapshot_rows: usize,
 }
 
 pub(super) fn columnar_grouped_count_plan_for_plan(
@@ -199,7 +205,6 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
     let source = sources
         .get(&plan.source_name)
         .ok_or_else(|| anyhow::anyhow!("unknown vectorized source '{}'", plan.source_name))?;
-    let input_namespace = format!("{mv_namespace}/columnar/grouped_count/input");
     let output_namespace = format!("{mv_namespace}/columnar/grouped_count/output");
     let state_namespace = format!("{mv_namespace}/columnar/grouped_count/state");
     let output_zset = SlateBackedColumnarZSet::new(
@@ -209,12 +214,12 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
     )
     .await
     .context("initialize SlateDB-backed grouped-count output zset")?;
-    let initial_snapshot = snapshot_batches_from_zset(
-        &output_zset
-            .materialize_columnar()
-            .await
-            .context("load grouped-count output snapshot")?,
-    )?;
+    let initial_output = output_zset
+        .materialize_columnar()
+        .await
+        .context("load grouped-count output snapshot")?;
+    let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
+    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
     let (aggregate_delta, hop_group_projection_delta) =
         if let Some(hop_group_projection) = plan.hop_group_projection.as_ref() {
             let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
@@ -241,13 +246,6 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
     Ok(ColumnarGroupedCountMaterializedViewState {
         source_name: plan.source_name,
         source_schema: Arc::clone(&source.schema),
-        input_zset: SlateBackedColumnarZSet::new(
-            Arc::clone(&table),
-            input_namespace,
-            Arc::clone(&source.schema),
-        )
-        .await
-        .context("initialize SlateDB-backed grouped-count input zset")?,
         output_zset,
         count_state: SlateGroupedCountState::new(table, &state_namespace)
             .await
@@ -260,6 +258,7 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
         hop_groups: plan.hop_groups,
         output_mapping: plan.output_mapping,
         count_idx: plan.count_idx,
+        row_count: initial_row_count,
         initial_snapshot,
     })
 }
@@ -276,28 +275,29 @@ pub(super) async fn run_columnar_grouped_count_materialized_view_tick(
     };
 
     let plan_start = Instant::now();
-    let tick = run_columnar_grouped_count_state_tick(
-        columnar,
-        insert_batches,
-        weighted_delta_batches,
-        &mv.output_schema,
-        &mv.previous_snapshot,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "evaluate Slate-backed grouped-count columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let tick =
+        run_columnar_grouped_count_state_tick(columnar, insert_batches, weighted_delta_batches)
+            .await
+            .with_context(|| {
+                format!(
+                    "evaluate Slate-backed grouped-count columnar delta for '{}'",
+                    mv.view_name
+                )
+            })?;
 
-    let delta_batches = tick.delta.batches().to_vec();
-    let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = tick.next_snapshot;
+    let publication = publish_columnar_grouped_count_tick(
+        registry,
+        &mv.view_name,
+        &mv.output_schema,
+        columnar,
+        tick,
+        version,
+    )?;
     tracing::debug!(
         view = %mv.view_name,
         version,
+        delta_rows = publication.delta_rows,
+        snapshot_rows = publication.snapshot_rows,
         total_ms = plan_start.elapsed().as_millis() as u64,
         mode = "columnar_grouped_count",
         "SlateDB-backed grouped-count columnar DBSP materialized view tick completed"
@@ -305,14 +305,58 @@ pub(super) async fn run_columnar_grouped_count_materialized_view_tick(
     Ok(true)
 }
 
+pub(super) fn publish_columnar_grouped_count_tick(
+    registry: &MaterializedViewRegistry,
+    view_name: &str,
+    output_schema: &SchemaRef,
+    columnar: &mut ColumnarGroupedCountMaterializedViewState,
+    tick: ColumnarGroupedCountTick,
+    version: i64,
+) -> Result<ColumnarGroupedCountPublication> {
+    let delta_batches = tick.delta.batches().to_vec();
+    let delta_rows = delta_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    columnar.row_count = columnar.row_count.saturating_add(tick.row_count_delta);
+    if columnar.row_count < 0 {
+        bail!("grouped-count columnar materialized view '{view_name}' row count became negative");
+    }
+    let snapshot_rows =
+        usize::try_from(columnar.row_count).context("grouped-count row count exceeds usize")?;
+    let handle = registry.register(view_name.to_string());
+    if let Some(zset_handle) = columnar.output_zset.current_handle() {
+        handle.publish_columnar_version(
+            version,
+            zset_handle,
+            ColumnarMaterializedViewStorage::new(
+                Arc::clone(&columnar.count_state.table),
+                Arc::clone(output_schema),
+            ),
+            snapshot_rows,
+            delta_batches,
+        );
+    } else {
+        handle.publish_arrow_version(
+            version,
+            vec![RecordBatch::new_empty(Arc::clone(output_schema))],
+            delta_batches,
+        );
+    }
+    Ok(ColumnarGroupedCountPublication {
+        delta_rows,
+        snapshot_rows,
+    })
+}
+
 pub(super) async fn run_columnar_grouped_count_state_tick(
     columnar: &mut ColumnarGroupedCountMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedCountTick> {
+    let tick_start = Instant::now();
     let total_start = profile::start();
+    let prepare_start = Instant::now();
     let phase_start = profile::start();
     let input_delta =
         if let Some(weighted_batches) = weighted_delta_batches.get(columnar.source_name.as_str()) {
@@ -341,24 +385,32 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
         } else {
             ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
         };
+    let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_count.prepare_input", phase_start);
-    let phase_start = profile::start();
-    columnar
-        .input_zset
-        .create_version(&input_delta, None)
-        .await?;
-    profile::record_since("grouped_count.input_create_version", phase_start);
+    let input_delta_rows = input_delta
+        .batches()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let pending_start = Instant::now();
     let phase_start = profile::start();
     let pending = grouped_count_pending_delta(columnar, input_delta.batches()).await?;
+    let pending_count = pending.len();
+    let pending_ms = pending_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_count.pending_delta", phase_start);
+    let apply_start = Instant::now();
     let phase_start = profile::start();
     let output_delta_batches = apply_grouped_count_delta(columnar, pending).await?;
+    let apply_ms = apply_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_count.apply_delta", phase_start);
+    let build_output_start = Instant::now();
     let phase_start = profile::start();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
             .context("build grouped-count output zset delta")?;
+    let build_output_ms = build_output_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_count.build_output_zset", phase_start);
+    let output_create_start = Instant::now();
     let phase_start = profile::start();
     columnar
         .output_zset
@@ -370,20 +422,37 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
                 .map(|handle| handle.version),
         )
         .await?;
+    let output_create_ms = output_create_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_count.output_create_version", phase_start);
 
-    let phase_start = profile::start();
     let delta_batches = output_delta.batches().to_vec();
-    let next_snapshot =
-        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
-            .await
-            .context("apply Slate-backed grouped-count columnar snapshot delta")?;
-    profile::record_since("grouped_count.output_snapshot_delta", phase_start);
+    let output_delta_rows = delta_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let row_count_delta =
+        columnar_zset_weight_sum(&output_delta).context("compute grouped-count row-count delta")?;
     profile::record_since("grouped_count.total", total_start);
+    tracing::debug!(
+        source = %columnar.source_name,
+        input_delta_rows,
+        pending_count,
+        output_delta_rows,
+        prepare_ms,
+        pending_ms,
+        apply_ms,
+        build_output_ms,
+        output_create_ms,
+        snapshot_ms = 0_u64,
+        row_count_delta,
+        total_ms = tick_start.elapsed().as_millis() as u64,
+        mode = "columnar_grouped_count",
+        "SlateDB-backed grouped-count columnar DBSP state tick completed"
+    );
 
     Ok(ColumnarGroupedCountTick {
         delta: output_delta,
-        next_snapshot,
+        row_count_delta,
     })
 }
 

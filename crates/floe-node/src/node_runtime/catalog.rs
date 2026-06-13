@@ -92,7 +92,21 @@ pub(super) fn source_definition_from_source(
     if !primary_key_columns.is_empty() {
         source.set_property(SOURCE_PRIMARY_KEY_PROPERTY, primary_key_columns.join(","));
     }
+    if sql_runtime_source_is_append_only(definition.connector()) {
+        source.set_property("append_only", "true");
+    }
     Ok(Some(source))
+}
+
+fn sql_runtime_source_is_append_only(connector: &SourceConnector) -> bool {
+    matches!(
+        connector,
+        SourceConnector::Kafka(_)
+            | SourceConnector::File(_)
+            | SourceConnector::Http(_)
+            | SourceConnector::Generator(_)
+            | SourceConnector::ObjectStore(_)
+    )
 }
 
 pub(super) fn replication_pipeline_definition_from_sql(

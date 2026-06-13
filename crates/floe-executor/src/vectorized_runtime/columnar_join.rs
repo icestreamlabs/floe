@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,8 +20,9 @@ use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
-use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
@@ -52,6 +53,7 @@ struct ColumnarJoinKeyIndices {
 }
 
 pub(super) struct ColumnarJoinMaterializedViewState {
+    operator_table: Arc<dyn KeyValueTable>,
     left: ColumnarJoinSourceState,
     right: ColumnarJoinSourceState,
     output_zset: SlateBackedColumnarZSet,
@@ -60,6 +62,7 @@ pub(super) struct ColumnarJoinMaterializedViewState {
     left_state_right_delta: Option<JoinDeltaEvaluator>,
     left_delta_right_delta: JoinDeltaEvaluator,
     initial_snapshot: Vec<RecordBatch>,
+    row_count: i64,
     persist_source_input_zsets: bool,
 }
 
@@ -79,6 +82,7 @@ struct ColumnarJoinSourceState {
     source_name: Option<String>,
     schema: SchemaRef,
     primary_key_columns: Vec<String>,
+    input_filter: Option<JoinInputFilterEvaluator>,
     input_zset: Option<SlateBackedColumnarZSet>,
     input_index: Option<Box<SlateBackedColumnarIndexedZSet>>,
     snapshot: Vec<RecordBatch>,
@@ -88,6 +92,7 @@ struct ColumnarJoinInputPlan {
     input_name: String,
     schema: SchemaRef,
     kind: ColumnarJoinInputPlanKind,
+    local_filters: Vec<Expr>,
 }
 
 enum ColumnarJoinInputPlanKind {
@@ -97,6 +102,7 @@ enum ColumnarJoinInputPlanKind {
 pub(super) struct ColumnarJoinTick {
     pub(super) delta: ColumnarZSet,
     pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) row_count_delta: i64,
     pub(super) input_changed: bool,
 }
 
@@ -137,6 +143,85 @@ struct JoinSignedDelta {
     negative: Vec<RecordBatch>,
 }
 
+struct JoinInputFilterEvaluator {
+    ctx: SessionContext,
+    provider: Arc<DynamicStateTableProvider>,
+    logical_plan: LogicalPlan,
+    weighted_schema: SchemaRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JoinPredicateSide {
+    Left,
+    Right,
+}
+
+impl JoinInputFilterEvaluator {
+    async fn build(
+        input_name: &str,
+        value_schema: &SchemaRef,
+        filters: Vec<Expr>,
+        udfs: &[ScalarUDF],
+    ) -> Result<Option<Self>> {
+        if filters.is_empty() {
+            return Ok(None);
+        }
+        let weighted_schema = weighted_snapshot_schema(value_schema)?;
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        for udf in udfs.iter().cloned() {
+            ctx.register_udf(udf);
+        }
+        let provider = Arc::new(DynamicStateTableProvider::new_with_scan_partitions(
+            Arc::clone(&weighted_schema),
+            1,
+        ));
+        let mut logical_plan = LogicalPlanBuilder::scan(
+            input_name,
+            provider_as_source(Arc::clone(&provider) as Arc<dyn TableProvider>),
+            None,
+        )?
+        .build()?;
+        for filter in filters {
+            logical_plan = LogicalPlanBuilder::from(logical_plan)
+                .filter(unqualify_expr_columns(filter)?)?
+                .build()?;
+        }
+        Ok(Some(Self {
+            ctx,
+            provider,
+            logical_plan,
+            weighted_schema,
+        }))
+    }
+
+    async fn evaluate(&self, weighted_batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
+        if weighted_batches.iter().all(|batch| batch.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
+        self.provider
+            .set_batches(weighted_batches.to_vec())
+            .context("set join input filter batches")?;
+        let result = match self
+            .ctx
+            .state()
+            .create_physical_plan(&self.logical_plan)
+            .await
+        {
+            Ok(plan) => collect(plan, self.ctx.task_ctx())
+                .await
+                .context("execute join input local filter")
+                .and_then(|batches| normalize_batches(batches, &self.weighted_schema)),
+            Err(err) => Err(err).context("build join input local filter plan"),
+        };
+        let clear_result = self.provider.set_batches(Vec::new());
+        match (result, clear_result) {
+            (Ok(batches), Ok(())) => Ok(batches),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err).context("clear join input local filter batches"),
+        }
+    }
+}
+
 pub(super) fn columnar_join_plan_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -149,10 +234,10 @@ pub(super) fn columnar_join_plan_for_plan(
     if !is_supported_join_type(&join.join_type) || (join.on.is_empty() && join.filter.is_none()) {
         return Ok(None);
     }
-    let Some(left) = join_input_plan_for_side(join.left.as_ref(), sources, "left")? else {
+    let Some(mut left) = join_input_plan_for_side(join.left.as_ref(), sources, "left")? else {
         return Ok(None);
     };
-    let Some(right) = join_input_plan_for_side(join.right.as_ref(), sources, "right")? else {
+    let Some(mut right) = join_input_plan_for_side(join.right.as_ref(), sources, "right")? else {
         return Ok(None);
     };
     let all_sources = source_set_for_plan(plan, sources);
@@ -167,6 +252,10 @@ pub(super) fn columnar_join_plan_for_plan(
     if contains_unsupported_join_wrapper(plan, sources)? {
         return Ok(None);
     }
+    let (left_filters, right_filters) =
+        local_join_filters(plan, join, &left.schema, &right.schema)?;
+    left.local_filters = left_filters;
+    right.local_filters = right_filters;
     let join_key_pairs = simple_join_key_pairs(join, &left.schema, &right.schema);
     if !matches!(join.join_type, JoinType::Inner)
         || left.source_name() == right.source_name()
@@ -252,6 +341,110 @@ fn oriented_join_key_pair(
         });
     }
     None
+}
+
+fn local_join_filters(
+    plan: &LogicalPlan,
+    join: &Join,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+) -> Result<(Vec<Expr>, Vec<Expr>)> {
+    let mut predicates = Vec::new();
+    collect_filter_conjuncts(plan, &mut predicates);
+    if let Some(filter) = join.filter.as_ref() {
+        split_conjunctions(filter, &mut predicates);
+    }
+
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut seen_left = HashSet::new();
+    let mut seen_right = HashSet::new();
+    for predicate in predicates {
+        match local_predicate_side(&predicate, left_schema, right_schema) {
+            Some(JoinPredicateSide::Left) => {
+                let predicate = unqualify_expr_columns(predicate)?;
+                if seen_left.insert(format!("{predicate:?}")) {
+                    left.push(predicate);
+                }
+            }
+            Some(JoinPredicateSide::Right) => {
+                let predicate = unqualify_expr_columns(predicate)?;
+                if seen_right.insert(format!("{predicate:?}")) {
+                    right.push(predicate);
+                }
+            }
+            None => {}
+        }
+    }
+    Ok((left, right))
+}
+
+fn collect_filter_conjuncts(plan: &LogicalPlan, out: &mut Vec<Expr>) {
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            split_conjunctions(&filter.predicate, out);
+            collect_filter_conjuncts(filter.input.as_ref(), out);
+        }
+        LogicalPlan::Projection(projection) => {
+            collect_filter_conjuncts(projection.input.as_ref(), out)
+        }
+        LogicalPlan::SubqueryAlias(alias) => collect_filter_conjuncts(alias.input.as_ref(), out),
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            collect_filter_conjuncts(sort.input.as_ref(), out)
+        }
+        LogicalPlan::Join(join) => {
+            collect_filter_conjuncts(join.left.as_ref(), out);
+            collect_filter_conjuncts(join.right.as_ref(), out);
+        }
+        _ => {}
+    }
+}
+
+fn split_conjunctions(expr: &Expr, out: &mut Vec<Expr>) {
+    let Expr::BinaryExpr(binary) = expr else {
+        out.push(expr.clone());
+        return;
+    };
+    if binary.op == Operator::And {
+        split_conjunctions(binary.left.as_ref(), out);
+        split_conjunctions(binary.right.as_ref(), out);
+    } else {
+        out.push(expr.clone());
+    }
+}
+
+fn local_predicate_side(
+    expr: &Expr,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+) -> Option<JoinPredicateSide> {
+    let mut side = None;
+    for column in expr.column_refs() {
+        let left_has = left_schema.index_of(&column.name).is_ok();
+        let right_has = right_schema.index_of(&column.name).is_ok();
+        let column_side = match (left_has, right_has) {
+            (true, false) => JoinPredicateSide::Left,
+            (false, true) => JoinPredicateSide::Right,
+            _ => return None,
+        };
+        if side.is_some_and(|current| current != column_side) {
+            return None;
+        }
+        side = Some(column_side);
+    }
+    side
+}
+
+fn unqualify_expr_columns(expr: Expr) -> Result<Expr> {
+    Ok(expr
+        .transform_up(|expr| match expr {
+            Expr::Column(mut column) => {
+                column.relation = None;
+                Ok(Transformed::yes(Expr::Column(column)))
+            }
+            other => Ok(Transformed::no(other)),
+        })?
+        .data)
 }
 
 fn resolve_join_key_indices(
@@ -391,12 +584,12 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     )
     .await
     .context("initialize SlateDB-backed join output zset")?;
-    let initial_snapshot = snapshot_batches_from_zset(
-        &output_zset
-            .materialize_columnar()
-            .await
-            .context("load join output snapshot")?,
-    )?;
+    let initial_output = output_zset
+        .materialize_columnar()
+        .await
+        .context("load join output snapshot")?;
+    let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
+    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
     let output_initialized = output_zset.current_handle().is_some();
 
     let left_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&left);
@@ -419,7 +612,7 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     .await
     .context("build SlateDB-backed left join input state")?;
     let right = Box::pin(build_join_input_state(
-        table,
+        Arc::clone(&table),
         &mv_namespace,
         "right",
         right_namespace,
@@ -478,6 +671,7 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     .context("build left-delta/right-delta join evaluator")?;
 
     Ok(ColumnarJoinMaterializedViewState {
+        operator_table: Arc::clone(&table),
         left,
         right,
         output_zset,
@@ -486,6 +680,7 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
         left_state_right_delta,
         left_delta_right_delta,
         initial_snapshot,
+        row_count: initial_row_count,
         persist_source_input_zsets,
     })
 }
@@ -518,12 +713,13 @@ async fn build_join_input_state(
     namespace: String,
     input: ColumnarJoinInputPlan,
     sources: &HashMap<String, VectorizedSourceState>,
-    _udfs: &[ScalarUDF],
+    udfs: &[ScalarUDF],
     _output_initialized: bool,
     index_key_indices: Option<&[usize]>,
     persist_source_input_zsets: bool,
 ) -> Result<ColumnarJoinSourceState> {
-    let ColumnarJoinInputPlanKind::Source { source_name } = input.kind;
+    let ColumnarJoinInputPlanKind::Source { source_name } = &input.kind;
+    let source_name = source_name.clone();
     let index_namespace = format!("{namespace}/index");
     let input_zset = Box::pin(build_join_side_input_zset(
         Arc::clone(&table),
@@ -536,11 +732,27 @@ async fn build_join_input_state(
     let source = sources
         .get(&source_name)
         .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
+    let input_filter = JoinInputFilterEvaluator::build(
+        &input.input_name,
+        &input.schema,
+        input.local_filters.clone(),
+        udfs,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "build {side} join input local filter for '{}'",
+            input.input_name
+        )
+    })?;
     let snapshot_zset = input_zset
         .materialize_columnar()
         .await
         .with_context(|| format!("load {side} join input snapshot"))?;
-    let snapshot = snapshot_batches_from_zset(&snapshot_zset)?;
+    let index_snapshot_zset = filter_join_source_delta(input_filter.as_ref(), snapshot_zset)
+        .await
+        .with_context(|| format!("filter {side} join input snapshot"))?;
+    let snapshot = snapshot_batches_from_zset(&index_snapshot_zset)?;
     let input_index = if let Some(key_indices) = index_key_indices {
         let mut index = SlateBackedColumnarIndexedZSet::new(
             Arc::clone(&table),
@@ -556,10 +768,10 @@ async fn build_join_input_state(
             )
         })?;
         let should_rebuild_index = persist_source_input_zsets
-            || (!index.has_persisted_segments() && !snapshot_zset.is_empty());
+            || (!index.has_persisted_segments() && !index_snapshot_zset.is_empty());
         if should_rebuild_index {
             index
-                .rebuild_from_zset(&snapshot_zset)
+                .rebuild_from_zset(&index_snapshot_zset)
                 .await
                 .with_context(|| {
                     format!(
@@ -577,6 +789,7 @@ async fn build_join_input_state(
         source_name: Some(source_name),
         schema: Arc::clone(&source.schema),
         primary_key_columns: source.primary_key_columns.clone(),
+        input_filter,
         snapshot,
         input_zset: Some(input_zset),
         input_index,
@@ -594,19 +807,47 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
         return Ok(false);
     };
     let plan_start = Instant::now();
-    let tick = Box::pin(run_columnar_join_state_tick(
+    let tick = Box::pin(run_columnar_join_state_tick_inner(
         columnar,
         insert_batches,
         weighted_delta_batches,
         &mv.output_schema,
         &mv.previous_snapshot,
+        true,
+        false,
     ))
     .await?;
 
     let delta_batches = tick.delta.batches().to_vec();
+    columnar.row_count = columnar.row_count.saturating_add(tick.row_count_delta);
+    if columnar.row_count < 0 {
+        bail!(
+            "join columnar materialized view '{}' row count became negative",
+            mv.view_name
+        );
+    }
+    let snapshot_rows =
+        usize::try_from(columnar.row_count).context("join row count exceeds usize")?;
     let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = tick.next_snapshot;
+    if let Some(zset_handle) = columnar.output_zset.current_handle() {
+        handle.publish_columnar_version(
+            version,
+            zset_handle,
+            ColumnarMaterializedViewStorage::new(
+                Arc::clone(&columnar.operator_table),
+                Arc::clone(&mv.output_schema),
+            ),
+            snapshot_rows,
+            delta_batches,
+        );
+    } else {
+        handle.publish_arrow_version(
+            version,
+            vec![RecordBatch::new_empty(Arc::clone(&mv.output_schema))],
+            delta_batches,
+        );
+        mv.previous_snapshot = tick.next_snapshot;
+    }
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -615,24 +856,6 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
         "SlateDB-backed join columnar DBSP materialized view tick completed"
     );
     Ok(true)
-}
-
-pub(super) async fn run_columnar_join_state_tick(
-    columnar: &mut ColumnarJoinMaterializedViewState,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
-) -> Result<ColumnarJoinTick> {
-    run_columnar_join_state_tick_inner(
-        columnar,
-        insert_batches,
-        weighted_delta_batches,
-        output_schema,
-        previous_snapshot,
-        true,
-    )
-    .await
 }
 
 pub(super) async fn run_columnar_join_state_tick_delta_only(
@@ -649,6 +872,7 @@ pub(super) async fn run_columnar_join_state_tick_delta_only(
         output_schema,
         previous_snapshot,
         false,
+        false,
     )
     .await
 }
@@ -659,6 +883,7 @@ async fn run_columnar_join_state_tick_inner(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
+    persist_output_zset: bool,
     maintain_output_snapshot: bool,
 ) -> Result<ColumnarJoinTick> {
     let total_start = profile::start();
@@ -668,7 +893,8 @@ async fn run_columnar_join_state_tick_inner(
         source_input_delta(&columnar.left, insert_batches, weighted_delta_batches)?;
     let right_input_delta =
         source_input_delta(&columnar.right, insert_batches, weighted_delta_batches)?;
-    let persist_source_delta = maintain_output_snapshot || columnar.persist_source_input_zsets;
+    let persist_source_delta =
+        persist_output_zset || maintain_output_snapshot || columnar.persist_source_input_zsets;
     let left_delta = {
         let left_zset = columnar
             .left
@@ -677,6 +903,9 @@ async fn run_columnar_join_state_tick_inner(
             .context("incremental join left source zset missing")?;
         prepare_join_source_delta(left_zset, left_input_delta, persist_source_delta).await?
     };
+    let left_delta = filter_join_source_delta(columnar.left.input_filter.as_ref(), left_delta)
+        .await
+        .context("filter left join source delta")?;
     let right_delta = {
         let right_zset = columnar
             .right
@@ -685,6 +914,9 @@ async fn run_columnar_join_state_tick_inner(
             .context("incremental join right source zset missing")?;
         prepare_join_source_delta(right_zset, right_input_delta, persist_source_delta).await?
     };
+    let right_delta = filter_join_source_delta(columnar.right.input_filter.as_ref(), right_delta)
+        .await
+        .context("filter right join source delta")?;
     let prepare_source_delta_ms = prepare_source_delta_start.elapsed().as_millis() as u64;
     profile::record_since("join.prepare_source_delta", phase_start);
     let phase_start = profile::start();
@@ -810,7 +1042,7 @@ async fn run_columnar_join_state_tick_inner(
         .map(RecordBatch::num_rows)
         .sum::<usize>();
     let mut output_create_ms = 0_u64;
-    if maintain_output_snapshot {
+    if persist_output_zset {
         let phase_start = profile::start();
         let output_create_start = Instant::now();
         columnar
@@ -912,6 +1144,8 @@ async fn run_columnar_join_state_tick_inner(
 
     profile::record_since("join.total", total_start);
     Ok(ColumnarJoinTick {
+        row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+            .context("compute join row-count delta")?,
         delta: persisted_output_delta,
         next_snapshot,
         input_changed: !left_delta.batches().is_empty() || !right_delta.batches().is_empty(),
@@ -1052,6 +1286,25 @@ async fn prepare_join_source_delta(
     } else {
         Ok(input_delta)
     }
+}
+
+async fn filter_join_source_delta(
+    input_filter: Option<&JoinInputFilterEvaluator>,
+    delta: ColumnarZSet,
+) -> Result<ColumnarZSet> {
+    let Some(input_filter) = input_filter else {
+        return Ok(delta);
+    };
+    if delta.is_empty() {
+        return Ok(delta);
+    }
+    let value_schema = delta.value_schema();
+    let filtered_batches = input_filter
+        .evaluate(delta.batches())
+        .await
+        .context("evaluate join input local filter")?;
+    ColumnarZSet::try_new_weighted(value_schema, filtered_batches)
+        .context("build filtered join source delta")
 }
 
 fn signed_source_delta(
@@ -1509,6 +1762,7 @@ fn join_input_plan_for_side(
         input_name: source_name.clone(),
         schema: Arc::clone(&source.schema),
         kind: ColumnarJoinInputPlanKind::Source { source_name },
+        local_filters: Vec::new(),
     }))
 }
 

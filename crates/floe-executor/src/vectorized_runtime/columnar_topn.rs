@@ -24,13 +24,14 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
-use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
+use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{
     diff_bounded_output_batches, diff_bounded_output_batches_by_row, weighted_snapshot_schema,
 };
-use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
@@ -78,6 +79,7 @@ enum ColumnarTopNInputPlan {
 }
 
 pub(super) struct ColumnarTopNMaterializedViewState {
+    operator_table: Arc<dyn KeyValueTable>,
     input_name: String,
     source_schema: SchemaRef,
     input_zset: Option<SlateBackedColumnarZSet>,
@@ -88,7 +90,10 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     partition_converter: RowConverter,
     source_primary_key_columns: Vec<String>,
     source_snapshot: Vec<RecordBatch>,
+    source_index: Option<SlateBackedColumnarIndexedZSet>,
+    source_snapshot_current: bool,
     initial_snapshot: Vec<RecordBatch>,
+    row_count: i64,
     append_only_fast_path: bool,
     row_number_limit: Option<usize>,
     source_output_projection: Option<Vec<usize>>,
@@ -116,6 +121,7 @@ struct TopNInputTick {
 pub(super) struct ColumnarTopNTick {
     pub(super) delta: ColumnarZSet,
     pub(super) next_snapshot: Vec<RecordBatch>,
+    pub(super) row_count_delta: i64,
     pub(super) input_changed: bool,
 }
 
@@ -240,12 +246,12 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
     )
     .await
     .context("initialize SlateDB-backed topn output zset")?;
-    let initial_snapshot = snapshot_batches_from_zset(
-        &output_zset
-            .materialize_columnar()
-            .await
-            .context("load topn output snapshot")?,
-    )?;
+    let initial_output = output_zset
+        .materialize_columnar()
+        .await
+        .context("load topn output snapshot")?;
+    let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
+    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
     match plan.input {
         ColumnarTopNInputPlan::Source { source_name } => {
             let source = sources
@@ -275,18 +281,37 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
             )
             .await
             .context("initialize SlateDB-backed topn input zset")?;
-            let source_snapshot = snapshot_batches_from_zset(
-                &input_zset
-                    .materialize_columnar()
-                    .await
-                    .context("load topn input snapshot")?,
-            )?;
+            let input_snapshot_zset = input_zset
+                .materialize_columnar()
+                .await
+                .context("load topn input snapshot")?;
+            let source_snapshot = snapshot_batches_from_zset(&input_snapshot_zset)?;
+            let source_index = if partition_indices.is_empty() {
+                None
+            } else {
+                let mut index = SlateBackedColumnarIndexedZSet::new(
+                    Arc::clone(&table),
+                    format!("{mv_namespace}/columnar/topn/input_index"),
+                    Arc::clone(&source.schema),
+                    partition_indices.clone(),
+                )
+                .await
+                .context("initialize SlateDB-backed topn source partition index")?;
+                if !index.has_persisted_segments() && !input_snapshot_zset.is_empty() {
+                    index
+                        .rebuild_from_zset(&input_snapshot_zset)
+                        .await
+                        .context("rebuild SlateDB-backed topn source partition index")?;
+                }
+                Some(index)
+            };
             let evaluator =
                 TopNEvaluator::build(plan.logical_plan, &source_name, source, udfs, output_schema)
                     .await
                     .context("build topn vectorized evaluator")?;
 
             Ok(ColumnarTopNMaterializedViewState {
+                operator_table: Arc::clone(&table),
                 input_name: source_name,
                 source_schema: Arc::clone(&source.schema),
                 input_zset: Some(input_zset),
@@ -297,7 +322,10 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 partition_converter,
                 source_primary_key_columns: source.primary_key_columns.clone(),
                 source_snapshot,
+                source_index,
+                source_snapshot_current: true,
                 initial_snapshot,
+                row_count: initial_row_count,
                 append_only_fast_path: plan.append_only_fast_path,
                 row_number_limit: plan.row_number_limit,
                 source_output_projection,
@@ -343,6 +371,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
             .context("build grouped-stats topn vectorized evaluator")?;
 
             Ok(ColumnarTopNMaterializedViewState {
+                operator_table: Arc::clone(&table),
                 input_name,
                 source_schema: schema,
                 input_zset: None,
@@ -353,7 +382,10 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 partition_converter,
                 source_primary_key_columns: Vec::new(),
                 source_snapshot,
+                source_index: None,
+                source_snapshot_current: true,
                 initial_snapshot,
+                row_count: initial_row_count,
                 append_only_fast_path: plan.append_only_fast_path,
                 row_number_limit: plan.row_number_limit,
                 source_output_projection: None,
@@ -397,19 +429,50 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     };
     let plan_start = Instant::now();
 
-    let tick = run_columnar_topn_state_tick(
+    let maintain_output_snapshot = columnar.source_index.is_none();
+    let tick = run_columnar_topn_state_tick_inner(
         columnar,
         insert_batches,
         weighted_delta_batches,
         &mv.output_schema,
         &mv.previous_snapshot,
+        maintain_output_snapshot,
     )
     .await?;
 
     let delta_batches = tick.delta.batches().to_vec();
+    columnar.row_count = columnar.row_count.saturating_add(tick.row_count_delta);
+    if columnar.row_count < 0 {
+        bail!(
+            "topn columnar materialized view '{}' row count became negative",
+            mv.view_name
+        );
+    }
+    let snapshot_rows =
+        usize::try_from(columnar.row_count).context("topn row count exceeds usize")?;
     let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = tick.next_snapshot;
+    if maintain_output_snapshot {
+        handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
+        mv.previous_snapshot = tick.next_snapshot;
+    } else if let Some(zset_handle) = columnar.output_zset.current_handle() {
+        handle.publish_columnar_version(
+            version,
+            zset_handle,
+            ColumnarMaterializedViewStorage::new(
+                Arc::clone(&columnar.operator_table),
+                Arc::clone(&mv.output_schema),
+            ),
+            snapshot_rows,
+            delta_batches,
+        );
+    } else {
+        handle.publish_arrow_version(
+            version,
+            vec![RecordBatch::new_empty(Arc::clone(&mv.output_schema))],
+            delta_batches,
+        );
+        mv.previous_snapshot = tick.next_snapshot;
+    }
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -426,6 +489,25 @@ pub(super) async fn run_columnar_topn_state_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
+) -> Result<ColumnarTopNTick> {
+    run_columnar_topn_state_tick_inner(
+        columnar,
+        insert_batches,
+        weighted_delta_batches,
+        output_schema,
+        previous_snapshot,
+        true,
+    )
+    .await
+}
+
+async fn run_columnar_topn_state_tick_inner(
+    columnar: &mut ColumnarTopNMaterializedViewState,
+    insert_batches: &HashMap<String, Vec<RecordBatch>>,
+    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+    maintain_output_snapshot: bool,
 ) -> Result<ColumnarTopNTick> {
     let total_start = profile::start();
     let phase_start = profile::start();
@@ -449,8 +531,24 @@ pub(super) async fn run_columnar_topn_state_tick(
     )?;
     let touched_ms = touched_start.elapsed().as_millis() as u64;
     profile::record_since("topn.touched_partitions", phase_start);
+    if columnar.source_index.is_some()
+        && !maintain_output_snapshot
+        && let Some(tick) = run_columnar_topn_indexed_source_state_tick(
+            columnar,
+            &persisted_input_delta,
+            output_schema,
+            previous_snapshot,
+            input_changed,
+            maintain_output_snapshot,
+        )
+        .await?
+    {
+        profile::record_since("topn.total", total_start);
+        return Ok(tick);
+    }
     if columnar.append_only_fast_path
         && input_tick.append_only_source_delta
+        && columnar.source_snapshot_current
         && let Some(tick) = run_columnar_topn_append_only_source_state_tick(
             columnar,
             &persisted_input_delta,
@@ -458,6 +556,21 @@ pub(super) async fn run_columnar_topn_state_tick(
             output_schema,
             previous_snapshot,
             input_changed,
+        )
+        .await?
+    {
+        profile::record_since("topn.total", total_start);
+        return Ok(tick);
+    }
+    if columnar.source_index.is_some()
+        && maintain_output_snapshot
+        && let Some(tick) = run_columnar_topn_indexed_source_state_tick(
+            columnar,
+            &persisted_input_delta,
+            output_schema,
+            previous_snapshot,
+            input_changed,
+            maintain_output_snapshot,
         )
         .await?
     {
@@ -523,6 +636,12 @@ pub(super) async fn run_columnar_topn_state_tick(
         let output_create_ms = output_create_start.elapsed().as_millis() as u64;
         profile::record_since("topn.identity_output_create_version", phase_start);
 
+        if let Some(index) = columnar.source_index.as_mut() {
+            index
+                .apply_delta(&persisted_input_delta)
+                .await
+                .context("apply topn identity source delta to partition index")?;
+        }
         let next_snapshot =
             direct_project_record_batches(&next_source_snapshot, output_schema, projection, "topn")
                 .context("build under-limit identity topn output snapshot")?;
@@ -548,8 +667,11 @@ pub(super) async fn run_columnar_topn_state_tick(
         );
 
         columnar.source_snapshot = next_source_snapshot;
+        columnar.source_snapshot_current = true;
         profile::record_since("topn.total", total_start);
         return Ok(ColumnarTopNTick {
+            row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+                .context("compute topn identity row-count delta")?,
             delta: persisted_output_delta,
             next_snapshot,
             input_changed,
@@ -669,8 +791,17 @@ pub(super) async fn run_columnar_topn_state_tick(
     );
 
     columnar.source_snapshot = next_source_snapshot;
+    if let Some(index) = columnar.source_index.as_mut() {
+        index
+            .apply_delta(&persisted_input_delta)
+            .await
+            .context("apply topn source delta to partition index")?;
+    }
+    columnar.source_snapshot_current = true;
     profile::record_since("topn.total", total_start);
     Ok(ColumnarTopNTick {
+        row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+            .context("compute topn row-count delta")?,
         delta: persisted_output_delta,
         next_snapshot,
         input_changed,
@@ -758,6 +889,12 @@ async fn run_columnar_topn_append_only_source_state_tick(
         profile::record_since("topn.append_only_output_snapshot_replace", phase_start);
 
         let phase_start = profile::start();
+        if let Some(index) = columnar.source_index.as_mut() {
+            index
+                .apply_delta(input_delta)
+                .await
+                .context("apply direct append-only topn source delta to partition index")?;
+        }
         columnar.source_snapshot = apply_source_snapshot_delta(
             &columnar.source_schema,
             &columnar.source_primary_key_columns,
@@ -765,9 +902,12 @@ async fn run_columnar_topn_append_only_source_state_tick(
             input_delta,
         )
         .await?;
+        columnar.source_snapshot_current = true;
         profile::record_since("topn.append_only_source_snapshot_delta", phase_start);
 
         return Ok(Some(ColumnarTopNTick {
+            row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+                .context("compute direct append-only topn row-count delta")?,
             delta: persisted_output_delta,
             next_snapshot,
             input_changed,
@@ -830,6 +970,12 @@ async fn run_columnar_topn_append_only_source_state_tick(
     profile::record_since("topn.append_only_output_snapshot_replace", phase_start);
 
     let phase_start = profile::start();
+    if let Some(index) = columnar.source_index.as_mut() {
+        index
+            .apply_delta(input_delta)
+            .await
+            .context("apply append-only topn source delta to partition index")?;
+    }
     columnar.source_snapshot = apply_source_snapshot_delta(
         &columnar.source_schema,
         &columnar.source_primary_key_columns,
@@ -837,9 +983,145 @@ async fn run_columnar_topn_append_only_source_state_tick(
         input_delta,
     )
     .await?;
+    columnar.source_snapshot_current = true;
     profile::record_since("topn.append_only_source_snapshot_delta", phase_start);
 
     Ok(Some(ColumnarTopNTick {
+        row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+            .context("compute append-only topn row-count delta")?,
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    }))
+}
+
+async fn run_columnar_topn_indexed_source_state_tick(
+    columnar: &mut ColumnarTopNMaterializedViewState,
+    input_delta: &ColumnarZSet,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+    input_changed: bool,
+    maintain_output_snapshot: bool,
+) -> Result<Option<ColumnarTopNTick>> {
+    if input_delta.is_empty() || columnar.partition_indices.is_empty() {
+        return Ok(None);
+    }
+
+    let key_batches = {
+        let index = columnar
+            .source_index
+            .as_ref()
+            .context("topn source partition index missing")?;
+        lookup_key_batches_from_delta(
+            input_delta.batches(),
+            &columnar.partition_indices,
+            &index.key_schema(),
+        )?
+    };
+    if key_batches.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(None);
+    }
+
+    let phase_start = profile::start();
+    let previous_lookup = {
+        let index = columnar
+            .source_index
+            .as_ref()
+            .context("topn source partition index missing")?;
+        index
+            .lookup_key_batches(&key_batches)
+            .await
+            .context("lookup topn source partitions from SlateDB-backed index")?
+    };
+    let previous_source_for_keys = materialize_columnar_zset_values(&previous_lookup)
+        .await
+        .context("materialize indexed topn previous source partitions")?;
+    profile::record_since("topn.indexed_lookup_previous", phase_start);
+
+    let phase_start = profile::start();
+    let next_source_for_keys = apply_source_snapshot_delta(
+        &columnar.source_schema,
+        &columnar.source_primary_key_columns,
+        &previous_source_for_keys,
+        input_delta,
+    )
+    .await
+    .context("apply topn indexed source partition delta")?;
+    profile::record_since("topn.indexed_next_source_for_keys", phase_start);
+
+    let phase_start = profile::start();
+    let previous_output = columnar
+        .evaluator
+        .evaluate(&previous_source_for_keys)
+        .await
+        .context("evaluate indexed previous topn partition outputs")?;
+    profile::record_since("topn.indexed_evaluate_previous", phase_start);
+
+    let phase_start = profile::start();
+    let next_output = columnar
+        .evaluator
+        .evaluate(&next_source_for_keys)
+        .await
+        .context("evaluate indexed next topn partition outputs")?;
+    profile::record_since("topn.indexed_evaluate_next", phase_start);
+
+    let phase_start = profile::start();
+    let diff =
+        diff_bounded_output_batches(Arc::clone(output_schema), &previous_output, &next_output)
+            .await
+            .context("diff indexed topn partition outputs")?;
+    profile::record_since("topn.indexed_diff_output", phase_start);
+
+    let phase_start = profile::start();
+    let output_delta =
+        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
+            .context("build indexed topn output zset delta")?;
+    profile::record_since("topn.indexed_build_output_zset", phase_start);
+
+    let phase_start = profile::start();
+    let persisted_output_delta = if let Some(handle) = columnar
+        .output_zset
+        .create_version(
+            &output_delta,
+            columnar
+                .output_zset
+                .current_handle()
+                .map(|handle| handle.version),
+        )
+        .await?
+    {
+        columnar.output_zset.read_delta(&handle).await?
+    } else {
+        output_delta
+    };
+    profile::record_since("topn.indexed_output_create_version", phase_start);
+
+    let next_snapshot = if maintain_output_snapshot {
+        let delta_batches = persisted_output_delta.batches().to_vec();
+        let phase_start = profile::start();
+        let next_snapshot =
+            apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
+                .await
+                .context("apply indexed topn output snapshot delta")?;
+        profile::record_since("topn.indexed_output_snapshot_delta", phase_start);
+        next_snapshot
+    } else {
+        Vec::new()
+    };
+
+    let phase_start = profile::start();
+    if let Some(index) = columnar.source_index.as_mut() {
+        index
+            .apply_delta(input_delta)
+            .await
+            .context("apply topn source delta to partition index")?;
+    }
+    columnar.source_snapshot_current = false;
+    profile::record_since("topn.indexed_apply_source_index", phase_start);
+
+    Ok(Some(ColumnarTopNTick {
+        row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+            .context("compute indexed topn row-count delta")?,
         delta: persisted_output_delta,
         next_snapshot,
         input_changed,
@@ -1503,6 +1785,42 @@ fn source_input_delta(
     } else {
         ColumnarZSet::empty(Arc::clone(&columnar.source_schema))
     }
+}
+
+fn lookup_key_batches_from_delta(
+    delta_batches: &[RecordBatch],
+    key_indices: &[usize],
+    lookup_key_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>> {
+    if key_indices.len() != lookup_key_schema.fields().len() {
+        bail!("topn lookup key count does not match indexed key schema");
+    }
+    let mut key_batches = Vec::new();
+    for batch in delta_batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let mut columns = Vec::with_capacity(key_indices.len());
+        for (output_idx, input_idx) in key_indices.iter().copied().enumerate() {
+            let column = batch.column(input_idx);
+            let expected = lookup_key_schema.field(output_idx).data_type();
+            if column.data_type() != expected {
+                bail!(
+                    "topn lookup key column {} type {:?} does not match indexed key type {:?}",
+                    output_idx,
+                    column.data_type(),
+                    expected
+                );
+            }
+            columns.push(Arc::clone(column));
+        }
+        key_batches.push(
+            RecordBatch::try_new(Arc::clone(lookup_key_schema), columns)
+                .context("build topn lookup key batch")?,
+        );
+    }
+    Ok(key_batches)
+}
+
+async fn materialize_columnar_zset_values(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
+    apply_weighted_snapshot_delta(&zset.value_schema(), &[], zset.batches().to_vec()).await
 }
 
 fn record_batch_row_count(batches: &[RecordBatch]) -> usize {
