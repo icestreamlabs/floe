@@ -178,6 +178,49 @@ impl Source {
             Self::Person => "nexmark_person",
         }
     }
+
+    fn floe_columns(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Bid => &[
+                ("auction", "BIGINT"),
+                ("bidder", "BIGINT"),
+                ("price", "BIGINT"),
+                ("channel", "TEXT"),
+                ("url", "TEXT"),
+                ("date_time", "TIMESTAMP"),
+                ("extra", "TEXT"),
+            ],
+            Self::Auction => &[
+                ("id", "BIGINT"),
+                ("item_name", "TEXT"),
+                ("description", "TEXT"),
+                ("initial_bid", "BIGINT"),
+                ("reserve", "BIGINT"),
+                ("seller", "BIGINT"),
+                ("category", "BIGINT"),
+                ("expires", "TIMESTAMP"),
+                ("date_time", "TIMESTAMP"),
+                ("extra", "TEXT"),
+            ],
+            Self::Person => &[
+                ("id", "BIGINT"),
+                ("name", "TEXT"),
+                ("email_address", "TEXT"),
+                ("credit_card", "TEXT"),
+                ("city", "TEXT"),
+                ("state", "TEXT"),
+                ("date_time", "TIMESTAMP"),
+                ("extra", "TEXT"),
+            ],
+        }
+    }
+
+    fn floe_primary_key(self) -> &'static [&'static str] {
+        match self {
+            Self::Bid => &["auction", "bidder", "date_time", "price"],
+            Self::Auction | Self::Person => &["id"],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

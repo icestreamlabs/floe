@@ -351,7 +351,9 @@ fn parse_create_postgres_cdc_source_from_connection_parts() {
     .expect("parse source");
     match stmt {
         FloeStatement::CreateSource(definition) => {
-            let SourceConnector::PostgresCdc(options) = definition.connector();
+            let SourceConnector::PostgresCdc(options) = definition.connector() else {
+                panic!("expected Postgres CDC source");
+            };
             assert_eq!(
                 options.connection(),
                 "host=localhost port=55433 user=postgres dbname=postgres password=postgres"
@@ -363,6 +365,361 @@ fn parse_create_postgres_cdc_source_from_connection_parts() {
         }
         other => panic!("expected CREATE SOURCE statement, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_create_kafka_source_statement() {
+    let stmt = parse_floe_statement(
+        "CREATE SOURCE bids WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topics = 'nexmark_bid,nexmark_bid_retry',
+            group_id = 'floe_sql',
+            default_source = 'nexmark_bid',
+            poll_ms = 5,
+            max_messages_per_tick = 1024,
+            format = 'debezium-json'
+        )",
+    )
+    .expect("parse source");
+
+    let FloeStatement::CreateSource(definition) = stmt else {
+        panic!("expected CREATE SOURCE statement");
+    };
+    assert_eq!(definition.name(), "bids");
+    assert_eq!(
+        definition.connector(),
+        &SourceConnector::Kafka(
+            KafkaSourceOptions::new(
+                "localhost:9092",
+                vec!["nexmark_bid".to_string(), "nexmark_bid_retry".to_string()],
+                Some("floe_sql".to_string()),
+                Some("nexmark_bid".to_string()),
+                Some(5),
+                Some(1024),
+                Some("debezium_json".to_string()),
+            )
+            .expect("options")
+        )
+    );
+}
+
+#[test]
+fn parse_create_source_with_inline_schema_and_format_encode() {
+    let stmt = parse_floe_statement(
+        "CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY,
+            amount NUMERIC(15,2),
+            status TEXT,
+            created_at TIMESTAMP
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT PLAIN ENCODE JSON",
+    )
+    .expect("parse source");
+
+    let FloeStatement::CreateSource(definition) = stmt else {
+        panic!("expected CREATE SOURCE statement");
+    };
+    assert_eq!(definition.name(), "orders");
+    assert_eq!(definition.columns().len(), 4);
+    assert_eq!(definition.columns()[0].name(), "id");
+    assert!(definition.columns()[0].primary_key());
+    assert!(!definition.columns()[0].nullable());
+    assert_eq!(
+        definition.columns()[1].data_type(),
+        &SqlColumnType::Decimal128 {
+            precision: 15,
+            scale: 2,
+        }
+    );
+    assert_eq!(
+        definition.connector(),
+        &SourceConnector::Kafka(
+            KafkaSourceOptions::new(
+                "localhost:9092",
+                vec!["orders".to_string()],
+                None,
+                None,
+                None,
+                None,
+                Some("floe_json".to_string()),
+            )
+            .expect("options")
+        )
+    );
+}
+
+#[test]
+fn parse_create_source_if_not_exists_with_risingwave_kafka_options() {
+    let stmt = parse_floe_statement(
+        "CREATE SOURCE IF NOT EXISTS orders (
+            id BIGINT,
+            amount BIGINT,
+            PRIMARY KEY (id)
+        )
+        WITH (
+            connector = 'kafka',
+            topic = 'orders',
+            properties.bootstrap.server = 'localhost:9092',
+            scan.startup.mode = 'earliest',
+            properties.fetch.wait.max.ms = '1',
+            properties.fetch.queue.backoff.ms = '1',
+            properties.fetch.min.bytes = '1'
+        )
+        FORMAT PLAIN ENCODE JSON",
+    )
+    .expect("parse source");
+
+    let FloeStatement::CreateSource(definition) = stmt else {
+        panic!("expected CREATE SOURCE statement");
+    };
+    assert!(definition.if_not_exists());
+    assert_eq!(definition.columns().len(), 2);
+    assert!(definition.columns()[0].primary_key());
+    assert_eq!(
+        definition.connector(),
+        &SourceConnector::Kafka(
+            KafkaSourceOptions::new(
+                "localhost:9092",
+                vec!["orders".to_string()],
+                None,
+                None,
+                None,
+                None,
+                Some("floe_json".to_string()),
+            )
+            .expect("options")
+        )
+    );
+}
+
+#[test]
+fn parse_create_source_rejects_not_null_columns() {
+    let err = parse_floe_statement(
+        "CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY,
+            status TEXT NOT NULL
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT PLAIN ENCODE JSON",
+    )
+    .expect_err("NOT NULL source column should fail");
+    assert!(
+        err.to_string()
+            .contains("CREATE SOURCE schemas do not support NOT NULL")
+    );
+}
+
+#[test]
+fn parse_create_source_rejects_risingwave_clauses_floe_does_not_support() {
+    let cases = [
+        (
+            "CREATE SOURCE orders (
+                id BIGINT,
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS ts
+            )
+            WITH (connector = 'kafka', brokers = 'localhost:9092', topic = 'orders')
+            FORMAT PLAIN ENCODE JSON",
+            "WATERMARK clauses are not supported",
+        ),
+        (
+            "CREATE SOURCE orders (
+                id BIGINT
+            )
+            INCLUDE KEY AS key
+            WITH (connector = 'kafka', brokers = 'localhost:9092', topic = 'orders')
+            FORMAT PLAIN ENCODE JSON",
+            "INCLUDE clauses are not supported",
+        ),
+        (
+            "CREATE SOURCE orders (
+                *,
+                gen_id BIGINT AS id + 1
+            )
+            WITH (connector = 'kafka', brokers = 'localhost:9092', topic = 'orders')
+            FORMAT PLAIN ENCODE JSON",
+            "'*' schemas require external schema discovery",
+        ),
+        (
+            "CREATE SOURCE orders (
+                id BIGINT AS id + 1
+            )
+            WITH (connector = 'kafka', brokers = 'localhost:9092', topic = 'orders')
+            FORMAT PLAIN ENCODE JSON",
+            "generated/default columns are not supported",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let err = parse_floe_statement(sql).expect_err("unsupported source clause should fail");
+        assert!(
+            err.to_string().contains(expected),
+            "expected error containing {expected:?}, got {err}"
+        );
+    }
+}
+
+#[test]
+fn parse_create_source_rejects_unsupported_risingwave_kafka_options() {
+    let err = parse_floe_statement(
+        "CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY
+        )
+        WITH (
+            connector = 'kafka',
+            topic = 'orders',
+            properties.bootstrap.server = 'localhost:9092',
+            scan.startup.mode = 'latest'
+        )
+        FORMAT PLAIN ENCODE JSON",
+    )
+    .expect_err("unsupported startup mode should fail");
+    assert!(
+        err.to_string()
+            .contains("supports only scan.startup.mode = 'earliest'")
+    );
+}
+
+#[test]
+fn parse_create_source_rejects_unsupported_format_encode() {
+    let err = parse_floe_statement(
+        "CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT UPSERT ENCODE JSON",
+    )
+    .expect_err("UPSERT source format should fail");
+    assert!(err.to_string().contains("unsupported source FORMAT"));
+}
+
+#[test]
+fn parse_create_file_http_generator_and_object_store_sources() {
+    let statements = parse_floe_program(
+        "
+        CREATE SOURCE file_bid WITH (
+            connector = 'file',
+            path = '/tmp/events.jsonl',
+            default_source = 'nexmark_bid'
+        );
+        CREATE SOURCE http_bid WITH (
+            connector = 'http',
+            host = '127.0.0.1',
+            port = 8080,
+            default_source = 'nexmark_bid'
+        );
+        CREATE SOURCE gen WITH (
+            connector = 'generator',
+            events_per_second = 12.5,
+            max_events = 100
+        );
+        CREATE SOURCE object_bid WITH (
+            connector = 'object-store',
+            url = 's3://bucket/events/',
+            default_source = 'nexmark_bid'
+        );
+        ",
+    )
+    .expect("parse sources");
+
+    assert!(matches!(
+        statements[0],
+        FloeStatement::CreateSource(CreateSourceDefinition { .. })
+    ));
+    let FloeStatement::CreateSource(file) = &statements[0] else {
+        panic!("expected file source");
+    };
+    assert_eq!(
+        file.connector(),
+        &SourceConnector::File(
+            FileSourceOptions::new("/tmp/events.jsonl", Some("nexmark_bid".to_string()))
+                .expect("options")
+        )
+    );
+    let FloeStatement::CreateSource(http) = &statements[1] else {
+        panic!("expected http source");
+    };
+    assert_eq!(
+        http.connector(),
+        &SourceConnector::Http(
+            HttpSourceOptions::new(
+                Some("127.0.0.1".to_string()),
+                8080,
+                Some("nexmark_bid".to_string())
+            )
+            .expect("options")
+        )
+    );
+    let FloeStatement::CreateSource(generator) = &statements[2] else {
+        panic!("expected generator source");
+    };
+    assert_eq!(
+        generator.connector(),
+        &SourceConnector::Generator(
+            GeneratorSourceOptions::new(Some(12.5), Some(100)).expect("options")
+        )
+    );
+    let FloeStatement::CreateSource(object_store) = &statements[3] else {
+        panic!("expected object store source");
+    };
+    assert_eq!(
+        object_store.connector(),
+        &SourceConnector::ObjectStore(
+            ObjectStoreSourceOptions::new("s3://bucket/events/", Some("nexmark_bid".to_string()))
+                .expect("options")
+        )
+    );
+}
+
+#[test]
+fn parse_create_sink_statement_preserves_runtime_options() {
+    let stmt = parse_floe_statement(
+        "CREATE SINK out_bid FROM mv_bid WITH (
+            type = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'mv_bid',
+            batch_rows = 100,
+            batch_bytes = 65536,
+            queue_capacity = 32,
+            retry_max_attempts = 7,
+            retry_base_ms = 10,
+            retry_max_backoff_ms = 500,
+            transactional_id = 'tx-out-bid',
+            checkpoint_topic = 'floe-checkpoints',
+            checkpoint_partition = 2
+        )",
+    )
+    .expect("parse sink");
+
+    let FloeStatement::CreateSink(definition) = stmt else {
+        panic!("expected CREATE SINK statement");
+    };
+    assert_eq!(definition.options().batch_rows(), Some(100));
+    assert_eq!(definition.options().batch_bytes(), Some(65_536));
+    assert_eq!(definition.options().queue_capacity(), Some(32));
+    assert_eq!(definition.options().retry_max_attempts(), Some(7));
+    assert_eq!(definition.options().retry_base_ms(), Some(10));
+    assert_eq!(definition.options().retry_max_backoff_ms(), Some(500));
+    assert_eq!(definition.options().transactional_id(), Some("tx-out-bid"));
+    assert_eq!(
+        definition.options().checkpoint_topic(),
+        Some("floe-checkpoints")
+    );
+    assert_eq!(definition.options().checkpoint_partition(), Some(2));
 }
 
 #[test]

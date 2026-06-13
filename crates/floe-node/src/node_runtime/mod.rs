@@ -91,8 +91,8 @@ use crate::{cli, http_ingest, metrics, sinks};
 use floe_config as config;
 use floe_config::{
     ConnectorConfig, NodeConfig, PostgresCdcReconnectConfig, PostgresCdcSnapshotConfig, SinkConfig,
-    SinkSpec, SourceJournalConfig, apply_connector_properties, load_config,
-    materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
+    SinkSpec, SourceJournalConfig, apply_connector_properties, connector_spec_from_sql,
+    load_config, materialized_view_definitions_from_config, normalize_connectors, normalize_sinks,
     sink_spec_from_sql,
 };
 

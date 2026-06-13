@@ -79,7 +79,92 @@ CREATE SINK out_orders FROM mv_orders WITH (
 
 ## CREATE SOURCE
 
-`CREATE SOURCE` currently supports the native Postgres CDC connector:
+`CREATE SOURCE` follows the RisingWave-style shape for non-CDC sources:
+
+```sql
+CREATE SOURCE [IF NOT EXISTS] <source_name> (
+  [PRIMARY KEY (<column_name>, ...),]
+  <column_name> <data_type>,
+  ...
+)
+WITH (
+  connector = '<connector>',
+  ...
+)
+FORMAT <format> ENCODE <encoding>;
+```
+
+Inline schemas are supported for JSON-backed `kafka`, `file`, `http`, and
+`object_store` sources. When an inline schema is present and `default_source`
+is omitted, Floe uses the `CREATE SOURCE` name as the default source for
+unwrapped JSON rows. `CREATE SOURCE` schemas do not support `NOT NULL`
+constraints; use `CREATE TABLE` when nullability must be enforced. Floe accepts
+`CREATE SOURCE IF NOT EXISTS` and skips a duplicate source declaration during
+startup SQL processing.
+
+RisingWave compatibility boundary:
+
+- Kafka accepts `properties.bootstrap.server` as an alias for `brokers`.
+- Kafka accepts `scan.startup.mode = 'earliest'`, matching Floe's current
+  earliest-offset behavior for new consumer groups.
+- Kafka accepts RisingWave's low-latency fetch options only at Floe's fixed
+  values: `properties.fetch.wait.max.ms = '1'`,
+  `properties.fetch.queue.backoff.ms = '1'`, and
+  `properties.fetch.min.bytes = '1'`.
+- `INCLUDE`, `WATERMARK`, generated columns, `*` external-schema expansion,
+  schema registry options, Avro, Protobuf, CSV, bytes, parquet, and UPSERT
+  source formats are not supported by Floe yet.
+
+Supported source connector types:
+
+- `generator`: optional `events_per_second`, `max_events`
+- `file`: `path`, optional `default_source`
+- `http`: `port`, optional `host`, `default_source`
+- `kafka`: `brokers`/`properties.bootstrap.server`, `topic`/`topics`,
+  optional `group_id`, `default_source`, `poll_ms`, `max_messages_per_tick`,
+  `format`, `scan.startup.mode = 'earliest'`
+- `object_store`: `url`, optional `default_source`
+- `postgres_cdc`/`postgres-cdc`: native Postgres CDC options
+
+Supported source format clauses:
+
+- `FORMAT PLAIN ENCODE JSON`: Floe JSON input (`floe_json`)
+- `FORMAT DEBEZIUM ENCODE JSON`: Debezium JSON input (`debezium_json`, Kafka only)
+
+Example Kafka source with inline schema:
+
+```sql
+CREATE SOURCE orders (
+  id BIGINT PRIMARY KEY,
+  amount BIGINT,
+  status TEXT,
+  created_at TIMESTAMP
+)
+WITH (
+  connector = 'kafka',
+  brokers = 'localhost:9092',
+  topic = 'orders',
+  group_id = 'floe'
+)
+FORMAT PLAIN ENCODE JSON;
+```
+
+Example file source with inline schema:
+
+```sql
+CREATE SOURCE file_bids (
+  auction BIGINT,
+  bidder BIGINT,
+  price BIGINT
+)
+WITH (
+  connector = 'file',
+  path = '/tmp/events.jsonl'
+)
+FORMAT PLAIN ENCODE JSON;
+```
+
+Example Postgres CDC source:
 
 ```sql
 CREATE SOURCE pg_main WITH (
@@ -120,6 +205,11 @@ Supported Postgres CDC source options:
 - `publication.create`, `publication.auto_create`, or `auto_create_publication`
 
 Slot and publication auto-creation default to `true`.
+
+Non-CDC `CREATE SOURCE` statements create runtime connectors. Postgres CDC
+sources are persisted catalog sources because CDC tables and replication
+pipelines bind to them. For CDC tables, keep using `CREATE TABLE ... FROM` to
+declare the Floe table schema.
 
 ## CREATE TABLE
 
@@ -210,7 +300,7 @@ Reliability options:
 - `retry_max_attempts` (Kafka/HTTP/Postgres)
 - `retry_base_ms` (Kafka/HTTP/Postgres)
 - `retry_max_backoff_ms` (Kafka/HTTP/Postgres)
-- `transactional_id`, `checkpoint_topic`, `checkpoint_partition` (Kafka config-file sinks)
+- `transactional_id`, `checkpoint_topic`, `checkpoint_partition` (Kafka sinks)
 
 Kafka sink formats are `json` and `debezium_json`. Debezium Kafka sinks require
 `key_columns`. Postgres sink modes are `upsert` and `append_only`; `upsert`

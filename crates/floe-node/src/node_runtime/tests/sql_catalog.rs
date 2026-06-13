@@ -37,6 +37,36 @@ fn source_definition_from_table_sets_pk_property() {
 }
 
 #[test]
+fn source_definition_from_sql_source_sets_columns_and_pk_property() {
+    let statement = parse_floe_statement(
+        "CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT,
+            status TEXT
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT PLAIN ENCODE JSON",
+    )
+    .expect("parse source");
+    let FloeStatement::CreateSource(definition) = statement else {
+        panic!("expected create source statement");
+    };
+    let source = source_definition_from_source(&definition)
+        .expect("source definition")
+        .expect("inline source schema");
+    assert_eq!(source.name(), "orders");
+    assert_eq!(source.columns().len(), 3);
+    assert_eq!(source.columns()[0].name(), "id");
+    assert_eq!(source.property(SOURCE_PRIMARY_KEY_PROPERTY), Some("id"));
+    assert!(!source.columns()[0].nullable());
+    assert!(source.columns()[1].nullable());
+}
+
+#[test]
 fn catalog_source_definition_from_sql_preserves_postgres_cdc_options() {
     let statement = parse_floe_statement(
         "CREATE SOURCE pg_main WITH (

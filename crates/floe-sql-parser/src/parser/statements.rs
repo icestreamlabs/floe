@@ -1,6 +1,41 @@
 use super::*;
 use crate::definitions::ReplicationPipelineDefinitionParts;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SourceFormatClause {
+    data_format: String,
+    data_encode: String,
+}
+
+impl SourceFormatClause {
+    pub(super) fn new(data_format: impl Into<String>, data_encode: impl Into<String>) -> Self {
+        Self {
+            data_format: normalize_sink_format(&data_format.into()),
+            data_encode: normalize_sink_format(&data_encode.into()),
+        }
+    }
+
+    pub(super) fn message_format(&self) -> Result<String> {
+        if self.data_encode != "json" {
+            return Err(anyhow!(
+                "unsupported source ENCODE '{}'; Floe currently supports ENCODE JSON",
+                self.data_encode
+            ));
+        }
+        match self.data_format.as_str() {
+            "plain" => Ok("floe_json".to_string()),
+            "debezium" => Ok("debezium_json".to_string()),
+            other => Err(anyhow!(
+                "unsupported source FORMAT '{other}'; Floe currently supports FORMAT PLAIN ENCODE JSON and FORMAT DEBEZIUM ENCODE JSON"
+            )),
+        }
+    }
+
+    pub(super) fn is_plain_json(&self) -> bool {
+        self.data_format == "plain" && self.data_encode == "json"
+    }
+}
+
 pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {
     let normalized = normalize_sql(sql)?;
     let (table_sql, source) = split_create_table_source_clause(normalized)?;
@@ -82,6 +117,296 @@ pub fn parse_create_table(sql: &str) -> Result<CreateTableDefinition> {
         }
     }
     CreateTableDefinition::new_with_source(table_name, columns, source)
+}
+
+pub(super) fn parse_optional_source_schema<'a>(
+    input: &'a str,
+    source_name: &str,
+) -> Result<(&'a str, Vec<CreateTableColumnDefinition>)> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('(') {
+        return Ok((input, Vec::new()));
+    }
+    let (rest, schema_clause) = parse_balanced_parenthesized_clause(trimmed)?;
+    reject_unsupported_source_schema_tokens(&schema_clause)?;
+    let table_sql = format!("CREATE TABLE __floe_source {schema_clause}");
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, &table_sql)
+        .map_err(|err| anyhow!("failed to parse CREATE SOURCE schema: {err}"))?;
+    if statements.len() != 1 {
+        return Err(anyhow!("CREATE SOURCE schema must contain one column list"));
+    }
+    let statement = statements.remove(0);
+    let Statement::CreateTable(create_table) = statement else {
+        return Err(anyhow!("expected CREATE SOURCE schema column list"));
+    };
+    if create_table.columns.is_empty() {
+        return Err(anyhow!(
+            "CREATE SOURCE {source_name} must declare at least one column when schema is provided"
+        ));
+    }
+
+    let pk_names = source_primary_key_columns(&create_table.constraints)?;
+    let mut columns = Vec::with_capacity(create_table.columns.len());
+    for column in &create_table.columns {
+        let name = column.name.value.clone();
+        let mut primary_key = pk_names.iter().any(|pk_name| pk_name == &name);
+        for option in &column.options {
+            match &option.option {
+                ColumnOption::NotNull => {
+                    return Err(anyhow!(
+                        "CREATE SOURCE schemas do not support NOT NULL constraints; use CREATE TABLE for enforced nullability"
+                    ));
+                }
+                ColumnOption::Unique { is_primary, .. } if *is_primary => {
+                    primary_key = true;
+                }
+                ColumnOption::Null => {}
+                ColumnOption::Generated { .. }
+                | ColumnOption::Default(_)
+                | ColumnOption::Materialized(_)
+                | ColumnOption::Ephemeral(_)
+                | ColumnOption::Alias(_) => {
+                    return Err(anyhow!(
+                        "CREATE SOURCE generated/default columns are not supported by Floe"
+                    ));
+                }
+                ColumnOption::Check(_) => {
+                    return Err(anyhow!(
+                        "CREATE SOURCE CHECK constraints are not supported by Floe"
+                    ));
+                }
+                ColumnOption::ForeignKey { .. } => {
+                    return Err(anyhow!(
+                        "CREATE SOURCE foreign keys are not supported by Floe"
+                    ));
+                }
+                other => {
+                    return Err(anyhow!("unsupported CREATE SOURCE column option '{other}'"));
+                }
+            }
+        }
+        let data_type = parse_table_column_type(&column.data_type, source_name, &name)?;
+        columns.push(CreateTableColumnDefinition::new(
+            name,
+            data_type,
+            !primary_key,
+            primary_key,
+        ));
+    }
+    for pk_name in &pk_names {
+        if columns.iter().all(|column| column.name() != pk_name) {
+            return Err(anyhow!(
+                "primary key columns not declared in source {}: {}",
+                source_name,
+                pk_name
+            ));
+        }
+    }
+    Ok((rest, columns))
+}
+
+fn reject_unsupported_source_schema_tokens(schema_clause: &str) -> Result<()> {
+    if contains_keyword_token(schema_clause, "WATERMARK") {
+        return Err(anyhow!(
+            "CREATE SOURCE WATERMARK clauses are not supported by Floe"
+        ));
+    }
+    if contains_keyword_token(schema_clause, "INCLUDE") {
+        return Err(anyhow!(
+            "CREATE SOURCE INCLUDE clauses are not supported by Floe"
+        ));
+    }
+    if contains_top_level_star(schema_clause) {
+        return Err(anyhow!(
+            "CREATE SOURCE '*' schemas require external schema discovery, which Floe does not support"
+        ));
+    }
+    if contains_keyword_token(schema_clause, "AS") {
+        return Err(anyhow!(
+            "CREATE SOURCE generated/default columns are not supported by Floe"
+        ));
+    }
+    Ok(())
+}
+
+fn contains_keyword_token(input: &str, keyword: &str) -> bool {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = 0;
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        if in_single {
+            if ch == '\'' {
+                if idx + 1 < chars.len() && chars[idx + 1].1 == '\'' {
+                    idx += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+        } else if in_double {
+            if ch == '"' {
+                if idx + 1 < chars.len() && chars[idx + 1].1 == '"' {
+                    idx += 1;
+                } else {
+                    in_double = false;
+                }
+            }
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                _ if is_keyword_boundary(input[..byte_idx].chars().next_back())
+                    && consume_keyword(&input[byte_idx..], keyword).is_some() =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn contains_top_level_star(input: &str) -> bool {
+    let chars: Vec<char> = input.chars().collect();
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = 0;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if in_single {
+            if ch == '\'' {
+                if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
+                    idx += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+        } else if in_double {
+            if ch == '"' {
+                if idx + 1 < chars.len() && chars[idx + 1] == '"' {
+                    idx += 1;
+                } else {
+                    in_double = false;
+                }
+            }
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                '*' if depth == 1 => return true,
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    false
+}
+
+pub(super) fn parse_optional_source_format(
+    input: &str,
+) -> Result<(&str, Option<SourceFormatClause>)> {
+    let Some(rest) = consume_keyword(input, "FORMAT") else {
+        return Ok((input, None));
+    };
+    let (next, data_format) = parse_identifier(rest)?;
+    let rest = consume_keyword(next, "ENCODE")
+        .ok_or_else(|| anyhow!("expected ENCODE after source FORMAT"))?;
+    let (next, data_encode) = parse_identifier(rest)?;
+    let rest = next;
+    if rest.trim_start().starts_with('(') {
+        let (_next, _options) = parse_parenthesized_options(rest)?;
+        return Err(anyhow!(
+            "source ENCODE option lists are not yet supported in Floe"
+        ));
+    }
+    Ok((
+        rest,
+        Some(SourceFormatClause::new(data_format, data_encode)),
+    ))
+}
+
+pub(super) fn merge_source_format_option(
+    with_format: Option<String>,
+    clause: Option<&SourceFormatClause>,
+) -> Result<Option<String>> {
+    let clause_format = clause.map(SourceFormatClause::message_format).transpose()?;
+    match (with_format, clause_format) {
+        (Some(left), Some(right)) if left != right => Err(anyhow!(
+            "source format option '{left}' conflicts with FORMAT/ENCODE clause '{right}'"
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn source_primary_key_columns(constraints: &[TableConstraint]) -> Result<Vec<String>> {
+    let mut primary_key_columns = Vec::new();
+    for constraint in constraints {
+        if let TableConstraint::PrimaryKey { columns, .. } = constraint {
+            for column in columns {
+                primary_key_columns.push(primary_key_column_name(&column.column)?);
+            }
+        }
+    }
+    Ok(primary_key_columns)
+}
+
+fn parse_balanced_parenthesized_clause(input: &str) -> Result<(&str, String)> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('(') {
+        return Err(anyhow!("expected '(' to start source schema"));
+    }
+    let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut depth = 0_i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut idx = 0;
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+        if in_single {
+            if ch == '\'' {
+                if idx + 1 < chars.len() && chars[idx + 1].1 == '\'' {
+                    idx += 1;
+                } else {
+                    in_single = false;
+                }
+            }
+        } else if in_double {
+            if ch == '"' {
+                if idx + 1 < chars.len() && chars[idx + 1].1 == '"' {
+                    idx += 1;
+                } else {
+                    in_double = false;
+                }
+            }
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = byte_idx + ch.len_utf8();
+                        return Ok((&trimmed[end..], trimmed[..end].to_string()));
+                    }
+                    if depth < 0 {
+                        return Err(anyhow!("unbalanced ')' in source schema"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    Err(anyhow!("unterminated source schema"))
 }
 
 pub(super) fn split_create_table_source_clause(
@@ -284,6 +609,36 @@ pub(super) fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
     } else {
         None
     };
+    let checkpoint_partition =
+        option_any(&options, &["checkpoint_partition", "checkpoint.partition"])
+            .map(|value| parse_i32_option("checkpoint_partition", value))
+            .transpose()?;
+    if checkpoint_partition.is_some_and(|partition| partition < 0) {
+        return Err(anyhow!("option 'checkpoint_partition' must be >= 0"));
+    }
+    let sink_options = SinkOptions::new(
+        option_any(&options, &["batch_rows", "batch.rows"])
+            .map(|value| parse_positive_usize_option("batch_rows", value))
+            .transpose()?,
+        option_any(&options, &["batch_bytes", "batch.bytes"])
+            .map(|value| parse_positive_usize_option("batch_bytes", value))
+            .transpose()?,
+        option_any(&options, &["queue_capacity", "queue.capacity"])
+            .map(|value| parse_positive_usize_option("queue_capacity", value))
+            .transpose()?,
+        option_any(&options, &["retry_max_attempts", "retry.max_attempts"])
+            .map(|value| parse_positive_usize_option("retry_max_attempts", value))
+            .transpose()?,
+        option_any(&options, &["retry_base_ms", "retry.base_ms"])
+            .map(|value| parse_positive_u64_option("retry_base_ms", value))
+            .transpose()?,
+        option_any(&options, &["retry_max_backoff_ms", "retry.max_backoff_ms"])
+            .map(|value| parse_positive_u64_option("retry_max_backoff_ms", value))
+            .transpose()?,
+        option_any(&options, &["transactional_id", "transactional.id"]).map(ToString::to_string),
+        option_any(&options, &["checkpoint_topic", "checkpoint.topic"]).map(ToString::to_string),
+        checkpoint_partition,
+    );
 
     let connector = match connector.as_str() {
         "kafka" => {
@@ -316,7 +671,7 @@ pub(super) fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
             let url = required_option(&options, "url")?.to_string();
             let batch_size = options
                 .get("batch_size")
-                .map(|value| parse_usize_option("batch_size", value))
+                .map(|value| parse_positive_usize_option("batch_size", value))
                 .transpose()?;
             SinkConnector::Http { url, batch_size }
         }
@@ -354,12 +709,13 @@ pub(super) fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
         other => return Err(anyhow!("unsupported sink connector type '{other}'")),
     };
 
-    Ok(SinkDefinition::new(
+    Ok(SinkDefinition::new_with_options(
         sink_name,
         mv_name,
         connector,
         with_snapshot,
         as_of,
+        sink_options,
     ))
 }
 

@@ -118,6 +118,164 @@ fn dry_run_rejects_multiple_materialized_views() -> Result<()> {
 }
 
 #[test]
+fn dry_run_accepts_sql_runtime_sources_and_full_sink_options() -> Result<()> {
+    let temp_dir = TempDir::new().context("create temp dir")?;
+    let input_path = temp_dir.path().join("events.jsonl");
+    let sink_path = temp_dir.path().join("sink.jsonl");
+    std::fs::write(
+        &input_path,
+        r#"{"auction":1,"bidder":42,"price":100,"channel":"web","url":"u","date_time":0,"extra":""}"#,
+    )
+    .context("write input file")?;
+    let sql = format!(
+        r#"
+        CREATE SOURCE file_bid WITH (
+            connector = 'file',
+            path = '{}',
+            default_source = 'nexmark_bid'
+        );
+        CREATE SOURCE http_bid WITH (
+            connector = 'http',
+            host = '127.0.0.1',
+            port = 18080,
+            default_source = 'nexmark_bid'
+        );
+        CREATE SOURCE kafka_bid WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topics = 'nexmark_bid',
+            group_id = 'floe_sql',
+            default_source = 'nexmark_bid',
+            poll_ms = 5,
+            max_messages_per_tick = 512,
+            format = 'floe-json'
+        );
+        CREATE SOURCE object_bid WITH (
+            connector = 'object-store',
+            url = 'file://{}',
+            default_source = 'nexmark_bid'
+        );
+        CREATE SOURCE gen_sql WITH (
+            connector = 'generator',
+            events_per_second = 10,
+            max_events = 100
+        );
+        CREATE MATERIALIZED VIEW mv_sql_sources AS
+        SELECT auction, bidder, price FROM nexmark_bid;
+        CREATE SINK sink_file_sql FROM mv_sql_sources WITH (
+            connector = 'file',
+            path = '{}',
+            append = false,
+            with_snapshot = true,
+            batch_rows = 10,
+            batch_bytes = 65536,
+            queue_capacity = 32
+        );
+        "#,
+        input_path.display(),
+        input_path.display(),
+        sink_path.display()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_floe-node"))
+        .arg("run")
+        .arg("--dry-run")
+        .arg("--mv-query")
+        .arg(sql)
+        .output()
+        .context("run floe-node SQL source dry-run")?;
+    if !output.status.success() {
+        bail!(
+            "expected dry-run to succeed, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dry_run_accepts_sql_source_inline_schema_for_mv() -> Result<()> {
+    let sql = r#"
+        CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT,
+            status TEXT,
+            created_at TIMESTAMP
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT PLAIN ENCODE JSON;
+
+        CREATE MATERIALIZED VIEW mv_orders AS
+        SELECT id, amount FROM orders WHERE amount > 10;
+    "#;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_floe-node"))
+        .arg("run")
+        .arg("--dry-run")
+        .arg("--mv-query")
+        .arg(sql)
+        .output()
+        .context("run floe-node inline source schema dry-run")?;
+    if !output.status.success() {
+        bail!(
+            "expected dry-run to succeed, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dry_run_accepts_duplicate_sql_source_with_if_not_exists() -> Result<()> {
+    let sql = r#"
+        CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT PLAIN ENCODE JSON;
+
+        CREATE SOURCE IF NOT EXISTS orders (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT
+        )
+        WITH (
+            connector = 'kafka',
+            properties.bootstrap.server = 'localhost:9092',
+            topic = 'orders',
+            scan.startup.mode = 'earliest'
+        )
+        FORMAT PLAIN ENCODE JSON;
+
+        CREATE MATERIALIZED VIEW mv_orders AS
+        SELECT id, amount FROM orders;
+    "#;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_floe-node"))
+        .arg("run")
+        .arg("--dry-run")
+        .arg("--mv-query")
+        .arg(sql)
+        .output()
+        .context("run floe-node duplicate SQL source dry-run")?;
+    if !output.status.success() {
+        bail!(
+            "expected dry-run to succeed, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn dry_run_accepts_sql_postgres_cdc_source_table_and_mv() -> Result<()> {
     let sql = r#"
         CREATE SOURCE pg_main WITH (

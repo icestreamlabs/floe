@@ -81,6 +81,30 @@ Precedence rules:
 and replication pipelines with SQL at startup. See the [SQL reference]({{ site.baseurl }}/sql/)
 for the full startup-SQL boundary. Runtime DDL over pgwire is not supported yet.
 
+For Kafka, file, HTTP, and object-store inputs, `CREATE SOURCE` can declare the
+source schema inline:
+
+```sql
+CREATE SOURCE orders (
+  id BIGINT PRIMARY KEY,
+  amount BIGINT,
+  status TEXT
+)
+WITH (
+  connector = 'kafka',
+  brokers = 'localhost:9092',
+  topic = 'orders'
+)
+FORMAT PLAIN ENCODE JSON;
+```
+
+Kafka SQL sources also accept RisingWave's `properties.bootstrap.server`
+spelling in place of `brokers`.
+
+Postgres CDC sources keep the source declaration separate from Floe table
+schemas: use `CREATE SOURCE ... connector = 'postgres-cdc'` plus
+`CREATE TABLE ... FROM <source> TABLE '<schema.table>'`.
+
 ## Append JSON Payloads
 
 File and HTTP ingest use Floe JSON objects. A payload can be wrapped:
@@ -314,8 +338,8 @@ batch_rows = 1000
 ```
 
 Kafka sink formats are `json` and `debezium_json`. Debezium sinks require
-`key_columns`. Config-file Kafka sinks also support `transactional_id`,
-`checkpoint_topic`, and `checkpoint_partition`.
+`key_columns`. Kafka sinks also support `transactional_id`, `checkpoint_topic`,
+and `checkpoint_partition`.
 
 File sinks:
 

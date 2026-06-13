@@ -33,6 +33,11 @@ pub(super) fn catalog_source_definition_from_sql(
                 options.auto_create_publication(),
             )?)
         }
+        other => {
+            return Err(anyhow!(
+                "source connector '{other:?}' is a runtime connector, not a catalog source"
+            ));
+        }
     };
     CatalogSourceDefinition::new(definition.name(), connector)
 }
@@ -50,6 +55,44 @@ pub(super) fn source_backed_table_definition_from_sql(
             )
         })
         .transpose()
+}
+
+pub(super) fn source_definition_from_source(
+    definition: &CreateSourceDefinition,
+) -> anyhow::Result<Option<SourceDefinition>> {
+    if definition.columns().is_empty() {
+        return Ok(None);
+    }
+    let columns = definition
+        .columns()
+        .iter()
+        .map(|column| {
+            let data_type = match column.data_type() {
+                ColumnType::Int64 => SourceDataType::Int64,
+                ColumnType::Bool => SourceDataType::Bool,
+                ColumnType::Utf8 => SourceDataType::Utf8,
+                ColumnType::TimestampMillis => SourceDataType::TimestampMillis,
+                ColumnType::DateDays => SourceDataType::DateDays,
+                ColumnType::Decimal128 { precision, scale } => SourceDataType::Decimal128 {
+                    precision: *precision,
+                    scale: *scale,
+                },
+                ColumnType::Numeric => SourceDataType::Numeric,
+            };
+            SourceColumn::new_nullable(column.name(), data_type, column.nullable())
+        })
+        .collect();
+    let mut source = SourceDefinition::new(definition.name(), columns)?;
+    let primary_key_columns = definition
+        .columns()
+        .iter()
+        .filter(|column| column.primary_key())
+        .map(|column| column.name().to_string())
+        .collect::<Vec<_>>();
+    if !primary_key_columns.is_empty() {
+        source.set_property(SOURCE_PRIMARY_KEY_PROPERTY, primary_key_columns.join(","));
+    }
+    Ok(Some(source))
 }
 
 pub(super) fn replication_pipeline_definition_from_sql(

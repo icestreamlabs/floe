@@ -30,11 +30,11 @@ impl Harness {
         let config_path = artifact_dir.join("floe_config.json");
         fs::write(
             &config_path,
-            serde_json::to_vec_pretty(&floe_config_json(&self.config, sources, topics, &groups))?,
+            serde_json::to_vec_pretty(&floe_config_json(&self.config))?,
         )
         .context("write floe config")?;
         let program_path = artifact_dir.join("program.sql");
-        let program_sql = floe_program_sql(query_id, sources)?;
+        let program_sql = floe_program_sql(&self.config, query_id, sources, topics, &groups)?;
         fs::write(&program_path, &program_sql).context("write floe program")?;
 
         let main_slatedb_name = self.config.floe_slatedb_name_for_query(query_id);
@@ -447,16 +447,19 @@ impl Harness {
             person: format!("{}_validation", groups.person),
         };
         let validation_config_path = validation_dir.join("floe_config.json");
-        let mut validation_config =
-            floe_config_json(&self.config, sources, topics, &validation_groups);
+        let mut validation_config = floe_config_json(&self.config);
         validation_config["storage"]["source_journal"] = json!("full");
         fs::write(
             &validation_config_path,
             serde_json::to_vec_pretty(&validation_config)?,
         )?;
-        let expected_query = floe_expected_query_text_for_source_tables(query_id, sources)?;
-        let validation_program =
-            format!("CREATE MATERIALIZED VIEW benchmark_result AS\n{expected_query};\n");
+        let validation_program = floe_validation_program_sql(
+            &self.config,
+            query_id,
+            sources,
+            topics,
+            &validation_groups,
+        )?;
         let validation_program_path = validation_dir.join("program.sql");
         fs::write(&validation_program_path, &validation_program)?;
 

@@ -59,7 +59,66 @@ pub fn normalize_sinks(sinks: Vec<SinkConfig>) -> Result<Vec<SinkSpec>> {
     Ok(specs)
 }
 
+pub fn connector_spec_from_sql(
+    definition: &CreateSourceDefinition,
+) -> Result<Option<ConnectorSpec>> {
+    let schema_default_source = (!definition.columns().is_empty()).then(|| definition.name());
+    let default_source = |configured: Option<&str>| -> Result<Option<String>> {
+        if let (Some(configured), Some(schema_source)) = (configured, schema_default_source)
+            && configured != schema_source
+        {
+            bail!(
+                "CREATE SOURCE '{}' declares an inline schema, so default_source must be omitted or match the source name",
+                definition.name()
+            );
+        }
+        Ok(configured
+            .or(schema_default_source)
+            .map(ToString::to_string))
+    };
+    let config = match definition.connector() {
+        SourceConnector::Kafka(options) => ConnectorConfig::Kafka {
+            name: Some(definition.name().to_string()),
+            brokers: options.brokers().to_string(),
+            topics: options.topics().to_vec(),
+            group_id: options.group_id().map(ToString::to_string),
+            default_source: default_source(options.default_source())?,
+            poll_ms: options.poll_ms(),
+            max_messages_per_tick: options.max_messages_per_tick(),
+            format: options.format().map(ToString::to_string),
+        },
+        SourceConnector::File(options) => ConnectorConfig::File {
+            name: Some(definition.name().to_string()),
+            path: options.path().to_string(),
+            default_source: default_source(options.default_source())?,
+        },
+        SourceConnector::Http(options) => ConnectorConfig::Http {
+            name: Some(definition.name().to_string()),
+            host: options.host().map(ToString::to_string),
+            port: options.port(),
+            default_source: default_source(options.default_source())?,
+        },
+        SourceConnector::Generator(options) => ConnectorConfig::Generator {
+            name: Some(definition.name().to_string()),
+            events_per_second: options.events_per_second(),
+            max_events: options.max_events(),
+        },
+        SourceConnector::ObjectStore(options) => ConnectorConfig::ObjectStore {
+            name: Some(definition.name().to_string()),
+            url: options.url().to_string(),
+            default_source: default_source(options.default_source())?,
+        },
+        SourceConnector::PostgresCdc(_) => return Ok(None),
+    };
+    validation::validate_connector(&config, 0).context("validate SQL CREATE SOURCE connector")?;
+    Ok(Some(ConnectorSpec {
+        name: definition.name().to_string(),
+        config,
+    }))
+}
+
 pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
+    let options = definition.options();
     let config = match definition.connector() {
         SinkConnector::Kafka {
             brokers,
@@ -75,15 +134,15 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             key_columns: (!key_columns.is_empty()).then(|| key_columns.clone()),
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
-            batch_rows: None,
-            batch_bytes: None,
-            queue_capacity: None,
-            retry_max_attempts: None,
-            retry_base_ms: None,
-            retry_max_backoff_ms: None,
-            transactional_id: None,
-            checkpoint_topic: None,
-            checkpoint_partition: None,
+            batch_rows: options.batch_rows(),
+            batch_bytes: options.batch_bytes(),
+            queue_capacity: options.queue_capacity(),
+            retry_max_attempts: options.retry_max_attempts(),
+            retry_base_ms: options.retry_base_ms(),
+            retry_max_backoff_ms: options.retry_max_backoff_ms(),
+            transactional_id: options.transactional_id().map(ToString::to_string),
+            checkpoint_topic: options.checkpoint_topic().map(ToString::to_string),
+            checkpoint_partition: options.checkpoint_partition(),
         },
         SinkConnector::File { path, append } => SinkConfig::File {
             name: Some(definition.name().to_string()),
@@ -92,9 +151,9 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
             append: *append,
-            batch_rows: None,
-            batch_bytes: None,
-            queue_capacity: None,
+            batch_rows: options.batch_rows(),
+            batch_bytes: options.batch_bytes(),
+            queue_capacity: options.queue_capacity(),
         },
         SinkConnector::Http { url, batch_size } => SinkConfig::Http {
             name: Some(definition.name().to_string()),
@@ -103,12 +162,12 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
             batch_size: *batch_size,
-            batch_rows: None,
-            batch_bytes: None,
-            queue_capacity: None,
-            retry_max_attempts: None,
-            retry_base_ms: None,
-            retry_max_backoff_ms: None,
+            batch_rows: options.batch_rows(),
+            batch_bytes: options.batch_bytes(),
+            queue_capacity: options.queue_capacity(),
+            retry_max_attempts: options.retry_max_attempts(),
+            retry_base_ms: options.retry_base_ms(),
+            retry_max_backoff_ms: options.retry_max_backoff_ms(),
         },
         SinkConnector::Postgres {
             connection,
@@ -124,11 +183,12 @@ pub fn sink_spec_from_sql(definition: &SinkDefinition) -> Result<SinkSpec> {
             primary_key: (!primary_key.is_empty()).then(|| primary_key.clone()),
             with_snapshot: Some(definition.with_snapshot()),
             as_of: definition.as_of(),
-            retry_max_attempts: None,
-            retry_base_ms: None,
-            retry_max_backoff_ms: None,
+            retry_max_attempts: options.retry_max_attempts(),
+            retry_base_ms: options.retry_base_ms(),
+            retry_max_backoff_ms: options.retry_max_backoff_ms(),
         },
     };
+    validation::validate_sink(&config, 0).context("validate SQL CREATE SINK")?;
     Ok(SinkSpec {
         name: definition.name().to_string(),
         config,

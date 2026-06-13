@@ -323,16 +323,50 @@ pub(super) fn parse_usize_option(name: &str, value: &str) -> Result<usize> {
         .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
 }
 
+pub(super) fn parse_positive_usize_option(name: &str, value: &str) -> Result<usize> {
+    let value = parse_usize_option(name, value)?;
+    if value == 0 {
+        return Err(anyhow!("option '{name}' must be greater than zero"));
+    }
+    Ok(value)
+}
+
 pub(super) fn parse_u64_option(name: &str, value: &str) -> Result<u64> {
     value
         .parse::<u64>()
         .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
 }
 
+pub(super) fn parse_positive_u64_option(name: &str, value: &str) -> Result<u64> {
+    let value = parse_u64_option(name, value)?;
+    if value == 0 {
+        return Err(anyhow!("option '{name}' must be greater than zero"));
+    }
+    Ok(value)
+}
+
 pub(super) fn parse_u32_option(name: &str, value: &str) -> Result<u32> {
     value
         .parse::<u32>()
         .map_err(|_| anyhow!("option '{name}' must be a non-negative integer"))
+}
+
+pub(super) fn parse_u16_option(name: &str, value: &str) -> Result<u16> {
+    value
+        .parse::<u16>()
+        .map_err(|_| anyhow!("option '{name}' must be a valid port number"))
+}
+
+pub(super) fn parse_i32_option(name: &str, value: &str) -> Result<i32> {
+    value
+        .parse::<i32>()
+        .map_err(|_| anyhow!("option '{name}' must be a valid Int32"))
+}
+
+pub(super) fn parse_f64_option(name: &str, value: &str) -> Result<f64> {
+    value
+        .parse::<f64>()
+        .map_err(|_| anyhow!("option '{name}' must be a valid number"))
 }
 
 pub(super) fn parse_replication_error_policy_mode(
@@ -369,6 +403,21 @@ pub(super) fn parse_column_list_option(value: &str) -> Result<Vec<String>> {
     Ok(columns)
 }
 
+pub(super) fn parse_string_list_option(name: &str, value: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    for raw in value.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            return Err(anyhow!("option '{name}' cannot contain empty values"));
+        }
+        values.push(item.to_string());
+    }
+    if values.is_empty() {
+        return Err(anyhow!("option '{name}' cannot be empty"));
+    }
+    Ok(values)
+}
+
 pub(super) fn required_option<'a>(
     options: &'a std::collections::HashMap<String, String>,
     key: &str,
@@ -377,6 +426,16 @@ pub(super) fn required_option<'a>(
         .get(key)
         .map(String::as_str)
         .ok_or_else(|| anyhow!("CREATE SINK requires '{key}' option"))
+}
+
+pub(super) fn required_source_option<'a>(
+    options: &'a std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<&'a str> {
+    options
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("CREATE SOURCE requires '{key}' option"))
 }
 
 pub(super) fn required_replication_option<'a>(

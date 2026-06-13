@@ -910,30 +910,9 @@ impl Harness {
         bid_topic: &str,
         auction_topic: &str,
     ) -> Result<String> {
-        let mut connectors = vec![json!({
-            "type": "kafka",
-            "brokers": self.config.broker_addr,
-            "topics": [bid_topic],
-            "group_id": format!("{}_{}_bids", self.config.floe_kafka_group_id_prefix, self.config.run_id),
-            "default_source": "nexmark_bid",
-            "poll_ms": self.config.floe_kafka_poll_ms,
-            "max_messages_per_tick": self.config.floe_kafka_max_messages_per_tick
-        })];
-        if self.config.bench_query == BenchQuery::Join {
-            connectors.push(json!({
-                "type": "kafka",
-                "brokers": self.config.broker_addr,
-                "topics": [auction_topic],
-                "group_id": format!("{}_{}_auctions", self.config.floe_kafka_group_id_prefix, self.config.run_id),
-                "default_source": "nexmark_auction",
-                "poll_ms": self.config.floe_kafka_poll_ms,
-                "max_messages_per_tick": self.config.floe_kafka_max_messages_per_tick
-            }));
-        }
         write_file(
             config_path,
             serde_json::to_vec_pretty(&json!({
-                "connectors": connectors,
                 "runtime": {
                     "ingest_queue_capacity": self.config.floe_ingest_queue_capacity,
                     "ingest_batch_size": self.config.floe_ingest_batch_size,
@@ -944,14 +923,82 @@ impl Harness {
                 "storage": {"await_durable": false}
             }))?,
         )?;
+        let bid_source = self.floe_kafka_source_sql(
+            "nexmark_bid",
+            &[
+                ("auction", "BIGINT"),
+                ("bidder", "BIGINT"),
+                ("price", "BIGINT"),
+                ("channel", "TEXT"),
+                ("url", "TEXT"),
+                ("date_time", "TIMESTAMP"),
+                ("extra", "TEXT"),
+            ],
+            &["auction", "bidder", "date_time", "price"],
+            bid_topic,
+            &format!(
+                "{}_{}_bids",
+                self.config.floe_kafka_group_id_prefix, self.config.run_id
+            ),
+        );
+        let auction_source = if self.config.bench_query == BenchQuery::Join {
+            self.floe_kafka_source_sql(
+                "nexmark_auction",
+                &[
+                    ("id", "BIGINT"),
+                    ("item_name", "TEXT"),
+                    ("description", "TEXT"),
+                    ("initial_bid", "BIGINT"),
+                    ("reserve", "BIGINT"),
+                    ("seller", "BIGINT"),
+                    ("category", "BIGINT"),
+                    ("expires", "TIMESTAMP"),
+                    ("date_time", "TIMESTAMP"),
+                    ("extra", "TEXT"),
+                ],
+                &["id"],
+                auction_topic,
+                &format!(
+                    "{}_{}_auctions",
+                    self.config.floe_kafka_group_id_prefix, self.config.run_id
+                ),
+            )
+        } else {
+            String::new()
+        };
         Ok(match self.config.bench_query {
             BenchQuery::FilterProjection => format!(
-                "CREATE MATERIALIZED VIEW {QUERY_RESULT_RELATION} AS SELECT auction, bidder, price AS projected_price FROM nexmark_bid WHERE auction <= 5000;"
+                "{bid_source}\nCREATE MATERIALIZED VIEW {QUERY_RESULT_RELATION} AS SELECT auction, bidder, price AS projected_price FROM nexmark_bid WHERE auction <= 5000;"
             ),
             BenchQuery::Join => format!(
-                "CREATE MATERIALIZED VIEW {QUERY_RESULT_RELATION} AS SELECT b.auction, b.bidder, b.price AS projected_price, a.seller FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id WHERE a.category = 10;"
+                "{bid_source}\n{auction_source}\nCREATE MATERIALIZED VIEW {QUERY_RESULT_RELATION} AS SELECT b.auction, b.bidder, b.price AS projected_price, a.seller FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id WHERE a.category = 10;"
             ),
         })
+    }
+
+    fn floe_kafka_source_sql(
+        &self,
+        name: &str,
+        columns: &[(&str, &str)],
+        primary_key: &[&str],
+        topic: &str,
+        group_id: &str,
+    ) -> String {
+        let columns = columns
+            .iter()
+            .map(|(name, typ)| format!("  {name} {typ}"))
+            .chain(
+                (!primary_key.is_empty())
+                    .then(|| format!("  PRIMARY KEY ({})", primary_key.join(", "))),
+            )
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!(
+            "CREATE SOURCE {name} (\n{columns}\n)\nWITH (\n  connector = 'kafka',\n  brokers = '{}',\n  topic = '{topic}',\n  group_id = '{group_id}',\n  poll_ms = {},\n  max_messages_per_tick = {}\n)\nFORMAT PLAIN ENCODE JSON;",
+            self.config.broker_addr,
+            self.config.floe_kafka_poll_ms,
+            self.config.floe_kafka_max_messages_per_tick
+        )
     }
 
     fn docker_rm_force(&self, names: &[&str]) {

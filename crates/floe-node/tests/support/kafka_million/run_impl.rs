@@ -116,36 +116,22 @@ pub(super) async fn run_redpanda_kafka_million_test_impl(
         );
     }
 
-    let sinks = match sink_mode {
-        SinkMode::WithKafkaSink => vec![serde_json::json!({
+    let use_sql_source = matches!(spec.dataset, MillionDatasetKind::BidOnly { .. });
+    let connectors = if use_sql_source {
+        Vec::new()
+    } else {
+        vec![serde_json::json!({
             "type": "kafka",
-            "name": "kafka_sink_million",
-            "brokers": brokers.clone(),
-            "topic": output_topic.clone(),
-            "mv": spec.mv_name,
-            "with_snapshot": false,
-            "batch_rows": sink_batch_rows,
-            "batch_bytes": 16777216,
-            "queue_capacity": 65536,
-            "retry_max_attempts": 8,
-            "retry_base_ms": 50,
-            "retry_max_backoff_ms": 1000
-        })],
-        SinkMode::NoSink => Vec::new(),
+            "brokers": brokers,
+            "topics": [input_topic],
+            "group_id": group_id,
+            "poll_ms": 10,
+            "max_messages_per_tick": connector_max_messages_per_tick
+        })]
     };
 
     let config = serde_json::json!({
-        "connectors": [
-            {
-                "type": "kafka",
-                "brokers": brokers,
-                "topics": [input_topic],
-                "group_id": group_id,
-                "poll_ms": 10,
-                "max_messages_per_tick": connector_max_messages_per_tick
-            }
-        ],
-        "sinks": sinks,
+        "connectors": connectors,
         "storage": {
             "await_durable": false
         },
@@ -183,10 +169,21 @@ pub(super) async fn run_redpanda_kafka_million_test_impl(
     }
 
     let node_spawn_started = Instant::now();
+    let mv_sql = million_sql_program(MillionSqlProgram {
+        spec,
+        sink_mode,
+        use_sql_source,
+        brokers: &brokers,
+        input_topic: &input_topic,
+        group_id: &group_id,
+        output_topic: &output_topic,
+        connector_max_messages_per_tick,
+        sink_batch_rows,
+    });
     let mut child = spawn_node(NodeSpawnConfig {
         config_path: &config_path,
         pg_port,
-        mv_sql: spec.mv_sql,
+        mv_sql: &mv_sql,
         stdout_log_path: &stdout_log_path,
         stderr_log_path: &stderr_log_path,
         ingest_batch_size,
@@ -365,6 +362,71 @@ pub(super) async fn run_redpanda_kafka_million_test_impl(
 
     stop_child(&mut child, "INT").await;
     test_result
+}
+
+struct MillionSqlProgram<'a> {
+    spec: MillionQuerySpec,
+    sink_mode: SinkMode,
+    use_sql_source: bool,
+    brokers: &'a str,
+    input_topic: &'a str,
+    group_id: &'a str,
+    output_topic: &'a str,
+    connector_max_messages_per_tick: usize,
+    sink_batch_rows: usize,
+}
+
+fn million_sql_program(program: MillionSqlProgram<'_>) -> String {
+    let mut sql = String::new();
+    if program.use_sql_source {
+        sql.push_str(&format!(
+            r#"CREATE SOURCE nexmark_bid (
+  auction BIGINT,
+  bidder BIGINT,
+  price BIGINT,
+  channel TEXT,
+  url TEXT,
+  date_time TIMESTAMP,
+  extra TEXT,
+  PRIMARY KEY (auction, bidder, date_time, price)
+)
+WITH (
+  connector = 'kafka',
+  brokers = '{}',
+  topic = '{}',
+  group_id = '{}',
+  poll_ms = 10,
+  max_messages_per_tick = {}
+)
+FORMAT PLAIN ENCODE JSON;
+"#,
+            program.brokers,
+            program.input_topic,
+            program.group_id,
+            program.connector_max_messages_per_tick
+        ));
+    }
+    sql.push_str(program.spec.mv_sql.trim().trim_end_matches(';'));
+    sql.push_str(";\n");
+    if matches!(program.sink_mode, SinkMode::WithKafkaSink) {
+        sql.push_str(&format!(
+            r#"CREATE SINK kafka_sink_million FROM {} WITH (
+  connector = 'kafka',
+  brokers = '{}',
+  topic = '{}',
+  with_snapshot = false,
+  batch_rows = {},
+  batch_bytes = 16777216,
+  queue_capacity = 65536,
+  retry_max_attempts = 8,
+  retry_base_ms = 50,
+  retry_max_backoff_ms = 1000
+);
+"#,
+            program.spec.mv_name, program.brokers, program.output_topic, program.sink_batch_rows
+        ));
+    }
+    sql
 }
 
 pub(super) async fn ensure_topic_exists(brokers: &str, topic: &str) -> Result<()> {

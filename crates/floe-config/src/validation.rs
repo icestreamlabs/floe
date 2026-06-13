@@ -228,7 +228,7 @@ fn validate_postgres_cdc_config(postgres_cdc: &PostgresCdcConfig) -> Result<()> 
     Ok(())
 }
 
-fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
+pub(crate) fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
     match connector {
         ConnectorConfig::Kafka {
             name,
@@ -368,7 +368,7 @@ fn validate_connector(connector: &ConnectorConfig, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
+pub(crate) fn validate_sink(sink: &SinkConfig, index: usize) -> Result<()> {
     match sink {
         SinkConfig::Kafka {
             name,

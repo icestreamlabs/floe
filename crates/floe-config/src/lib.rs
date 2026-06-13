@@ -8,7 +8,10 @@ use url::Url;
 use floe_core::catalog::PostgresCdcSchemaEvolutionPolicy;
 use floe_node_core::generator::{AUCTION_SOURCE_NAME, BID_SOURCE_NAME, PERSON_SOURCE_NAME};
 use floe_node_core::source::SourceRegistry;
-use floe_sql_parser::{MaterializedViewDefinition, SinkConnector, SinkDefinition};
+use floe_sql_parser::{
+    CreateSourceDefinition, MaterializedViewDefinition, SinkConnector, SinkDefinition,
+    SourceConnector,
+};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -712,8 +715,8 @@ mod validation;
 
 pub use loading::{load_config, load_toml_config, parse_toml_config};
 pub use normalization::{
-    apply_connector_properties, materialized_view_definitions_from_config, normalize_connectors,
-    normalize_sinks, sink_spec_from_sql,
+    apply_connector_properties, connector_spec_from_sql, materialized_view_definitions_from_config,
+    normalize_connectors, normalize_sinks, sink_spec_from_sql,
 };
 use validation::validate_node_config;
 

@@ -149,6 +149,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut durable_table_source_names: BTreeSet<String> = BTreeSet::new();
     let mut replication_pipelines: HashMap<String, CatalogReplicationPipelineDefinition> =
         HashMap::new();
+    let mut sql_connector_specs = Vec::new();
     let mut sql_sink_specs = Vec::new();
     if let Some(storage) = storage.as_ref() {
         for definition in storage
@@ -234,16 +235,38 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         for statement in parse_floe_program(sql_program)? {
             match statement {
                 FloeStatement::CreateSource(definition) => {
-                    let source = catalog_source_definition_from_sql(&definition)?;
-                    if let Some(storage) = storage.as_ref() {
-                        storage
-                            .upsert_catalog_source(source.clone())
-                            .await
-                            .with_context(|| {
-                                format!("persist source definition '{}'", source.name())
-                            })?;
+                    if definition.if_not_exists()
+                        && source_exists_for_if_not_exists(
+                            definition.name(),
+                            &connector_specs,
+                            &sql_connector_specs,
+                            &source_registry,
+                            &catalog_sources,
+                        )
+                    {
+                        tracing::info!(
+                            source = %definition.name(),
+                            "source already exists; skipping due to IF NOT EXISTS"
+                        );
+                        continue;
                     }
-                    catalog_sources.insert(source.name().to_string(), source);
+                    if let Some(connector) = connector_spec_from_sql(&definition)? {
+                        sql_connector_specs.push(connector);
+                        if let Some(source) = source_definition_from_source(&definition)? {
+                            source_registry.register(source);
+                        }
+                    } else {
+                        let source = catalog_source_definition_from_sql(&definition)?;
+                        if let Some(storage) = storage.as_ref() {
+                            storage
+                                .upsert_catalog_source(source.clone())
+                                .await
+                                .with_context(|| {
+                                    format!("persist source definition '{}'", source.name())
+                                })?;
+                        }
+                        catalog_sources.insert(source.name().to_string(), source);
+                    }
                 }
                 FloeStatement::CreateTable(definition) => {
                     let table = table_definition_from_sql(&definition)?;
@@ -326,6 +349,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         }
     }
 
+    merge_sql_connectors(&mut connector_specs, sql_connector_specs)?;
     merge_sql_sinks(&mut sink_specs, sql_sink_specs, &materialized_view_map)?;
 
     if let Some(storage) = storage.as_ref() {
@@ -935,4 +959,17 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         runtime_failure,
     })
     .await
+}
+
+fn source_exists_for_if_not_exists(
+    name: &str,
+    connector_specs: &[config::ConnectorSpec],
+    sql_connector_specs: &[config::ConnectorSpec],
+    source_registry: &SourceRegistry,
+    catalog_sources: &HashMap<String, CatalogSourceDefinition>,
+) -> bool {
+    source_registry.contains(name)
+        || catalog_sources.contains_key(name)
+        || connector_specs.iter().any(|spec| spec.name == name)
+        || sql_connector_specs.iter().any(|spec| spec.name == name)
 }

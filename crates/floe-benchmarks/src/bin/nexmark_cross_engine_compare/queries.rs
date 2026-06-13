@@ -722,26 +722,8 @@ SELECT COUNT(*) AS row_count FROM persons_source;
     Ok(sql)
 }
 
-pub(super) fn floe_config_json(
-    config: &Config,
-    sources: &[Source],
-    topics: &Topics,
-    groups: &Groups,
-) -> serde_json::Value {
-    let mut connectors = Vec::new();
-    for source in sources {
-        connectors.push(json!({
-            "type": "kafka",
-            "brokers": config.broker_addr,
-            "topics": [topics.for_source(*source)],
-            "group_id": groups.for_source(*source),
-            "default_source": source.floe_source(),
-            "poll_ms": config.floe_kafka_poll_ms,
-            "max_messages_per_tick": config.floe_kafka_max_messages_per_tick,
-        }));
-    }
+pub(super) fn floe_config_json(config: &Config) -> serde_json::Value {
     json!({
-        "connectors": connectors,
         "runtime": {
             "ingest_queue_capacity": config.floe_ingest_queue_capacity,
             "ingest_batch_size": config.floe_ingest_batch_size,
@@ -770,12 +752,72 @@ pub(super) fn floe_config_json(
     })
 }
 
-pub(super) fn floe_program_sql(query_id: &str, _sources: &[Source]) -> Result<String> {
+pub(super) fn floe_program_sql(
+    config: &Config,
+    query_id: &str,
+    sources: &[Source],
+    topics: &Topics,
+    groups: &Groups,
+) -> Result<String> {
     let query_text =
         query_sql_floe(query_id).with_context(|| format!("Floe query SQL for {query_id}"))?;
     Ok(format!(
-        "CREATE MATERIALIZED VIEW benchmark_result AS\n{query_text};\n"
+        "{}CREATE MATERIALIZED VIEW benchmark_result AS\n{query_text};\n",
+        floe_source_setup_sql(config, sources, topics, groups)
     ))
+}
+
+pub(super) fn floe_validation_program_sql(
+    config: &Config,
+    query_id: &str,
+    sources: &[Source],
+    topics: &Topics,
+    groups: &Groups,
+) -> Result<String> {
+    let expected_query = floe_expected_query_text_for_source_tables(query_id, sources)?;
+    Ok(format!(
+        "{}CREATE MATERIALIZED VIEW benchmark_result AS\n{expected_query};\n",
+        floe_source_setup_sql(config, sources, topics, groups)
+    ))
+}
+
+fn floe_source_setup_sql(
+    config: &Config,
+    sources: &[Source],
+    topics: &Topics,
+    groups: &Groups,
+) -> String {
+    let mut sql = String::new();
+    for source in sources {
+        sql.push_str(&floe_kafka_source_sql(
+            config,
+            *source,
+            topics.for_source(*source),
+            groups.for_source(*source),
+        ));
+        sql.push('\n');
+    }
+    sql
+}
+
+fn floe_kafka_source_sql(config: &Config, source: Source, topic: &str, group_id: &str) -> String {
+    let columns = source
+        .floe_columns()
+        .iter()
+        .map(|(name, typ)| format!("  {name} {typ}"))
+        .chain(
+            (!source.floe_primary_key().is_empty())
+                .then(|| format!("  PRIMARY KEY ({})", source.floe_primary_key().join(", "))),
+        )
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "CREATE SOURCE {} (\n{columns}\n)\nWITH (\n  connector = 'kafka',\n  brokers = '{}',\n  topic = '{topic}',\n  group_id = '{group_id}',\n  poll_ms = {},\n  max_messages_per_tick = {}\n)\nFORMAT PLAIN ENCODE JSON;\n",
+        source.floe_source(),
+        config.broker_addr,
+        config.floe_kafka_poll_ms,
+        config.floe_kafka_max_messages_per_tick
+    )
 }
 
 pub(super) fn floe_expected_query_text_for_source_tables(

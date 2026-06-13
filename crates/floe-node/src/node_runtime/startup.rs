@@ -328,6 +328,23 @@ pub(super) fn connectors_from_cli(args: &cli::RunArgs) -> Vec<ConnectorConfig> {
     connectors
 }
 
+pub(super) fn merge_sql_connectors(
+    connector_specs: &mut Vec<config::ConnectorSpec>,
+    sql_connector_specs: Vec<config::ConnectorSpec>,
+) -> anyhow::Result<()> {
+    let mut connector_names: BTreeSet<String> = connector_specs
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    for connector in sql_connector_specs {
+        if !connector_names.insert(connector.name.clone()) {
+            return Err(anyhow!("duplicate connector name '{}'", connector.name));
+        }
+        connector_specs.push(connector);
+    }
+    Ok(())
+}
+
 pub(super) fn cli_connector_creation_flags(args: &cli::RunArgs) -> Vec<&'static str> {
     let mut flags = Vec::new();
     if args.http_port.is_some() {

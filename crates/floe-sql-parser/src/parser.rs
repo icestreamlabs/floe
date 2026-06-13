@@ -10,11 +10,12 @@ use sqlparser::parser::Parser;
 
 use crate::definitions::{
     CreateSourceDefinition, CreateTableColumnDefinition, CreateTableDefinition,
-    CreateTableSourceDefinition, FloeStatement, MaterializedViewDefinition,
+    CreateTableSourceDefinition, FileSourceOptions, FloeStatement, GeneratorSourceOptions,
+    HttpSourceOptions, KafkaSourceOptions, MaterializedViewDefinition, ObjectStoreSourceOptions,
     PostgresCdcSchemaEvolutionPolicy, PostgresCdcSourceOptions, ReplicationBufferMode,
     ReplicationBufferPolicy, ReplicationErrorPolicy, ReplicationErrorPolicyMode,
     ReplicationPipelineDefinition, ReplicationPipelineFormat, ReplicationPipelineTarget,
-    SinkConnector, SinkDefinition, SourceConnector, SqlColumnType,
+    SinkConnector, SinkDefinition, SinkOptions, SourceConnector, SqlColumnType,
 };
 
 #[path = "parser/options.rs"]
@@ -83,11 +84,26 @@ pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
         .ok_or_else(|| anyhow!("expected CREATE at start of source statement"))?;
     rest = consume_keyword(rest, "SOURCE")
         .ok_or_else(|| anyhow!("expected SOURCE after CREATE in source statement"))?;
+    let if_not_exists = if let Some(after_if) = consume_keyword(rest, "IF") {
+        let after_not = consume_keyword(after_if, "NOT")
+            .ok_or_else(|| anyhow!("expected NOT after IF in CREATE SOURCE IF NOT EXISTS"))?;
+        let after_exists = consume_keyword(after_not, "EXISTS")
+            .ok_or_else(|| anyhow!("expected EXISTS after IF NOT in CREATE SOURCE"))?;
+        rest = after_exists;
+        true
+    } else {
+        false
+    };
     let (next, source_name) = parse_identifier(rest)?;
     rest = next;
+    let (next, columns) = parse_optional_source_schema(rest, &source_name)?;
+    rest = next;
+    reject_unsupported_source_clauses_before_with(rest)?;
     rest = consume_keyword(rest, "WITH")
         .ok_or_else(|| anyhow!("expected WITH (...) in CREATE SOURCE statement"))?;
     let (next, options) = parse_parenthesized_options(rest)?;
+    rest = next;
+    let (next, format_clause) = parse_optional_source_format(rest)?;
     rest = next;
 
     if !rest.trim().is_empty() {
@@ -102,7 +118,98 @@ pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
         .to_ascii_lowercase()
         .replace('-', "_");
     let connector = match connector.as_str() {
+        "kafka" => {
+            validate_risingwave_kafka_options(&options)?;
+            SourceConnector::Kafka(KafkaSourceOptions::new(
+                option_any(
+                    &options,
+                    &[
+                        "brokers",
+                        "properties.bootstrap.server",
+                        "bootstrap.servers",
+                        "bootstrap.server",
+                    ],
+                )
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CREATE SOURCE kafka requires brokers/properties.bootstrap.server option"
+                    )
+                })?
+                .to_string(),
+                option_any(&options, &["topics", "topic"])
+                    .map(|value| parse_string_list_option("topics", value))
+                    .transpose()?
+                    .ok_or_else(|| anyhow!("CREATE SOURCE kafka requires topics/topic"))?,
+                option_any(&options, &["group_id", "group.id"]).map(ToString::to_string),
+                option_any(&options, &["default_source", "source"]).map(ToString::to_string),
+                option_any(&options, &["poll_ms", "poll.ms"])
+                    .map(|value| parse_positive_u64_option("poll_ms", value))
+                    .transpose()?,
+                option_any(&options, &["max_messages_per_tick", "max_messages"])
+                    .map(|value| parse_positive_usize_option("max_messages_per_tick", value))
+                    .transpose()?,
+                merge_source_format_option(
+                    option_any(&options, &["format"]).map(normalize_sink_format),
+                    format_clause.as_ref(),
+                )?,
+            )?)
+        }
+        "file" => {
+            ensure_source_format_is_plain_json(format_clause.as_ref(), "file")?;
+            SourceConnector::File(FileSourceOptions::new(
+                required_source_option(&options, "path")?.to_string(),
+                option_any(&options, &["default_source", "source"]).map(ToString::to_string),
+            )?)
+        }
+        "http" => {
+            ensure_source_format_is_plain_json(format_clause.as_ref(), "http")?;
+            SourceConnector::Http(HttpSourceOptions::new(
+                option_any(&options, &["host", "hostname"]).map(ToString::to_string),
+                option_any(&options, &["port"])
+                    .map(|value| parse_u16_option("port", value))
+                    .transpose()?
+                    .ok_or_else(|| anyhow!("CREATE SOURCE http requires port"))?,
+                option_any(&options, &["default_source", "source"]).map(ToString::to_string),
+            )?)
+        }
+        "generator" | "nexmark" => {
+            if format_clause.is_some() {
+                return Err(anyhow!(
+                    "CREATE SOURCE generator uses built-in Nexmark encoding; omit FORMAT/ENCODE"
+                ));
+            }
+            if !columns.is_empty() {
+                return Err(anyhow!(
+                    "CREATE SOURCE generator uses built-in Nexmark schemas; omit inline schema"
+                ));
+            }
+            SourceConnector::Generator(GeneratorSourceOptions::new(
+                option_any(&options, &["events_per_second", "events.per_second"])
+                    .map(|value| parse_f64_option("events_per_second", value))
+                    .transpose()?,
+                option_any(&options, &["max_events", "max.events"])
+                    .map(|value| parse_u64_option("max_events", value))
+                    .transpose()?,
+            )?)
+        }
+        "object_store" | "objectstore" => {
+            ensure_source_format_is_plain_json(format_clause.as_ref(), "object_store")?;
+            SourceConnector::ObjectStore(ObjectStoreSourceOptions::new(
+                required_source_option(&options, "url")?.to_string(),
+                option_any(&options, &["default_source", "source"]).map(ToString::to_string),
+            )?)
+        }
         "postgres_cdc" => {
+            if format_clause.is_some() {
+                return Err(anyhow!(
+                    "CREATE SOURCE postgres-cdc uses native CDC encoding; omit FORMAT/ENCODE"
+                ));
+            }
+            if !columns.is_empty() {
+                return Err(anyhow!(
+                    "CREATE SOURCE postgres-cdc does not accept inline schema; use CREATE TABLE ... FROM for CDC tables"
+                ));
+            }
             SourceConnector::PostgresCdc(PostgresCdcSourceOptions::new_with_setup_policy(
                 postgres_connection_string_from_options(&options)?,
                 option_any(&options, &["slot.name", "slot"])
@@ -137,7 +244,63 @@ pub fn parse_create_source(sql: &str) -> Result<CreateSourceDefinition> {
         other => return Err(anyhow!("unsupported source connector type '{other}'")),
     };
 
-    CreateSourceDefinition::new(source_name, connector)
+    CreateSourceDefinition::new_with_columns_and_if_not_exists(
+        source_name,
+        connector,
+        columns,
+        if_not_exists,
+    )
+}
+
+fn reject_unsupported_source_clauses_before_with(rest: &str) -> Result<()> {
+    let trimmed = rest.trim_start();
+    if starts_with_keyword(trimmed, "INCLUDE") {
+        return Err(anyhow!(
+            "CREATE SOURCE INCLUDE clauses are not supported by Floe"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_risingwave_kafka_options(
+    options: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    if let Some(mode) = option_any(options, &["scan.startup.mode"]) {
+        let normalized = mode.to_ascii_lowercase().replace('-', "_");
+        if normalized != "earliest" {
+            return Err(anyhow!(
+                "CREATE SOURCE kafka supports only scan.startup.mode = 'earliest'"
+            ));
+        }
+    }
+    for (key, expected) in [
+        ("properties.fetch.wait.max.ms", "1"),
+        ("properties.fetch.queue.backoff.ms", "1"),
+        ("properties.fetch.min.bytes", "1"),
+    ] {
+        if let Some(value) = options.get(key)
+            && value != expected
+        {
+            return Err(anyhow!(
+                "CREATE SOURCE kafka option {key} is fixed to {expected} in Floe"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_source_format_is_plain_json(
+    format: Option<&SourceFormatClause>,
+    connector: &str,
+) -> Result<()> {
+    if let Some(format) = format
+        && !format.is_plain_json()
+    {
+        return Err(anyhow!(
+            "CREATE SOURCE {connector} currently supports only FORMAT PLAIN ENCODE JSON"
+        ));
+    }
+    Ok(())
 }
 
 pub fn parse_materialized_view(sql: &str) -> Result<MaterializedViewDefinition> {

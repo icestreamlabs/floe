@@ -1,5 +1,5 @@
 use super::*;
-use floe_sql_parser::{SinkConnector, SinkDefinition};
+use floe_sql_parser::{SinkConnector, SinkDefinition, SinkOptions, parse_floe_statement};
 use std::path::PathBuf;
 
 fn write_temp_config(extension: &str, contents: &str) -> PathBuf {
@@ -156,6 +156,112 @@ fn maps_sql_sink_definition_to_runtime_config() {
 }
 
 #[test]
+fn maps_sql_source_definition_to_runtime_connector_config() {
+    let statement = parse_floe_statement(
+        "CREATE SOURCE bids WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topics = 'nexmark_bid,nexmark_bid_retry',
+            group_id = 'floe_sql',
+            default_source = 'nexmark_bid',
+            poll_ms = 5,
+            max_messages_per_tick = 1024,
+            format = 'floe-json'
+        )",
+    )
+    .expect("parse source");
+    let floe_sql_parser::FloeStatement::CreateSource(definition) = statement else {
+        panic!("expected source statement");
+    };
+
+    let spec = connector_spec_from_sql(&definition)
+        .expect("map connector")
+        .expect("runtime connector");
+    assert_eq!(spec.name, "bids");
+    match spec.config {
+        ConnectorConfig::Kafka {
+            name,
+            brokers,
+            topics,
+            group_id,
+            default_source,
+            poll_ms,
+            max_messages_per_tick,
+            format,
+        } => {
+            assert_eq!(name.as_deref(), Some("bids"));
+            assert_eq!(brokers, "localhost:9092");
+            assert_eq!(
+                topics,
+                vec!["nexmark_bid".to_string(), "nexmark_bid_retry".to_string()]
+            );
+            assert_eq!(group_id.as_deref(), Some("floe_sql"));
+            assert_eq!(default_source.as_deref(), Some("nexmark_bid"));
+            assert_eq!(poll_ms, Some(5));
+            assert_eq!(max_messages_per_tick, Some(1024));
+            assert_eq!(format.as_deref(), Some("floe_json"));
+        }
+        other => panic!("expected Kafka connector config, got {other:?}"),
+    }
+}
+
+#[test]
+fn maps_sql_source_schema_name_to_default_source() {
+    let statement = parse_floe_statement(
+        "CREATE SOURCE orders (
+            id BIGINT PRIMARY KEY,
+            amount BIGINT
+        )
+        WITH (
+            connector = 'kafka',
+            brokers = 'localhost:9092',
+            topic = 'orders'
+        )
+        FORMAT PLAIN ENCODE JSON",
+    )
+    .expect("parse source");
+    let floe_sql_parser::FloeStatement::CreateSource(definition) = statement else {
+        panic!("expected source statement");
+    };
+
+    let spec = connector_spec_from_sql(&definition)
+        .expect("map connector")
+        .expect("runtime connector");
+    match spec.config {
+        ConnectorConfig::Kafka {
+            default_source,
+            format,
+            ..
+        } => {
+            assert_eq!(default_source.as_deref(), Some("orders"));
+            assert_eq!(format.as_deref(), Some("floe_json"));
+        }
+        other => panic!("expected Kafka connector config, got {other:?}"),
+    }
+}
+
+#[test]
+fn maps_sql_postgres_cdc_source_to_catalog_only() {
+    let statement = parse_floe_statement(
+        "CREATE SOURCE pg_main WITH (
+            connector = 'postgres-cdc',
+            connection = 'postgres://postgres:postgres@localhost/postgres',
+            slot = 'floe_slot'
+        )",
+    )
+    .expect("parse source");
+    let floe_sql_parser::FloeStatement::CreateSource(definition) = statement else {
+        panic!("expected source statement");
+    };
+
+    assert!(
+        connector_spec_from_sql(&definition)
+            .expect("map connector")
+            .is_none()
+    );
+}
+
+#[test]
 fn maps_sql_kafka_debezium_sink_options_to_runtime_config() {
     let definition = SinkDefinition::new(
         "out_orders",
@@ -189,6 +295,60 @@ fn maps_sql_kafka_debezium_sink_options_to_runtime_config() {
                 key_columns,
                 Some(vec!["tenant_id".to_string(), "id".to_string()])
             );
+        }
+        other => panic!("expected Kafka sink config, got {other:?}"),
+    }
+}
+
+#[test]
+fn maps_sql_sink_runtime_options_to_runtime_config() {
+    let definition = SinkDefinition::new_with_options(
+        "out_orders",
+        "mv_orders",
+        SinkConnector::Kafka {
+            brokers: "localhost:9092".to_string(),
+            topic: "orders".to_string(),
+            format: Some("json".to_string()),
+            key_columns: Vec::new(),
+        },
+        true,
+        Some(11),
+        SinkOptions::new(
+            Some(100),
+            Some(65_536),
+            Some(32),
+            Some(7),
+            Some(10),
+            Some(500),
+            Some("tx-out-orders".to_string()),
+            Some("floe-checkpoints".to_string()),
+            Some(2),
+        ),
+    );
+
+    let spec = sink_spec_from_sql(&definition).expect("map sink");
+    match spec.config {
+        SinkConfig::Kafka {
+            batch_rows,
+            batch_bytes,
+            queue_capacity,
+            retry_max_attempts,
+            retry_base_ms,
+            retry_max_backoff_ms,
+            transactional_id,
+            checkpoint_topic,
+            checkpoint_partition,
+            ..
+        } => {
+            assert_eq!(batch_rows, Some(100));
+            assert_eq!(batch_bytes, Some(65_536));
+            assert_eq!(queue_capacity, Some(32));
+            assert_eq!(retry_max_attempts, Some(7));
+            assert_eq!(retry_base_ms, Some(10));
+            assert_eq!(retry_max_backoff_ms, Some(500));
+            assert_eq!(transactional_id.as_deref(), Some("tx-out-orders"));
+            assert_eq!(checkpoint_topic.as_deref(), Some("floe-checkpoints"));
+            assert_eq!(checkpoint_partition, Some(2));
         }
         other => panic!("expected Kafka sink config, got {other:?}"),
     }
