@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -55,17 +55,6 @@ pub(super) struct ColumnarGroupedMaxPlan {
     group_schema: SchemaRef,
     output_mapping: Vec<usize>,
     max_idx: usize,
-}
-
-impl ColumnarGroupedMaxPlan {
-    pub(super) fn source_names(&self) -> BTreeSet<String> {
-        match &self.input {
-            ColumnarGroupedMaxInputPlan::Source { source_name } => {
-                [source_name.clone()].into_iter().collect()
-            }
-            ColumnarGroupedMaxInputPlan::Join { plan, .. } => plan.source_names(),
-        }
-    }
 }
 
 enum ColumnarGroupedMaxInputPlan {

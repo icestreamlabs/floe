@@ -39,18 +39,6 @@ pub(super) struct ColumnarUnionPlan {
     distinct: bool,
 }
 
-impl ColumnarUnionPlan {
-    pub(super) fn source_names(&self) -> BTreeSet<String> {
-        self.inputs
-            .iter()
-            .filter_map(|input| match &input.kind {
-                ColumnarUnionInputPlanKind::Source { source_name } => Some(source_name.clone()),
-                ColumnarUnionInputPlanKind::Constant { .. } => None,
-            })
-            .collect()
-    }
-}
-
 pub(super) struct ColumnarUnionMaterializedViewState {
     sources: Vec<ColumnarUnionSourceState>,
     output_zset: SlateBackedColumnarZSet,
@@ -83,7 +71,6 @@ struct ColumnarUnionConstantState {
 pub(super) struct ColumnarUnionTick {
     pub(super) delta: ColumnarZSet,
     pub(super) next_snapshot: Vec<RecordBatch>,
-    pub(super) input_changed: bool,
 }
 
 struct ColumnarUnionInputPlan {
@@ -408,7 +395,7 @@ pub(super) async fn run_columnar_union_state_tick(
     output_schema: &SchemaRef,
     previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarUnionTick> {
-    let (output_delta, input_changed) =
+    let (output_delta, _input_changed) =
         prepare_union_delta_tick(columnar, insert_batches, weighted_delta_batches).await?;
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
@@ -438,7 +425,6 @@ pub(super) async fn run_columnar_union_state_tick(
     Ok(ColumnarUnionTick {
         delta: persisted_output_delta,
         next_snapshot,
-        input_changed,
     })
 }
 

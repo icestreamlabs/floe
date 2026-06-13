@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -44,12 +44,6 @@ pub(super) struct ColumnarGroupedCountPlan {
     hop_group_projection_schema: Option<SchemaRef>,
     output_mapping: Vec<usize>,
     count_idx: usize,
-}
-
-impl ColumnarGroupedCountPlan {
-    pub(super) fn source_names(&self) -> BTreeSet<String> {
-        [self.source_name.clone()].into_iter().collect()
-    }
 }
 
 pub(super) struct ColumnarGroupedCountMaterializedViewState {
@@ -100,7 +94,6 @@ struct HopGroup {
 pub(super) struct ColumnarGroupedCountTick {
     pub(super) delta: ColumnarZSet,
     pub(super) next_snapshot: Vec<RecordBatch>,
-    pub(super) input_changed: bool,
 }
 
 pub(super) fn columnar_grouped_count_plan_for_plan(
@@ -355,7 +348,6 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
         .create_version(&input_delta, None)
         .await?;
     profile::record_since("grouped_count.input_create_version", phase_start);
-    let input_changed = !input_delta.batches().is_empty();
     let phase_start = profile::start();
     let pending = grouped_count_pending_delta(columnar, input_delta.batches()).await?;
     profile::record_since("grouped_count.pending_delta", phase_start);
@@ -392,7 +384,6 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
     Ok(ColumnarGroupedCountTick {
         delta: output_delta,
         next_snapshot,
-        input_changed,
     })
 }
 

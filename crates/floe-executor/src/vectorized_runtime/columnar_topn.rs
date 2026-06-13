@@ -28,7 +28,7 @@ use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
 
 use crate::delta_consolidation::{
-    diff_snapshot_batches, diff_snapshot_batches_by_row, weighted_snapshot_schema,
+    diff_bounded_output_batches, diff_bounded_output_batches_by_row, weighted_snapshot_schema,
 };
 use crate::mv::registry::MaterializedViewRegistry;
 use crate::namespaces;
@@ -36,11 +36,6 @@ use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
 
-use super::columnar_composed::{
-    ColumnarComposedMaterializedViewState, ColumnarComposedPlan,
-    build_columnar_aggregate_join_materialized_view_state_in_namespace,
-    columnar_aggregate_join_plan_for_plan, run_columnar_composed_state_tick,
-};
 use super::columnar_grouped_stats::{
     ColumnarGroupedStatsMaterializedViewState, ColumnarGroupedStatsPlan,
     build_columnar_grouped_stats_materialized_view_state_in_namespace,
@@ -55,7 +50,6 @@ pub(super) struct ColumnarTopNPlan {
     pub(super) logical_plan: LogicalPlan,
     input: ColumnarTopNInputPlan,
     partition_columns: Vec<String>,
-    full_snapshot_diff: bool,
     append_only_fast_path: bool,
     row_number_limit: Option<usize>,
     append_only_direct_plan: Option<AppendOnlyDirectTopNPlan>,
@@ -81,31 +75,6 @@ enum ColumnarTopNInputPlan {
         schema: SchemaRef,
         plan: Box<ColumnarGroupedStatsPlan>,
     },
-    AggregateJoin {
-        input_name: String,
-        schema: SchemaRef,
-        plan: Box<ColumnarComposedPlan>,
-    },
-}
-
-impl ColumnarTopNPlan {
-    pub(super) fn source_name(&self) -> Option<String> {
-        match &self.input {
-            ColumnarTopNInputPlan::Source { source_name } => Some(source_name.clone()),
-            ColumnarTopNInputPlan::GroupedStats { .. } => None,
-            ColumnarTopNInputPlan::AggregateJoin { .. } => None,
-        }
-    }
-
-    pub(super) fn source_names(&self) -> BTreeSet<String> {
-        match &self.input {
-            ColumnarTopNInputPlan::Source { source_name } => {
-                [source_name.clone()].into_iter().collect()
-            }
-            ColumnarTopNInputPlan::GroupedStats { plan, .. } => plan.source_names(),
-            ColumnarTopNInputPlan::AggregateJoin { plan, .. } => plan.source_names(),
-        }
-    }
 }
 
 pub(super) struct ColumnarTopNMaterializedViewState {
@@ -113,7 +82,6 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     source_schema: SchemaRef,
     input_zset: Option<SlateBackedColumnarZSet>,
     grouped_stats: Option<Box<ColumnarGroupedStatsMaterializedViewState>>,
-    aggregate_join: Option<Box<ColumnarComposedMaterializedViewState>>,
     output_zset: SlateBackedColumnarZSet,
     evaluator: TopNEvaluator,
     partition_indices: Vec<usize>,
@@ -121,7 +89,6 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     source_primary_key_columns: Vec<String>,
     source_snapshot: Vec<RecordBatch>,
     initial_snapshot: Vec<RecordBatch>,
-    full_snapshot_diff: bool,
     append_only_fast_path: bool,
     row_number_limit: Option<usize>,
     source_output_projection: Option<Vec<usize>>,
@@ -208,12 +175,7 @@ pub(super) fn columnar_topn_plan_for_plan(
     } else {
         return Ok(None);
     };
-    let input = if let Some(source_name) = single_source_for_plan(plan, sources) {
-        if contains_unsupported_topn_wrapper(plan) {
-            return Ok(None);
-        }
-        ColumnarTopNInputPlan::Source { source_name }
-    } else if let Some((input_name, schema, grouped_stats)) =
+    let input = if let Some((input_name, schema, grouped_stats)) =
         grouped_stats_topn_input_for_plan(plan, sources)?
     {
         ColumnarTopNInputPlan::GroupedStats {
@@ -221,26 +183,18 @@ pub(super) fn columnar_topn_plan_for_plan(
             schema,
             plan: Box::new(grouped_stats),
         }
-    } else if let Some((input_name, schema, aggregate_join)) =
-        aggregate_join_topn_input_for_plan(plan, sources)?
-    {
-        ColumnarTopNInputPlan::AggregateJoin {
-            input_name,
-            schema,
-            plan: Box::new(aggregate_join),
+    } else if contains_aggregate(plan) {
+        return Ok(None);
+    } else if let Some(source_name) = single_source_for_plan(plan, sources) {
+        if contains_unsupported_topn_wrapper(plan) {
+            return Ok(None);
         }
+        ColumnarTopNInputPlan::Source { source_name }
     } else {
         return Ok(None);
     };
-    let full_snapshot_diff = contains_aggregate(plan)
-        || matches!(
-            input,
-            ColumnarTopNInputPlan::GroupedStats { .. }
-                | ColumnarTopNInputPlan::AggregateJoin { .. }
-        );
 
     Ok(Some(ColumnarTopNPlan {
-        full_snapshot_diff,
         append_only_fast_path,
         row_number_limit,
         append_only_direct_plan,
@@ -337,7 +291,6 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_schema: Arc::clone(&source.schema),
                 input_zset: Some(input_zset),
                 grouped_stats: None,
-                aggregate_join: None,
                 output_zset,
                 evaluator,
                 partition_indices,
@@ -345,7 +298,6 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_primary_key_columns: source.primary_key_columns.clone(),
                 source_snapshot,
                 initial_snapshot,
-                full_snapshot_diff: plan.full_snapshot_diff,
                 append_only_fast_path: plan.append_only_fast_path,
                 row_number_limit: plan.row_number_limit,
                 source_output_projection,
@@ -395,7 +347,6 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_schema: schema,
                 input_zset: None,
                 grouped_stats: Some(grouped_stats),
-                aggregate_join: None,
                 output_zset,
                 evaluator,
                 partition_indices,
@@ -403,65 +354,6 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_primary_key_columns: Vec::new(),
                 source_snapshot,
                 initial_snapshot,
-                full_snapshot_diff: plan.full_snapshot_diff,
-                append_only_fast_path: plan.append_only_fast_path,
-                row_number_limit: plan.row_number_limit,
-                source_output_projection: None,
-                append_only_direct: None,
-            })
-        }
-        ColumnarTopNInputPlan::AggregateJoin {
-            input_name,
-            schema,
-            plan: aggregate_join_plan,
-        } => {
-            let partition_indices = plan
-                .partition_columns
-                .iter()
-                .map(|column| partition_column_index_for_schema(&schema, column))
-                .collect::<Result<Vec<_>>>()?;
-            let partition_converter = row_converter_for_indices(&schema, &partition_indices)?;
-            let aggregate_join_namespace = format!("{mv_namespace}/columnar/topn/aggregate_join");
-            let aggregate_join = Box::pin(build_boxed_aggregate_join_topn_input_state(
-                table,
-                aggregate_join_namespace,
-                &schema,
-                *aggregate_join_plan,
-                sources,
-                udfs,
-            ))
-            .await
-            .with_context(|| {
-                format!(
-                    "build SlateDB-backed topn aggregate-join input for '{}'",
-                    input_name
-                )
-            })?;
-            let source_snapshot = aggregate_join.initial_snapshot();
-            let evaluator = TopNEvaluator::build_derived_input(
-                plan.logical_plan,
-                &input_name,
-                &schema,
-                udfs,
-                output_schema,
-            )
-            .await
-            .context("build aggregate-join topn vectorized evaluator")?;
-
-            Ok(ColumnarTopNMaterializedViewState {
-                input_name,
-                source_schema: schema,
-                input_zset: None,
-                grouped_stats: None,
-                aggregate_join: Some(aggregate_join),
-                output_zset,
-                evaluator,
-                partition_indices,
-                partition_converter,
-                source_primary_key_columns: Vec::new(),
-                source_snapshot,
-                initial_snapshot,
-                full_snapshot_diff: plan.full_snapshot_diff,
                 append_only_fast_path: plan.append_only_fast_path,
                 row_number_limit: plan.row_number_limit,
                 source_output_projection: None,
@@ -493,27 +385,6 @@ async fn build_boxed_grouped_stats_topn_input_state(
     ))
 }
 
-async fn build_boxed_aggregate_join_topn_input_state(
-    table: Arc<dyn KeyValueTable>,
-    namespace: String,
-    output_schema: &SchemaRef,
-    plan: ColumnarComposedPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-    udfs: &[ScalarUDF],
-) -> Result<Box<ColumnarComposedMaterializedViewState>> {
-    Ok(Box::new(
-        build_columnar_aggregate_join_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
-        )
-        .await?,
-    ))
-}
-
 pub(super) async fn run_columnar_topn_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -526,7 +397,6 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     };
     let plan_start = Instant::now();
 
-    let full_snapshot_diff = columnar.full_snapshot_diff;
     let tick = run_columnar_topn_state_tick(
         columnar,
         insert_batches,
@@ -544,11 +414,7 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
         view = %mv.view_name,
         version,
         total_ms = plan_start.elapsed().as_millis() as u64,
-        mode = if full_snapshot_diff {
-            "columnar_aggregate_topn"
-        } else {
-            "columnar_topn"
-        },
+        mode = "columnar_topn",
         "SlateDB-backed topn columnar DBSP materialized view tick completed"
     );
     Ok(true)
@@ -569,17 +435,8 @@ pub(super) async fn run_columnar_topn_state_tick(
         .context("prepare SlateDB-backed topn input tick")?;
     let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("topn.prepare_input", phase_start);
-    if columnar.full_snapshot_diff {
-        return run_columnar_topn_full_snapshot_diff_state_tick(
-            columnar,
-            input_tick,
-            output_schema,
-            previous_snapshot,
-        )
-        .await;
-    }
-    if columnar.input_zset.is_none() {
-        bail!("non-snapshot-diff topn requires a source input zset");
+    if columnar.input_zset.is_none() && columnar.grouped_stats.is_none() {
+        bail!("topn requires a source zset or incremental derived input");
     }
     let input_changed = input_tick.input_changed;
     let persisted_input_delta = input_tick.delta;
@@ -609,13 +466,17 @@ pub(super) async fn run_columnar_topn_state_tick(
     }
     let phase_start = profile::start();
     let source_snapshot_start = Instant::now();
-    let next_source_snapshot = apply_source_snapshot_delta(
-        &columnar.source_schema,
-        &columnar.source_primary_key_columns,
-        &columnar.source_snapshot,
-        &persisted_input_delta,
-    )
-    .await?;
+    let next_source_snapshot = if let Some(snapshot) = input_tick.next_source_snapshot {
+        snapshot
+    } else {
+        apply_source_snapshot_delta(
+            &columnar.source_schema,
+            &columnar.source_primary_key_columns,
+            &columnar.source_snapshot,
+            &persisted_input_delta,
+        )
+        .await?
+    };
     let source_snapshot_ms = source_snapshot_start.elapsed().as_millis() as u64;
     profile::record_since("topn.source_snapshot_delta", phase_start);
 
@@ -738,9 +599,10 @@ pub(super) async fn run_columnar_topn_state_tick(
     profile::record_since("topn.evaluate_next", phase_start);
     let phase_start = profile::start();
     let diff_start = Instant::now();
-    let diff = diff_snapshot_batches(Arc::clone(output_schema), &previous_output, &next_output)
-        .await
-        .context("diff topn partition outputs")?;
+    let diff =
+        diff_bounded_output_batches(Arc::clone(output_schema), &previous_output, &next_output)
+            .await
+            .context("diff topn partition outputs")?;
     let diff_ms = diff_start.elapsed().as_millis() as u64;
     profile::record_since("topn.diff_output", phase_start);
 
@@ -927,7 +789,7 @@ async fn run_columnar_topn_append_only_source_state_tick(
     profile::record_since("topn.append_only_evaluate_next", phase_start);
 
     let phase_start = profile::start();
-    let diff = diff_snapshot_batches_by_row(
+    let diff = diff_bounded_output_batches_by_row(
         Arc::clone(output_schema),
         &previous_output_for_keys,
         &next_output,
@@ -1525,74 +1387,6 @@ fn finish_direct_topn_batch(
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
-async fn run_columnar_topn_full_snapshot_diff_state_tick(
-    columnar: &mut ColumnarTopNMaterializedViewState,
-    input_tick: TopNInputTick,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
-) -> Result<ColumnarTopNTick> {
-    let has_input_change = input_tick.input_changed;
-    let next_source_snapshot = if let Some(snapshot) = input_tick.next_source_snapshot {
-        snapshot
-    } else if has_input_change {
-        apply_source_snapshot_delta(
-            &columnar.source_schema,
-            &columnar.source_primary_key_columns,
-            &columnar.source_snapshot,
-            &input_tick.delta,
-        )
-        .await?
-    } else {
-        columnar.source_snapshot.clone()
-    };
-
-    let output_delta_batches = if has_input_change {
-        let next_output = columnar
-            .evaluator
-            .evaluate(&next_source_snapshot)
-            .await
-            .context("evaluate next aggregate-topn output")?;
-        diff_snapshot_batches(Arc::clone(output_schema), previous_snapshot, &next_output)
-            .await
-            .context("diff aggregate-topn output")?
-            .batches
-    } else {
-        Vec::new()
-    };
-
-    let output_delta =
-        ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), output_delta_batches)
-            .context("build aggregate-topn output zset delta")?;
-    let persisted_output_delta = if let Some(handle) = columnar
-        .output_zset
-        .create_version(
-            &output_delta,
-            columnar
-                .output_zset
-                .current_handle()
-                .map(|handle| handle.version),
-        )
-        .await?
-    {
-        columnar.output_zset.read_delta(&handle).await?
-    } else {
-        output_delta
-    };
-
-    let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot =
-        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
-            .await
-            .context("apply Slate-backed aggregate-topn columnar snapshot delta")?;
-
-    columnar.source_snapshot = next_source_snapshot;
-    Ok(ColumnarTopNTick {
-        delta: persisted_output_delta,
-        next_snapshot,
-        input_changed: has_input_change,
-    })
-}
-
 async fn prepare_topn_input_tick(
     columnar: &mut ColumnarTopNMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -1601,14 +1395,6 @@ async fn prepare_topn_input_tick(
     let total_start = profile::start();
     if columnar.grouped_stats.is_some() {
         return prepare_grouped_stats_topn_input_tick(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-    if columnar.aggregate_join.is_some() {
-        return prepare_aggregate_join_topn_input_tick(
             columnar,
             insert_batches,
             weighted_delta_batches,
@@ -1665,51 +1451,6 @@ async fn prepare_grouped_stats_topn_input_tick(
     .with_context(|| {
         format!(
             "evaluate topn grouped-stats input '{}'",
-            columnar.input_name
-        )
-    })?;
-    let input_changed = !tick.delta.batches().is_empty();
-    if tick.input_changed && !input_changed {
-        columnar.source_snapshot = tick.next_snapshot;
-        return Ok(TopNInputTick {
-            delta: tick.delta,
-            input_changed: false,
-            next_source_snapshot: None,
-            append_only_source_delta: false,
-        });
-    }
-    Ok(TopNInputTick {
-        delta: tick.delta,
-        input_changed,
-        next_source_snapshot: input_changed.then_some(tick.next_snapshot),
-        append_only_source_delta: false,
-    })
-}
-
-async fn prepare_aggregate_join_topn_input_tick(
-    columnar: &mut ColumnarTopNMaterializedViewState,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-) -> Result<TopNInputTick> {
-    let Some(aggregate_join) = columnar.aggregate_join.as_mut() else {
-        return Ok(TopNInputTick {
-            delta: ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?,
-            input_changed: false,
-            next_source_snapshot: None,
-            append_only_source_delta: false,
-        });
-    };
-    let tick = run_columnar_composed_state_tick(
-        aggregate_join.as_mut(),
-        insert_batches,
-        weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.source_snapshot,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "evaluate topn aggregate-join input '{}'",
             columnar.input_name
         )
     })?;
@@ -2497,29 +2238,6 @@ fn grouped_stats_topn_input_for_plan(
         return Ok(None);
     };
     Ok(Some((input_name, schema, grouped_stats)))
-}
-
-fn aggregate_join_topn_input_for_plan(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> Result<Option<(String, SchemaRef, ColumnarComposedPlan)>> {
-    if !global_sort_limit_for_plan(plan) {
-        return Ok(None);
-    }
-    let Some(input) = global_topn_input_plan(plan) else {
-        return Ok(None);
-    };
-    let Some(input_name) = derived_relation_name(input) else {
-        return Ok(None);
-    };
-    let Some(aggregate_join) = columnar_aggregate_join_plan_for_plan(input, sources)? else {
-        return Ok(None);
-    };
-    Ok(Some((
-        input_name,
-        df_schema_to_arrow(input.schema()),
-        aggregate_join,
-    )))
 }
 
 fn global_topn_input_plan(plan: &LogicalPlan) -> Option<&LogicalPlan> {

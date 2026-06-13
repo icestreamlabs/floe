@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -54,11 +54,6 @@ use super::columnar_join_topn::{
     columnar_join_topn_plan_for_plan, partitioned_join_top1_value_input_for_plan,
     run_columnar_join_topn_state_tick,
 };
-use super::columnar_multijoin::{
-    ColumnarMultiJoinMaterializedViewState, ColumnarMultiJoinPlan,
-    build_columnar_multijoin_materialized_view_state_in_namespace,
-    columnar_multijoin_plan_for_plan, run_columnar_multijoin_state_tick,
-};
 use super::columnar_topn::{
     ColumnarTopNMaterializedViewState, ColumnarTopNPlan,
     build_columnar_topn_materialized_view_state_in_namespace, columnar_topn_plan_for_plan,
@@ -105,24 +100,6 @@ pub(super) struct ColumnarGroupedStatsPlan {
     post_aggregate_plan: Option<LogicalPlan>,
 }
 
-impl ColumnarGroupedStatsPlan {
-    pub(super) fn source_names(&self) -> BTreeSet<String> {
-        match &self.input {
-            ColumnarGroupedStatsInputPlan::Source { source_name } => {
-                [source_name.clone()].into_iter().collect()
-            }
-            ColumnarGroupedStatsInputPlan::Join { plan, .. } => plan.source_names(),
-            ColumnarGroupedStatsInputPlan::MultiJoin { plan, .. } => plan.source_names(),
-            ColumnarGroupedStatsInputPlan::JoinTopN { plan, .. } => {
-                plan.source_names().into_iter().collect()
-            }
-            ColumnarGroupedStatsInputPlan::GroupedMax { plan, .. } => plan.source_names(),
-            ColumnarGroupedStatsInputPlan::GroupedStats { plan, .. } => plan.source_names(),
-            ColumnarGroupedStatsInputPlan::TopN { plan, .. } => plan.source_names(),
-        }
-    }
-}
-
 enum ColumnarGroupedStatsInputPlan {
     Source {
         source_name: String,
@@ -132,12 +109,6 @@ enum ColumnarGroupedStatsInputPlan {
         source_schema: SchemaRef,
         projection_input_schema: SchemaRef,
         plan: Box<ColumnarJoinPlan>,
-    },
-    MultiJoin {
-        input_name: String,
-        source_schema: SchemaRef,
-        projection_input_schema: SchemaRef,
-        plan: Box<ColumnarMultiJoinPlan>,
     },
     JoinTopN {
         input_name: String,
@@ -171,7 +142,6 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     source_schema: SchemaRef,
     input_zset: Option<SlateBackedColumnarZSet>,
     join: Option<Box<ColumnarJoinMaterializedViewState>>,
-    multijoin: Option<Box<ColumnarMultiJoinMaterializedViewState>>,
     join_topn: Option<Box<ColumnarJoinTopNMaterializedViewState>>,
     grouped_max: Option<Box<ColumnarGroupedMaxMaterializedViewState>>,
     grouped_stats: Option<Box<ColumnarGroupedStatsMaterializedViewState>>,
@@ -460,19 +430,6 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
                 projection_input_schema,
                 plan: Box::new(join),
             }
-        } else if let Some(multijoin) =
-            columnar_multijoin_plan_for_plan(aggregate.input.as_ref(), sources)?
-        {
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_multijoin_input".to_string());
-            ColumnarGroupedStatsInputPlan::MultiJoin {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(multijoin),
-            }
         } else if let Some(join_topn) =
             columnar_join_topn_plan_for_plan(aggregate.input.as_ref(), sources)?
         {
@@ -565,11 +522,6 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     let projection_input = match &input {
         ColumnarGroupedStatsInputPlan::Source { .. } => aggregate.input.as_ref().clone(),
         ColumnarGroupedStatsInputPlan::Join {
-            input_name,
-            projection_input_schema,
-            ..
-        }
-        | ColumnarGroupedStatsInputPlan::MultiJoin {
             input_name,
             projection_input_schema,
             ..
@@ -691,7 +643,6 @@ fn grouped_stats_input_is_append_only(
             .get(source_name)
             .is_some_and(|source| source.append_only),
         ColumnarGroupedStatsInputPlan::Join { .. }
-        | ColumnarGroupedStatsInputPlan::MultiJoin { .. }
         | ColumnarGroupedStatsInputPlan::JoinTopN { .. }
         | ColumnarGroupedStatsInputPlan::GroupedMax { .. }
         | ColumnarGroupedStatsInputPlan::GroupedStats { .. }
@@ -751,7 +702,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         source_schema,
         input_zset,
         join,
-        multijoin,
         join_topn,
         grouped_max,
         grouped_stats,
@@ -783,7 +733,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 source_name,
                 Arc::clone(&source.schema),
                 Some(input_zset),
-                None,
                 None,
                 None,
                 None,
@@ -838,58 +787,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 None,
                 None,
                 None,
-                None,
-                input_snapshot,
-                GroupedStatsProjectionState::Derived(projection_delta),
-            )
-        }
-        ColumnarGroupedStatsInputPlan::MultiJoin {
-            input_name,
-            source_schema,
-            projection_input_schema,
-            plan: multijoin_plan,
-        } => {
-            let multijoin_namespace =
-                format!("{mv_namespace}/columnar/grouped_stats/multijoin_input");
-            let multijoin = Box::pin(build_boxed_multijoin_grouped_stats_input_state(
-                Arc::clone(&table),
-                multijoin_namespace,
-                &source_schema,
-                *multijoin_plan,
-                sources,
-                udfs,
-            ))
-            .await
-            .with_context(|| {
-                format!(
-                    "build SlateDB-backed grouped-stats multijoin input for '{}'",
-                    input_name
-                )
-            })?;
-            let input_snapshot = multijoin.initial_snapshot();
-            let projection_delta = build_derived_projection_state(
-                LogicalPlan::Projection(plan.projection.clone()),
-                &input_name,
-                &projection_input_schema,
-                udfs,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "build grouped-stats multijoin projection delta plan for '{}'",
-                    input_name
-                )
-            })?;
-            (
-                input_name,
-                source_schema,
-                None,
-                None,
-                Some(multijoin),
-                None,
-                None,
-                None,
-                None,
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -934,7 +831,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
                 None,
                 None,
                 Some(join_topn),
@@ -985,7 +881,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
                 None,
                 None,
                 None,
@@ -1040,7 +935,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 None,
                 None,
                 None,
-                None,
                 Some(grouped_stats),
                 None,
                 input_snapshot,
@@ -1091,7 +985,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 None,
                 None,
                 None,
-                None,
                 Some(topn),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
@@ -1118,7 +1011,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         source_schema,
         input_zset,
         join,
-        multijoin,
         join_topn,
         grouped_max,
         grouped_stats,
@@ -1184,27 +1076,6 @@ async fn build_boxed_grouped_max_grouped_stats_input_state(
                 sources,
                 udfs,
             ),
-        )
-        .await?,
-    ))
-}
-
-async fn build_boxed_multijoin_grouped_stats_input_state(
-    table: Arc<dyn KeyValueTable>,
-    namespace: String,
-    output_schema: &SchemaRef,
-    plan: ColumnarMultiJoinPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-    udfs: &[ScalarUDF],
-) -> Result<Box<ColumnarMultiJoinMaterializedViewState>> {
-    Ok(Box::new(
-        build_columnar_multijoin_materialized_view_state_in_namespace(
-            table,
-            namespace,
-            output_schema,
-            plan,
-            sources,
-            udfs,
         )
         .await?,
     ))
@@ -1540,14 +1411,6 @@ async fn prepare_grouped_stats_input_delta(
         )
         .await;
     }
-    if columnar.multijoin.is_some() {
-        return prepare_multijoin_grouped_stats_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
     if columnar.join_topn.is_some() {
         return prepare_join_topn_grouped_stats_input_delta(
             columnar,
@@ -1654,34 +1517,6 @@ async fn prepare_join_grouped_stats_input_delta(
         "grouped-stats nested join input prepared"
     );
     if tick.input_changed && !tick.next_snapshot.is_empty() {
-        columnar.input_snapshot = tick.next_snapshot;
-    }
-    Ok(tick.delta)
-}
-
-async fn prepare_multijoin_grouped_stats_input_delta(
-    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-) -> Result<ColumnarZSet> {
-    let Some(multijoin) = columnar.multijoin.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
-    let tick = Box::pin(run_columnar_multijoin_state_tick(
-        multijoin.as_mut(),
-        insert_batches,
-        weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.input_snapshot,
-    ))
-    .await
-    .with_context(|| {
-        format!(
-            "evaluate grouped-stats nested multijoin input '{}'",
-            columnar.input_name
-        )
-    })?;
-    if tick.input_changed {
         columnar.input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)

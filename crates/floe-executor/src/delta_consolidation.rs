@@ -165,14 +165,14 @@ pub fn add_weight_column_to_batches(
         .collect()
 }
 
-pub async fn diff_snapshot_batches(
+pub async fn diff_bounded_output_batches(
     base_schema: SchemaRef,
     previous: &[RecordBatch],
     next: &[RecordBatch],
 ) -> DFResult<ConsolidationOutput> {
     for batch in previous.iter().chain(next.iter()) {
         if batch.schema().as_ref() != base_schema.as_ref() {
-            return internal_err!("snapshot batch schema does not match diff schema");
+            return internal_err!("bounded output batch schema does not match delta schema");
         }
     }
 
@@ -184,14 +184,14 @@ pub async fn diff_snapshot_batches(
         .await
 }
 
-pub fn diff_snapshot_batches_by_row(
+pub fn diff_bounded_output_batches_by_row(
     base_schema: SchemaRef,
     previous: &[RecordBatch],
     next: &[RecordBatch],
 ) -> DFResult<ConsolidationOutput> {
     for batch in previous.iter().chain(next.iter()) {
         if batch.schema().as_ref() != base_schema.as_ref() {
-            return internal_err!("snapshot batch schema does not match diff schema");
+            return internal_err!("bounded output batch schema does not match delta schema");
         }
     }
 
