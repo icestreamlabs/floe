@@ -12,10 +12,13 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn getpgid(pid: i32) -> i32;
-}
+#[path = "harness_common/mod.rs"]
+mod harness_common;
+
+use self::harness_common::{
+    configure_process_group, terminate_child_process_group,
+    terminate_stale_floe_nodes_on_pgwire_port,
+};
 
 const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
     "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q12", "q13", "q14", "q15", "q16",
@@ -753,7 +756,7 @@ impl Harness {
     }
 
     fn kill_stale_floe_nodes(&self) {
-        let _ = run_status("pkill", ["-f", "floe-node run"], None);
+        terminate_stale_floe_nodes_on_pgwire_port(self.config.floe_pg_port, Duration::from_secs(5));
     }
 
     fn wait_for_postgres_slot_active(
@@ -2469,75 +2472,6 @@ where
 fn ensure_status(status: ExitStatus) -> Result<()> {
     ensure!(status.success(), "command failed with {status}");
     Ok(())
-}
-
-fn configure_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-}
-
-fn terminate_child_process_group(child: &mut Child, graceful_timeout: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    signal_child_process_group(child, "INT");
-    if wait_for_child_exit(child, graceful_timeout) {
-        return;
-    }
-    signal_child_process_group(child, "TERM");
-    if wait_for_child_exit(child, Duration::from_secs(2)) {
-        return;
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
-        }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return false;
-        };
-        if remaining.is_zero() {
-            return false;
-        }
-        thread::park_timeout(Duration::from_millis(100).min(remaining));
-    }
-}
-
-fn signal_child_process_group(child: &Child, signal: &str) {
-    #[cfg(unix)]
-    {
-        let pid = child.id();
-        let target = if child_owns_process_group(pid) {
-            format!("-{pid}")
-        } else {
-            pid.to_string()
-        };
-        let _ = Command::new("kill")
-            .args([format!("-{signal}"), target])
-            .status();
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (child, signal);
-    }
-}
-
-#[cfg(unix)]
-fn child_owns_process_group(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    let pgid = unsafe { getpgid(pid) };
-    pgid == pid
 }
 
 fn wait_before_retry(deadline: Instant, interval: Duration) -> bool {

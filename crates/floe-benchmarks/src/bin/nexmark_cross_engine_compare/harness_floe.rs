@@ -43,7 +43,7 @@ impl Harness {
         }
 
         self.stop_floe_process();
-        let _ = run_status("pkill", ["-f", "/target/release/floe-node run"], None);
+        terminate_stale_floe_nodes_on_pgwire_port(self.config.floe_pg_port, Duration::from_secs(5));
         self.start_floe_node(
             artifact_dir,
             &config_path,
@@ -155,6 +155,7 @@ impl Harness {
         let stdout = File::create(artifact_dir.join("floe-node.stdout.log"))?;
         let stderr = File::create(artifact_dir.join("floe-node.stderr.log"))?;
         let mut command = Command::new(self.config.target_release_binary("floe-node"));
+        configure_process_group(&mut command);
         command
             .arg("run")
             .arg("--pgwire-addr")

@@ -244,6 +244,20 @@ pub fn terminate_child_process_group(child: &mut Child, graceful_timeout: Durati
     let _ = child.wait();
 }
 
+pub fn terminate_stale_floe_nodes_on_pgwire_port(port: u16, graceful_timeout: Duration) {
+    #[cfg(target_os = "linux")]
+    {
+        for pid in floe_node_pids_on_pgwire_port(port) {
+            terminate_process_pid(pid, graceful_timeout);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (port, graceful_timeout);
+    }
+}
+
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -260,17 +274,96 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn floe_node_pids_on_pgwire_port(port: u16) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let cmdline = fs::read(entry.path().join("cmdline")).ok()?;
+            let args = cmdline
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).to_string())
+                .collect::<Vec<_>>();
+            floe_node_cmdline_matches_pgwire_port(&args, port).then_some(pid)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn floe_node_cmdline_matches_pgwire_port(args: &[String], port: u16) -> bool {
+    let Some(program) = args.first() else {
+        return false;
+    };
+    if Path::new(program).file_name().and_then(OsStr::to_str) != Some("floe-node") {
+        return false;
+    }
+    if args.get(1).map(String::as_str) != Some("run") {
+        return false;
+    }
+
+    let pgwire_addr = format!("127.0.0.1:{port}");
+    args.windows(2)
+        .any(|pair| pair[0] == "--pgwire-addr" && pair[1] == pgwire_addr)
+        || args
+            .iter()
+            .any(|arg| arg == &format!("--pgwire-addr={pgwire_addr}"))
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_process_pid(pid: u32, graceful_timeout: Duration) {
+    signal_pid(pid, "INT");
+    if wait_for_pid_exit(pid, graceful_timeout) {
+        return;
+    }
+    signal_pid(pid, "TERM");
+    if wait_for_pid_exit(pid, Duration::from_secs(2)) {
+        return;
+    }
+    signal_pid(pid, "KILL");
+    let _ = wait_for_pid_exit(pid, Duration::from_secs(2));
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pid(pid: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .status();
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let proc_path = PathBuf::from("/proc").join(pid.to_string());
+    loop {
+        if !proc_path.exists() {
+            return true;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::park_timeout(Duration::from_millis(100).min(remaining));
+    }
+}
+
 fn signal_child_process_group(child: &Child, signal: &str) {
     #[cfg(unix)]
     {
         let pid = child.id();
-        let target = if child_owns_process_group(pid) {
-            format!("-{pid}")
-        } else {
-            pid.to_string()
+        let Some(target) = signal_target_for_child(pid, child_owns_process_group(pid)) else {
+            return;
         };
         let _ = Command::new("kill")
-            .args([format!("-{signal}"), target])
+            .arg(format!("-{signal}"))
+            .arg("--")
+            .arg(target)
             .status();
     }
 
@@ -281,12 +374,27 @@ fn signal_child_process_group(child: &Child, signal: &str) {
 }
 
 #[cfg(unix)]
+fn signal_target_for_child(pid: u32, owns_process_group: bool) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    if owns_process_group {
+        Some(format!("-{pid}"))
+    } else {
+        Some(pid.to_string())
+    }
+}
+
+#[cfg(unix)]
 fn child_owns_process_group(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
     let pgid = unsafe { getpgid(pid) };
-    pgid == pid
+    pgid > 0 && pgid == pid
 }
 
 pub fn seconds(ms: u128) -> String {
@@ -307,3 +415,83 @@ pub fn print_tail(path: impl AsRef<Path>, lines: usize) {
 }
 
 use std::io::Write as _;
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use super::floe_node_cmdline_matches_pgwire_port;
+    #[cfg(unix)]
+    use super::{
+        child_owns_process_group, configure_process_group, signal_target_for_child,
+        terminate_child_process_group,
+    };
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_target_uses_process_group_only_for_group_leader() {
+        assert_eq!(
+            signal_target_for_child(12_345, true).as_deref(),
+            Some("-12345")
+        );
+        assert_eq!(
+            signal_target_for_child(12_345, false).as_deref(),
+            Some("12345")
+        );
+        assert_eq!(signal_target_for_child(0, true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_process_group_uses_child_pid_target() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let owns_process_group = child_owns_process_group(pid);
+        let signal_target = signal_target_for_child(pid, owns_process_group);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(!owns_process_group);
+        assert_eq!(signal_target, Some(pid.to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_process_group_uses_group_target() {
+        let mut command = Command::new("sleep");
+        configure_process_group(&mut command);
+        let mut child = command.arg("60").spawn().expect("spawn sleep");
+        let pid = child.id();
+        let owns_process_group = child_owns_process_group(pid);
+        let signal_target = signal_target_for_child(pid, owns_process_group);
+        terminate_child_process_group(&mut child, Duration::from_millis(100));
+
+        assert!(owns_process_group);
+        assert_eq!(signal_target, Some(format!("-{pid}")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_floe_matcher_requires_floe_run_on_exact_pgwire_port() {
+        let args = vec![
+            "/repo/target/release/floe-node".to_string(),
+            "run".to_string(),
+            "--pgwire-addr".to_string(),
+            "127.0.0.1:15432".to_string(),
+            "--admin-port".to_string(),
+            "0".to_string(),
+        ];
+        assert!(floe_node_cmdline_matches_pgwire_port(&args, 15432));
+        assert!(!floe_node_cmdline_matches_pgwire_port(&args, 15433));
+
+        let mut non_floe = args.clone();
+        non_floe[0] = "/usr/bin/gnome-shell".to_string();
+        assert!(!floe_node_cmdline_matches_pgwire_port(&non_floe, 15432));
+    }
+}

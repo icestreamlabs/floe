@@ -338,19 +338,9 @@ impl Harness {
 
     pub(super) fn stop_floe_process(&mut self) {
         if let Some(mut child) = self.floe_child.take() {
-            let pid = child.id().to_string();
-            let _ = run_status("kill", ["-INT", &pid], None);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if child.try_wait().ok().flatten().is_some() {
-                    return;
-                }
-                wait_before_retry(deadline, Duration::from_millis(100));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_process_group(&mut child, Duration::from_secs(5));
         }
-        let _ = run_status("pkill", ["-f", "/target/release/floe-node run"], None);
+        terminate_stale_floe_nodes_on_pgwire_port(self.config.floe_pg_port, Duration::from_secs(5));
     }
 }
 

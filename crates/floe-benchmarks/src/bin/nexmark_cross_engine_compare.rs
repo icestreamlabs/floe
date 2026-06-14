@@ -27,6 +27,8 @@ const NEXMARK_BID_AUCTION_CARDINALITY: u64 = 10_000;
 mod commands;
 #[path = "nexmark_cross_engine_compare/fingerprints.rs"]
 mod fingerprints;
+#[path = "harness_common/mod.rs"]
+mod harness_common;
 #[path = "nexmark_cross_engine_compare/harness_engines.rs"]
 mod harness_engines;
 #[path = "nexmark_cross_engine_compare/harness_feldera_summary.rs"]
@@ -45,6 +47,10 @@ mod tests;
 
 use self::commands::*;
 use self::fingerprints::*;
+use self::harness_common::{
+    configure_process_group, terminate_child_process_group,
+    terminate_stale_floe_nodes_on_pgwire_port,
+};
 use self::queries::*;
 
 fn wait_before_retry(deadline: Instant, interval: Duration) -> bool {
