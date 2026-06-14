@@ -13,11 +13,13 @@ use slatedb::config::ScanOptions;
 use crate::profile;
 use crate::storage::KeyValueTable;
 use crate::storage::keyspace;
-use crate::storage::segment::{ArrowSegmentStore, decode_record_batches, encode_record_batches};
+use crate::storage::segment::{
+    ArrowSegmentStore, decode_record_batches, encode_record_batches, encode_segment_envelope,
+};
 
 use super::columnar_zset::{
-    ColumnarZSet, consolidate_columnar_zset, row_converter_for_schema, validate_weighted_batch,
-    value_array_refs,
+    ColumnarZSet, consolidate_columnar_zset, row_converter_for_schema, segment_stats_arrow,
+    validate_weighted_batch, value_array_refs,
 };
 
 const INDEX_BUCKET_COUNT: u16 = 16;
@@ -27,7 +29,10 @@ const INDEX_BUCKET_INLINE_MAGIC: &[u8; 4] = b"cib2";
 const INDEX_BUCKET_INLINE_VERSION: u8 = 1;
 const INDEX_RANGE_INLINE_MAGIC: &[u8; 4] = b"cir1";
 const INDEX_RANGE_INLINE_VERSION: u8 = 1;
+const INDEX_RANGE_SEGMENT_MAGIC: &[u8; 4] = b"crs1";
+const INDEX_RANGE_SEGMENT_VERSION: u8 = 1;
 const INDEX_RANGE_TARGET_ROWS: usize = 1024;
+const INDEX_INLINE_ROW_MAX_ROWS: usize = 2048;
 
 pub struct SlateBackedColumnarIndexedZSet {
     table: Arc<dyn KeyValueTable>,
@@ -250,15 +255,38 @@ impl SlateBackedColumnarIndexedZSet {
         let phase_start = profile::start();
         let mut write_batch = WriteBatch::new();
         let range_chunks = range_posting_chunks(postings);
-        for (chunk_id, entries) in range_chunks.into_iter().enumerate() {
+        if batch.num_rows() <= INDEX_INLINE_ROW_MAX_ROWS {
+            for (chunk_id, entries) in range_chunks.into_iter().enumerate() {
+                write_batch.put_bytes(
+                    Bytes::from(self.range_index_key(segment_id, chunk_id)?),
+                    Bytes::from(encode_range_postings_with_inline_rows(
+                        &self.weighted_schema,
+                        &batch,
+                        &entries,
+                    )?),
+                );
+            }
+        } else {
+            let segment_delta =
+                ColumnarZSet::try_new_weighted(Arc::clone(&self.value_schema), vec![batch.clone()])
+                    .context("build columnar indexed zset segment delta")?;
+            let stats = segment_stats_arrow(&segment_delta)?;
+            let (segment_bytes, _) = encode_segment_envelope(
+                Arc::clone(&self.weighted_schema),
+                segment_delta.batches(),
+                stats,
+            )
+            .context("encode columnar indexed zset segment")?;
             write_batch.put_bytes(
-                Bytes::from(self.range_index_key(segment_id, chunk_id)?),
-                Bytes::from(encode_range_postings_with_inline_rows(
-                    &self.weighted_schema,
-                    &batch,
-                    &entries,
-                )?),
+                Bytes::from(self.segment_store.key_for_segment(segment_id)),
+                Bytes::from(segment_bytes),
             );
+            for (chunk_id, entries) in range_chunks.into_iter().enumerate() {
+                write_batch.put_bytes(
+                    Bytes::from(self.range_index_key(segment_id, chunk_id)?),
+                    Bytes::from(encode_range_postings_with_segment_rows(&entries)?),
+                );
+            }
         }
         write_batch.put_bytes(
             Bytes::from(self.state_key.clone()),
@@ -342,7 +370,7 @@ impl SlateBackedColumnarIndexedZSet {
         let phase_start = profile::start();
         let mut inline_batches = Vec::new();
         let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
-        self.lookup_key_ranges(lookup_keys, &mut inline_batches)
+        self.lookup_key_ranges(lookup_keys, &mut inline_batches, &mut refs_by_segment)
             .await?;
         if !self.range_lookup_only {
             self.lookup_key_buckets(
@@ -414,6 +442,7 @@ impl SlateBackedColumnarIndexedZSet {
         &self,
         lookup_keys: &LookupKeySet,
         inline_batches: &mut Vec<RecordBatch>,
+        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
     ) -> Result<()> {
         let Some(bounds) = lookup_keys.bounds.as_ref() else {
             return Ok(());
@@ -425,13 +454,24 @@ impl SlateBackedColumnarIndexedZSet {
         if wanted_keys.is_empty() {
             return Ok(());
         }
-        let mut visit_entry = |_entry_key: &[u8], entry_value: &[u8]| -> Result<()> {
-            inline_batches.extend(decode_range_lookup_rows(
+        let mut visit_entry = |entry_key: &[u8], entry_value: &[u8]| -> Result<()> {
+            match decode_range_lookup_rows(
                 entry_value,
                 &wanted_keys,
                 bounds,
                 &self.weighted_schema,
-            )?);
+            )? {
+                RangeLookupRows::Inline(batches) => inline_batches.extend(batches),
+                RangeLookupRows::SegmentRefs(row_indices) => {
+                    if !row_indices.is_empty() {
+                        let segment_id = self.segment_id_from_range_key(entry_key)?;
+                        refs_by_segment
+                            .entry(segment_id)
+                            .or_default()
+                            .extend(row_indices);
+                    }
+                }
+            }
             Ok(())
         };
         self.table
@@ -767,6 +807,17 @@ impl SlateBackedColumnarIndexedZSet {
         Ok(key)
     }
 
+    fn segment_id_from_range_key(&self, key: &[u8]) -> Result<u64> {
+        let prefix_len = self.range_prefix.len();
+        if key.len() != prefix_len + 12 || !key.starts_with(&self.range_prefix) {
+            bail!("columnar index range key prefix mismatch");
+        }
+        let suffix = key
+            .get(prefix_len..prefix_len + 8)
+            .ok_or_else(|| anyhow!("columnar index range segment id truncated"))?;
+        Ok(u64::from_be_bytes(suffix.try_into()?))
+    }
+
     fn segment_id_from_bucket_key(&self, key: &[u8]) -> Result<u64> {
         let prefix_len = self.index_prefix.len() + 1 + 2;
         if key.len() != prefix_len + 8 {
@@ -797,6 +848,11 @@ enum CurrentIndexMutation {
 enum BucketLookupRows {
     Inline(Vec<RecordBatch>),
     Legacy(Vec<u32>),
+}
+
+enum RangeLookupRows {
+    Inline(Vec<RecordBatch>),
+    SegmentRefs(Vec<u32>),
 }
 
 fn indexed_lookup_scan_options() -> ScanOptions {
@@ -1097,6 +1153,36 @@ fn encode_range_postings_with_inline_rows(
     Ok(out)
 }
 
+fn encode_range_postings_with_segment_rows(
+    entries: &[(Vec<u8>, Vec<(u32, i64)>)],
+) -> Result<Vec<u8>> {
+    let min_key = entries
+        .first()
+        .map(|(key, _)| key.as_slice())
+        .context("columnar range index entry missing min key")?;
+    let max_key = entries
+        .last()
+        .map(|(key, _)| key.as_slice())
+        .context("columnar range index entry missing max key")?;
+    let postings = encode_bucket_postings(entries)?;
+    let min_len = u32::try_from(min_key.len()).context("columnar range min key too large")?;
+    let max_len = u32::try_from(max_key.len()).context("columnar range max key too large")?;
+    let payload_len =
+        u32::try_from(postings.len()).context("columnar range postings payload too large")?;
+    let mut out = Vec::with_capacity(
+        INDEX_RANGE_SEGMENT_MAGIC.len() + 1 + 12 + min_key.len() + max_key.len() + postings.len(),
+    );
+    out.extend_from_slice(INDEX_RANGE_SEGMENT_MAGIC);
+    out.push(INDEX_RANGE_SEGMENT_VERSION);
+    out.extend_from_slice(&min_len.to_be_bytes());
+    out.extend_from_slice(min_key);
+    out.extend_from_slice(&max_len.to_be_bytes());
+    out.extend_from_slice(max_key);
+    out.extend_from_slice(&payload_len.to_be_bytes());
+    out.extend_from_slice(&postings);
+    Ok(out)
+}
+
 fn encode_bucket_postings(entries: &[(Vec<u8>, Vec<(u32, i64)>)]) -> Result<Vec<u8>> {
     let mut capacity = 4;
     for (key, postings) in entries {
@@ -1196,14 +1282,23 @@ fn decode_range_lookup_rows(
     wanted_keys: &HashSet<Vec<u8>>,
     lookup_bounds: &IndexKeyBounds,
     schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    if !bytes.starts_with(INDEX_RANGE_INLINE_MAGIC) {
+) -> Result<RangeLookupRows> {
+    let inline_rows = if bytes.starts_with(INDEX_RANGE_INLINE_MAGIC) {
+        true
+    } else if bytes.starts_with(INDEX_RANGE_SEGMENT_MAGIC) {
+        false
+    } else {
         bail!("columnar range index payload magic mismatch");
-    }
+    };
     let mut cursor = INDEX_RANGE_INLINE_MAGIC.len();
     let version =
         read_u8(bytes, &mut cursor).context("decode columnar range index payload version")?;
-    if version != INDEX_RANGE_INLINE_VERSION {
+    let expected_version = if inline_rows {
+        INDEX_RANGE_INLINE_VERSION
+    } else {
+        INDEX_RANGE_SEGMENT_VERSION
+    };
+    if version != expected_version {
         bail!("unsupported columnar range index payload version {version}");
     }
     let min_len = usize::try_from(
@@ -1231,11 +1326,26 @@ fn decode_range_lookup_rows(
     }
 
     if max_key < lookup_bounds.min.as_slice() || min_key > lookup_bounds.max.as_slice() {
-        return Ok(Vec::new());
+        return if inline_rows {
+            Ok(RangeLookupRows::Inline(Vec::new()))
+        } else {
+            Ok(RangeLookupRows::SegmentRefs(Vec::new()))
+        };
     }
-    match decode_bucket_lookup_rows(payload, wanted_keys, schema)? {
-        BucketLookupRows::Inline(batches) => Ok(batches),
-        BucketLookupRows::Legacy(_) => bail!("columnar range index nested legacy payload"),
+    if inline_rows {
+        match decode_bucket_lookup_rows(payload, wanted_keys, schema)? {
+            BucketLookupRows::Inline(batches) => Ok(RangeLookupRows::Inline(batches)),
+            BucketLookupRows::Legacy(_) => bail!("columnar range index nested legacy payload"),
+        }
+    } else {
+        let mut row_indices = Vec::new();
+        decode_bucket_postings_for_keys(payload, wanted_keys, |row_index, weight| {
+            if weight != 0 {
+                row_indices.push(row_index);
+            }
+            Ok(())
+        })?;
+        Ok(RangeLookupRows::SegmentRefs(row_indices))
     }
 }
 
@@ -1596,6 +1706,41 @@ mod tests {
         assert_eq!(found_rows, rows);
         assert!(counting.scan_range_calls() > 0);
         assert!(counting.scan_range_calls() <= usize::from(INDEX_BUCKET_COUNT));
+    }
+
+    #[tokio::test]
+    async fn columnar_index_large_delta_uses_segment_backed_range_rows() {
+        let table = build_table("columnar-index-segment-backed-range").await;
+        let mut index =
+            SlateBackedColumnarIndexedZSet::new(table, "orders_by_id", value_schema(), vec![0])
+                .await
+                .expect("index");
+        let rows = INDEX_INLINE_ROW_MAX_ROWS + 16;
+        let ids = (0..rows as i64).collect::<Vec<_>>();
+        let delta = ColumnarZSet::try_new_weighted(
+            value_schema(),
+            vec![weighted_batch(
+                ids.clone(),
+                vec!["n"; rows],
+                ids.iter().map(|id| id * 10).collect(),
+                vec![1; rows],
+            )],
+        )
+        .expect("delta");
+        index.apply_delta(&delta).await.expect("apply delta");
+
+        let found = index
+            .lookup_key_batches(&[key_batch(vec![7, 1024, rows as i64 - 1])])
+            .await
+            .expect("lookup");
+        assert_eq!(
+            lookup_rows(&found),
+            vec![
+                (7, "n".to_string(), 70, 1),
+                (1024, "n".to_string(), 10240, 1),
+                (rows as i64 - 1, "n".to_string(), (rows as i64 - 1) * 10, 1),
+            ]
+        );
     }
 
     #[tokio::test]

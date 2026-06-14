@@ -1047,8 +1047,11 @@ async fn apply_append_only_grouped_max_delta(
     let mut max_updates = Vec::new();
     let phase_start = profile::start();
     let update_loop_start = Instant::now();
-    for (group_key, delta) in pending.groups {
-        let old_max = columnar.max_state.load_max(&group_key)?;
+    let group_work = pending.groups.into_iter().collect::<Vec<_>>();
+    let old_maxes = columnar
+        .max_state
+        .load_maxes(group_work.iter().map(|(group_key, _)| group_key))?;
+    for ((group_key, delta), old_max) in group_work.into_iter().zip(old_maxes) {
         let max_added = max_added_for_delta(&delta);
         let new_max = match (old_max, max_added) {
             (None, max_added) => max_added,
@@ -1353,6 +1356,30 @@ impl SlateGroupedMaxState {
         Ok(max_summaries.get(group_key).copied())
     }
 
+    fn load_maxes<'a>(
+        &self,
+        group_keys: impl IntoIterator<Item = &'a Vec<u8>>,
+    ) -> Result<Vec<Option<i64>>> {
+        let bounds = self
+            .group_bounds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max group bounds poisoned"))?;
+        let max_summaries = self
+            .max_summaries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-max max summary head poisoned"))?;
+        Ok(group_keys
+            .into_iter()
+            .map(|group_key| {
+                if group_key_may_exist_in_bounds(&bounds, group_key) {
+                    max_summaries.get(group_key).copied()
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
     async fn load_all_max_summaries(&self) -> Result<HashMap<Vec<u8>, i64>> {
         let summary_prefix = self.tag_prefix(SUMMARY_TAG);
         let mut values = HashMap::new();
@@ -1447,13 +1474,7 @@ impl SlateGroupedMaxState {
             .group_bounds
             .lock()
             .map_err(|_| anyhow::anyhow!("grouped-max group bounds poisoned"))?;
-        Ok(match &*bounds {
-            GroupKeyBoundsState::Unknown => true,
-            GroupKeyBoundsState::Empty => false,
-            GroupKeyBoundsState::Present { min, max } => {
-                group_key >= min.as_slice() && group_key <= max.as_slice()
-            }
-        })
+        Ok(group_key_may_exist_in_bounds(&bounds, group_key))
     }
 
     fn write_group_bounds(
@@ -1534,6 +1555,16 @@ impl SlateGroupedMaxState {
             bail!("grouped-max summary state key has trailing bytes");
         }
         Ok(group_key)
+    }
+}
+
+fn group_key_may_exist_in_bounds(bounds: &GroupKeyBoundsState, group_key: &[u8]) -> bool {
+    match bounds {
+        GroupKeyBoundsState::Unknown => true,
+        GroupKeyBoundsState::Empty => false,
+        GroupKeyBoundsState::Present { min, max } => {
+            group_key >= min.as_slice() && group_key <= max.as_slice()
+        }
     }
 }
 
