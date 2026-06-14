@@ -776,13 +776,23 @@ async fn build_join_input_state(
         .with_context(|| format!("filter {side} join input snapshot"))?;
     let snapshot = snapshot_batches_from_zset(&index_snapshot_zset)?;
     let input_index = if let Some(key_indices) = index_key_indices {
-        let mut index = SlateBackedColumnarIndexedZSet::new(
-            Arc::clone(&table),
-            index_namespace,
-            Arc::clone(&source.schema),
-            key_indices.to_vec(),
-        )
-        .await
+        let mut index = if persist_source_input_zsets {
+            SlateBackedColumnarIndexedZSet::new(
+                Arc::clone(&table),
+                index_namespace,
+                Arc::clone(&source.schema),
+                key_indices.to_vec(),
+            )
+            .await
+        } else {
+            SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
+                Arc::clone(&table),
+                index_namespace,
+                Arc::clone(&source.schema),
+                key_indices.to_vec(),
+            )
+            .await
+        }
         .with_context(|| {
             format!(
                 "initialize SlateDB-backed {side} join input index for '{}'",

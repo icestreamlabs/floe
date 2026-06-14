@@ -54,6 +54,7 @@ pub struct SlateBackedColumnarIndexedZSet {
     range_lookup_only: bool,
     current_lookup_enabled: bool,
     current_lookup_initialized: bool,
+    segment_large_range_rows: bool,
 }
 
 #[derive(Clone)]
@@ -92,7 +93,7 @@ impl SlateBackedColumnarIndexedZSet {
         value_schema: SchemaRef,
         key_indices: Vec<usize>,
     ) -> Result<Self> {
-        Self::new_internal(table, namespace, value_schema, key_indices, false).await
+        Self::new_internal(table, namespace, value_schema, key_indices, false, false).await
     }
 
     pub async fn new_with_current_lookup(
@@ -101,7 +102,16 @@ impl SlateBackedColumnarIndexedZSet {
         value_schema: SchemaRef,
         key_indices: Vec<usize>,
     ) -> Result<Self> {
-        Self::new_internal(table, namespace, value_schema, key_indices, true).await
+        Self::new_internal(table, namespace, value_schema, key_indices, true, false).await
+    }
+
+    pub async fn new_with_segment_backed_large_ranges(
+        table: Arc<dyn KeyValueTable>,
+        namespace: impl Into<String>,
+        value_schema: SchemaRef,
+        key_indices: Vec<usize>,
+    ) -> Result<Self> {
+        Self::new_internal(table, namespace, value_schema, key_indices, false, true).await
     }
 
     async fn new_internal(
@@ -110,6 +120,7 @@ impl SlateBackedColumnarIndexedZSet {
         value_schema: SchemaRef,
         key_indices: Vec<usize>,
         current_lookup_enabled: bool,
+        segment_large_range_rows: bool,
     ) -> Result<Self> {
         validate_key_indices(&value_schema, &key_indices)?;
         let namespace = namespace.into();
@@ -158,6 +169,7 @@ impl SlateBackedColumnarIndexedZSet {
             range_lookup_only,
             current_lookup_enabled,
             current_lookup_initialized,
+            segment_large_range_rows,
         })
     }
 
@@ -255,7 +267,7 @@ impl SlateBackedColumnarIndexedZSet {
         let phase_start = profile::start();
         let mut write_batch = WriteBatch::new();
         let range_chunks = range_posting_chunks(postings);
-        if batch.num_rows() <= INDEX_INLINE_ROW_MAX_ROWS {
+        if !self.segment_large_range_rows || batch.num_rows() <= INDEX_INLINE_ROW_MAX_ROWS {
             for (chunk_id, entries) in range_chunks.into_iter().enumerate() {
                 write_batch.put_bytes(
                     Bytes::from(self.range_index_key(segment_id, chunk_id)?),
@@ -1711,10 +1723,14 @@ mod tests {
     #[tokio::test]
     async fn columnar_index_large_delta_uses_segment_backed_range_rows() {
         let table = build_table("columnar-index-segment-backed-range").await;
-        let mut index =
-            SlateBackedColumnarIndexedZSet::new(table, "orders_by_id", value_schema(), vec![0])
-                .await
-                .expect("index");
+        let mut index = SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
+            table,
+            "orders_by_id",
+            value_schema(),
+            vec![0],
+        )
+        .await
+        .expect("index");
         let rows = INDEX_INLINE_ROW_MAX_ROWS + 16;
         let ids = (0..rows as i64).collect::<Vec<_>>();
         let delta = ColumnarZSet::try_new_weighted(
