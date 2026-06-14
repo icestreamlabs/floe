@@ -6,7 +6,12 @@ use datafusion::arrow::array::{
     TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::expr_fn::SimpleScalarUDF;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
+};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::storage::{KeyValueTable, SlateTable, keyspace};
 use floe_core::source::{
@@ -34,6 +39,32 @@ fn timestamp_millis_values(batch: &RecordBatch, column_idx: usize) -> Vec<i64> {
         .downcast_ref::<TimestampMillisecondArray>()
         .expect("timestamp(ms) column");
     (0..values.len()).map(|idx| values.value(idx)).collect()
+}
+
+fn test_hop_udf() -> ScalarUDF {
+    let passthrough_ts: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            if let Some(first) = args.first() {
+                return Ok(first.clone());
+            }
+            Ok(ColumnarValue::Array(Arc::new(
+                TimestampMillisecondArray::from(vec![None::<i64>]),
+            )))
+        },
+    );
+    ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+        "hop",
+        Signature::one_of(
+            vec![TypeSignature::Exact(vec![
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Int64,
+                DataType::Int64,
+            ])],
+            Volatility::Immutable,
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        passthrough_ts,
+    ))
 }
 
 fn date_days_values(batch: &RecordBatch, column_idx: usize) -> Vec<i32> {
@@ -2707,6 +2738,127 @@ async fn grouped_count_with_hidden_key_uses_slate_backed_columnar_operator_incre
 }
 
 #[tokio::test]
+async fn append_only_hop_grouped_count_recovers_compact_state() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("source definition")
+    .with_property("append_only", "true");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 2000])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-count-hop-append").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("auction", DataType::Int64, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let mut runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_counts",
+            r#"SELECT auction, COUNT(*) AS count FROM bids GROUP BY auction, HOP("dateTime", 1000, 3000)"#,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        vec![test_hop_udf()],
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedCount
+    );
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_bid_counts").expect("materialized view");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 1).await;
+    assert_eq!(
+        id_count_rows(&snapshot),
+        vec![(1, 1), (1, 1), (1, 2), (1, 2)]
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_udfs_and_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_bid_counts",
+            r#"SELECT auction, COUNT(*) AS count FROM bids GROUP BY auction, HOP("dateTime", 1000, 3000)"#,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        vec![test_hop_udf()],
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    recovered.run_tick(2).await.expect("recovered empty tick");
+
+    let duplicate = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000])),
+        ],
+    )
+    .expect("duplicate source batch");
+    recovered
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![duplicate.clone()],
+            vec![duplicate],
+        )
+        .await
+        .expect("append duplicate source row");
+    recovered.run_tick(3).await.expect("post-recovery tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_bid_counts")
+        .expect("recovered materialized view");
+    let snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 3)
+            .await;
+    assert_eq!(
+        id_count_rows(&snapshot),
+        vec![(1, 1), (1, 2), (1, 3), (1, 3)]
+    );
+    let delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("post-recovery delta");
+    assert_eq!(
+        weighted_id_count_rows(&delta),
+        vec![
+            (1, 1, -1),
+            (1, 2, -1),
+            (1, 2, -1),
+            (1, 2, 1),
+            (1, 3, 1),
+            (1, 3, 1),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn grouped_count_supports_boolean_group_key_incrementally() {
     let definition = SourceDefinition::new(
         "events",
@@ -3277,6 +3429,24 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
         Some(group_count as usize)
     );
 
+    let logged_insert = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![7])),
+            Arc::new(Int64Array::from(vec![7000])),
+        ],
+    )
+    .expect("logged source insert batch");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![logged_insert.clone()],
+            vec![logged_insert],
+        )
+        .await
+        .expect("append logged source rows");
+    runtime.run_tick(2).await.expect("logged tick");
+
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
@@ -3297,7 +3467,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
         Arc::clone(&schema),
         vec![
             Arc::new(Int64Array::from(vec![7])),
-            Arc::new(Int64Array::from(vec![7000])),
+            Arc::new(Int64Array::from(vec![9000])),
         ],
     )
     .expect("recovered source insert batch");
@@ -3305,7 +3475,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
         .append_source_batches_for_execution_and_query("bids", vec![insert.clone()], vec![insert])
         .await
         .expect("append recovered source rows");
-    recovered.run_tick(2).await.expect("recovered tick");
+    recovered.run_tick(3).await.expect("recovered tick");
 
     let snapshot = scan_materialized_view_table(
         Arc::clone(&recovery_registry),
@@ -3314,7 +3484,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
         "SELECT auction, total_bids, sum_price FROM mv_bid_stats WHERE auction = 7",
     )
     .await;
-    assert_eq!(id_count_sum_rows(&snapshot), vec![(7, 2, 7070)]);
+    assert_eq!(id_count_sum_rows(&snapshot), vec![(7, 3, 16070)]);
 }
 
 #[tokio::test]

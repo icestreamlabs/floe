@@ -9,9 +9,11 @@ struct PhaseMetric {
 }
 
 static PHASE_PROFILE: OnceLock<Mutex<BTreeMap<&'static str, PhaseMetric>>> = OnceLock::new();
+static PHASE_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub(super) fn enabled() -> bool {
-    std::env::var_os("FLOE_PROFILE_COLUMNAR_PHASES").is_some()
+    *PHASE_PROFILE_ENABLED
+        .get_or_init(|| std::env::var_os("FLOE_PROFILE_COLUMNAR_PHASES").is_some())
 }
 
 pub(super) fn start() -> Option<Instant> {

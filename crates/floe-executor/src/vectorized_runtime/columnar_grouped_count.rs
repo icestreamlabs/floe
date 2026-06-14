@@ -5,10 +5,11 @@ use std::time::Instant;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{
-    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, TimestampMillisecondArray, UInt32Array,
+    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, TimestampMillisecondArray,
+    UInt32Array, UInt64Array,
 };
 use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::common::{Column, ScalarValue};
@@ -45,6 +46,7 @@ pub(super) struct ColumnarGroupedCountPlan {
     hop_group_projection_schema: Option<SchemaRef>,
     output_mapping: Vec<usize>,
     count_idx: usize,
+    append_only_single_hop: Option<AppendOnlySingleHopCountPlan>,
 }
 
 pub(super) struct ColumnarGroupedCountMaterializedViewState {
@@ -52,6 +54,7 @@ pub(super) struct ColumnarGroupedCountMaterializedViewState {
     source_schema: SchemaRef,
     output_zset: SlateBackedColumnarZSet,
     count_state: SlateGroupedCountState,
+    append_only_single_hop: Option<AppendOnlySingleHopCountState>,
     aggregate_delta: Option<IncrementalMaterializedViewState>,
     hop_group_projection_delta: Option<IncrementalMaterializedViewState>,
     aggregate_schema: SchemaRef,
@@ -83,6 +86,49 @@ struct PendingGroupDelta {
     delta: i64,
     batch: RecordBatch,
     row_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AppendOnlySingleHopCountPlan {
+    value_group_idx: usize,
+    hop_group_idx: usize,
+    value_kind: AppendOnlySingleHopValueKind,
+    output_columns: Vec<AppendOnlySingleHopOutputColumn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppendOnlySingleHopValueKind {
+    Int64,
+    UInt64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AppendOnlySingleHopOutputColumn {
+    Value,
+    HopStart,
+    Count,
+}
+
+struct AppendOnlySingleHopCountState {
+    plan: AppendOnlySingleHopCountPlan,
+    table: Arc<dyn KeyValueTable>,
+    count_log_prefix: Vec<u8>,
+    count_sequence_key: Vec<u8>,
+    next_count_segment_id: Mutex<u64>,
+    counts: Mutex<AHashMap<AppendOnlySingleHopKey, i64>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AppendOnlySingleHopKey {
+    value: AppendOnlySingleHopValue,
+    window_start_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AppendOnlySingleHopValue {
+    Null,
+    Int64(i64),
+    UInt64(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +206,17 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
     let group_schema = Arc::new(Schema::new(group_fields));
+    let append_only_single_hop = sources
+        .get(&source_name)
+        .filter(|source| source.append_only)
+        .and_then(|_| {
+            append_only_single_hop_count_plan(
+                &group_schema,
+                &hop_groups,
+                count_idx,
+                &output_mapping,
+            )
+        });
 
     Ok(Some(ColumnarGroupedCountPlan {
         source_name,
@@ -171,7 +228,52 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
         hop_group_projection_schema,
         output_mapping,
         count_idx,
+        append_only_single_hop,
     }))
+}
+
+fn append_only_single_hop_count_plan(
+    group_schema: &SchemaRef,
+    hop_groups: &[HopGroup],
+    count_idx: usize,
+    output_mapping: &[usize],
+) -> Option<AppendOnlySingleHopCountPlan> {
+    if hop_groups.len() != 1 || count_idx != 2 {
+        return None;
+    }
+    let hop_group_idx = hop_groups[0].group_idx;
+    if hop_group_idx >= count_idx {
+        return None;
+    }
+    let value_group_idx = if hop_group_idx == 0 { 1 } else { 0 };
+    let value_kind = match group_schema.field(value_group_idx).data_type() {
+        DataType::Int64 => AppendOnlySingleHopValueKind::Int64,
+        DataType::UInt64 => AppendOnlySingleHopValueKind::UInt64,
+        _ => return None,
+    };
+    match group_schema.field(hop_group_idx).data_type() {
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {}
+        _ => return None,
+    }
+
+    let mut output_columns = Vec::with_capacity(output_mapping.len());
+    for source_idx in output_mapping {
+        if *source_idx == value_group_idx {
+            output_columns.push(AppendOnlySingleHopOutputColumn::Value);
+        } else if *source_idx == hop_group_idx {
+            output_columns.push(AppendOnlySingleHopOutputColumn::HopStart);
+        } else if *source_idx == count_idx {
+            output_columns.push(AppendOnlySingleHopOutputColumn::Count);
+        } else {
+            return None;
+        }
+    }
+    Some(AppendOnlySingleHopCountPlan {
+        value_group_idx,
+        hop_group_idx,
+        value_kind,
+        output_columns,
+    })
 }
 
 pub(super) async fn build_columnar_grouped_count_materialized_view_state(
@@ -242,14 +344,28 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
             .context("build grouped-count vectorized aggregate delta plan")?;
             (Some(aggregate_delta), None)
         };
+    let count_state = SlateGroupedCountState::new(Arc::clone(&table), &state_namespace)
+        .await
+        .context("initialize SlateDB-backed grouped-count state")?;
+    let append_only_single_hop = if count_state.is_empty()? {
+        match plan.append_only_single_hop.clone() {
+            Some(fast_plan) => Some(
+                AppendOnlySingleHopCountState::new(table, &state_namespace, fast_plan)
+                    .await
+                    .context("initialize append-only single-HOP grouped-count state")?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
 
     Ok(ColumnarGroupedCountMaterializedViewState {
         source_name: plan.source_name,
         source_schema: Arc::clone(&source.schema),
         output_zset,
-        count_state: SlateGroupedCountState::new(table, &state_namespace)
-            .await
-            .context("initialize SlateDB-backed grouped-count state")?,
+        count_state,
+        append_only_single_hop,
         aggregate_delta,
         hop_group_projection_delta,
         aggregate_schema: plan.aggregate_schema,
@@ -392,17 +508,29 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
         .iter()
         .map(RecordBatch::num_rows)
         .sum::<usize>();
+    let apply_start = Instant::now();
     let pending_start = Instant::now();
     let phase_start = profile::start();
-    let pending = grouped_count_pending_delta(columnar, input_delta.batches()).await?;
-    let pending_count = pending.len();
-    let pending_ms = pending_start.elapsed().as_millis() as u64;
-    profile::record_since("grouped_count.pending_delta", phase_start);
-    let apply_start = Instant::now();
-    let phase_start = profile::start();
-    let output_delta_batches = apply_grouped_count_delta(columnar, pending).await?;
+    let fast_output_delta_batches =
+        append_only_single_hop_output_delta_batches(columnar, input_delta.batches()).await?;
+    let pending_ms;
+    let pending_count;
+    let output_delta_batches = if let Some(output_delta_batches) = fast_output_delta_batches {
+        pending_ms = pending_start.elapsed().as_millis() as u64;
+        pending_count = output_delta_batches.iter().map(RecordBatch::num_rows).sum();
+        profile::record_since("grouped_count.pending_delta", phase_start);
+        output_delta_batches
+    } else {
+        let pending = grouped_count_pending_delta(columnar, input_delta.batches()).await?;
+        pending_count = pending.len();
+        pending_ms = pending_start.elapsed().as_millis() as u64;
+        profile::record_since("grouped_count.pending_delta", phase_start);
+        let phase_start = profile::start();
+        let output_delta_batches = apply_grouped_count_delta(columnar, pending).await?;
+        profile::record_since("grouped_count.apply_delta", phase_start);
+        output_delta_batches
+    };
     let apply_ms = apply_start.elapsed().as_millis() as u64;
-    profile::record_since("grouped_count.apply_delta", phase_start);
     let build_output_start = Instant::now();
     let phase_start = profile::start();
     let output_delta =
@@ -454,6 +582,65 @@ pub(super) async fn run_columnar_grouped_count_state_tick(
         delta: output_delta,
         row_count_delta,
     })
+}
+
+async fn append_only_single_hop_output_delta_batches(
+    columnar: &ColumnarGroupedCountMaterializedViewState,
+    input_batches: &[RecordBatch],
+) -> Result<Option<Vec<RecordBatch>>> {
+    let Some(state) = columnar.append_only_single_hop.as_ref() else {
+        return Ok(None);
+    };
+    let hop_projection_delta = columnar
+        .hop_group_projection_delta
+        .as_ref()
+        .context("append-only single-HOP grouped count requires HOP projection state")?;
+    if input_batches.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut positive_source_batches = Vec::new();
+    for batch in input_batches {
+        let unit_delta =
+            unit_source_delta_batches(&columnar.source_schema, batch)?.with_context(|| {
+                format!(
+                    "append-only grouped-count materialized view received non-unit weighted source deltas for '{}'",
+                    columnar.source_name
+                )
+            })?;
+        if unit_delta.negative.iter().any(|batch| batch.num_rows() > 0) {
+            bail!("append-only single-HOP grouped count received a retraction");
+        }
+        positive_source_batches.extend(
+            unit_delta
+                .positive
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0),
+        );
+    }
+    if positive_source_batches.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let projection_schema = columnar
+        .hop_group_projection_schema
+        .as_ref()
+        .context("grouped-count HOP projection schema missing")?;
+    let positive_groups = collect_incremental_output(
+        hop_projection_delta,
+        &positive_source_batches,
+        projection_schema,
+    )
+    .await?;
+    let hop = columnar
+        .hop_groups
+        .first()
+        .context("append-only single-HOP grouped count requires one HOP group")?;
+    let pending = state.pending_delta(&positive_groups, hop)?;
+    state
+        .apply_pending_delta(pending, columnar.output_zset.value_schema())
+        .await
+        .map(Some)
 }
 
 async fn grouped_count_pending_delta(
@@ -958,6 +1145,380 @@ async fn apply_grouped_count_delta(
     output
 }
 
+impl AppendOnlySingleHopCountState {
+    async fn new(
+        table: Arc<dyn KeyValueTable>,
+        namespace: &str,
+        plan: AppendOnlySingleHopCountPlan,
+    ) -> Result<Self> {
+        let count_log_namespace = format!("{namespace}__append_only_single_hop_count_log");
+        let count_meta_namespace = format!("{namespace}__append_only_single_hop_count_meta");
+        let count_log_prefix =
+            keyspace::namespace_prefix(keyspace::prefix::INDEX, &count_log_namespace);
+        let mut count_sequence_key =
+            keyspace::namespace_prefix(keyspace::prefix::INDEX, &count_meta_namespace);
+        count_sequence_key.extend_from_slice(b"sequence");
+        let next_count_segment_id =
+            read_count_sequence(table.as_ref(), &count_sequence_key).await?;
+        let state = Self {
+            plan,
+            table,
+            count_log_prefix,
+            count_sequence_key,
+            next_count_segment_id: Mutex::new(next_count_segment_id),
+            counts: Mutex::new(AHashMap::new()),
+        };
+        let counts = state
+            .load_all_counts()
+            .await
+            .context("load append-only single-HOP grouped-count state head")?;
+        *state.counts.lock().map_err(|_| {
+            anyhow::anyhow!("append-only single-HOP grouped-count state head poisoned")
+        })? = counts;
+        Ok(state)
+    }
+
+    fn pending_delta(
+        &self,
+        batches: &[RecordBatch],
+        hop: &HopGroup,
+    ) -> Result<AHashMap<AppendOnlySingleHopKey, i64>> {
+        let mut pending = AHashMap::new();
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let hop_times = batch
+                .column(self.plan.hop_group_idx)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("HOP group expression must produce timestamp(ms)")
+                })?;
+            match self.plan.value_kind {
+                AppendOnlySingleHopValueKind::Int64 => {
+                    let values = batch
+                        .column(self.plan.value_group_idx)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "append-only single-HOP grouped count expected Int64 group key"
+                            )
+                        })?;
+                    for row_idx in 0..batch.num_rows() {
+                        if hop_times.is_null(row_idx) {
+                            continue;
+                        }
+                        let value = if values.is_null(row_idx) {
+                            AppendOnlySingleHopValue::Null
+                        } else {
+                            AppendOnlySingleHopValue::Int64(values.value(row_idx))
+                        };
+                        add_single_hop_pending_windows(
+                            value,
+                            hop_times.value(row_idx),
+                            hop,
+                            &mut pending,
+                        )?;
+                    }
+                }
+                AppendOnlySingleHopValueKind::UInt64 => {
+                    let values = batch
+                        .column(self.plan.value_group_idx)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "append-only single-HOP grouped count expected UInt64 group key"
+                            )
+                        })?;
+                    for row_idx in 0..batch.num_rows() {
+                        if hop_times.is_null(row_idx) {
+                            continue;
+                        }
+                        let value = if values.is_null(row_idx) {
+                            AppendOnlySingleHopValue::Null
+                        } else {
+                            AppendOnlySingleHopValue::UInt64(values.value(row_idx))
+                        };
+                        add_single_hop_pending_windows(
+                            value,
+                            hop_times.value(row_idx),
+                            hop,
+                            &mut pending,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(pending)
+    }
+
+    async fn apply_pending_delta(
+        &self,
+        pending: AHashMap<AppendOnlySingleHopKey, i64>,
+        output_schema: SchemaRef,
+    ) -> Result<Vec<RecordBatch>> {
+        let total_start = profile::start();
+        let mut builder = AppendOnlySingleHopOutputBuilder::new(
+            output_schema,
+            &self.plan.output_columns,
+            pending.len().saturating_mul(2),
+        )?;
+        if pending.is_empty() {
+            let output = builder.finish();
+            profile::record_since("grouped_count.append_only_hop_total", total_start);
+            return output;
+        }
+
+        let pending = pending.into_iter().collect::<Vec<_>>();
+        let phase_start = profile::start();
+        let old_counts = self.load_counts(pending.iter().map(|(key, _)| *key))?;
+        profile::record_since("grouped_count.append_only_hop_state_lookup", phase_start);
+
+        let phase_start = profile::start();
+        let mut count_updates = Vec::with_capacity(pending.len());
+        for ((key, delta), old_count) in pending.into_iter().zip(old_counts) {
+            let new_count = old_count
+                .checked_add(delta)
+                .ok_or_else(|| anyhow::anyhow!("append-only single-HOP grouped-count overflow"))?;
+            if new_count < 0 {
+                bail!("append-only single-HOP grouped-count removed more rows than were present");
+            }
+            if new_count == old_count {
+                continue;
+            }
+            if old_count > 0 {
+                builder.append(key, old_count, -1)?;
+            }
+            if new_count > 0 {
+                builder.append(key, new_count, 1)?;
+            }
+            count_updates.push((key, new_count));
+        }
+        profile::record_since("grouped_count.append_only_hop_update_loop", phase_start);
+
+        if !count_updates.is_empty() {
+            let mut writes = WriteBatch::new();
+            self.write_count_updates(&mut writes, &count_updates)?;
+            let phase_start = profile::start();
+            self.table
+                .write_batch(writes)
+                .await
+                .context("persist append-only single-HOP grouped-count state updates")?;
+            profile::record_since("grouped_count.append_only_hop_write_batch", phase_start);
+            let phase_start = profile::start();
+            self.apply_count_updates(count_updates)?;
+            profile::record_since("grouped_count.append_only_hop_cache_update", phase_start);
+        }
+
+        let output = builder.finish();
+        profile::record_since("grouped_count.append_only_hop_total", total_start);
+        output
+    }
+
+    async fn load_all_counts(&self) -> Result<AHashMap<AppendOnlySingleHopKey, i64>> {
+        let mut log_entries = Vec::new();
+        for (key, value_bytes) in self
+            .table
+            .scan_prefix(&self.count_log_prefix, &ScanOptions::default())
+            .await
+            .context("scan append-only single-HOP grouped-count state log")?
+        {
+            log_entries.push((self.count_log_segment_id(&key)?, value_bytes));
+        }
+        log_entries.sort_by_key(|(segment_id, _)| *segment_id);
+        let mut counts = AHashMap::new();
+        for (_, value_bytes) in log_entries {
+            for (key, count) in
+                decode_append_only_single_hop_count_updates(&value_bytes, self.plan.value_kind)?
+            {
+                if count == 0 {
+                    counts.remove(&key);
+                } else {
+                    counts.insert(key, count);
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    fn load_counts(
+        &self,
+        keys: impl IntoIterator<Item = AppendOnlySingleHopKey>,
+    ) -> Result<Vec<i64>> {
+        let counts = self.counts.lock().map_err(|_| {
+            anyhow::anyhow!("append-only single-HOP grouped-count state head poisoned")
+        })?;
+        Ok(keys
+            .into_iter()
+            .map(|key| counts.get(&key).copied().unwrap_or(0))
+            .collect())
+    }
+
+    fn apply_count_updates(&self, updates: Vec<(AppendOnlySingleHopKey, i64)>) -> Result<()> {
+        let mut counts = self.counts.lock().map_err(|_| {
+            anyhow::anyhow!("append-only single-HOP grouped-count state head poisoned")
+        })?;
+        for (key, count) in updates {
+            if count == 0 {
+                counts.remove(&key);
+            } else {
+                counts.insert(key, count);
+            }
+        }
+        Ok(())
+    }
+
+    fn write_count_updates(
+        &self,
+        batch: &mut WriteBatch,
+        updates: &[(AppendOnlySingleHopKey, i64)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut next_segment_id = self.next_count_segment_id.lock().map_err(|_| {
+            anyhow::anyhow!("append-only single-HOP grouped-count sequence poisoned")
+        })?;
+        let segment_id = *next_segment_id;
+        *next_segment_id = next_segment_id.saturating_add(1);
+        batch.put(
+            self.count_log_key(segment_id),
+            encode_append_only_single_hop_count_updates(updates, self.plan.value_kind)?,
+        );
+        batch.put(
+            self.count_sequence_key.clone(),
+            (*next_segment_id).to_be_bytes(),
+        );
+        Ok(())
+    }
+
+    fn count_log_key(&self, segment_id: u64) -> Vec<u8> {
+        let mut key = self.count_log_prefix.clone();
+        key.extend_from_slice(&segment_id.to_be_bytes());
+        key
+    }
+
+    fn count_log_segment_id(&self, key: &[u8]) -> Result<u64> {
+        if !key.starts_with(&self.count_log_prefix) {
+            bail!("append-only single-HOP grouped-count log key prefix mismatch");
+        }
+        let suffix = &key[self.count_log_prefix.len()..];
+        let bytes: [u8; 8] = suffix.try_into().map_err(|_| {
+            anyhow::anyhow!("append-only single-HOP grouped-count segment id must be 8 bytes")
+        })?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+}
+
+fn add_single_hop_pending_windows(
+    value: AppendOnlySingleHopValue,
+    time_ms: i64,
+    hop: &HopGroup,
+    pending: &mut AHashMap<AppendOnlySingleHopKey, i64>,
+) -> Result<()> {
+    if hop.slide_ms <= 0 || hop.size_ms <= 0 {
+        bail!("HOP window slide and size must be positive");
+    }
+    let last_start = time_ms.div_euclid(hop.slide_ms) * hop.slide_ms;
+    let mut offset = 0_i64;
+    while offset < hop.size_ms {
+        let start = last_start
+            .checked_sub(offset)
+            .ok_or_else(|| anyhow::anyhow!("HOP window start overflow"))?;
+        let end = start
+            .checked_add(hop.size_ms)
+            .ok_or_else(|| anyhow::anyhow!("HOP window end overflow"))?;
+        if time_ms >= start && time_ms < end {
+            let key = AppendOnlySingleHopKey {
+                value,
+                window_start_ms: start,
+            };
+            let entry = pending.entry(key).or_insert(0);
+            *entry = entry
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("append-only single-HOP pending overflow"))?;
+        }
+        offset = offset
+            .checked_add(hop.slide_ms)
+            .ok_or_else(|| anyhow::anyhow!("HOP window offset overflow"))?;
+    }
+    Ok(())
+}
+
+struct AppendOnlySingleHopOutputBuilder {
+    weighted_schema: SchemaRef,
+    output_columns: Vec<AppendOnlySingleHopOutputColumn>,
+    builders: Vec<ScalarColumnBuilder>,
+    weights: Int64Builder,
+    rows: usize,
+}
+
+impl AppendOnlySingleHopOutputBuilder {
+    fn new(
+        schema: SchemaRef,
+        output_columns: &[AppendOnlySingleHopOutputColumn],
+        capacity: usize,
+    ) -> Result<Self> {
+        let capacity = capacity.max(1);
+        let builders = schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), capacity))
+            .collect::<Result<Vec<_>>>()?;
+        let weighted_schema = weighted_snapshot_schema(&schema)?;
+        Ok(Self {
+            weighted_schema,
+            output_columns: output_columns.to_vec(),
+            builders,
+            weights: Int64Builder::with_capacity(capacity),
+            rows: 0,
+        })
+    }
+
+    fn append(&mut self, key: AppendOnlySingleHopKey, count: i64, weight: i64) -> Result<()> {
+        for (output_idx, output_column) in self.output_columns.iter().copied().enumerate() {
+            match output_column {
+                AppendOnlySingleHopOutputColumn::Value => match key.value {
+                    AppendOnlySingleHopValue::Null => {
+                        self.builders[output_idx].append_encoded_scalar(None)?;
+                    }
+                    AppendOnlySingleHopValue::Int64(value) => {
+                        self.builders[output_idx].append_i64_value(value)?;
+                    }
+                    AppendOnlySingleHopValue::UInt64(value) => {
+                        self.builders[output_idx].append_u64_value(value)?;
+                    }
+                },
+                AppendOnlySingleHopOutputColumn::HopStart => {
+                    self.builders[output_idx].append_timestamp_millis_value(key.window_start_ms)?;
+                }
+                AppendOnlySingleHopOutputColumn::Count => {
+                    self.builders[output_idx].append_i64_value(count)?;
+                }
+            }
+        }
+        self.weights.append_value(weight);
+        self.rows = self.rows.saturating_add(1);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<RecordBatch>> {
+        if self.rows == 0 {
+            return Ok(Vec::new());
+        }
+        let mut columns = self
+            .builders
+            .iter_mut()
+            .map(ScalarColumnBuilder::finish_array)
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(self.weights.finish()) as ArrayRef);
+        Ok(vec![RecordBatch::try_new(self.weighted_schema, columns)?])
+    }
+}
+
 impl SlateGroupedCountState {
     async fn new(table: Arc<dyn KeyValueTable>, namespace: &str) -> Result<Self> {
         let key_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace);
@@ -1039,6 +1600,14 @@ impl SlateGroupedCountState {
             .into_iter()
             .map(|group_key| counts.get(group_key).copied().unwrap_or(0))
             .collect())
+    }
+
+    fn is_empty(&self) -> Result<bool> {
+        let counts = self
+            .counts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("grouped-count state head poisoned"))?;
+        Ok(counts.is_empty())
     }
 
     fn apply_count_updates(&self, updates: Vec<(Vec<u8>, i64)>) -> Result<()> {
@@ -1469,6 +2038,117 @@ fn encode_count_log_updates(updates: &[(Vec<u8>, i64)]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn encode_append_only_single_hop_count_updates(
+    updates: &[(AppendOnlySingleHopKey, i64)],
+    value_kind: AppendOnlySingleHopValueKind,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(1 + 4 + updates.len().saturating_mul(25));
+    out.push(append_only_single_hop_value_kind_tag(value_kind));
+    let update_count = u32::try_from(updates.len())
+        .context("append-only single-HOP grouped-count update count too large")?;
+    out.extend_from_slice(&update_count.to_be_bytes());
+    for (key, count) in updates {
+        match (value_kind, key.value) {
+            (_, AppendOnlySingleHopValue::Null) => {
+                out.push(0);
+                out.extend_from_slice(&0_u64.to_be_bytes());
+            }
+            (AppendOnlySingleHopValueKind::Int64, AppendOnlySingleHopValue::Int64(value)) => {
+                out.push(1);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            (AppendOnlySingleHopValueKind::UInt64, AppendOnlySingleHopValue::UInt64(value)) => {
+                out.push(1);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            _ => bail!("append-only single-HOP grouped-count key type mismatch"),
+        }
+        out.extend_from_slice(&key.window_start_ms.to_be_bytes());
+        out.extend_from_slice(&count.to_be_bytes());
+    }
+    Ok(out)
+}
+
+fn decode_append_only_single_hop_count_updates(
+    bytes: &[u8],
+    value_kind: AppendOnlySingleHopValueKind,
+) -> Result<Vec<(AppendOnlySingleHopKey, i64)>> {
+    let mut cursor = 0;
+    let tag = *read_bytes_at(
+        bytes,
+        &mut cursor,
+        1,
+        "append-only single-HOP grouped-count value kind",
+    )?
+    .first()
+    .context("append-only single-HOP grouped-count value kind missing")?;
+    if tag != append_only_single_hop_value_kind_tag(value_kind) {
+        bail!("append-only single-HOP grouped-count value kind mismatch");
+    }
+    let update_count = read_u32_at(bytes, &mut cursor)?;
+    let mut updates = Vec::with_capacity(update_count as usize);
+    for _ in 0..update_count {
+        let value_present = *read_bytes_at(
+            bytes,
+            &mut cursor,
+            1,
+            "append-only single-HOP grouped-count group value marker",
+        )?
+        .first()
+        .context("append-only single-HOP grouped-count group value marker missing")?;
+        let value_bytes = read_bytes_at(
+            bytes,
+            &mut cursor,
+            8,
+            "append-only single-HOP grouped-count group value",
+        )?;
+        let value = match value_present {
+            0 => AppendOnlySingleHopValue::Null,
+            1 => match value_kind {
+                AppendOnlySingleHopValueKind::Int64 => {
+                    AppendOnlySingleHopValue::Int64(decode_i64(value_bytes)?)
+                }
+                AppendOnlySingleHopValueKind::UInt64 => {
+                    AppendOnlySingleHopValue::UInt64(decode_u64(value_bytes)?)
+                }
+            },
+            _ => {
+                bail!("append-only single-HOP grouped-count group value marker must be 0 or 1")
+            }
+        };
+        let window_start_ms = decode_i64(read_bytes_at(
+            bytes,
+            &mut cursor,
+            8,
+            "append-only single-HOP grouped-count window start",
+        )?)?;
+        let count = decode_i64(read_bytes_at(
+            bytes,
+            &mut cursor,
+            8,
+            "append-only single-HOP grouped-count count",
+        )?)?;
+        updates.push((
+            AppendOnlySingleHopKey {
+                value,
+                window_start_ms,
+            },
+            count,
+        ));
+    }
+    if cursor != bytes.len() {
+        bail!("append-only single-HOP grouped-count log payload has trailing bytes");
+    }
+    Ok(updates)
+}
+
+fn append_only_single_hop_value_kind_tag(value_kind: AppendOnlySingleHopValueKind) -> u8 {
+    match value_kind {
+        AppendOnlySingleHopValueKind::Int64 => 1,
+        AppendOnlySingleHopValueKind::UInt64 => 2,
+    }
+}
+
 fn decode_count_log_updates(bytes: &[u8]) -> Result<Vec<(Vec<u8>, i64)>> {
     let mut cursor = 0;
     let update_count = read_u32_at(bytes, &mut cursor)?;
@@ -1525,6 +2205,13 @@ fn decode_i64(bytes: &[u8]) -> Result<i64> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("grouped-count state value must be 8 bytes"))?;
     Ok(i64::from_be_bytes(bytes))
+}
+
+fn decode_u64(bytes: &[u8]) -> Result<u64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("grouped-count state value must be 8 bytes"))?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 #[cfg(test)]
