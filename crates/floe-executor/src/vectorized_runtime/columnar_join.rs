@@ -34,6 +34,8 @@ use super::{
     apply_weighted_snapshot_delta, normalize_batches,
 };
 
+const APPEND_ONLY_JOIN_SNAPSHOT_ROW_LIMIT: usize = 100_000;
+
 pub(super) struct ColumnarJoinPlan {
     logical_plan: LogicalPlan,
     left: ColumnarJoinInputPlan,
@@ -108,6 +110,9 @@ struct ColumnarJoinSourceState {
     input_zset: Option<SlateBackedColumnarZSet>,
     input_index: Option<Box<SlateBackedColumnarIndexedZSet>>,
     snapshot: Vec<RecordBatch>,
+    append_only_snapshot_enabled: bool,
+    defer_index_maintenance: bool,
+    index_stale: bool,
 }
 
 struct ColumnarJoinInputPlan {
@@ -535,6 +540,7 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         sources,
         udfs,
         true,
+        false,
     )
     .await
 }
@@ -555,6 +561,28 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace_del
         sources,
         udfs,
         false,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn build_columnar_join_materialized_view_state_in_namespace_delta_only_with_persistent_inputs(
+    table: Arc<dyn KeyValueTable>,
+    mv_namespace: String,
+    output_schema: &SchemaRef,
+    plan: ColumnarJoinPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+) -> Result<ColumnarJoinMaterializedViewState> {
+    build_columnar_join_materialized_view_state_in_namespace_with_options(
+        table,
+        mv_namespace,
+        output_schema,
+        plan,
+        sources,
+        udfs,
+        true,
+        true,
     )
     .await
 }
@@ -567,6 +595,7 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
     persist_source_input_zsets: bool,
+    reuse_physical_plan: bool,
 ) -> Result<ColumnarJoinMaterializedViewState> {
     let ColumnarJoinPlan {
         logical_plan,
@@ -617,7 +646,7 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     let left_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&left);
     let right_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&right);
 
-    let left = Box::pin(build_join_input_state(
+    let mut left = Box::pin(build_join_input_state(
         Arc::clone(&table),
         &mv_namespace,
         "left",
@@ -630,10 +659,13 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
             .as_ref()
             .map(|indices| indices.left.as_slice()),
         persist_source_input_zsets,
+        false,
     ))
     .await
     .context("build SlateDB-backed left join input state")?;
-    let right = Box::pin(build_join_input_state(
+    let right_segment_backed_large_ranges =
+        persist_source_input_zsets && left.append_only_snapshot_enabled;
+    let mut right = Box::pin(build_join_input_state(
         Arc::clone(&table),
         &mv_namespace,
         "right",
@@ -646,14 +678,21 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
             .as_ref()
             .map(|indices| indices.right.as_slice()),
         persist_source_input_zsets,
+        right_segment_backed_large_ranges,
     ))
     .await
     .context("build SlateDB-backed right join input state")?;
+    if persist_source_input_zsets && left.append_only_snapshot_enabled {
+        right.defer_index_maintenance = true;
+    }
+    if persist_source_input_zsets && right.append_only_snapshot_enabled {
+        left.defer_index_maintenance = true;
+    }
 
-    // DataFusion physical join plans are not reusable with swapped dynamic inputs across
-    // collect calls. Keep the logical plan cached, but rebuild the physical plan per delta
-    // evaluation so cross-tick indexed joins observe the current provider batches.
-    let rebuild_each_evaluate = true;
+    // Reusing DataFusion physical join plans is only valid for selected nested
+    // join inputs. Generic materialized joins still rebuild so provider batches
+    // are never captured stale by a physical plan.
+    let rebuild_each_evaluate = !reuse_physical_plan;
     let left_delta_right_state = Some(
         JoinDeltaEvaluator::build(
             logical_plan.clone(),
@@ -739,6 +778,7 @@ async fn build_join_input_state(
     _output_initialized: bool,
     index_key_indices: Option<&[usize]>,
     persist_source_input_zsets: bool,
+    segment_backed_large_ranges: bool,
 ) -> Result<ColumnarJoinSourceState> {
     let ColumnarJoinInputPlanKind::Source { source_name } = &input.kind;
     let source_name = source_name.clone();
@@ -775,9 +815,11 @@ async fn build_join_input_state(
         .await
         .with_context(|| format!("filter {side} join input snapshot"))?;
     let snapshot = snapshot_batches_from_zset(&index_snapshot_zset)?;
+    let append_only_snapshot_enabled = source.append_only
+        && record_batch_row_count(&snapshot) <= APPEND_ONLY_JOIN_SNAPSHOT_ROW_LIMIT;
     let input_index = if let Some(key_indices) = index_key_indices {
-        let mut index = if persist_source_input_zsets {
-            SlateBackedColumnarIndexedZSet::new(
+        let mut index = if segment_backed_large_ranges || !persist_source_input_zsets {
+            SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
                 Arc::clone(&table),
                 index_namespace,
                 Arc::clone(&source.schema),
@@ -785,7 +827,7 @@ async fn build_join_input_state(
             )
             .await
         } else {
-            SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
+            SlateBackedColumnarIndexedZSet::new(
                 Arc::clone(&table),
                 index_namespace,
                 Arc::clone(&source.schema),
@@ -823,6 +865,9 @@ async fn build_join_input_state(
         primary_key_columns: source.primary_key_columns.clone(),
         input_filter,
         snapshot,
+        append_only_snapshot_enabled,
+        defer_index_maintenance: false,
+        index_stale: false,
         input_zset: Some(input_zset),
         input_index,
     })
@@ -963,34 +1008,48 @@ async fn run_columnar_join_state_tick_inner(
         .context("incremental join key indices missing")?;
     let phase_start = profile::start();
     let lookup_right_start = Instant::now();
-    let right_state_for_left_delta = lookup_indexed_join_state_for_delta(
-        columnar
-            .right
-            .input_index
-            .as_deref()
-            .context("incremental join right source index missing")?,
-        left_delta.batches(),
-        &join_key_indices.left,
-        &columnar.right.schema,
-        "right",
-    )
-    .await?;
+    let right_state_for_left_delta = if left_delta.is_empty() {
+        Vec::new()
+    } else if columnar.right.append_only_snapshot_enabled {
+        columnar.right.snapshot.clone()
+    } else {
+        ensure_join_input_index_current(&mut columnar.right, "right").await?;
+        lookup_indexed_join_state_for_delta(
+            columnar
+                .right
+                .input_index
+                .as_deref()
+                .context("incremental join right source index missing")?,
+            left_delta.batches(),
+            &join_key_indices.left,
+            &columnar.right.schema,
+            "right",
+        )
+        .await?
+    };
     let lookup_right_ms = lookup_right_start.elapsed().as_millis() as u64;
     profile::record_since("join.lookup_right_total", phase_start);
     let phase_start = profile::start();
     let lookup_left_start = Instant::now();
-    let left_state_for_right_delta = lookup_indexed_join_state_for_delta(
-        columnar
-            .left
-            .input_index
-            .as_deref()
-            .context("incremental join left source index missing")?,
-        right_delta.batches(),
-        &join_key_indices.right,
-        &columnar.left.schema,
-        "left",
-    )
-    .await?;
+    let left_state_for_right_delta = if right_delta.is_empty() {
+        Vec::new()
+    } else if columnar.left.append_only_snapshot_enabled {
+        columnar.left.snapshot.clone()
+    } else {
+        ensure_join_input_index_current(&mut columnar.left, "left").await?;
+        lookup_indexed_join_state_for_delta(
+            columnar
+                .left
+                .input_index
+                .as_deref()
+                .context("incremental join left source index missing")?,
+            right_delta.batches(),
+            &join_key_indices.right,
+            &columnar.left.schema,
+            "left",
+        )
+        .await?
+    };
     let lookup_left_ms = lookup_left_start.elapsed().as_millis() as u64;
     profile::record_since("join.lookup_left_total", phase_start);
 
@@ -1113,10 +1172,14 @@ async fn run_columnar_join_state_tick_inner(
     if let Some(index) = columnar.left.input_index.as_deref_mut() {
         let phase_start = profile::start();
         let apply_left_index_start = Instant::now();
-        index
-            .apply_delta(&left_delta)
-            .await
-            .context("apply left join delta to SlateDB-backed columnar index")?;
+        if columnar.left.defer_index_maintenance && !left_delta.is_empty() {
+            columnar.left.index_stale = true;
+        } else {
+            index
+                .apply_delta(&left_delta)
+                .await
+                .context("apply left join delta to SlateDB-backed columnar index")?;
+        }
         apply_left_index_ms = apply_left_index_start.elapsed().as_millis() as u64;
         profile::record_since("join.apply_left_index", phase_start);
     }
@@ -1124,13 +1187,33 @@ async fn run_columnar_join_state_tick_inner(
     if let Some(index) = columnar.right.input_index.as_deref_mut() {
         let phase_start = profile::start();
         let apply_right_index_start = Instant::now();
-        index
-            .apply_delta(&right_delta)
-            .await
-            .context("apply right join delta to SlateDB-backed columnar index")?;
+        if columnar.right.defer_index_maintenance && !right_delta.is_empty() {
+            columnar.right.index_stale = true;
+        } else {
+            index
+                .apply_delta(&right_delta)
+                .await
+                .context("apply right join delta to SlateDB-backed columnar index")?;
+        }
         apply_right_index_ms = apply_right_index_start.elapsed().as_millis() as u64;
         profile::record_since("join.apply_right_index", phase_start);
     }
+
+    if !maintain_output_snapshot {
+        if columnar.left.append_only_snapshot_enabled
+            && !apply_append_only_join_snapshot_delta(&mut columnar.left.snapshot, &left_delta)?
+        {
+            columnar.left.append_only_snapshot_enabled = false;
+            columnar.left.snapshot.clear();
+        }
+        if columnar.right.append_only_snapshot_enabled
+            && !apply_append_only_join_snapshot_delta(&mut columnar.right.snapshot, &right_delta)?
+        {
+            columnar.right.append_only_snapshot_enabled = false;
+            columnar.right.snapshot.clear();
+        }
+    }
+
     let mut source_snapshot_delta_ms = 0_u64;
     if maintain_output_snapshot {
         let phase_start = profile::start();
@@ -1149,6 +1232,19 @@ async fn run_columnar_join_state_tick_inner(
             &right_delta,
         )
         .await?;
+        if columnar.left.append_only_snapshot_enabled
+            && record_batch_row_count(&columnar.left.snapshot) > APPEND_ONLY_JOIN_SNAPSHOT_ROW_LIMIT
+        {
+            columnar.left.append_only_snapshot_enabled = false;
+            columnar.left.snapshot.clear();
+        }
+        if columnar.right.append_only_snapshot_enabled
+            && record_batch_row_count(&columnar.right.snapshot)
+                > APPEND_ONLY_JOIN_SNAPSHOT_ROW_LIMIT
+        {
+            columnar.right.append_only_snapshot_enabled = false;
+            columnar.right.snapshot.clear();
+        }
         source_snapshot_delta_ms = source_snapshot_delta_start.elapsed().as_millis() as u64;
         profile::record_since("join.source_snapshot_delta", phase_start);
     }
@@ -1318,6 +1414,62 @@ async fn prepare_join_source_delta(
     } else {
         Ok(input_delta)
     }
+}
+
+fn apply_append_only_join_snapshot_delta(
+    snapshot: &mut Vec<RecordBatch>,
+    delta: &ColumnarZSet,
+) -> Result<bool> {
+    if delta.is_empty() {
+        return Ok(true);
+    }
+    let mut delta_batches = snapshot_batches_from_zset(delta)?;
+    let delta_rows = record_batch_row_count(&delta_batches);
+    if delta_rows == 0 {
+        return Ok(true);
+    }
+    let current_rows = record_batch_row_count(snapshot);
+    if current_rows.saturating_add(delta_rows) > APPEND_ONLY_JOIN_SNAPSHOT_ROW_LIMIT {
+        return Ok(false);
+    }
+    if snapshot.len() == 1 && snapshot[0].num_rows() == 0 {
+        snapshot.clear();
+    }
+    snapshot.append(&mut delta_batches);
+    Ok(true)
+}
+
+fn record_batch_row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+async fn ensure_join_input_index_current(
+    source: &mut ColumnarJoinSourceState,
+    side: &str,
+) -> Result<()> {
+    if !source.index_stale {
+        return Ok(());
+    }
+    let input_zset = source
+        .input_zset
+        .as_mut()
+        .context("deferred join source zset missing")?;
+    let snapshot_zset = input_zset
+        .materialize_columnar()
+        .await
+        .with_context(|| format!("materialize stale {side} join input zset"))?;
+    let index_snapshot_zset = filter_join_source_delta(source.input_filter.as_ref(), snapshot_zset)
+        .await
+        .with_context(|| format!("filter stale {side} join input snapshot"))?;
+    source
+        .input_index
+        .as_deref_mut()
+        .context("deferred join source index missing")?
+        .rebuild_from_zset(&index_snapshot_zset)
+        .await
+        .with_context(|| format!("rebuild deferred {side} join input index"))?;
+    source.index_stale = false;
+    Ok(())
 }
 
 async fn filter_join_source_delta(

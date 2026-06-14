@@ -8,35 +8,36 @@ A query is considered acceptable when it is at least 95% of the listed baseline.
 
 - Baseline run: `1779915284118`
 - Baseline commit: `b4c8036` on `main`
-- Current comparison run: `1781470811475`
+- Current comparison run: `1781477580476`
 - Harness: `target/release/nexmark_cross_engine_compare floe nexmark_all`
 
 | Query | Baseline | 95% target | Current | Status |
 | --- | ---: | ---: | ---: | --- |
-| q0 | 646412 | 614092 | 656598 | pass |
-| q1 | 786163 | 746855 | 802568 | pass |
-| q2 | 823045 | 781893 | 821018 | pass |
-| q3 | 96153 | 91346 | 94339 | pass |
-| q4 | 749814 | 712324 | 593768 | fail |
-| q5 | 495294 | 470530 | 630914 | pass |
-| q6 | 417010 | 396160 | 509072 | pass |
-| q7 | 807754 | 767367 | 814332 | pass |
-| q8 | 92592 | 87963 | 84033 | fail |
-| q9 | 469986 | 446487 | 392080 | fail |
-| q12 | 813008 | 772358 | 816993 | pass |
-| q13 | 420307 | 399292 | 759398 | pass |
-| q14 | 814332 | 773616 | 793650 | pass |
-| q15 | 383435 | 364264 | 821018 | pass |
-| q16 | 819000 | 778050 | 807754 | pass |
-| q17 | 800640 | 760608 | 443458 | fail |
-| q18 | 253678 | 240995 | 311138 | pass |
-| q19 | 149611 | 142131 | 345781 | pass |
-| q20 | 535241 | 508479 | 591334 | pass |
-| q21 | 434593 | 412864 | 823723 | pass |
-| q22 | 665335 | 632069 | 820344 | pass |
+| q0 | 646412 | 614092 | 682593 | pass |
+| q1 | 786163 | 746855 | 853970 | pass |
+| q2 | 823045 | 781893 | 833333 | pass |
+| q3 | 96153 | 91346 | 100502 | pass |
+| q4 | 749814 | 712324 | 799050 | pass |
+| q5 | 495294 | 470530 | 662251 | pass |
+| q6 | 417010 | 396160 | 796529 | pass |
+| q7 | 807754 | 767367 | 829187 | pass |
+| q8 | 92592 | 87963 | 92592 | pass |
+| q9 | 469986 | 446487 | 530462 | pass |
+| q12 | 813008 | 772358 | 845308 | pass |
+| q13 | 420307 | 399292 | 805422 | pass |
+| q14 | 814332 | 773616 | 856898 | pass |
+| q15 | 383435 | 364264 | 842459 | pass |
+| q16 | 819000 | 778050 | 848176 | pass |
+| q17 | 800640 | 760608 | 854700 | pass |
+| q18 | 253678 | 240995 | 358808 | pass |
+| q19 | 149611 | 142131 | 403877 | pass |
+| q20 | 535241 | 508479 | 639240 | pass |
+| q21 | 434593 | 412864 | 844594 | pass |
+| q22 | 665335 | 632069 | 846023 | pass |
 
-Current append-only gaps to close before moving to CDC: q17, q4, q9, and q8.
-q8 is a small 10k-row query, so treat it as lower priority than the 1M-row gaps.
+Kafka append-only is within the 5% threshold across the full sweep. q8 is a 10k-row
+query and cold single-query runs are dominated by Redpanda/group-status polling overhead,
+so compare it using the full warm sweep.
 
 ## Postgres CDC Nexmark
 
@@ -72,5 +73,5 @@ Those queries need a clean rerun before judging them.
 | q21 | 80932 | 76886 | 71423 | fail |
 | q22 | 97895 | 93001 | 89397 | fail |
 
-CDC status is provisional until a clean sweep completes. After Kafka append-only is within 5%,
-rerun the CDC sweep and update the `Current` column before optimizing from these numbers.
+CDC status is provisional until a clean sweep completes. Rerun the CDC sweep and update
+the `Current` column before optimizing from these numbers.

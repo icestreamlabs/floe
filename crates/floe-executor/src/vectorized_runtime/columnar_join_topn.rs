@@ -33,6 +33,8 @@ use super::{
     apply_weighted_snapshot_delta, profile,
 };
 
+const APPEND_ONLY_LEFT_SNAPSHOT_ROW_LIMIT: usize = 100_000;
+
 pub(super) struct ColumnarJoinTopNPlan {
     left_source: String,
     right_source: String,
@@ -69,6 +71,7 @@ pub(super) struct ColumnarJoinTopNMaterializedViewState {
     right: JoinTopNSourceState,
     output_zset: SlateBackedColumnarZSet,
     current_output_index: Option<JoinTopNCurrentOutputIndex>,
+    append_only_left_snapshot: Option<Vec<RecordBatch>>,
     evaluator: JoinTopNEvaluator,
     row_count: i64,
     initial_snapshot: Vec<RecordBatch>,
@@ -487,6 +490,14 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         .await
         .context("load join-topn right input snapshot")?;
     let left_index_namespace = format!("{left_namespace}/index");
+    let left_snapshot = snapshot_batches_from_zset(&left_snapshot_zset)?;
+    let append_only_left_snapshot = if left_source.append_only
+        && record_batch_row_count(&left_snapshot) <= APPEND_ONLY_LEFT_SNAPSHOT_ROW_LIMIT
+    {
+        Some(left_snapshot)
+    } else {
+        None
+    };
     let left_index_keys =
         vec![left_key_idx.context("partitioned join-topn left key index is missing")?];
     let mut left_index = SlateBackedColumnarIndexedZSet::new(
@@ -504,7 +515,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
     let right_index_namespace = format!("{right_namespace}/index");
     let right_index_keys =
         vec![right_key_idx.context("partitioned join-topn right key index is missing")?];
-    let mut right_index = SlateBackedColumnarIndexedZSet::new(
+    let mut right_index = SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
         Arc::clone(&table),
         right_index_namespace,
         Arc::clone(&right_source.schema),
@@ -578,6 +589,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         },
         output_zset,
         current_output_index,
+        append_only_left_snapshot,
         evaluator,
         row_count: initial_row_count,
         initial_snapshot,
@@ -718,17 +730,24 @@ pub(super) async fn run_columnar_join_topn_state_tick(
             {
                 let phase_start = profile::start();
                 let lookup_left_start = timing_start(timing_enabled);
-                let previous_left = lookup_indexed_join_topn_state_for_i64_keys(
-                    columnar
-                        .left
-                        .input_index
-                        .as_deref()
-                        .context("partitioned join-topn left source index missing")?,
-                    &touched_keys,
-                    &columnar.left.schema,
-                    "left",
-                )
-                .await?;
+                let previous_left_lookup;
+                let previous_left =
+                    if let Some(snapshot) = columnar.append_only_left_snapshot.as_ref() {
+                        snapshot.as_slice()
+                    } else {
+                        previous_left_lookup = lookup_indexed_join_topn_state_for_i64_keys(
+                            columnar
+                                .left
+                                .input_index
+                                .as_deref()
+                                .context("partitioned join-topn left source index missing")?,
+                            &touched_keys,
+                            &columnar.left.schema,
+                            "left",
+                        )
+                        .await?;
+                        previous_left_lookup.as_slice()
+                    };
                 timings.lookup_left_ms = elapsed_ms(lookup_left_start);
                 profile::record_since("join_topn.lookup_previous_left", phase_start);
                 let phase_start = profile::start();
@@ -905,6 +924,13 @@ pub(super) async fn run_columnar_join_topn_state_tick(
     }
     let update_output_index_ms = elapsed_ms(update_output_index_start);
     profile::record_since("join_topn.update_output_index", phase_start);
+
+    if let Some(snapshot) = columnar.append_only_left_snapshot.as_mut()
+        && !apply_append_only_left_snapshot_delta(snapshot, &left_delta)?
+    {
+        columnar.append_only_left_snapshot = None;
+    }
+
     let phase_start = profile::start();
     let update_indexes_start = timing_start(timing_enabled);
     if let Some(index) = columnar.left.input_index.as_deref_mut() {
@@ -991,6 +1017,29 @@ async fn persisted_source_delta(
     } else {
         Ok(input_delta)
     }
+}
+
+fn apply_append_only_left_snapshot_delta(
+    snapshot: &mut Vec<RecordBatch>,
+    delta: &ColumnarZSet,
+) -> Result<bool> {
+    if delta.is_empty() {
+        return Ok(true);
+    }
+    let mut delta_batches = snapshot_batches_from_zset(delta)?;
+    let delta_rows = record_batch_row_count(&delta_batches);
+    if delta_rows == 0 {
+        return Ok(true);
+    }
+    let current_rows = record_batch_row_count(snapshot);
+    if current_rows.saturating_add(delta_rows) > APPEND_ONLY_LEFT_SNAPSHOT_ROW_LIMIT {
+        return Ok(false);
+    }
+    if snapshot.len() == 1 && snapshot[0].num_rows() == 0 {
+        snapshot.clear();
+    }
+    snapshot.append(&mut delta_batches);
+    Ok(true)
 }
 
 async fn apply_source_snapshot_delta(

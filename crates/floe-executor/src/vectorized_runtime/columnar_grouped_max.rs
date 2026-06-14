@@ -27,11 +27,11 @@ use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
 use crate::vectorized_runtime::source_state::incremental_source_for_plan;
-use crate::vectorized_source_delta::unit_source_delta_batches;
+use crate::vectorized_source_delta::{insert_only_source_delta_batch, unit_source_delta_batches};
 
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
-    build_columnar_join_materialized_view_state_in_namespace_delta_only,
+    build_columnar_join_materialized_view_state_in_namespace_delta_only_with_persistent_inputs,
     columnar_join_plan_for_plan, columnar_join_plan_sources_append_only,
     run_columnar_join_state_tick_delta_only,
 };
@@ -42,6 +42,8 @@ use super::{
     collect_incremental_output, direct_project_record_batches, direct_projection_indices,
     normalize_batches,
 };
+
+const APPEND_ONLY_GROUPED_MAX_STREAMING_ROW_LIMIT: usize = 8_192;
 
 const SUMMARY_TAG: u8 = b's';
 const SUMMARY_LOG_TAG: u8 = b'l';
@@ -432,7 +434,7 @@ async fn build_boxed_join_grouped_max_input_state(
 ) -> Result<Box<ColumnarJoinMaterializedViewState>> {
     Ok(Box::new(
         Box::pin(
-            build_columnar_join_materialized_view_state_in_namespace_delta_only(
+            build_columnar_join_materialized_view_state_in_namespace_delta_only_with_persistent_inputs(
                 table,
                 namespace,
                 output_schema,
@@ -577,23 +579,45 @@ async fn run_columnar_grouped_max_state_tick_inner(
     let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_max.prepare_input", phase_start);
     let input_changed = !persisted_input_delta.batches().is_empty();
-    let phase_start = profile::start();
-    let pending_start = Instant::now();
-    let pending = grouped_max_pending_delta(columnar, persisted_input_delta.batches()).await?;
-    let pending_group_count = pending.groups.len();
-    let projected_delta_rows = pending
-        .projected_delta
-        .batches()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum::<usize>();
-    let pending_ms = pending_start.elapsed().as_millis() as u64;
-    profile::record_since("grouped_max.pending_delta", phase_start);
-    let phase_start = profile::start();
-    let apply_start = Instant::now();
-    let output_delta_batches = apply_grouped_max_delta(columnar, pending).await?;
-    let apply_ms = apply_start.elapsed().as_millis() as u64;
-    profile::record_since("grouped_max.apply_delta", phase_start);
+    let streaming_start = Instant::now();
+    let streaming_output =
+        grouped_max_append_only_streaming_delta(columnar, persisted_input_delta.batches()).await?;
+    let (pending_group_count, projected_delta_rows, pending_ms, output_delta_batches, apply_ms) =
+        if let Some(output_delta_batches) = streaming_output {
+            (
+                0,
+                0,
+                0,
+                output_delta_batches,
+                streaming_start.elapsed().as_millis() as u64,
+            )
+        } else {
+            let phase_start = profile::start();
+            let pending_start = Instant::now();
+            let pending =
+                grouped_max_pending_delta(columnar, persisted_input_delta.batches()).await?;
+            let pending_group_count = pending.groups.len();
+            let projected_delta_rows = pending
+                .projected_delta
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            let pending_ms = pending_start.elapsed().as_millis() as u64;
+            profile::record_since("grouped_max.pending_delta", phase_start);
+            let phase_start = profile::start();
+            let apply_start = Instant::now();
+            let output_delta_batches = apply_grouped_max_delta(columnar, pending).await?;
+            let apply_ms = apply_start.elapsed().as_millis() as u64;
+            profile::record_since("grouped_max.apply_delta", phase_start);
+            (
+                pending_group_count,
+                projected_delta_rows,
+                pending_ms,
+                output_delta_batches,
+                apply_ms,
+            )
+        };
     let phase_start = profile::start();
     let build_output_start = Instant::now();
     let output_delta =
@@ -763,6 +787,126 @@ async fn prepare_join_grouped_max_input_delta(
         columnar.input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)
+}
+
+async fn grouped_max_append_only_streaming_delta(
+    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
+    input_batches: &[RecordBatch],
+) -> Result<Option<Vec<RecordBatch>>> {
+    if !columnar.append_only_input {
+        return Ok(None);
+    }
+    let input_row_count = input_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    if input_row_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if input_row_count > APPEND_ONLY_GROUPED_MAX_STREAMING_ROW_LIMIT {
+        return Ok(None);
+    }
+
+    let phase_start = profile::start();
+    let mut positive_source_batches = Vec::new();
+    for batch in input_batches {
+        let Some(insert_batch) = insert_only_source_delta_batch(&columnar.source_schema, batch)?
+        else {
+            return Ok(None);
+        };
+        positive_source_batches.push(insert_batch);
+    }
+    profile::record_since("grouped_max.pending_split_source_delta", phase_start);
+
+    let phase_start = profile::start();
+    let positive_output =
+        collect_grouped_max_projection_output(columnar, &positive_source_batches).await?;
+    profile::record_since("grouped_max.pending_project_positive", phase_start);
+    if positive_output.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(Some(Vec::new()));
+    }
+
+    let phase_start = profile::start();
+    let mut builder = WeightedMaxOutputBuilder::new(
+        columnar.output_zset.value_schema(),
+        &columnar.output_mapping,
+    )?;
+    let converter = row_converter_for_schema(&columnar.group_schema)?;
+    let mut current_maxes = HashMap::<Vec<u8>, Option<i64>>::with_capacity(input_row_count);
+    let mut max_updates = Vec::new();
+    let mut bounds_update = None;
+
+    for batch in &positive_output {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let group_columns = (0..columnar.max_idx)
+            .map(|idx| Arc::clone(batch.column(idx)))
+            .collect::<Vec<ArrayRef>>();
+        let group_rows = converter
+            .convert_columns(&group_columns)
+            .context("encode grouped-max streaming group keys")?;
+        let values = batch
+            .column(columnar.max_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("grouped-max value must be Int64"))?;
+        for row_idx in 0..batch.num_rows() {
+            if values.is_null(row_idx) {
+                continue;
+            }
+            let value = values.value(row_idx);
+            let group_key = group_rows.row(row_idx).data().to_vec();
+            let old_max = match current_maxes.get(&group_key) {
+                Some(max) => *max,
+                None => columnar.max_state.load_max(&group_key)?,
+            };
+            let new_max = match old_max {
+                Some(old_max) if old_max >= value => Some(old_max),
+                _ => Some(value),
+            };
+            current_maxes.insert(group_key.clone(), new_max);
+            if old_max != new_max {
+                if let Some(old_max) = old_max {
+                    builder.append(&batch, row_idx, columnar.max_idx, old_max, -1)?;
+                }
+                if let Some(new_max) = new_max {
+                    builder.append(&batch, row_idx, columnar.max_idx, new_max, 1)?;
+                }
+                max_updates.push((group_key.clone(), new_max));
+            }
+            merge_group_key_bounds_update(&mut bounds_update, &group_key);
+        }
+    }
+    profile::record_since("grouped_max.apply_update_loop", phase_start);
+
+    let phase_start = profile::start();
+    let mut writes = WriteBatch::new();
+    columnar
+        .max_state
+        .write_max_updates(&mut writes, &max_updates)?;
+    columnar
+        .max_state
+        .write_group_bounds(&mut writes, bounds_update.as_ref())?;
+    profile::record_since("grouped_max.apply_write_batch_build_tail", phase_start);
+
+    let phase_start = profile::start();
+    columnar
+        .max_state
+        .table
+        .write_batch(writes)
+        .await
+        .context("persist streaming append-only grouped-max state updates")?;
+    profile::record_since("grouped_max.apply_write_batch", phase_start);
+
+    let phase_start = profile::start();
+    columnar.max_state.apply_max_updates(max_updates)?;
+    profile::record_since("grouped_max.apply_summary_cache_update", phase_start);
+
+    let phase_start = profile::start();
+    let output = builder.finish()?;
+    profile::record_since("grouped_max.apply_finish_output", phase_start);
+    Ok(Some(output))
 }
 
 async fn grouped_max_pending_delta(

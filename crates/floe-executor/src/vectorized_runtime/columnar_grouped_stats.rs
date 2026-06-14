@@ -89,6 +89,7 @@ const APPEND_ONLY_COMPACT_LOG_MAGIC: &[u8; 4] = b"cgsl";
 const APPEND_ONLY_COMPACT_LOG_VERSION: u8 = 1;
 const COMPACT_SNAPSHOT_DENSE_WRITE_MIN_GROUPS: usize = 1024;
 const COMPACT_MAX_CANDIDATE_LIMIT: usize = 32;
+const APPEND_ONLY_DIRECT_STREAMING_ROW_LIMIT: usize = 8_192;
 
 pub(super) struct ColumnarGroupedStatsPlan {
     input: ColumnarGroupedStatsInputPlan,
@@ -99,6 +100,7 @@ pub(super) struct ColumnarGroupedStatsPlan {
     group_schema: SchemaRef,
     specs: Vec<AggregateSpec>,
     output_mapping: Vec<usize>,
+    output_casts: Vec<Option<GroupedStatsOutputCast>>,
     group_count: usize,
     post_aggregate_plan: Option<LogicalPlan>,
 }
@@ -161,6 +163,7 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     group_schema: SchemaRef,
     specs: Vec<AggregateSpec>,
     output_mapping: Vec<usize>,
+    output_casts: Vec<Option<GroupedStatsOutputCast>>,
     append_only_direct_count_output: bool,
     group_count: usize,
     initial_snapshot: Vec<RecordBatch>,
@@ -215,6 +218,11 @@ enum AggregateValueType {
     Decimal128,
 }
 
+#[derive(Clone, Copy)]
+enum GroupedStatsOutputCast {
+    AvgInt64ToInt64,
+}
+
 fn compact_grouped_stats_specs(specs: &[AggregateSpec]) -> Option<Vec<AggregateSpec>> {
     specs
         .iter()
@@ -247,6 +255,10 @@ fn output_mapping_contains_count(
             .and_then(|agg_idx| specs.get(agg_idx))
             .is_some_and(|spec| spec.kind == AggregateKind::Count)
     })
+}
+
+fn specs_contain_count(specs: &[AggregateSpec]) -> bool {
+    specs.iter().any(|spec| spec.kind == AggregateKind::Count)
 }
 
 struct SlateGroupedStatsState {
@@ -328,6 +340,11 @@ struct PendingCompactStatsGroupDelta {
 }
 
 type PendingCompactStatsGroupDeltas = HashMap<Vec<u8>, PendingCompactStatsGroupDelta>;
+
+struct DirectCompactTouchedGroup {
+    batch: RecordBatch,
+    row_idx: usize,
+}
 
 struct AppendOnlyCompactGroupStateLogBuilder {
     bytes: Vec<u8>,
@@ -536,12 +553,20 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     }
 
     let mut post_aggregate_plan = plan_match.post_aggregate_plan.clone();
+    let mut output_casts = Vec::new();
     let output_mapping = if post_aggregate_plan.is_some() {
         Vec::new()
     } else if let Some(mapping) =
         output_mapping_for_projection(plan_match.projection, aggregate, output_schema)
     {
-        if output_mapping_matches_types(&mapping, &aggregate_schema, output_schema) {
+        if let Some(casts) = output_casts_for_mapping(
+            &mapping,
+            &aggregate_schema,
+            output_schema,
+            group_count,
+            &specs,
+        ) {
+            output_casts = casts;
             mapping
         } else if plan_match.projection.is_some() {
             post_aggregate_plan = Some(plan.clone());
@@ -561,8 +586,15 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     {
         return Ok(None);
     }
-    for (output_field, source_idx) in output_schema.fields().iter().zip(output_mapping.iter()) {
-        if output_field.data_type() != aggregate_schema.field(*source_idx).data_type() {
+    for ((output_field, source_idx), output_cast) in output_schema
+        .fields()
+        .iter()
+        .zip(output_mapping.iter())
+        .zip(output_casts.iter())
+    {
+        if output_cast.is_none()
+            && output_field.data_type() != aggregate_schema.field(*source_idx).data_type()
+        {
             return Ok(None);
         }
     }
@@ -692,6 +724,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         group_schema,
         specs,
         output_mapping,
+        output_casts,
         group_count,
         post_aggregate_plan,
     }))
@@ -1068,8 +1101,11 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
     };
     let compact_specs = compact_grouped_stats_specs(&plan.specs);
     let append_only_direct_count_output = append_only_input
-        && post_aggregate.is_none()
-        && output_mapping_contains_count(&plan.output_mapping, plan.group_count, &plan.specs);
+        && if post_aggregate.is_some() {
+            specs_contain_count(&plan.specs)
+        } else {
+            output_mapping_contains_count(&plan.output_mapping, plan.group_count, &plan.specs)
+        };
 
     Ok(ColumnarGroupedStatsMaterializedViewState {
         input_name,
@@ -1098,6 +1134,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         group_schema: plan.group_schema,
         specs: plan.specs,
         output_mapping: plan.output_mapping,
+        output_casts: plan.output_casts,
         append_only_direct_count_output,
         group_count: plan.group_count,
         initial_snapshot,
@@ -1355,34 +1392,49 @@ pub(super) async fn run_columnar_grouped_stats_state_tick(
     let output_delta_batches = if columnar.append_only_input
         && columnar.stats_state.compact_enabled()
     {
-        let phase_start = profile::start();
-        let pending_start = Instant::now();
-        if let Some(pending) = grouped_stats_append_only_compact_pending_delta(
+        let direct_apply_start = Instant::now();
+        let direct_phase_start = profile::start();
+        if let Some(output_delta_batches) = grouped_stats_append_only_direct_count_compact_delta(
             columnar,
             persisted_input_delta.batches(),
         )
         .await?
         {
-            pending_ms = pending_start.elapsed().as_millis() as u64;
-            profile::record_since("grouped_stats.pending_delta", phase_start);
-            let phase_start = profile::start();
-            let apply_start = Instant::now();
-            let output_delta_batches =
-                apply_append_only_compact_grouped_stats_compact_delta(columnar, pending).await?;
-            apply_ms = apply_start.elapsed().as_millis() as u64;
-            profile::record_since("grouped_stats.apply_delta", phase_start);
+            pending_ms = 0;
+            apply_ms = direct_apply_start.elapsed().as_millis() as u64;
+            profile::record_since("grouped_stats.apply_delta", direct_phase_start);
             output_delta_batches
         } else {
-            let pending =
-                grouped_stats_pending_delta(columnar, persisted_input_delta.batches()).await?;
-            pending_ms = pending_start.elapsed().as_millis() as u64;
-            profile::record_since("grouped_stats.pending_delta", phase_start);
             let phase_start = profile::start();
-            let apply_start = Instant::now();
-            let output_delta_batches = apply_grouped_stats_delta(columnar, pending).await?;
-            apply_ms = apply_start.elapsed().as_millis() as u64;
-            profile::record_since("grouped_stats.apply_delta", phase_start);
-            output_delta_batches
+            let pending_start = Instant::now();
+            if let Some(pending) = grouped_stats_append_only_compact_pending_delta(
+                columnar,
+                persisted_input_delta.batches(),
+            )
+            .await?
+            {
+                pending_ms = pending_start.elapsed().as_millis() as u64;
+                profile::record_since("grouped_stats.pending_delta", phase_start);
+                let phase_start = profile::start();
+                let apply_start = Instant::now();
+                let output_delta_batches =
+                    apply_append_only_compact_grouped_stats_compact_delta(columnar, pending)
+                        .await?;
+                apply_ms = apply_start.elapsed().as_millis() as u64;
+                profile::record_since("grouped_stats.apply_delta", phase_start);
+                output_delta_batches
+            } else {
+                let pending =
+                    grouped_stats_pending_delta(columnar, persisted_input_delta.batches()).await?;
+                pending_ms = pending_start.elapsed().as_millis() as u64;
+                profile::record_since("grouped_stats.pending_delta", phase_start);
+                let phase_start = profile::start();
+                let apply_start = Instant::now();
+                let output_delta_batches = apply_grouped_stats_delta(columnar, pending).await?;
+                apply_ms = apply_start.elapsed().as_millis() as u64;
+                profile::record_since("grouped_stats.apply_delta", phase_start);
+                output_delta_batches
+            }
         }
     } else {
         let phase_start = profile::start();
@@ -1789,6 +1841,334 @@ async fn grouped_stats_append_only_compact_pending_delta(
     Ok(Some(pending))
 }
 
+async fn grouped_stats_append_only_direct_count_compact_delta(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    input_batches: &[RecordBatch],
+) -> Result<Option<Vec<RecordBatch>>> {
+    if !columnar.append_only_direct_count_output
+        || !columnar.append_only_input
+        || !columnar.stats_state.compact_enabled()
+    {
+        return Ok(None);
+    }
+    let input_row_count = input_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    if input_row_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    columnar
+        .stats_state
+        .load_compact_snapshot_if_needed()
+        .await?;
+    let write_compact_snapshot = columnar
+        .stats_state
+        .should_write_append_only_compact_snapshot(input_row_count)?;
+    let write_append_only_compact_log =
+        !write_compact_snapshot && columnar.stats_state.compact_snapshot_active()?;
+    if !columnar.stats_state.compact_states_loaded_or_empty()? {
+        return Ok(None);
+    }
+
+    let mut positive_source_batches = Vec::new();
+    let phase_start = profile::start();
+    for batch in input_batches {
+        let Some(insert_batch) = insert_only_source_delta_batch(&columnar.source_schema, batch)?
+        else {
+            return Ok(None);
+        };
+        positive_source_batches.push(insert_batch);
+    }
+    profile::record_since("grouped_stats.pending_split_source_delta", phase_start);
+
+    let phase_start = profile::start();
+    let positive_output =
+        collect_grouped_stats_projection_output(columnar, &positive_source_batches).await?;
+    profile::record_since("grouped_stats.pending_project_positive", phase_start);
+    if positive_output.iter().all(|batch| batch.num_rows() == 0) {
+        return Ok(Some(Vec::new()));
+    }
+    if columnar.post_aggregate.is_none()
+        && input_row_count <= APPEND_ONLY_DIRECT_STREAMING_ROW_LIMIT
+    {
+        return grouped_stats_append_only_streaming_direct_count_compact_delta(
+            columnar,
+            &positive_output,
+            input_row_count,
+            write_compact_snapshot,
+            write_append_only_compact_log,
+        )
+        .await
+        .map(Some);
+    }
+
+    let output_row_capacity = input_row_count.saturating_mul(2).max(1024);
+    let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
+        columnar.output_zset.value_schema(),
+        &columnar.output_mapping,
+        &columnar.output_casts,
+        output_row_capacity,
+    )?;
+    let mut old_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
+        Arc::clone(&columnar.aggregate_schema),
+        columnar.group_count,
+        input_row_count.max(1024),
+    )?;
+    let mut new_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
+        Arc::clone(&columnar.aggregate_schema),
+        columnar.group_count,
+        input_row_count.max(1024),
+    )?;
+    let mut writes = WriteBatch::new();
+    let mut append_only_compact_log =
+        AppendOnlyCompactGroupStateLogBuilder::with_capacity(input_row_count);
+
+    let phase_start = profile::start();
+    columnar
+        .stats_state
+        .mutate_loaded_compact_states(|values| {
+            let mut touched =
+                HashMap::<Vec<u8>, DirectCompactTouchedGroup>::with_capacity(input_row_count);
+            let converter = if columnar.group_count == 0 {
+                None
+            } else {
+                Some(row_converter_for_schema(&columnar.group_schema)?)
+            };
+
+            for batch in &positive_output {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let value_arrays = projected_value_arrays(batch, &columnar.specs)?;
+                let filter_arrays = projected_filter_arrays(batch, &columnar.specs)?;
+                match converter.as_ref() {
+                    Some(converter) => {
+                        let group_columns = (0..columnar.group_count)
+                            .map(|idx| Arc::clone(batch.column(idx)))
+                            .collect::<Vec<ArrayRef>>();
+                        let group_rows = converter
+                            .convert_columns(&group_columns)
+                            .context("encode grouped-stats direct compact group keys")?;
+                        for row_idx in 0..batch.num_rows() {
+                            let group_key = group_rows.row(row_idx).data().to_vec();
+                            apply_projected_compact_stats_row_to_loaded_state(
+                                columnar,
+                                batch,
+                                row_idx,
+                                group_key,
+                                &value_arrays,
+                                &filter_arrays,
+                                values,
+                                &mut touched,
+                                &mut direct_builder,
+                                &mut old_aggregate_builder,
+                            )?;
+                        }
+                    }
+                    None => {
+                        for row_idx in 0..batch.num_rows() {
+                            apply_projected_compact_stats_row_to_loaded_state(
+                                columnar,
+                                batch,
+                                row_idx,
+                                Vec::new(),
+                                &value_arrays,
+                                &filter_arrays,
+                                values,
+                                &mut touched,
+                                &mut direct_builder,
+                                &mut old_aggregate_builder,
+                            )?;
+                        }
+                    }
+                }
+            }
+            profile::record_since("grouped_stats.pending_add_positive", phase_start);
+
+            for (group_key, touched_group) in touched {
+                let phase_start = profile::start();
+                let state = values.get(&group_key).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats touched compact state missing")
+                })?;
+                if state.row_count > 0 {
+                    if columnar.post_aggregate.is_some() {
+                        new_aggregate_builder.append_compact_state(
+                            &touched_group.batch,
+                            touched_group.row_idx,
+                            &columnar.specs,
+                            state,
+                        )?;
+                    } else {
+                        direct_builder.append_compact_state(
+                            &touched_group.batch,
+                            touched_group.row_idx,
+                            columnar.group_count,
+                            &columnar.specs,
+                            state,
+                            1,
+                        )?;
+                    }
+                }
+                profile::record_since("grouped_stats.apply_build_rows", phase_start);
+
+                let phase_start = profile::start();
+                if !write_compact_snapshot {
+                    if write_append_only_compact_log {
+                        append_only_compact_log.append(&group_key, state)?;
+                    } else {
+                        columnar.stats_state.write_compact_state_to_batch(
+                            &mut writes,
+                            &group_key,
+                            state,
+                        )?;
+                    }
+                }
+                profile::record_since("grouped_stats.apply_cache_state", phase_start);
+            }
+            Ok(())
+        })?;
+
+    if write_compact_snapshot {
+        let phase_start = profile::start();
+        columnar.stats_state.write_compact_snapshot(&mut writes)?;
+        profile::record_since("grouped_stats.apply_snapshot_state", phase_start);
+    } else if write_append_only_compact_log {
+        let phase_start = profile::start();
+        columnar
+            .stats_state
+            .write_append_only_compact_state_log(&mut writes, append_only_compact_log)?;
+        profile::record_since("grouped_stats.apply_append_only_compact_log", phase_start);
+    }
+
+    let phase_start = profile::start();
+    columnar
+        .stats_state
+        .table
+        .write_batch(writes)
+        .await
+        .context("persist append-only direct compact grouped-stats state updates")?;
+    profile::record_since("grouped_stats.apply_write_batch", phase_start);
+    let output_delta_batches = if let Some(post_aggregate) = columnar.post_aggregate.as_ref() {
+        post_aggregate_delta_batches(
+            post_aggregate,
+            columnar.output_zset.value_schema(),
+            old_aggregate_builder.finish()?,
+            new_aggregate_builder.finish()?,
+        )
+        .await?
+    } else {
+        direct_builder.finish()?
+    };
+    Ok(Some(output_delta_batches))
+}
+
+async fn grouped_stats_append_only_streaming_direct_count_compact_delta(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    positive_output: &[RecordBatch],
+    input_row_count: usize,
+    write_compact_snapshot: bool,
+    write_append_only_compact_log: bool,
+) -> Result<Vec<RecordBatch>> {
+    let output_row_capacity = input_row_count.saturating_mul(2).max(1024);
+    let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
+        columnar.output_zset.value_schema(),
+        &columnar.output_mapping,
+        &columnar.output_casts,
+        output_row_capacity,
+    )?;
+    let mut writes = WriteBatch::new();
+    let mut append_only_compact_log =
+        AppendOnlyCompactGroupStateLogBuilder::with_capacity(input_row_count);
+
+    columnar
+        .stats_state
+        .mutate_loaded_compact_states(|values| {
+            let converter = if columnar.group_count == 0 {
+                None
+            } else {
+                Some(row_converter_for_schema(&columnar.group_schema)?)
+            };
+
+            for batch in positive_output {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let value_arrays = projected_value_arrays(batch, &columnar.specs)?;
+                let filter_arrays = projected_filter_arrays(batch, &columnar.specs)?;
+                match converter.as_ref() {
+                    Some(converter) => {
+                        let group_columns = (0..columnar.group_count)
+                            .map(|idx| Arc::clone(batch.column(idx)))
+                            .collect::<Vec<ArrayRef>>();
+                        let group_rows = converter
+                            .convert_columns(&group_columns)
+                            .context("encode grouped-stats streaming compact group keys")?;
+                        for row_idx in 0..batch.num_rows() {
+                            let group_key = group_rows.row(row_idx).data().to_vec();
+                            apply_projected_compact_stats_row_streaming(
+                                columnar,
+                                batch,
+                                row_idx,
+                                group_key,
+                                &value_arrays,
+                                &filter_arrays,
+                                values,
+                                &mut direct_builder,
+                                &mut writes,
+                                &mut append_only_compact_log,
+                                write_compact_snapshot,
+                                write_append_only_compact_log,
+                            )?;
+                        }
+                    }
+                    None => {
+                        for row_idx in 0..batch.num_rows() {
+                            apply_projected_compact_stats_row_streaming(
+                                columnar,
+                                batch,
+                                row_idx,
+                                Vec::new(),
+                                &value_arrays,
+                                &filter_arrays,
+                                values,
+                                &mut direct_builder,
+                                &mut writes,
+                                &mut append_only_compact_log,
+                                write_compact_snapshot,
+                                write_append_only_compact_log,
+                            )?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+    if write_compact_snapshot {
+        let phase_start = profile::start();
+        columnar.stats_state.write_compact_snapshot(&mut writes)?;
+        profile::record_since("grouped_stats.apply_snapshot_state", phase_start);
+    } else if write_append_only_compact_log {
+        let phase_start = profile::start();
+        columnar
+            .stats_state
+            .write_append_only_compact_state_log(&mut writes, append_only_compact_log)?;
+        profile::record_since("grouped_stats.apply_append_only_compact_log", phase_start);
+    }
+
+    let phase_start = profile::start();
+    columnar
+        .stats_state
+        .table
+        .write_batch(writes)
+        .await
+        .context("persist append-only streaming compact grouped-stats state updates")?;
+    profile::record_since("grouped_stats.apply_write_batch", phase_start);
+    direct_builder.finish()
+}
+
 async fn collect_grouped_stats_projection_output(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     source_batches: &[RecordBatch],
@@ -2027,6 +2407,296 @@ fn add_projected_compact_stats_row_to_pending(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_projected_compact_stats_row_streaming(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    batch: &RecordBatch,
+    row_idx: usize,
+    group_key: Vec<u8>,
+    value_arrays: &[ProjectedValueArray<'_>],
+    filter_arrays: &[Option<&BooleanArray>],
+    values: &mut CompactGroupStateMap,
+    direct_builder: &mut WeightedStatsOutputBuilder,
+    writes: &mut WriteBatch,
+    append_only_compact_log: &mut AppendOnlyCompactGroupStateLogBuilder,
+    write_compact_snapshot: bool,
+    write_append_only_compact_log: bool,
+) -> Result<()> {
+    let state = match values.entry(group_key.clone()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(empty_compact_group_state(columnar)?),
+    };
+    if state.row_count > 0 {
+        let phase_start = profile::start();
+        direct_builder.append_compact_state(
+            batch,
+            row_idx,
+            columnar.group_count,
+            &columnar.specs,
+            state,
+            -1,
+        )?;
+        profile::record_since("grouped_stats.apply_build_rows", phase_start);
+    }
+
+    let phase_start = profile::start();
+    state.row_count = state
+        .row_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("grouped-stats row count overflow"))?;
+    for (agg_idx, spec) in columnar.specs.iter().enumerate() {
+        if !filter_allows(&filter_arrays[agg_idx], row_idx) {
+            continue;
+        }
+        match spec.kind {
+            AggregateKind::Count => {
+                if spec.value_idx.is_some()
+                    && !projected_value_is_non_null(&value_arrays[agg_idx], row_idx)
+                {
+                    continue;
+                }
+                let CompactAggregateState::I64(value) =
+                    state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *value = value
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats count overflow"))?;
+            }
+            AggregateKind::Sum => {
+                let Some(delta) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                let CompactAggregateState::I64(value) =
+                    state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *value = value
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats sum overflow"))?;
+            }
+            AggregateKind::Avg => {
+                let Some(delta) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                let CompactAggregateState::Pair { sum, count } =
+                    state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *sum = sum
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg sum overflow"))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg count overflow"))?;
+            }
+            AggregateKind::Min | AggregateKind::Max => {
+                let Some(delta) = projected_ordered_i64_value(&value_arrays[agg_idx], row_idx)
+                else {
+                    continue;
+                };
+                {
+                    let CompactAggregateState::MinMaxI64(value) =
+                        state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                        })?
+                    else {
+                        bail!("grouped-stats compact aggregate state kind mismatch");
+                    };
+                    *value = Some(match *value {
+                        Some(current) => minmax_value(spec.kind, current, delta),
+                        None => delta,
+                    });
+                }
+                let candidates = state.minmax_candidates.get_mut(agg_idx).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats compact candidate index missing")
+                })?;
+                push_minmax_candidate(spec.kind, candidates, delta);
+            }
+            AggregateKind::DistinctCount => {
+                bail!("grouped-stats distinct count is not compactable")
+            }
+        }
+    }
+    profile::record_since("grouped_stats.apply_update_state", phase_start);
+
+    let phase_start = profile::start();
+    if state.row_count > 0 {
+        direct_builder.append_compact_state(
+            batch,
+            row_idx,
+            columnar.group_count,
+            &columnar.specs,
+            state,
+            1,
+        )?;
+    }
+    profile::record_since("grouped_stats.apply_build_rows", phase_start);
+
+    let phase_start = profile::start();
+    if !write_compact_snapshot {
+        if write_append_only_compact_log {
+            append_only_compact_log.append(&group_key, state)?;
+        } else {
+            columnar
+                .stats_state
+                .write_compact_state_to_batch(writes, &group_key, state)?;
+        }
+    }
+    profile::record_since("grouped_stats.apply_cache_state", phase_start);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_projected_compact_stats_row_to_loaded_state(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    batch: &RecordBatch,
+    row_idx: usize,
+    key: Vec<u8>,
+    value_arrays: &[ProjectedValueArray<'_>],
+    filter_arrays: &[Option<&BooleanArray>],
+    values: &mut CompactGroupStateMap,
+    touched: &mut HashMap<Vec<u8>, DirectCompactTouchedGroup>,
+    direct_builder: &mut WeightedStatsOutputBuilder,
+    old_aggregate_builder: &mut AggregateStatsOutputBuilder,
+) -> Result<()> {
+    let first_touch = !touched.contains_key(&key);
+    let state = match values.entry(key.clone()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(empty_compact_group_state(columnar)?),
+    };
+    if first_touch {
+        if state.row_count > 0 {
+            let phase_start = profile::start();
+            if columnar.post_aggregate.is_some() {
+                old_aggregate_builder.append_compact_state(
+                    batch,
+                    row_idx,
+                    &columnar.specs,
+                    state,
+                )?;
+            } else {
+                direct_builder.append_compact_state(
+                    batch,
+                    row_idx,
+                    columnar.group_count,
+                    &columnar.specs,
+                    state,
+                    -1,
+                )?;
+            }
+            profile::record_since("grouped_stats.apply_build_rows", phase_start);
+        }
+        touched.insert(
+            key,
+            DirectCompactTouchedGroup {
+                batch: batch.clone(),
+                row_idx,
+            },
+        );
+    }
+
+    let phase_start = profile::start();
+    state.row_count = state
+        .row_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("grouped-stats row count overflow"))?;
+    for (agg_idx, spec) in columnar.specs.iter().enumerate() {
+        if !filter_allows(&filter_arrays[agg_idx], row_idx) {
+            continue;
+        }
+        match spec.kind {
+            AggregateKind::Count => {
+                if spec.value_idx.is_some()
+                    && !projected_value_is_non_null(&value_arrays[agg_idx], row_idx)
+                {
+                    continue;
+                }
+                let CompactAggregateState::I64(value) =
+                    state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *value = value
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats count overflow"))?;
+            }
+            AggregateKind::Sum => {
+                let Some(delta) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                let CompactAggregateState::I64(value) =
+                    state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *value = value
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats sum overflow"))?;
+            }
+            AggregateKind::Avg => {
+                let Some(delta) = projected_i64_value(&value_arrays[agg_idx], row_idx) else {
+                    continue;
+                };
+                let CompactAggregateState::Pair { sum, count } =
+                    state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                        anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                    })?
+                else {
+                    bail!("grouped-stats compact aggregate state kind mismatch");
+                };
+                *sum = sum
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg sum overflow"))?;
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("grouped-stats avg count overflow"))?;
+            }
+            AggregateKind::Min | AggregateKind::Max => {
+                let Some(delta) = projected_ordered_i64_value(&value_arrays[agg_idx], row_idx)
+                else {
+                    continue;
+                };
+                {
+                    let CompactAggregateState::MinMaxI64(value) =
+                        state.aggregates.get_mut(agg_idx).ok_or_else(|| {
+                            anyhow::anyhow!("grouped-stats compact aggregate index missing")
+                        })?
+                    else {
+                        bail!("grouped-stats compact aggregate state kind mismatch");
+                    };
+                    *value = Some(match *value {
+                        Some(current) => minmax_value(spec.kind, current, delta),
+                        None => delta,
+                    });
+                }
+                let candidates = state.minmax_candidates.get_mut(agg_idx).ok_or_else(|| {
+                    anyhow::anyhow!("grouped-stats compact candidate index missing")
+                })?;
+                push_minmax_candidate(spec.kind, candidates, delta);
+            }
+            AggregateKind::DistinctCount => {
+                bail!("grouped-stats distinct count is not compactable")
+            }
+        }
+    }
+    profile::record_since("grouped_stats.apply_update_state", phase_start);
+    Ok(())
+}
+
 fn add_projected_stats_row_to_pending(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     batch: &RecordBatch,
@@ -2171,6 +2841,7 @@ async fn apply_grouped_stats_delta(
     let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
+        &columnar.output_casts,
         output_row_capacity,
     )?;
     let mut old_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
@@ -2627,6 +3298,7 @@ async fn apply_append_only_compact_grouped_stats_compact_delta(
     let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
+        &columnar.output_casts,
         output_row_capacity,
     )?;
     let mut old_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
@@ -6050,13 +6722,24 @@ impl AggregateStatsOutputBuilder {
 struct WeightedStatsOutputBuilder {
     weighted_schema: SchemaRef,
     output_mapping: Vec<usize>,
+    output_casts: Vec<Option<GroupedStatsOutputCast>>,
     builders: Vec<ScalarColumnBuilder>,
     weights: Int64Builder,
     rows: usize,
 }
 
 impl WeightedStatsOutputBuilder {
-    fn with_capacity(schema: SchemaRef, output_mapping: &[usize], capacity: usize) -> Result<Self> {
+    fn with_capacity(
+        schema: SchemaRef,
+        output_mapping: &[usize],
+        output_casts: &[Option<GroupedStatsOutputCast>],
+        capacity: usize,
+    ) -> Result<Self> {
+        if output_mapping.len() != schema.fields().len()
+            || output_casts.len() != schema.fields().len()
+        {
+            bail!("grouped-stats output mapping does not match output schema");
+        }
         let builders = schema
             .fields()
             .iter()
@@ -6066,6 +6749,7 @@ impl WeightedStatsOutputBuilder {
         Ok(Self {
             weighted_schema,
             output_mapping: output_mapping.to_vec(),
+            output_casts: output_casts.to_vec(),
             builders,
             weights: Int64Builder::with_capacity(capacity),
             rows: 0,
@@ -6081,7 +6765,11 @@ impl WeightedStatsOutputBuilder {
         weight: i64,
     ) -> Result<()> {
         for (output_idx, source_idx) in self.output_mapping.iter().copied().enumerate() {
+            let output_cast = self.output_casts[output_idx];
             if source_idx < group_count {
+                if output_cast.is_some() {
+                    bail!("grouped-stats output cast cannot apply to group column");
+                }
                 self.builders[output_idx]
                     .append_array_value(projection_batch.column(source_idx).as_ref(), row_idx)?;
             } else {
@@ -6089,7 +6777,7 @@ impl WeightedStatsOutputBuilder {
                 let value = aggregate_values
                     .get(aggregate_idx)
                     .ok_or_else(|| anyhow::anyhow!("grouped-stats output mapping out of bounds"))?;
-                append_aggregate_value(&mut self.builders[output_idx], value)?;
+                append_output_aggregate_value(&mut self.builders[output_idx], value, output_cast)?;
             }
         }
         self.weights.append_value(weight);
@@ -6107,12 +6795,16 @@ impl WeightedStatsOutputBuilder {
         weight: i64,
     ) -> Result<()> {
         for (output_idx, source_idx) in self.output_mapping.iter().copied().enumerate() {
+            let output_cast = self.output_casts[output_idx];
             if source_idx < group_count {
+                if output_cast.is_some() {
+                    bail!("grouped-stats output cast cannot apply to group column");
+                }
                 self.builders[output_idx]
                     .append_array_value(projection_batch.column(source_idx).as_ref(), row_idx)?;
             } else {
                 let aggregate_idx = source_idx - group_count;
-                append_compact_aggregate_state_value(
+                append_compact_output_aggregate_state_value(
                     &mut self.builders[output_idx],
                     specs.get(aggregate_idx).ok_or_else(|| {
                         anyhow::anyhow!("grouped-stats output mapping out of bounds")
@@ -6120,6 +6812,7 @@ impl WeightedStatsOutputBuilder {
                     state.aggregates.get(aggregate_idx).ok_or_else(|| {
                         anyhow::anyhow!("grouped-stats compact output mapping out of bounds")
                     })?,
+                    output_cast,
                 )?;
             }
         }
@@ -6159,6 +6852,21 @@ fn append_aggregate_value(builder: &mut ScalarColumnBuilder, value: &AggregateVa
             builder.append_encoded_scalar(Some(&EncodedRowScalar::Decimal128(*value)))
         }
         AggregateValue::Null => builder.append_encoded_scalar(None),
+    }
+}
+
+fn append_output_aggregate_value(
+    builder: &mut ScalarColumnBuilder,
+    value: &AggregateValue,
+    output_cast: Option<GroupedStatsOutputCast>,
+) -> Result<()> {
+    match output_cast {
+        None => append_aggregate_value(builder, value),
+        Some(GroupedStatsOutputCast::AvgInt64ToInt64) => match value {
+            AggregateValue::Float64(value) => append_f64_to_i64_cast(builder, *value),
+            AggregateValue::Null => builder.append_encoded_scalar(None),
+            _ => bail!("grouped-stats AVG output cast requires Float64 aggregate value"),
+        },
     }
 }
 
@@ -6204,6 +6912,43 @@ fn append_compact_aggregate_state_value(
         }
         _ => bail!("grouped-stats compact aggregate state kind mismatch"),
     }
+}
+
+fn append_compact_output_aggregate_state_value(
+    builder: &mut ScalarColumnBuilder,
+    spec: &AggregateSpec,
+    state: &CompactAggregateState,
+    output_cast: Option<GroupedStatsOutputCast>,
+) -> Result<()> {
+    match output_cast {
+        None => append_compact_aggregate_state_value(builder, spec, state),
+        Some(GroupedStatsOutputCast::AvgInt64ToInt64) => {
+            let (AggregateKind::Avg, CompactAggregateState::Pair { sum, count }) =
+                (spec.kind, state)
+            else {
+                bail!("grouped-stats AVG output cast requires compact AVG state");
+            };
+            append_avg_int64_to_i64_cast(builder, *sum, *count)
+        }
+    }
+}
+
+fn append_avg_int64_to_i64_cast(
+    builder: &mut ScalarColumnBuilder,
+    sum: i64,
+    count: i64,
+) -> Result<()> {
+    if count == 0 {
+        return builder.append_encoded_scalar(None);
+    }
+    builder.append_i64_value(sum / count)
+}
+
+fn append_f64_to_i64_cast(builder: &mut ScalarColumnBuilder, value: f64) -> Result<()> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        bail!("grouped-stats Float64 to Int64 output cast out of range");
+    }
+    builder.append_i64_value(value.trunc() as i64)
 }
 
 async fn post_aggregate_delta_batches(
@@ -6886,36 +7631,62 @@ fn output_mapping_for_projection(
     }
 }
 
-fn output_mapping_matches_types(
+fn output_casts_for_mapping(
     mapping: &[usize],
     aggregate_schema: &SchemaRef,
     output_schema: &SchemaRef,
-) -> bool {
-    mapping.len() == output_schema.fields().len()
-        && mapping
-            .iter()
-            .zip(output_schema.fields())
-            .all(|(source_idx, output_field)| {
-                *source_idx < aggregate_schema.fields().len()
-                    && output_field.data_type() == aggregate_schema.field(*source_idx).data_type()
-            })
+    group_count: usize,
+    specs: &[AggregateSpec],
+) -> Option<Vec<Option<GroupedStatsOutputCast>>> {
+    if mapping.len() != output_schema.fields().len() {
+        return None;
+    }
+    mapping
+        .iter()
+        .zip(output_schema.fields())
+        .map(|(source_idx, output_field)| {
+            if *source_idx >= aggregate_schema.fields().len() {
+                return None;
+            }
+            let source_type = aggregate_schema.field(*source_idx).data_type();
+            if output_field.data_type() == source_type {
+                return Some(None);
+            }
+            if output_field.data_type() == &DataType::Int64
+                && source_type == &DataType::Float64
+                && let Some(aggregate_idx) = source_idx.checked_sub(group_count)
+                && specs.get(aggregate_idx).is_some_and(|spec| {
+                    spec.kind == AggregateKind::Avg
+                        && spec.value_type == Some(AggregateValueType::Int64)
+                })
+            {
+                return Some(Some(GroupedStatsOutputCast::AvgInt64ToInt64));
+            }
+            None
+        })
+        .collect()
 }
 
 fn output_expr_source_idx(
     expr: &Expr,
     aggregate_schema: &datafusion::common::DFSchemaRef,
 ) -> Option<usize> {
-    let Expr::Column(column) = expr else {
-        let expr_name = strip_alias(expr).schema_name().to_string();
-        return aggregate_schema
+    match expr {
+        Expr::Column(column) => aggregate_schema
             .fields()
             .iter()
-            .position(|field| field.name() == &expr_name);
-    };
-    aggregate_schema
-        .fields()
-        .iter()
-        .position(|field| field.name() == &column.name)
+            .position(|field| field.name() == &column.name),
+        Expr::Cast(cast) => {
+            output_expr_source_idx(strip_alias(cast.expr.as_ref()), aggregate_schema)
+        }
+        _ => {
+            let expr_name = strip_alias(expr).schema_name().to_string();
+            aggregate_schema
+                .fields()
+                .iter()
+                .position(|field| field.name() == &expr_name)
+        }
+    }
 }
 
 fn is_count_star_args(args: &[Expr]) -> bool {
