@@ -98,6 +98,7 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     source_snapshot_current: bool,
     initial_snapshot: Vec<RecordBatch>,
     row_count: i64,
+    append_only_input: bool,
     append_only_fast_path: bool,
     row_number_limit: Option<usize>,
     source_output_projection: Option<Vec<usize>>,
@@ -356,6 +357,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_snapshot_current: true,
                 initial_snapshot,
                 row_count: initial_row_count,
+                append_only_input: source.append_only,
                 append_only_fast_path: plan.append_only_fast_path,
                 row_number_limit: plan.row_number_limit,
                 source_output_projection,
@@ -417,6 +419,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_snapshot_current: true,
                 initial_snapshot,
                 row_count: initial_row_count,
+                append_only_input: false,
                 append_only_fast_path: plan.append_only_fast_path,
                 row_number_limit: plan.row_number_limit,
                 source_output_projection: None,
@@ -460,7 +463,8 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     };
     let plan_start = Instant::now();
 
-    let maintain_output_snapshot = columnar.source_index.is_none();
+    let maintain_output_snapshot = columnar.source_index.is_none()
+        || (columnar.append_only_input && columnar.append_only_fast_path);
     let tick = run_columnar_topn_state_tick_inner(
         columnar,
         insert_batches,

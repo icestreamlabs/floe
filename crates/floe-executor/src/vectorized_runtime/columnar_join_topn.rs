@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -162,6 +162,14 @@ struct JoinTopNPreviousBestBid {
 }
 
 #[derive(Clone)]
+struct JoinTopNPreviousBestOrder {
+    price: i64,
+    bid_time: i64,
+    bidder: i64,
+    bid_extra: Option<String>,
+}
+
+#[derive(Clone)]
 struct JoinTopNOutputStateIndices {
     partition: Vec<usize>,
     price: usize,
@@ -175,6 +183,7 @@ struct JoinTopNCurrentOutputIndex {
     key_prefix: Vec<u8>,
     output_schema: SchemaRef,
     output_state_indices: JoinTopNOutputStateIndices,
+    order_values: Mutex<HashMap<Vec<u8>, JoinTopNPreviousBestOrder>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1095,6 +1104,30 @@ fn columnar_zset_is_delete_only(delta: &ColumnarZSet) -> Result<bool> {
     Ok(saw_delete)
 }
 
+fn columnar_zset_is_insert_only(delta: &ColumnarZSet) -> Result<bool> {
+    if delta.is_empty() {
+        return Ok(false);
+    }
+    let weight_idx = delta.value_column_count();
+    let mut saw_insert = false;
+    for batch in delta.batches() {
+        let weights = weight_column_at(batch, weight_idx)?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) {
+                bail!("join-topn delta weight column cannot contain NULL");
+            }
+            let weight = weights.value(row_idx);
+            if weight < 0 {
+                return Ok(false);
+            }
+            if weight > 0 {
+                saw_insert = true;
+            }
+        }
+    }
+    Ok(saw_insert)
+}
+
 fn negative_output_delta_from_snapshot(
     output_schema: &SchemaRef,
     snapshot: &[RecordBatch],
@@ -1208,12 +1241,14 @@ impl JoinTopNCurrentOutputIndex {
             key_prefix,
             output_schema,
             output_state_indices,
+            order_values: Mutex::new(HashMap::new()),
         })
     }
 
     async fn rebuild_from_snapshot(&self, snapshot: &[RecordBatch]) -> Result<()> {
         let mut writes = WriteBatch::new();
         let mut has_writes = false;
+        let mut order_values = HashMap::new();
         for (key, _) in self
             .table
             .scan_prefix_bytes(&self.key_prefix, &ScanOptions::default())
@@ -1225,9 +1260,14 @@ impl JoinTopNCurrentOutputIndex {
         }
         for batch in snapshot {
             for row_idx in 0..batch.num_rows() {
-                let key = self.state_key_for_output_row(batch, row_idx)?;
+                let partition_key =
+                    output_partition_key(batch, row_idx, &self.output_state_indices)?;
+                let payload = encode_partition_key_payload(&partition_key)?;
+                let key = self.state_key_for_payload(&payload);
                 let value = encode_current_output_row(batch, row_idx, &self.output_schema)?;
+                let order = current_output_order(batch, row_idx, &self.output_state_indices)?;
                 writes.put_bytes(Bytes::from(key), Bytes::from(value));
+                order_values.insert(payload, order);
                 has_writes = true;
             }
         }
@@ -1237,6 +1277,10 @@ impl JoinTopNCurrentOutputIndex {
                 .await
                 .context("persist rebuilt join-topn current output index")?;
         }
+        *self
+            .order_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("join-topn current order index poisoned"))? = order_values;
         Ok(())
     }
 
@@ -1245,7 +1289,9 @@ impl JoinTopNCurrentOutputIndex {
             return Ok(());
         }
         let mut positive_updates: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut positive_orders: HashMap<Vec<u8>, JoinTopNPreviousBestOrder> = HashMap::new();
         let mut negative_updates: HashSet<Vec<u8>> = HashSet::new();
+        let mut negative_payloads: HashSet<Vec<u8>> = HashSet::new();
         let weight_idx = delta.value_column_count();
         for batch in delta.batches() {
             let weights = weight_column_at(batch, weight_idx)?;
@@ -1253,14 +1299,22 @@ impl JoinTopNCurrentOutputIndex {
                 if weights.is_null(row_idx) || weights.value(row_idx) == 0 {
                     continue;
                 }
-                let key = self.state_key_for_output_row(batch, row_idx)?;
+                let partition_key =
+                    output_partition_key(batch, row_idx, &self.output_state_indices)?;
+                let payload = encode_partition_key_payload(&partition_key)?;
+                let key = self.state_key_for_payload(&payload);
                 if weights.value(row_idx) > 0 {
                     positive_updates.insert(
                         key,
                         encode_current_output_row(batch, row_idx, &self.output_schema)?,
                     );
+                    positive_orders.insert(
+                        payload,
+                        current_output_order(batch, row_idx, &self.output_state_indices)?,
+                    );
                 } else {
                     negative_updates.insert(key);
+                    negative_payloads.insert(payload);
                 }
             }
         }
@@ -1280,6 +1334,18 @@ impl JoinTopNCurrentOutputIndex {
             .write_batch(writes)
             .await
             .context("persist join-topn current output index delta")?;
+        let mut order_values = self
+            .order_values
+            .lock()
+            .map_err(|_| anyhow::anyhow!("join-topn current order index poisoned"))?;
+        for payload in negative_payloads {
+            if !positive_orders.contains_key(&payload) {
+                order_values.remove(&payload);
+            }
+        }
+        for (payload, order) in positive_orders {
+            order_values.insert(payload, order);
+        }
         Ok(())
     }
 
@@ -1361,12 +1427,6 @@ impl JoinTopNCurrentOutputIndex {
             }
         }
         Ok(values)
-    }
-
-    fn state_key_for_output_row(&self, batch: &RecordBatch, row_idx: usize) -> Result<Vec<u8>> {
-        let partition_key = output_partition_key(batch, row_idx, &self.output_state_indices)?;
-        let payload = encode_partition_key_payload(&partition_key)?;
-        Ok(self.state_key_for_payload(&payload))
     }
 
     fn state_key_for_payload(&self, payload: &[u8]) -> Vec<u8> {
@@ -1608,6 +1668,36 @@ fn decode_current_output_previous_best(
             bid_extra,
         },
     ))
+}
+
+fn current_output_order(
+    batch: &RecordBatch,
+    row_idx: usize,
+    output_state_indices: &JoinTopNOutputStateIndices,
+) -> Result<JoinTopNPreviousBestOrder> {
+    let price = current_output_i64(
+        encoded_scalar(batch, output_state_indices.price, row_idx)?.as_ref(),
+        "price",
+    )?;
+    let bid_time = current_output_i64(
+        encoded_scalar(batch, output_state_indices.bid_time, row_idx)?.as_ref(),
+        "bid_time",
+    )?;
+    let bidder = current_output_i64(
+        encoded_scalar(batch, output_state_indices.bidder, row_idx)?.as_ref(),
+        "bidder",
+    )?;
+    let bid_extra = current_output_string(encoded_scalar(
+        batch,
+        output_state_indices.bid_extra,
+        row_idx,
+    )?)?;
+    Ok(JoinTopNPreviousBestOrder {
+        price,
+        bid_time,
+        bidder,
+        bid_extra,
+    })
 }
 
 fn append_current_output_row_bytes(
@@ -1884,6 +1974,20 @@ impl JoinTopNBestBidEvaluator {
         if left_rows.is_empty() {
             return Ok(Vec::new());
         }
+        if columnar_zset_is_insert_only(right_delta)? {
+            return self
+                .right_insert_delta_output_delta(
+                    output_schema,
+                    left_batches,
+                    &left_rows,
+                    right_delta,
+                    output_index,
+                    output_state_indices,
+                    left_rows_ms,
+                    total_start,
+                )
+                .await;
+        }
         let candidate_start = timing_start(timing_enabled);
         let affected_partitions = self.right_delta_partition_keys(
             &left_rows,
@@ -2066,6 +2170,158 @@ impl JoinTopNBestBidEvaluator {
             "join-topn append-only merge phase timings"
         );
         Ok(output_batches)
+    }
+
+    async fn right_insert_delta_output_delta(
+        &self,
+        output_schema: &SchemaRef,
+        left_batches: &[RecordBatch],
+        left_rows: &HashMap<i64, Vec<JoinTopNLeftRow>>,
+        right_delta: &ColumnarZSet,
+        output_index: &JoinTopNCurrentOutputIndex,
+        output_state_indices: &JoinTopNOutputStateIndices,
+        left_rows_ms: u64,
+        total_start: Option<Instant>,
+    ) -> Result<Vec<RecordBatch>> {
+        let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
+        let candidate_start = timing_start(timing_enabled);
+        let candidate_best = self.best_bids_by_partition_with_weight_filter(
+            left_rows,
+            right_delta.batches(),
+            right_delta.value_column_count(),
+            RightDeltaWeightFilter::Positive,
+        )?;
+        let candidate_ms = elapsed_ms(candidate_start);
+        if candidate_best.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (previous_order_count, mut replacement_keys, previous_lookup_ms, compare_ms) = {
+            let previous_lookup_start = timing_start(timing_enabled);
+            let previous_orders = output_index
+                .order_values
+                .lock()
+                .map_err(|_| anyhow::anyhow!("join-topn current order index poisoned"))?;
+            let previous_order_count = previous_orders.len();
+            let previous_lookup_ms = elapsed_ms(previous_lookup_start);
+
+            let compare_start = timing_start(timing_enabled);
+            let mut replacement_keys = Vec::new();
+            for (partition_key, candidate) in candidate_best.iter() {
+                let payload = encode_partition_key_payload(partition_key)?;
+                let Some(previous) = previous_orders.get(&payload) else {
+                    replacement_keys.push(partition_key.clone());
+                    continue;
+                };
+                if candidate_orders_before_order(candidate, previous) {
+                    replacement_keys.push(partition_key.clone());
+                }
+            }
+            let compare_ms = elapsed_ms(compare_start);
+            (
+                previous_order_count,
+                replacement_keys,
+                previous_lookup_ms,
+                compare_ms,
+            )
+        };
+        replacement_keys.sort();
+        if replacement_keys.is_empty() {
+            tracing::debug!(
+                left_row_count = left_rows.values().map(Vec::len).sum::<usize>(),
+                candidate_count = candidate_best.len(),
+                affected_partition_count = candidate_best.len(),
+                previous_snapshot_rows = previous_order_count,
+                previous_best_count = previous_order_count,
+                retracted_current_count = 0usize,
+                output_delta_rows = 0usize,
+                left_rows_ms,
+                candidate_ms,
+                previous_lookup_ms,
+                previous_best_ms = 0u64,
+                retracted_ms = 0u64,
+                build_ms = compare_ms,
+                compare_ms,
+                recompute_ms = 0u64,
+                total_ms = elapsed_ms(total_start),
+                "join-topn append-only merge phase timings"
+            );
+            return Ok(Vec::new());
+        }
+
+        let previous_best_start = timing_start(timing_enabled);
+        let previous_values = output_index
+            .lookup_values_for_partition_keys(replacement_keys.iter())
+            .await?;
+        let previous_best = previous_best_bids_from_current_output_values(
+            previous_values.iter().cloned(),
+            output_schema.fields().len(),
+            output_state_indices,
+            replacement_keys.iter(),
+        )?;
+        let previous_best_ms = elapsed_ms(previous_best_start);
+
+        let build_start = timing_start(timing_enabled);
+        let capacity = replacement_keys.len().saturating_mul(2);
+        let mut builders = output_schema
+            .fields()
+            .iter()
+            .map(|field| ScalarColumnBuilder::new(field.data_type(), capacity))
+            .collect::<Result<Vec<_>>>()?;
+        let mut weights = Int64Builder::with_capacity(capacity);
+        let mut row_count = 0usize;
+        for partition_key in replacement_keys.iter() {
+            if let Some(previous) = previous_best.get(partition_key) {
+                append_current_output_row_bytes(
+                    &mut builders,
+                    &previous.encoded_output_row,
+                    output_schema.fields().len(),
+                )?;
+                weights.append_value(-1);
+                row_count += 1;
+            }
+            let candidate = candidate_best
+                .get(partition_key)
+                .expect("candidate best bid missing for replacement key");
+            self.append_output_row(
+                &mut builders,
+                left_batches,
+                right_delta.batches(),
+                candidate,
+            )?;
+            weights.append_value(1);
+            row_count += 1;
+        }
+        let mut columns = builders
+            .iter_mut()
+            .map(ScalarColumnBuilder::finish_array)
+            .collect::<Vec<_>>();
+        columns.push(Arc::new(weights.finish()) as ArrayRef);
+        let output = vec![RecordBatch::try_new(
+            weighted_snapshot_schema(output_schema)?,
+            columns,
+        )?];
+        let build_ms = elapsed_ms(build_start);
+        tracing::debug!(
+            left_row_count = left_rows.values().map(Vec::len).sum::<usize>(),
+            candidate_count = candidate_best.len(),
+            affected_partition_count = candidate_best.len(),
+            previous_snapshot_rows = previous_order_count,
+            previous_best_count = previous_best.len(),
+            retracted_current_count = 0usize,
+            output_delta_rows = row_count,
+            left_rows_ms,
+            candidate_ms,
+            previous_lookup_ms,
+            previous_best_ms,
+            retracted_ms = 0u64,
+            build_ms,
+            compare_ms,
+            recompute_ms = 0u64,
+            total_ms = elapsed_ms(total_start),
+            "join-topn append-only merge phase timings"
+        );
+        Ok(output)
     }
 
     fn output_state_indices(&self) -> Option<JoinTopNOutputStateIndices> {
@@ -2465,15 +2721,44 @@ fn candidate_orders_before_previous(
     candidate: &JoinTopNBestBid,
     previous: &JoinTopNPreviousBestBid,
 ) -> bool {
-    candidate.price > previous.price
-        || (candidate.price == previous.price
-            && (candidate.bid_time < previous.bid_time
-                || (candidate.bid_time == previous.bid_time
-                    && (candidate.bidder < previous.bidder
-                        || (candidate.bidder == previous.bidder
+    candidate_orders_before_values(
+        candidate,
+        previous.price,
+        previous.bid_time,
+        previous.bidder,
+        previous.bid_extra.as_deref(),
+    )
+}
+
+fn candidate_orders_before_order(
+    candidate: &JoinTopNBestBid,
+    previous: &JoinTopNPreviousBestOrder,
+) -> bool {
+    candidate_orders_before_values(
+        candidate,
+        previous.price,
+        previous.bid_time,
+        previous.bidder,
+        previous.bid_extra.as_deref(),
+    )
+}
+
+fn candidate_orders_before_values(
+    candidate: &JoinTopNBestBid,
+    previous_price: i64,
+    previous_bid_time: i64,
+    previous_bidder: i64,
+    previous_bid_extra: Option<&str>,
+) -> bool {
+    candidate.price > previous_price
+        || (candidate.price == previous_price
+            && (candidate.bid_time < previous_bid_time
+                || (candidate.bid_time == previous_bid_time
+                    && (candidate.bidder < previous_bidder
+                        || (candidate.bidder == previous_bidder
                             && optional_str_cmp_asc(
                                 candidate.bid_extra.as_deref(),
-                                previous.bid_extra.as_deref(),
+                                previous_bid_extra,
                             ) == Ordering::Less)))))
 }
 

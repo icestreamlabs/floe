@@ -32,7 +32,8 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 use super::columnar_join::{
     ColumnarJoinMaterializedViewState, ColumnarJoinPlan,
     build_columnar_join_materialized_view_state_in_namespace_delta_only,
-    columnar_join_plan_for_plan, run_columnar_join_state_tick_delta_only,
+    columnar_join_plan_for_plan, columnar_join_plan_sources_append_only,
+    run_columnar_join_state_tick_delta_only,
 };
 use super::profile;
 use super::{
@@ -49,6 +50,7 @@ const SUMMARY_BUCKET_COUNT: u16 = 16;
 
 pub(super) struct ColumnarGroupedMaxPlan {
     input: ColumnarGroupedMaxInputPlan,
+    append_only_input: bool,
     projection: Projection,
     projection_schema: SchemaRef,
     group_schema: SchemaRef,
@@ -71,6 +73,7 @@ enum ColumnarGroupedMaxInputPlan {
 
 pub(super) struct ColumnarGroupedMaxMaterializedViewState {
     input_name: String,
+    append_only_input: bool,
     source_schema: SchemaRef,
     input_zset: Option<SlateBackedColumnarZSet>,
     join: Option<Box<ColumnarJoinMaterializedViewState>>,
@@ -192,13 +195,17 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
 
     let mut projection_expr = aggregate.group_expr.clone();
     projection_expr.push(max_value_expr);
-    let (input, value_projection) =
+    let (input, append_only_input, value_projection) =
         if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
+            let append_only_input = sources
+                .get(&source_name)
+                .is_some_and(|source| source.append_only);
             let projection_input = aggregate.input.as_ref().clone();
             let value_projection = Projection::try_new(projection_expr, Arc::new(projection_input))
                 .context("build grouped-max value projection")?;
             (
                 ColumnarGroupedMaxInputPlan::Source { source_name },
+                append_only_input,
                 value_projection,
             )
         } else {
@@ -211,6 +218,7 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
             let Some(join) = columnar_join_plan_for_plan(&projected_join_plan, sources)? else {
                 return Ok(None);
             };
+            let append_only_input = columnar_join_plan_sources_append_only(&join, sources);
             let projection_schema = df_schema_to_arrow(&projected_join.schema)?;
             let projection_input_schema = derived_projection_input_schema(&projection_schema);
             let input_name = derived_relation_name(aggregate.input.as_ref())
@@ -223,6 +231,7 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
                     plan: Box::new(join),
                     preprojected: true,
                 },
+                append_only_input,
                 projected_join,
             )
         };
@@ -242,6 +251,7 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
 
     Ok(Some(ColumnarGroupedMaxPlan {
         input,
+        append_only_input,
         projection: value_projection,
         projection_schema,
         group_schema,
@@ -395,6 +405,7 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
 
     Ok(ColumnarGroupedMaxMaterializedViewState {
         input_name,
+        append_only_input: plan.append_only_input,
         source_schema,
         input_zset,
         join,
@@ -919,6 +930,9 @@ async fn apply_grouped_max_delta(
         profile::record_since("grouped_max.apply_total_inner", total_start);
         return output;
     }
+    if columnar.append_only_input && columnar_zset_is_insert_only(&pending.projected_delta)? {
+        return apply_append_only_grouped_max_delta(columnar, pending, total_start).await;
+    }
 
     let phase_start = profile::start();
     let value_index_start = Instant::now();
@@ -1017,6 +1031,124 @@ async fn apply_grouped_max_delta(
     );
     profile::record_since("grouped_max.apply_total_inner", total_start);
     output
+}
+
+async fn apply_append_only_grouped_max_delta(
+    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
+    pending: PendingMaxDelta,
+    total_start: Option<Instant>,
+) -> Result<Vec<RecordBatch>> {
+    let mut builder = WeightedMaxOutputBuilder::new(
+        columnar.output_zset.value_schema(),
+        &columnar.output_mapping,
+    )?;
+    let mut writes = WriteBatch::new();
+    let mut bounds_update = None;
+    let mut max_updates = Vec::new();
+    let phase_start = profile::start();
+    let update_loop_start = Instant::now();
+    for (group_key, delta) in pending.groups {
+        let old_max = columnar.max_state.load_max(&group_key)?;
+        let max_added = max_added_for_delta(&delta);
+        let new_max = match (old_max, max_added) {
+            (None, max_added) => max_added,
+            (Some(old_max), Some(max_added)) if max_added > old_max => Some(max_added),
+            (Some(old_max), _) => Some(old_max),
+        };
+        if old_max != new_max {
+            if let Some(old_max) = old_max {
+                builder.append(&delta.batch, delta.row_idx, columnar.max_idx, old_max, -1)?;
+            }
+            if let Some(new_max) = new_max {
+                builder.append(&delta.batch, delta.row_idx, columnar.max_idx, new_max, 1)?;
+            }
+            max_updates.push((group_key.clone(), new_max));
+        }
+        if new_max.is_some() {
+            merge_group_key_bounds_update(&mut bounds_update, &group_key);
+        }
+    }
+    let update_loop_ms = update_loop_start.elapsed().as_millis() as u64;
+    profile::record_since("grouped_max.apply_update_loop", phase_start);
+
+    let phase_start = profile::start();
+    let write_build_start = Instant::now();
+    columnar
+        .max_state
+        .write_max_updates(&mut writes, &max_updates)?;
+    columnar
+        .max_state
+        .write_group_bounds(&mut writes, bounds_update.as_ref())?;
+    let write_build_ms = write_build_start.elapsed().as_millis() as u64;
+    profile::record_since("grouped_max.apply_write_batch_build_tail", phase_start);
+
+    let phase_start = profile::start();
+    let write_start = Instant::now();
+    columnar
+        .max_state
+        .table
+        .write_batch(writes)
+        .await
+        .context("persist append-only grouped-max state updates")?;
+    let write_ms = write_start.elapsed().as_millis() as u64;
+    profile::record_since("grouped_max.apply_write_batch", phase_start);
+
+    let phase_start = profile::start();
+    let cache_start = Instant::now();
+    let max_update_count = max_updates.len();
+    columnar.max_state.apply_max_updates(max_updates)?;
+    let cache_ms = cache_start.elapsed().as_millis() as u64;
+    profile::record_since("grouped_max.apply_summary_cache_update", phase_start);
+
+    let phase_start = profile::start();
+    let finish_start = Instant::now();
+    let output = builder.finish()?;
+    let finish_ms = finish_start.elapsed().as_millis() as u64;
+    profile::record_since("grouped_max.apply_finish_output", phase_start);
+    tracing::debug!(
+        pending_group_count = max_update_count,
+        recompute_count = 0usize,
+        max_update_count,
+        value_index_ms = 0u64,
+        recompute_lookup_ms = 0u64,
+        update_loop_ms,
+        write_build_ms,
+        write_ms,
+        cache_ms,
+        finish_ms,
+        mode = "append_only",
+        "grouped-max apply phase timings"
+    );
+    profile::record_since("grouped_max.apply_total_inner", total_start);
+    Ok(output)
+}
+
+fn columnar_zset_is_insert_only(delta: &ColumnarZSet) -> Result<bool> {
+    if delta.is_empty() {
+        return Ok(false);
+    }
+    let weight_idx = delta.value_column_count();
+    let mut saw_insert = false;
+    for batch in delta.batches() {
+        let weights = batch
+            .column(weight_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("grouped-max delta weight column must be Int64"))?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) {
+                bail!("grouped-max delta weight column cannot contain NULL");
+            }
+            let weight = weights.value(row_idx);
+            if weight < 0 {
+                return Ok(false);
+            }
+            if weight > 0 {
+                saw_insert = true;
+            }
+        }
+    }
+    Ok(saw_insert)
 }
 
 fn grouped_max_recompute_required(old_max: Option<i64>, delta: &PendingMaxGroupDelta) -> bool {

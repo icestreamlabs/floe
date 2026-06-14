@@ -77,6 +77,28 @@ impl ColumnarJoinMaterializedViewState {
     }
 }
 
+pub(super) fn columnar_join_plan_sources_append_only(
+    plan: &ColumnarJoinPlan,
+    sources: &HashMap<String, VectorizedSourceState>,
+) -> bool {
+    [
+        join_input_source_name(&plan.left),
+        join_input_source_name(&plan.right),
+    ]
+    .into_iter()
+    .all(|source_name| {
+        sources
+            .get(source_name)
+            .is_some_and(|source| source.append_only)
+    })
+}
+
+fn join_input_source_name(input: &ColumnarJoinInputPlan) -> &str {
+    match &input.kind {
+        ColumnarJoinInputPlanKind::Source { source_name } => source_name,
+    }
+}
+
 struct ColumnarJoinSourceState {
     input_name: String,
     source_name: Option<String>,
