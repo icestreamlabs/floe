@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
     StringArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
@@ -25,7 +26,9 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::collect;
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
-use dbsp::storage::KeyValueTable;
+use dbsp::storage::{KeyValueTable, keyspace};
+use slatedb::WriteBatch;
+use slatedb::config::ScanOptions;
 
 use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{
@@ -91,6 +94,7 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     source_primary_key_columns: Vec<String>,
     source_snapshot: Vec<RecordBatch>,
     source_index: Option<SlateBackedColumnarIndexedZSet>,
+    partition_counts: Option<SlateBackedTopNPartitionCounts>,
     source_snapshot_current: bool,
     initial_snapshot: Vec<RecordBatch>,
     row_count: i64,
@@ -116,6 +120,12 @@ struct TopNInputTick {
     input_changed: bool,
     next_source_snapshot: Option<Vec<RecordBatch>>,
     append_only_source_delta: bool,
+}
+
+struct SlateBackedTopNPartitionCounts {
+    table: Arc<dyn KeyValueTable>,
+    count_prefix: Vec<u8>,
+    state_key: Vec<u8>,
 }
 
 pub(super) struct ColumnarTopNTick {
@@ -305,6 +315,25 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 }
                 Some(index)
             };
+            let partition_counts = if partition_indices.is_empty() {
+                None
+            } else {
+                let counts = SlateBackedTopNPartitionCounts::new(
+                    Arc::clone(&table),
+                    format!("{mv_namespace}/columnar/topn/partition_counts"),
+                );
+                if !counts.is_initialized().await? {
+                    counts
+                        .rebuild_from_batches(
+                            &partition_converter,
+                            &partition_indices,
+                            &source_snapshot,
+                        )
+                        .await
+                        .context("rebuild SlateDB-backed topn partition counts")?;
+                }
+                Some(counts)
+            };
             let evaluator =
                 TopNEvaluator::build(plan.logical_plan, &source_name, source, udfs, output_schema)
                     .await
@@ -323,6 +352,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_primary_key_columns: source.primary_key_columns.clone(),
                 source_snapshot,
                 source_index,
+                partition_counts,
                 source_snapshot_current: true,
                 initial_snapshot,
                 row_count: initial_row_count,
@@ -383,6 +413,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 source_primary_key_columns: Vec::new(),
                 source_snapshot,
                 source_index: None,
+                partition_counts: None,
                 source_snapshot_current: true,
                 initial_snapshot,
                 row_count: initial_row_count,
@@ -1022,7 +1053,141 @@ async fn run_columnar_topn_indexed_source_state_tick(
         return Ok(None);
     }
 
+    let count_deltas = columnar
+        .partition_counts
+        .as_ref()
+        .map(|_| {
+            partition_count_deltas_from_zset(
+                &columnar.partition_converter,
+                &columnar.partition_indices,
+                input_delta,
+            )
+        })
+        .transpose()?;
+    let count_load_start = Instant::now();
+    let previous_partition_counts =
+        if let (Some(counts), Some(deltas)) = (columnar.partition_counts.as_ref(), &count_deltas) {
+            let keys = deltas.keys().cloned().collect::<HashSet<_>>();
+            counts.load_counts(&keys).await?
+        } else {
+            HashMap::new()
+        };
+    let count_load_ms = count_load_start.elapsed().as_millis() as u64;
+
+    let indexed_under_limit_identity_from_counts = if let Some(limit) = columnar.row_number_limit {
+        if let (Some(projection), Some(deltas)) =
+            (columnar.source_output_projection.as_ref(), &count_deltas)
+        {
+            projection.len() == output_schema.fields().len()
+                && partition_counts_with_deltas_within_limit(
+                    &previous_partition_counts,
+                    deltas,
+                    limit,
+                )?
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if indexed_under_limit_identity_from_counts {
+        let projection = columnar
+            .source_output_projection
+            .as_ref()
+            .context("indexed under-limit topn source projection missing")?;
+
+        let phase_start = profile::start();
+        let build_output_start = Instant::now();
+        let output_delta =
+            direct_project_weighted_columnar_zset(input_delta, output_schema, projection)
+                .context("build indexed count-under-limit topn output zset delta")?;
+        let build_output_ms = build_output_start.elapsed().as_millis() as u64;
+        profile::record_since("topn.indexed_count_identity_build_output_zset", phase_start);
+
+        let phase_start = profile::start();
+        let output_create_start = Instant::now();
+        let persisted_output_delta = if let Some(handle) = columnar
+            .output_zset
+            .create_version(
+                &output_delta,
+                columnar
+                    .output_zset
+                    .current_handle()
+                    .map(|handle| handle.version),
+            )
+            .await?
+        {
+            columnar.output_zset.read_delta(&handle).await?
+        } else {
+            output_delta
+        };
+        let output_create_ms = output_create_start.elapsed().as_millis() as u64;
+        profile::record_since(
+            "topn.indexed_count_identity_output_create_version",
+            phase_start,
+        );
+
+        let phase_start = profile::start();
+        let apply_index_start = Instant::now();
+        if let Some(index) = columnar.source_index.as_mut() {
+            index
+                .apply_delta(input_delta)
+                .await
+                .context("apply indexed count-under-limit topn source delta to partition index")?;
+        }
+        if let (Some(counts), Some(deltas)) = (columnar.partition_counts.as_ref(), &count_deltas) {
+            counts
+                .apply_deltas(deltas, &previous_partition_counts)
+                .await?;
+        }
+        columnar.source_snapshot_current = false;
+        let apply_index_ms = apply_index_start.elapsed().as_millis() as u64;
+        profile::record_since(
+            "topn.indexed_count_identity_apply_source_index",
+            phase_start,
+        );
+        tracing::debug!(
+            input = %columnar.input_name,
+            path = "indexed_count_under_limit_identity",
+            input_delta_rows = input_delta.num_rows(),
+            key_batch_rows = key_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            output_delta_rows = persisted_output_delta.num_rows(),
+            count_delta_keys = count_deltas.as_ref().map(HashMap::len).unwrap_or(0),
+            count_load_ms,
+            build_output_ms,
+            output_create_ms,
+            apply_index_ms,
+            "indexed topn state tick phase timings"
+        );
+
+        return Ok(Some(ColumnarTopNTick {
+            row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+                .context("compute indexed count-under-limit topn row-count delta")?,
+            delta: persisted_output_delta,
+            next_snapshot: Vec::new(),
+            input_changed,
+        }));
+    }
+
+    if let Some(tick) = run_columnar_topn_indexed_direct_top1_state_tick(
+        columnar,
+        input_delta,
+        output_schema,
+        previous_snapshot,
+        maintain_output_snapshot,
+        key_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        count_deltas.as_ref(),
+        &previous_partition_counts,
+        count_load_ms,
+        input_changed,
+    )
+    .await?
+    {
+        return Ok(Some(tick));
+    }
+
     let phase_start = profile::start();
+    let previous_lookup_start = Instant::now();
     let previous_lookup = {
         let index = columnar
             .source_index
@@ -1036,9 +1201,11 @@ async fn run_columnar_topn_indexed_source_state_tick(
     let previous_source_for_keys = materialize_columnar_zset_values(&previous_lookup)
         .await
         .context("materialize indexed topn previous source partitions")?;
+    let previous_lookup_ms = previous_lookup_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_lookup_previous", phase_start);
 
     let phase_start = profile::start();
+    let next_source_start = Instant::now();
     let next_source_for_keys = apply_source_snapshot_delta(
         &columnar.source_schema,
         &columnar.source_primary_key_columns,
@@ -1047,38 +1214,145 @@ async fn run_columnar_topn_indexed_source_state_tick(
     )
     .await
     .context("apply topn indexed source partition delta")?;
+    let next_source_ms = next_source_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_next_source_for_keys", phase_start);
 
+    let indexed_under_limit_identity = if let Some(limit) = columnar.row_number_limit {
+        if let Some(projection) = columnar.source_output_projection.as_ref() {
+            projection.len() == output_schema.fields().len()
+                && partition_row_counts_within_limit(
+                    &columnar.partition_converter,
+                    &columnar.partition_indices,
+                    &previous_source_for_keys,
+                    limit,
+                )?
+                && partition_row_counts_within_limit(
+                    &columnar.partition_converter,
+                    &columnar.partition_indices,
+                    &next_source_for_keys,
+                    limit,
+                )?
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if indexed_under_limit_identity {
+        let projection = columnar
+            .source_output_projection
+            .as_ref()
+            .context("indexed under-limit topn source projection missing")?;
+
+        let phase_start = profile::start();
+        let build_output_start = Instant::now();
+        let output_delta =
+            direct_project_weighted_columnar_zset(input_delta, output_schema, projection)
+                .context("build indexed under-limit identity topn output zset delta")?;
+        let build_output_ms = build_output_start.elapsed().as_millis() as u64;
+        profile::record_since("topn.indexed_identity_build_output_zset", phase_start);
+
+        let phase_start = profile::start();
+        let output_create_start = Instant::now();
+        let persisted_output_delta = if let Some(handle) = columnar
+            .output_zset
+            .create_version(
+                &output_delta,
+                columnar
+                    .output_zset
+                    .current_handle()
+                    .map(|handle| handle.version),
+            )
+            .await?
+        {
+            columnar.output_zset.read_delta(&handle).await?
+        } else {
+            output_delta
+        };
+        let output_create_ms = output_create_start.elapsed().as_millis() as u64;
+        profile::record_since("topn.indexed_identity_output_create_version", phase_start);
+
+        let phase_start = profile::start();
+        let apply_index_start = Instant::now();
+        if let Some(index) = columnar.source_index.as_mut() {
+            index
+                .apply_delta(input_delta)
+                .await
+                .context("apply indexed under-limit topn source delta to partition index")?;
+        }
+        if let (Some(counts), Some(deltas)) = (columnar.partition_counts.as_ref(), &count_deltas) {
+            counts
+                .apply_deltas(deltas, &previous_partition_counts)
+                .await?;
+        }
+        columnar.source_snapshot_current = false;
+        let apply_index_ms = apply_index_start.elapsed().as_millis() as u64;
+        profile::record_since("topn.indexed_identity_apply_source_index", phase_start);
+        tracing::debug!(
+            input = %columnar.input_name,
+            path = "indexed_under_limit_identity",
+            input_delta_rows = input_delta.num_rows(),
+            key_batch_rows = key_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            previous_source_rows = record_batch_row_count(&previous_source_for_keys),
+            next_source_rows = record_batch_row_count(&next_source_for_keys),
+            output_delta_rows = persisted_output_delta.num_rows(),
+            count_load_ms,
+            previous_lookup_ms,
+            next_source_ms,
+            build_output_ms,
+            output_create_ms,
+            apply_index_ms,
+            "indexed topn state tick phase timings"
+        );
+
+        return Ok(Some(ColumnarTopNTick {
+            row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+                .context("compute indexed under-limit topn row-count delta")?,
+            delta: persisted_output_delta,
+            next_snapshot: Vec::new(),
+            input_changed,
+        }));
+    }
+
     let phase_start = profile::start();
+    let evaluate_previous_start = Instant::now();
     let previous_output = columnar
         .evaluator
         .evaluate(&previous_source_for_keys)
         .await
         .context("evaluate indexed previous topn partition outputs")?;
+    let evaluate_previous_ms = evaluate_previous_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_evaluate_previous", phase_start);
 
     let phase_start = profile::start();
+    let evaluate_next_start = Instant::now();
     let next_output = columnar
         .evaluator
         .evaluate(&next_source_for_keys)
         .await
         .context("evaluate indexed next topn partition outputs")?;
+    let evaluate_next_ms = evaluate_next_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_evaluate_next", phase_start);
 
     let phase_start = profile::start();
+    let diff_start = Instant::now();
     let diff =
         diff_bounded_output_batches(Arc::clone(output_schema), &previous_output, &next_output)
             .await
             .context("diff indexed topn partition outputs")?;
+    let diff_ms = diff_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_diff_output", phase_start);
 
     let phase_start = profile::start();
+    let build_output_start = Instant::now();
     let output_delta =
         ColumnarZSet::try_new_weighted(columnar.output_zset.value_schema(), diff.batches)
             .context("build indexed topn output zset delta")?;
+    let build_output_ms = build_output_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_build_output_zset", phase_start);
 
     let phase_start = profile::start();
+    let output_create_start = Instant::now();
     let persisted_output_delta = if let Some(handle) = columnar
         .output_zset
         .create_version(
@@ -1094,30 +1368,64 @@ async fn run_columnar_topn_indexed_source_state_tick(
     } else {
         output_delta
     };
+    let output_create_ms = output_create_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_output_create_version", phase_start);
 
     let next_snapshot = if maintain_output_snapshot {
         let delta_batches = persisted_output_delta.batches().to_vec();
         let phase_start = profile::start();
+        let output_snapshot_start = Instant::now();
         let next_snapshot =
             apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
                 .await
                 .context("apply indexed topn output snapshot delta")?;
+        let output_snapshot_ms = output_snapshot_start.elapsed().as_millis() as u64;
         profile::record_since("topn.indexed_output_snapshot_delta", phase_start);
+        tracing::debug!(
+            output_snapshot_ms,
+            "indexed topn output snapshot phase completed"
+        );
         next_snapshot
     } else {
         Vec::new()
     };
 
     let phase_start = profile::start();
+    let apply_index_start = Instant::now();
     if let Some(index) = columnar.source_index.as_mut() {
         index
             .apply_delta(input_delta)
             .await
             .context("apply topn source delta to partition index")?;
     }
+    if let (Some(counts), Some(deltas)) = (columnar.partition_counts.as_ref(), &count_deltas) {
+        counts
+            .apply_deltas(deltas, &previous_partition_counts)
+            .await?;
+    }
     columnar.source_snapshot_current = false;
+    let apply_index_ms = apply_index_start.elapsed().as_millis() as u64;
     profile::record_since("topn.indexed_apply_source_index", phase_start);
+    tracing::debug!(
+        input = %columnar.input_name,
+        input_delta_rows = input_delta.num_rows(),
+        key_batch_rows = key_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        previous_source_rows = record_batch_row_count(&previous_source_for_keys),
+        next_source_rows = record_batch_row_count(&next_source_for_keys),
+        previous_output_rows = record_batch_row_count(&previous_output),
+        next_output_rows = record_batch_row_count(&next_output),
+        output_delta_rows = persisted_output_delta.num_rows(),
+        count_load_ms,
+        previous_lookup_ms,
+        next_source_ms,
+        evaluate_previous_ms,
+        evaluate_next_ms,
+        diff_ms,
+        build_output_ms,
+        output_create_ms,
+        apply_index_ms,
+        "indexed topn state tick phase timings"
+    );
 
     Ok(Some(ColumnarTopNTick {
         row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
@@ -1128,11 +1436,184 @@ async fn run_columnar_topn_indexed_source_state_tick(
     }))
 }
 
+async fn run_columnar_topn_indexed_direct_top1_state_tick(
+    columnar: &mut ColumnarTopNMaterializedViewState,
+    input_delta: &ColumnarZSet,
+    output_schema: &SchemaRef,
+    previous_snapshot: &[RecordBatch],
+    maintain_output_snapshot: bool,
+    key_batch_rows: usize,
+    count_deltas: Option<&HashMap<Vec<u8>, i64>>,
+    previous_partition_counts: &HashMap<Vec<u8>, i64>,
+    count_load_ms: u64,
+    input_changed: bool,
+) -> Result<Option<ColumnarTopNTick>> {
+    if columnar.row_number_limit != Some(1) {
+        return Ok(None);
+    }
+    let Some(direct) = columnar.append_only_direct.as_ref() else {
+        return Ok(None);
+    };
+    if direct.limit != 1 {
+        return Ok(None);
+    }
+    let Some(projection) = columnar.source_output_projection.as_ref() else {
+        return Ok(None);
+    };
+    if projection.len() != output_schema.fields().len() {
+        return Ok(None);
+    }
+    let Some(output_partition_indices) =
+        output_indices_for_source_indices(projection, &columnar.partition_indices)
+    else {
+        return Ok(None);
+    };
+    let Some(output_direct) = direct_topn_state_for_output_projection(direct, projection) else {
+        return Ok(None);
+    };
+
+    let materialize_output_start = Instant::now();
+    let previous_output_zset = columnar
+        .output_zset
+        .materialize_columnar()
+        .await
+        .context("materialize direct top1 current output")?;
+    let materialize_output_ms = materialize_output_start.elapsed().as_millis() as u64;
+
+    let project_delta_start = Instant::now();
+    let projected_delta =
+        direct_project_weighted_columnar_zset(input_delta, output_schema, projection)
+            .context("project direct top1 input delta to output schema")?;
+    let project_delta_ms = project_delta_start.elapsed().as_millis() as u64;
+
+    let classify_start = Instant::now();
+    let direct_delta = match build_direct_top1_delta(
+        output_schema,
+        &output_partition_indices,
+        &output_direct,
+        &previous_output_zset,
+        &projected_delta,
+    )
+    .context("build direct top1 output delta")?
+    {
+        Some(delta) => delta,
+        None => return Ok(None),
+    };
+    let classify_ms = classify_start.elapsed().as_millis() as u64;
+
+    let phase_start = profile::start();
+    let build_output_start = Instant::now();
+    let output_delta = ColumnarZSet::try_new_weighted(
+        columnar.output_zset.value_schema(),
+        direct_delta.delta_batches,
+    )
+    .context("build direct indexed top1 output zset delta")?;
+    let build_output_ms = build_output_start.elapsed().as_millis() as u64;
+    profile::record_since("topn.indexed_direct_top1_build_output_zset", phase_start);
+
+    let phase_start = profile::start();
+    let output_create_start = Instant::now();
+    let persisted_output_delta = if let Some(handle) = columnar
+        .output_zset
+        .create_version(
+            &output_delta,
+            columnar
+                .output_zset
+                .current_handle()
+                .map(|handle| handle.version),
+        )
+        .await?
+    {
+        columnar.output_zset.read_delta(&handle).await?
+    } else {
+        output_delta
+    };
+    let output_create_ms = output_create_start.elapsed().as_millis() as u64;
+    profile::record_since(
+        "topn.indexed_direct_top1_output_create_version",
+        phase_start,
+    );
+
+    let next_snapshot = if maintain_output_snapshot {
+        let delta_batches = persisted_output_delta.batches().to_vec();
+        let phase_start = profile::start();
+        let output_snapshot_start = Instant::now();
+        let next_snapshot =
+            apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches)
+                .await
+                .context("apply direct indexed top1 output snapshot delta")?;
+        tracing::debug!(
+            output_snapshot_ms = output_snapshot_start.elapsed().as_millis() as u64,
+            "direct indexed top1 output snapshot phase completed"
+        );
+        profile::record_since(
+            "topn.indexed_direct_top1_output_snapshot_delta",
+            phase_start,
+        );
+        next_snapshot
+    } else {
+        Vec::new()
+    };
+
+    let phase_start = profile::start();
+    let apply_index_start = Instant::now();
+    if let Some(index) = columnar.source_index.as_mut() {
+        index
+            .apply_delta(input_delta)
+            .await
+            .context("apply direct indexed top1 source delta to partition index")?;
+    }
+    if let (Some(counts), Some(deltas)) = (columnar.partition_counts.as_ref(), count_deltas) {
+        counts
+            .apply_deltas(deltas, previous_partition_counts)
+            .await?;
+    }
+    columnar.source_snapshot_current = false;
+    let apply_index_ms = apply_index_start.elapsed().as_millis() as u64;
+    profile::record_since("topn.indexed_direct_top1_apply_source_index", phase_start);
+
+    tracing::debug!(
+        input = %columnar.input_name,
+        path = "indexed_direct_top1",
+        input_delta_rows = input_delta.num_rows(),
+        key_batch_rows,
+        previous_output_rows = previous_output_zset.num_rows(),
+        projected_delta_rows = projected_delta.num_rows(),
+        output_delta_rows = persisted_output_delta.num_rows(),
+        negative_top_rows = direct_delta.negative_count,
+        positive_top_rows = direct_delta.positive_count,
+        count_load_ms,
+        materialize_output_ms,
+        project_delta_ms,
+        classify_ms,
+        build_output_ms,
+        output_create_ms,
+        apply_index_ms,
+        "indexed topn state tick phase timings"
+    );
+
+    Ok(Some(ColumnarTopNTick {
+        row_count_delta: columnar_zset_weight_sum(&persisted_output_delta)
+            .context("compute direct indexed top1 row-count delta")?,
+        delta: persisted_output_delta,
+        next_snapshot,
+        input_changed,
+    }))
+}
+
 const DIRECT_TOPN_OUTPUT_BATCH_ROWS: usize = 4096;
+const TOPN_PARTITION_COUNT_SCAN_MIN_KEYS: usize = 256;
+const TOPN_PARTITION_COUNT_INITIALIZED: &[u8] = b"1";
 
 struct DirectTopNMergeOutput {
     next_output: Vec<RecordBatch>,
     delta_batches: Vec<RecordBatch>,
+}
+
+struct DirectTop1DeltaOutput {
+    delta_batches: Vec<RecordBatch>,
+    negative_count: usize,
+    positive_count: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1156,6 +1637,12 @@ struct DirectTopNRowRef {
     row_idx: usize,
 }
 
+#[derive(Clone)]
+struct DirectTop1SelectedRow {
+    candidate: DirectTopNCandidate,
+    row_key: Vec<u8>,
+}
+
 enum DirectTopNOrderArray<'a> {
     Int64(&'a Int64Array),
     Utf8(&'a StringArray),
@@ -1166,6 +1653,300 @@ enum DirectTopNOrderArray<'a> {
     Float64(&'a Float64Array),
     UInt64(&'a UInt64Array),
     Null,
+}
+
+fn build_direct_top1_delta(
+    output_schema: &SchemaRef,
+    output_partition_indices: &[usize],
+    direct: &AppendOnlyDirectTopNState,
+    previous_output: &ColumnarZSet,
+    projected_delta: &ColumnarZSet,
+) -> Result<Option<DirectTop1DeltaOutput>> {
+    let value_indices = output_value_indices(output_schema);
+    let value_converter = row_converter_for_indices(output_schema, &value_indices)?;
+    let partition_converter = if output_partition_indices.is_empty() {
+        None
+    } else {
+        Some(row_converter_for_indices(
+            output_schema,
+            output_partition_indices,
+        )?)
+    };
+    let current_rows = match direct_top1_current_rows(
+        output_partition_indices,
+        partition_converter.as_ref(),
+        &value_converter,
+        previous_output,
+    )? {
+        Some(rows) => rows,
+        None => return Ok(None),
+    };
+    let previous_order_columns = direct_topn_order_columns(direct, previous_output.batches())?;
+    let delta_order_columns = direct_topn_order_columns(direct, projected_delta.batches())?;
+    let best_positive_rows = match direct_top1_best_positive_rows(
+        output_partition_indices,
+        partition_converter.as_ref(),
+        &value_converter,
+        direct,
+        &previous_order_columns,
+        &delta_order_columns,
+        &current_rows,
+        projected_delta,
+    )? {
+        Some(rows) => rows,
+        None => return Ok(None),
+    };
+
+    let mut negatives = Vec::new();
+    let mut positives = Vec::new();
+    let mut best_positive_rows = best_positive_rows.into_iter().collect::<Vec<_>>();
+    best_positive_rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (partition_key, positive) in best_positive_rows {
+        if let Some(current) = current_rows.get(&partition_key) {
+            let order = compare_direct_topn_candidates(
+                direct,
+                &previous_order_columns,
+                &delta_order_columns,
+                &positive.candidate,
+                &current.candidate,
+            );
+            match order {
+                Ordering::Less => {
+                    negatives.push(DirectTopNRowRef {
+                        side: DirectTopNRowSide::Previous,
+                        batch_idx: current.candidate.batch_idx,
+                        row_idx: current.candidate.row_idx,
+                    });
+                    positives.push(DirectTopNRowRef {
+                        side: DirectTopNRowSide::Delta,
+                        batch_idx: positive.candidate.batch_idx,
+                        row_idx: positive.candidate.row_idx,
+                    });
+                }
+                Ordering::Equal => {
+                    if positive.row_key != current.row_key {
+                        return Ok(None);
+                    }
+                }
+                Ordering::Greater => {}
+            }
+        } else {
+            positives.push(DirectTopNRowRef {
+                side: DirectTopNRowSide::Delta,
+                batch_idx: positive.candidate.batch_idx,
+                row_idx: positive.candidate.row_idx,
+            });
+        }
+    }
+
+    let weighted_schema = weighted_snapshot_schema(output_schema)?;
+    let negative_count = negatives.len();
+    let positive_count = positives.len();
+    let delta_batches = build_direct_topn_weighted_batches(
+        &weighted_schema,
+        previous_output.batches(),
+        projected_delta.batches(),
+        &negatives,
+        &positives,
+    )?;
+    Ok(Some(DirectTop1DeltaOutput {
+        delta_batches,
+        negative_count,
+        positive_count,
+    }))
+}
+
+fn direct_top1_current_rows(
+    output_partition_indices: &[usize],
+    partition_converter: Option<&RowConverter>,
+    value_converter: &RowConverter,
+    previous_output: &ColumnarZSet,
+) -> Result<Option<HashMap<Vec<u8>, DirectTop1SelectedRow>>> {
+    let mut rows_by_partition = HashMap::new();
+    let value_indices = (0..previous_output.value_column_count()).collect::<Vec<_>>();
+    for (batch_idx, batch) in previous_output.batches().iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let value_rows = value_converter
+            .convert_columns(&project_columns(batch, &value_indices))
+            .context("encode direct top1 current output rows")?;
+        let partition_rows = if output_partition_indices.is_empty() {
+            None
+        } else {
+            Some(
+                partition_converter
+                    .context("direct top1 output partition converter missing")?
+                    .convert_columns(&project_columns(batch, output_partition_indices))
+                    .context("encode direct top1 current output partition rows")?,
+            )
+        };
+        let weights = topn_weight_column(batch, previous_output.value_column_count())?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) || weights.value(row_idx) != 1 {
+                return Ok(None);
+            }
+            let partition_key = partition_rows
+                .as_ref()
+                .map(|rows| rows.row(row_idx).data().to_vec())
+                .unwrap_or_default();
+            if rows_by_partition.contains_key(&partition_key) {
+                return Ok(None);
+            }
+            rows_by_partition.insert(
+                partition_key,
+                DirectTop1SelectedRow {
+                    candidate: DirectTopNCandidate {
+                        side: DirectTopNRowSide::Previous,
+                        batch_idx,
+                        row_idx,
+                        ordinal: row_idx,
+                    },
+                    row_key: value_rows.row(row_idx).data().to_vec(),
+                },
+            );
+        }
+    }
+    Ok(Some(rows_by_partition))
+}
+
+fn direct_top1_best_positive_rows(
+    output_partition_indices: &[usize],
+    partition_converter: Option<&RowConverter>,
+    value_converter: &RowConverter,
+    direct: &AppendOnlyDirectTopNState,
+    previous_order_columns: &[Vec<DirectTopNOrderArray<'_>>],
+    delta_order_columns: &[Vec<DirectTopNOrderArray<'_>>],
+    current_rows: &HashMap<Vec<u8>, DirectTop1SelectedRow>,
+    projected_delta: &ColumnarZSet,
+) -> Result<Option<HashMap<Vec<u8>, DirectTop1SelectedRow>>> {
+    let mut best_positive_by_partition: HashMap<Vec<u8>, DirectTop1SelectedRow> = HashMap::new();
+    let value_indices = (0..projected_delta.value_column_count()).collect::<Vec<_>>();
+    let mut ordinal = 0usize;
+    for (batch_idx, batch) in projected_delta.batches().iter().enumerate() {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let value_rows = value_converter
+            .convert_columns(&project_columns(batch, &value_indices))
+            .context("encode direct top1 delta rows")?;
+        let partition_rows = if output_partition_indices.is_empty() {
+            None
+        } else {
+            Some(
+                partition_converter
+                    .context("direct top1 delta partition converter missing")?
+                    .convert_columns(&project_columns(batch, output_partition_indices))
+                    .context("encode direct top1 delta partition rows")?,
+            )
+        };
+        let weights = topn_weight_column(batch, projected_delta.value_column_count())?;
+        for row_idx in 0..batch.num_rows() {
+            if weights.is_null(row_idx) {
+                return Ok(None);
+            }
+            let weight = weights.value(row_idx);
+            if weight == 0 {
+                continue;
+            }
+            if !matches!(weight, -1 | 1) {
+                return Ok(None);
+            }
+            let partition_key = partition_rows
+                .as_ref()
+                .map(|rows| rows.row(row_idx).data().to_vec())
+                .unwrap_or_default();
+            let row_key = value_rows.row(row_idx).data().to_vec();
+            if weight < 0 {
+                if current_rows
+                    .get(&partition_key)
+                    .is_some_and(|current| current.row_key == row_key)
+                {
+                    return Ok(None);
+                }
+                continue;
+            }
+
+            let selected = DirectTop1SelectedRow {
+                candidate: DirectTopNCandidate {
+                    side: DirectTopNRowSide::Delta,
+                    batch_idx,
+                    row_idx,
+                    ordinal,
+                },
+                row_key,
+            };
+            ordinal = ordinal.saturating_add(1);
+            match best_positive_by_partition.get_mut(&partition_key) {
+                Some(current_best) => {
+                    let order = compare_direct_topn_candidates(
+                        direct,
+                        previous_order_columns,
+                        delta_order_columns,
+                        &selected.candidate,
+                        &current_best.candidate,
+                    );
+                    match order {
+                        Ordering::Less => {
+                            *current_best = selected;
+                        }
+                        Ordering::Equal => {
+                            if selected.row_key != current_best.row_key {
+                                return Ok(None);
+                            }
+                        }
+                        Ordering::Greater => {}
+                    }
+                }
+                None => {
+                    best_positive_by_partition.insert(partition_key, selected);
+                }
+            }
+        }
+    }
+    Ok(Some(best_positive_by_partition))
+}
+
+fn output_value_indices(output_schema: &SchemaRef) -> Vec<usize> {
+    (0..output_schema.fields().len()).collect()
+}
+
+fn output_indices_for_source_indices(
+    projection: &[usize],
+    source_indices: &[usize],
+) -> Option<Vec<usize>> {
+    source_indices
+        .iter()
+        .map(|source_idx| {
+            projection
+                .iter()
+                .position(|projected_source_idx| projected_source_idx == source_idx)
+        })
+        .collect()
+}
+
+fn direct_topn_state_for_output_projection(
+    direct: &AppendOnlyDirectTopNState,
+    projection: &[usize],
+) -> Option<AppendOnlyDirectTopNState> {
+    let orderings = direct
+        .orderings
+        .iter()
+        .map(|ordering| {
+            let output_idx = projection
+                .iter()
+                .position(|source_idx| *source_idx == ordering.index)?;
+            Some(AppendOnlyDirectTopNOrderingState {
+                index: output_idx,
+                asc: ordering.asc,
+                nulls_first: ordering.nulls_first,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(AppendOnlyDirectTopNState {
+        limit: direct.limit,
+        orderings,
+    })
 }
 
 fn merge_append_only_direct_topn(
@@ -1669,6 +2450,147 @@ fn finish_direct_topn_batch(
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
+impl SlateBackedTopNPartitionCounts {
+    fn new(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Self {
+        let namespace = namespace.into();
+        let mut count_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, &namespace);
+        count_prefix.extend_from_slice(b"counts/");
+        let mut state_key = keyspace::namespace_prefix(keyspace::prefix::INDEX, &namespace);
+        state_key.extend_from_slice(b"state/initialized");
+        Self {
+            table,
+            count_prefix,
+            state_key,
+        }
+    }
+
+    async fn is_initialized(&self) -> Result<bool> {
+        Ok(self
+            .table
+            .get_bytes(&self.state_key)
+            .await
+            .context("load topn partition count state")?
+            .is_some())
+    }
+
+    async fn rebuild_from_batches(
+        &self,
+        converter: &RowConverter,
+        partition_indices: &[usize],
+        batches: &[RecordBatch],
+    ) -> Result<()> {
+        let counts = partition_row_count_map(converter, partition_indices, batches)?;
+        let mut writes = WriteBatch::new();
+        for (key, _) in self
+            .table
+            .scan_prefix_bytes(&self.count_prefix, &ScanOptions::default())
+            .await
+            .context("scan topn partition counts for rebuild")?
+        {
+            writes.delete(key.to_vec());
+        }
+        for (partition_key, count) in counts {
+            if count > 0 {
+                writes.put_bytes(
+                    Bytes::from(self.count_key(&partition_key)),
+                    Bytes::from(count.to_be_bytes().to_vec()),
+                );
+            }
+        }
+        writes.put_bytes(
+            Bytes::from(self.state_key.clone()),
+            Bytes::from(TOPN_PARTITION_COUNT_INITIALIZED.to_vec()),
+        );
+        self.table
+            .write_batch(writes)
+            .await
+            .context("persist rebuilt topn partition counts")
+    }
+
+    async fn load_counts(&self, keys: &HashSet<Vec<u8>>) -> Result<HashMap<Vec<u8>, i64>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut counts = HashMap::with_capacity(keys.len());
+        if keys.len() >= TOPN_PARTITION_COUNT_SCAN_MIN_KEYS {
+            for (state_key, value) in self
+                .table
+                .scan_prefix_bytes(&self.count_prefix, &ScanOptions::default())
+                .await
+                .context("scan topn partition counts")?
+            {
+                let Some(partition_key) = state_key.strip_prefix(self.count_prefix.as_slice())
+                else {
+                    continue;
+                };
+                if keys.contains(partition_key) {
+                    counts.insert(partition_key.to_vec(), decode_partition_count(&value)?);
+                }
+            }
+            return Ok(counts);
+        }
+
+        for key in keys {
+            if let Some(value) = self
+                .table
+                .get_bytes(&self.count_key(key))
+                .await
+                .context("load topn partition count")?
+            {
+                counts.insert(key.clone(), decode_partition_count(&value)?);
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn apply_deltas(
+        &self,
+        deltas: &HashMap<Vec<u8>, i64>,
+        previous_counts: &HashMap<Vec<u8>, i64>,
+    ) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut writes = WriteBatch::new();
+        let mut has_writes = false;
+        for (partition_key, delta) in deltas {
+            if *delta == 0 {
+                continue;
+            }
+            let previous = previous_counts.get(partition_key).copied().unwrap_or(0);
+            let next = previous
+                .checked_add(*delta)
+                .context("topn partition count overflow")?;
+            if next < 0 {
+                bail!("topn partition count became negative");
+            }
+            let state_key = self.count_key(partition_key);
+            if next == 0 {
+                writes.delete(state_key);
+            } else {
+                writes.put_bytes(
+                    Bytes::from(state_key),
+                    Bytes::from(next.to_be_bytes().to_vec()),
+                );
+            }
+            has_writes = true;
+        }
+        if has_writes {
+            self.table
+                .write_batch(writes)
+                .await
+                .context("persist topn partition count deltas")?;
+        }
+        Ok(())
+    }
+
+    fn count_key(&self, partition_key: &[u8]) -> Vec<u8> {
+        let mut key = self.count_prefix.clone();
+        key.extend_from_slice(partition_key);
+        key
+    }
+}
+
 async fn prepare_topn_input_tick(
     columnar: &mut ColumnarTopNMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -1917,6 +2839,116 @@ fn partition_row_counts_within_limit(
         }
     }
     Ok(true)
+}
+
+fn partition_row_count_map(
+    converter: &RowConverter,
+    partition_indices: &[usize],
+    batches: &[RecordBatch],
+) -> Result<HashMap<Vec<u8>, i64>> {
+    let mut counts = HashMap::new();
+    if partition_indices.is_empty() {
+        let count = i64::try_from(record_batch_row_count(batches))
+            .context("topn global partition row count exceeds i64")?;
+        if count > 0 {
+            counts.insert(Vec::new(), count);
+        }
+        return Ok(counts);
+    }
+    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
+        let rows = converter
+            .convert_columns(&project_columns(batch, partition_indices))
+            .context("encode topn partition count keys")?;
+        for row_idx in 0..batch.num_rows() {
+            add_partition_count_delta(&mut counts, rows.row(row_idx).data().to_vec(), 1)?;
+        }
+    }
+    Ok(counts)
+}
+
+fn partition_count_deltas_from_zset(
+    converter: &RowConverter,
+    partition_indices: &[usize],
+    delta: &ColumnarZSet,
+) -> Result<HashMap<Vec<u8>, i64>> {
+    let mut deltas = HashMap::new();
+    if partition_indices.is_empty() {
+        let mut total = 0i64;
+        for batch in delta.batches().iter().filter(|batch| batch.num_rows() > 0) {
+            let weights = topn_weight_column(batch, delta.value_column_count())?;
+            for row_idx in 0..batch.num_rows() {
+                total = total
+                    .checked_add(weights.value(row_idx))
+                    .context("topn global partition count delta overflow")?;
+            }
+        }
+        if total != 0 {
+            deltas.insert(Vec::new(), total);
+        }
+        return Ok(deltas);
+    }
+    for batch in delta.batches().iter().filter(|batch| batch.num_rows() > 0) {
+        let weights = topn_weight_column(batch, delta.value_column_count())?;
+        let rows = converter
+            .convert_columns(&project_columns(batch, partition_indices))
+            .context("encode topn partition count delta keys")?;
+        for row_idx in 0..batch.num_rows() {
+            add_partition_count_delta(
+                &mut deltas,
+                rows.row(row_idx).data().to_vec(),
+                weights.value(row_idx),
+            )?;
+        }
+    }
+    Ok(deltas)
+}
+
+fn partition_counts_with_deltas_within_limit(
+    previous_counts: &HashMap<Vec<u8>, i64>,
+    deltas: &HashMap<Vec<u8>, i64>,
+    limit: usize,
+) -> Result<bool> {
+    let limit = i64::try_from(limit).context("topn row-number limit exceeds i64")?;
+    for (partition_key, delta) in deltas {
+        let previous = previous_counts.get(partition_key).copied().unwrap_or(0);
+        if previous < 0 || previous > limit {
+            return Ok(false);
+        }
+        let next = previous
+            .checked_add(*delta)
+            .context("topn partition count overflow")?;
+        if next < 0 || next > limit {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn add_partition_count_delta(
+    counts: &mut HashMap<Vec<u8>, i64>,
+    partition_key: Vec<u8>,
+    delta: i64,
+) -> Result<()> {
+    let entry = counts.entry(partition_key).or_insert(0);
+    *entry = entry
+        .checked_add(delta)
+        .context("topn partition count delta overflow")?;
+    Ok(())
+}
+
+fn topn_weight_column(batch: &RecordBatch, weight_idx: usize) -> Result<&Int64Array> {
+    batch
+        .column(weight_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .with_context(|| format!("topn weight column {weight_idx} is not Int64"))
+}
+
+fn decode_partition_count(bytes: &[u8]) -> Result<i64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .context("topn partition count state has invalid length")?;
+    Ok(i64::from_be_bytes(bytes))
 }
 
 fn direct_project_weighted_columnar_zset(
