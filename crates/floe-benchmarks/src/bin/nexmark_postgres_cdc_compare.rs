@@ -12,6 +12,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getpgid(pid: i32) -> i32;
+}
+
 const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
     "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q12", "q13", "q14", "q15", "q16",
     "q17", "q18", "q19", "q20", "q21", "q22",
@@ -670,6 +675,7 @@ impl Harness {
         let stdout = File::create(artifact_dir.join("floe-node.stdout.log"))?;
         let stderr = File::create(artifact_dir.join("floe-node.stderr.log"))?;
         let mut command = Command::new(self.config.target_binary("floe-node"));
+        configure_process_group(&mut command);
         command
             .arg("run")
             .arg("--pgwire-addr")
@@ -2465,6 +2471,14 @@ fn ensure_status(status: ExitStatus) -> Result<()> {
     Ok(())
 }
 
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
 fn terminate_child_process_group(child: &mut Child, graceful_timeout: Duration) {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
@@ -2500,9 +2514,14 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
 fn signal_child_process_group(child: &Child, signal: &str) {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", child.id());
+        let pid = child.id();
+        let target = if child_owns_process_group(pid) {
+            format!("-{pid}")
+        } else {
+            pid.to_string()
+        };
         let _ = Command::new("kill")
-            .args([format!("-{signal}"), process_group])
+            .args([format!("-{signal}"), target])
             .status();
     }
 
@@ -2510,6 +2529,15 @@ fn signal_child_process_group(child: &Child, signal: &str) {
     {
         let _ = (child, signal);
     }
+}
+
+#[cfg(unix)]
+fn child_owns_process_group(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let pgid = unsafe { getpgid(pid) };
+    pgid == pid
 }
 
 fn wait_before_retry(deadline: Instant, interval: Duration) -> bool {

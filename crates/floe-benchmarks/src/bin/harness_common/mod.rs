@@ -10,6 +10,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getpgid(pid: i32) -> i32;
+}
+
 pub fn repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -258,9 +263,14 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> bool {
 fn signal_child_process_group(child: &Child, signal: &str) {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", child.id());
+        let pid = child.id();
+        let target = if child_owns_process_group(pid) {
+            format!("-{pid}")
+        } else {
+            pid.to_string()
+        };
         let _ = Command::new("kill")
-            .args([format!("-{signal}"), process_group])
+            .args([format!("-{signal}"), target])
             .status();
     }
 
@@ -268,6 +278,15 @@ fn signal_child_process_group(child: &Child, signal: &str) {
     {
         let _ = (child, signal);
     }
+}
+
+#[cfg(unix)]
+fn child_owns_process_group(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let pgid = unsafe { getpgid(pid) };
+    pgid == pid
 }
 
 pub fn seconds(ms: u128) -> String {
