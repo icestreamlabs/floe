@@ -338,7 +338,9 @@ async fn run_native_postgres_cdc_wal_stream_once(
                     .context("receive native Postgres CDC event")?,
             };
             let Some(event) = event else {
-                break;
+                return Err(reconnectable_postgres_cdc_error(anyhow!(
+                    "native Postgres CDC replication stream ended before cancellation"
+                )));
             };
             if let Some(frontier_lsn) = postgres_replication_event_frontier_lsn(&event) {
                 metrics::record_postgres_cdc_upstream_lsn(
@@ -354,8 +356,10 @@ async fn run_native_postgres_cdc_wal_stream_once(
                     None,
                 );
             }
-            if matches!(event, PostgresReplicationEvent::StoppedAt { .. }) {
-                break;
+            if let PostgresReplicationEvent::StoppedAt { reached } = event {
+                return Err(reconnectable_postgres_cdc_error(anyhow!(
+                    "native Postgres CDC replication stream stopped at {reached:?} before cancellation"
+                )));
             }
             let transaction = match assembler.accept_event(event) {
                 Ok(transaction) => {

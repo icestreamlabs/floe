@@ -15,7 +15,7 @@ use datafusion::logical_expr::logical_plan::{Join, TableScan};
 use datafusion::logical_expr::{
     Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, ScalarUDF,
 };
-use datafusion::physical_plan::collect;
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::KeyValueTable;
@@ -1708,11 +1708,12 @@ impl JoinDeltaEvaluator {
                 .await
                 .context("rebuild vectorized join delta physical plan")?
         } else {
-            Arc::clone(
+            fresh_execution_plan_from_template(Arc::clone(
                 self.plan
                     .as_ref()
                     .context("cached vectorized join delta physical plan missing")?,
-            )
+            ))
+            .context("reset cached vectorized join delta physical plan")?
         };
         let collected = collect(plan, self.ctx.task_ctx()).await;
         self.clear_inputs()?;
@@ -1727,6 +1728,20 @@ impl JoinDeltaEvaluator {
         self.right_input.clear()?;
         Ok(())
     }
+}
+
+fn fresh_execution_plan_from_template(
+    plan: Arc<dyn ExecutionPlan>,
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    // DataFusion hash/nested-loop joins keep build-side state inside the
+    // physical plan. Reuse the optimized plan shape, but reset every node so
+    // dynamic input providers are read fresh for each delta evaluation.
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|child| fresh_execution_plan_from_template(Arc::clone(child)))
+        .collect::<datafusion::error::Result<Vec<_>>>()?;
+    plan.with_new_children(children)?.reset_state()
 }
 
 fn dynamic_join_provider(

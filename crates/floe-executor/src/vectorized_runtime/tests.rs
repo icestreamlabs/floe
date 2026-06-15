@@ -7030,6 +7030,412 @@ async fn cdc_q6_shape_uses_incremental_top_bid_grouped_avg_semantics() {
 
     let snapshot = handle.arrow_snapshot_for(3).expect("post-retract snapshot");
     assert_eq!(id_count_rows(&snapshot), vec![(10, 115), (20, 300)]);
+
+    let deleted_auction = RecordBatch::try_new(
+        Arc::clone(&auction_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(StringArray::from(vec!["item-3"])),
+            Arc::new(StringArray::from(vec!["description-3"])),
+            Arc::new(Int64Array::from(vec![30])),
+            Arc::new(Int64Array::from(vec![300])),
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(Int64Array::from(vec![100])),
+            Arc::new(Int64Array::from(vec![20])),
+            Arc::new(Int64Array::from(vec![8])),
+            Arc::new(StringArray::from(vec!["auction-extra-3"])),
+        ],
+    )
+    .expect("deleted auction batch");
+    let weighted_auction_schema =
+        crate::delta_consolidation::weighted_snapshot_schema(&auction_schema)
+            .expect("weighted auction schema");
+    let weighted_auction =
+        weighted_batch_from_diffs(&deleted_auction, &weighted_auction_schema, &[-1])
+            .expect("weighted auction delete");
+    runtime
+        .apply_weighted_source_delta("nexmark_auction", weighted_auction)
+        .await
+        .expect("apply weighted auction delete");
+    runtime.run_tick(4).await.expect("auction delete tick");
+
+    let snapshot = handle
+        .arrow_snapshot_for(4)
+        .expect("post-auction-delete snapshot");
+    assert_eq!(id_count_rows(&snapshot), vec![(10, 115)]);
+}
+
+#[tokio::test]
+async fn cdc_q6_generated_mutations_match_query_provider_semantics() {
+    const BASE_TS: i64 = 1_700_000_000_000;
+    const BID_INITIAL_ROWS: i64 = 10_000;
+    const AUCTION_INITIAL_ROWS: i64 = 1_112;
+    const PERSON_KEYSPACE: i64 = 1_112;
+    const BID_UPDATES: i64 = 4_444;
+    const BID_DELETES: i64 = 2_222;
+    const BID_INSERTS: i64 = 2_222;
+    const AUCTION_UPDATES: i64 = 556;
+    const AUCTION_DELETES: i64 = 278;
+    const AUCTION_INSERTS: i64 = 278;
+    const LIVE_AUCTION_KEYSPACE: i64 = AUCTION_INITIAL_ROWS + AUCTION_INSERTS;
+
+    fn auction_batch(
+        schema: &SchemaRef,
+        ids: impl IntoIterator<Item = (i64, bool)>,
+    ) -> RecordBatch {
+        let mut id_values = Vec::new();
+        let mut item_names = Vec::new();
+        let mut descriptions = Vec::new();
+        let mut initial_bids = Vec::new();
+        let mut reserves = Vec::new();
+        let mut date_times = Vec::new();
+        let mut expires = Vec::new();
+        let mut sellers = Vec::new();
+        let mut categories = Vec::new();
+        let mut extras = Vec::new();
+        for (id, updated) in ids {
+            id_values.push(id);
+            item_names.push(format!("item_{id}"));
+            descriptions.push(format!("auction description {id}"));
+            initial_bids.push(100 + (id % 10_000));
+            reserves.push(1000 + (id % 100_000) + if updated { 31 } else { 0 });
+            date_times.push(BASE_TS + id);
+            expires.push(BASE_TS + id + 86_400_000 + if updated { 1000 } else { 0 });
+            sellers.push(((id - 1) % PERSON_KEYSPACE) + 1);
+            let category = ((id - 1) % 20) + 1;
+            categories.push(if updated {
+                if category == 20 { 1 } else { category + 1 }
+            } else {
+                category
+            });
+            extras.push(if updated {
+                format!("auction_extra_{id}_updated")
+            } else {
+                format!("auction_extra_{id}")
+            });
+        }
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(id_values)),
+                Arc::new(StringArray::from(item_names)),
+                Arc::new(StringArray::from(descriptions)),
+                Arc::new(Int64Array::from(initial_bids)),
+                Arc::new(Int64Array::from(reserves)),
+                Arc::new(Int64Array::from(date_times)),
+                Arc::new(Int64Array::from(expires)),
+                Arc::new(Int64Array::from(sellers)),
+                Arc::new(Int64Array::from(categories)),
+                Arc::new(StringArray::from(extras)),
+            ],
+        )
+        .expect("auction batch")
+    }
+
+    fn bid_batch(
+        schema: &SchemaRef,
+        ids: impl IntoIterator<Item = (i64, bool)>,
+        auction_keyspace: i64,
+    ) -> RecordBatch {
+        let mut id_values = Vec::new();
+        let mut auctions = Vec::new();
+        let mut bidders = Vec::new();
+        let mut prices = Vec::new();
+        let mut channels = Vec::new();
+        let mut urls = Vec::new();
+        let mut date_times = Vec::new();
+        let mut extras = Vec::new();
+        for (id, updated) in ids {
+            id_values.push(id);
+            let auction = ((id - 1) % auction_keyspace) + 1;
+            auctions.push(auction);
+            bidders.push(((id - 1) % PERSON_KEYSPACE) + 1);
+            prices.push(1000 + ((id * 17) % 2_000_000) + if updated { 17 } else { 0 });
+            let channel = if updated {
+                match id % 4 {
+                    0 => "apple",
+                    1 => "google",
+                    2 => "facebook",
+                    _ => "baidu",
+                }
+            } else {
+                match id % 5 {
+                    0 => "apple",
+                    1 => "google",
+                    2 => "facebook",
+                    3 => "baidu",
+                    _ => "web",
+                }
+            };
+            channels.push(channel.to_string());
+            urls.push(if updated {
+                format!(
+                    "https://cdc.example.com/watch/channel_id={}/u/{id}",
+                    (id + 7) % 100
+                )
+            } else {
+                format!(
+                    "https://nexmark.example.com/auction/{auction}/bid/{id}?channel_id={}",
+                    id % 100
+                )
+            });
+            date_times.push(BASE_TS + id + if updated { 1000 } else { 0 });
+            extras.push(if updated {
+                format!("bid_extra_ccc_{id}_updated")
+            } else {
+                format!("bid_extra_ccc_{id}")
+            });
+        }
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(id_values)),
+                Arc::new(Int64Array::from(auctions)),
+                Arc::new(Int64Array::from(bidders)),
+                Arc::new(Int64Array::from(prices)),
+                Arc::new(StringArray::from(channels)),
+                Arc::new(StringArray::from(urls)),
+                Arc::new(Int64Array::from(date_times)),
+                Arc::new(StringArray::from(extras)),
+            ],
+        )
+        .expect("bid batch")
+    }
+
+    async fn apply_weighted(
+        runtime: &mut VectorizedExecutionRuntime,
+        source_name: &str,
+        schema: &SchemaRef,
+        batch: RecordBatch,
+        diffs: &[i64],
+    ) {
+        let weighted_schema =
+            crate::delta_consolidation::weighted_snapshot_schema(schema).expect("weighted schema");
+        let weighted =
+            weighted_batch_from_diffs(&batch, &weighted_schema, diffs).expect("weighted delta");
+        runtime
+            .apply_weighted_source_delta(source_name, weighted)
+            .await
+            .expect("apply weighted delta");
+    }
+
+    let auctions = SourceDefinition::new(
+        "nexmark_auction",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("item_name", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("description", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("initial_bid", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("reserve", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("expires", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("category", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("extra", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("auction source definition")
+    .with_property(SOURCE_PRIMARY_KEY_PROPERTY, "id");
+    let bids = SourceDefinition::new(
+        "nexmark_bid",
+        vec![
+            SourceColumn::new_nullable("id", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("channel", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("url", SourceDataType::Utf8, false),
+            SourceColumn::new_nullable("date_time", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("extra", SourceDataType::Utf8, false),
+        ],
+    )
+    .expect("bid source definition")
+    .with_property(SOURCE_PRIMARY_KEY_PROPERTY, "id");
+    let auction_schema = auctions.to_arrow_schema();
+    let bid_schema = bids.to_arrow_schema();
+    let mut sources = SourceRegistry::new();
+    sources.register(auctions);
+    sources.register(bids);
+
+    let table = build_operator_state_table("vectorized-columnar-cdc-q6-generated-mutations").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("moving_avg_price", DataType::Int64, true),
+    ]));
+    let query = "SELECT seller, CAST(AVG(price) AS BIGINT) AS moving_avg_price \
+        FROM (SELECT a.seller, b.price, b.date_time, \
+        ROW_NUMBER() OVER (PARTITION BY a.id, a.seller ORDER BY b.price DESC, \
+        b.date_time ASC, b.bidder ASC, b.channel ASC, b.url ASC, b.extra ASC) AS rownum \
+        FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
+        WHERE b.date_time BETWEEN a.date_time AND a.expires) ranked \
+        WHERE rownum <= 1 GROUP BY seller";
+    let mut runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::new(
+            "mv_cdc_q6_generated",
+            query,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_operator_state_table(Arc::clone(&table))
+            .with_source_query_tables(),
+    )
+    .await
+    .expect("runtime");
+    assert_eq!(
+        runtime.materialized_views[0].execution_mode,
+        MaterializedViewExecutionMode::ColumnarGroupedStats
+    );
+
+    let initial_auctions = auction_batch(
+        &auction_schema,
+        (1..=AUCTION_INITIAL_ROWS).map(|id| (id, false)),
+    );
+    let initial_bids = bid_batch(
+        &bid_schema,
+        (1..=BID_INITIAL_ROWS).map(|id| (id, false)),
+        AUCTION_INITIAL_ROWS,
+    );
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_auction",
+            vec![initial_auctions.clone()],
+            vec![initial_auctions],
+        )
+        .await
+        .expect("append initial auctions");
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_bid",
+            vec![initial_bids.clone()],
+            vec![initial_bids],
+        )
+        .await
+        .expect("append initial bids");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let bid_update_batch = bid_batch(
+        &bid_schema,
+        (1..=BID_UPDATES)
+            .map(|id| (id, false))
+            .chain((1..=BID_UPDATES).map(|id| (id, true))),
+        AUCTION_INITIAL_ROWS,
+    );
+    let bid_update_diffs = std::iter::repeat_n(-1, BID_UPDATES as usize)
+        .chain(std::iter::repeat_n(1, BID_UPDATES as usize))
+        .collect::<Vec<_>>();
+    apply_weighted(
+        &mut runtime,
+        "nexmark_bid",
+        &bid_schema,
+        bid_update_batch,
+        &bid_update_diffs,
+    )
+    .await;
+    runtime.run_tick(2).await.expect("bid update tick");
+
+    let bid_delete_start = BID_UPDATES + 1;
+    let bid_delete_batch = bid_batch(
+        &bid_schema,
+        (bid_delete_start..bid_delete_start + BID_DELETES).map(|id| (id, false)),
+        AUCTION_INITIAL_ROWS,
+    );
+    let bid_delete_diffs = vec![-1; BID_DELETES as usize];
+    apply_weighted(
+        &mut runtime,
+        "nexmark_bid",
+        &bid_schema,
+        bid_delete_batch,
+        &bid_delete_diffs,
+    )
+    .await;
+    runtime.run_tick(3).await.expect("bid delete tick");
+
+    let bid_insert_batch = bid_batch(
+        &bid_schema,
+        (BID_INITIAL_ROWS + 1..=BID_INITIAL_ROWS + BID_INSERTS).map(|id| (id, false)),
+        LIVE_AUCTION_KEYSPACE,
+    );
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_bid",
+            vec![bid_insert_batch.clone()],
+            vec![bid_insert_batch],
+        )
+        .await
+        .expect("append bid inserts");
+    runtime.run_tick(4).await.expect("bid insert tick");
+
+    let auction_update_batch = auction_batch(
+        &auction_schema,
+        (1..=AUCTION_UPDATES)
+            .map(|id| (id, false))
+            .chain((1..=AUCTION_UPDATES).map(|id| (id, true))),
+    );
+    let auction_update_diffs = std::iter::repeat_n(-1, AUCTION_UPDATES as usize)
+        .chain(std::iter::repeat_n(1, AUCTION_UPDATES as usize))
+        .collect::<Vec<_>>();
+    apply_weighted(
+        &mut runtime,
+        "nexmark_auction",
+        &auction_schema,
+        auction_update_batch,
+        &auction_update_diffs,
+    )
+    .await;
+    runtime.run_tick(5).await.expect("auction update tick");
+
+    let auction_delete_start = AUCTION_UPDATES + 1;
+    let auction_delete_batch = auction_batch(
+        &auction_schema,
+        (auction_delete_start..auction_delete_start + AUCTION_DELETES).map(|id| (id, false)),
+    );
+    let auction_delete_diffs = vec![-1; AUCTION_DELETES as usize];
+    apply_weighted(
+        &mut runtime,
+        "nexmark_auction",
+        &auction_schema,
+        auction_delete_batch,
+        &auction_delete_diffs,
+    )
+    .await;
+    runtime.run_tick(6).await.expect("auction delete tick");
+
+    let auction_insert_batch = auction_batch(
+        &auction_schema,
+        (AUCTION_INITIAL_ROWS + 1..=AUCTION_INITIAL_ROWS + AUCTION_INSERTS).map(|id| (id, false)),
+    );
+    runtime
+        .append_source_batches_for_execution_and_query(
+            "nexmark_auction",
+            vec![auction_insert_batch.clone()],
+            vec![auction_insert_batch],
+        )
+        .await
+        .expect("append auction inserts");
+    runtime.run_tick(7).await.expect("auction insert tick");
+
+    let handle = registry
+        .get("mv_cdc_q6_generated")
+        .expect("materialized view");
+    let snapshot = handle.arrow_snapshot_for(7).expect("mv snapshot");
+    let actual = id_count_rows(&snapshot);
+
+    let ctx = SessionContext::new();
+    for (name, provider) in runtime.table_providers() {
+        ctx.register_table(&name, provider)
+            .expect("register source table");
+    }
+    let expected = ctx
+        .sql(query)
+        .await
+        .expect("plan expected q6")
+        .collect()
+        .await
+        .expect("collect expected q6");
+    assert_eq!(actual, id_count_rows(&expected));
 }
 
 #[tokio::test]
