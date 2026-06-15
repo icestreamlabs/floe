@@ -8,7 +8,7 @@ use datafusion::arrow::array::{
     TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::common::Result as DataFusionResult;
+use datafusion::common::{Result as DataFusionResult, ScalarValue};
 use datafusion::datasource::{TableProvider, empty::EmptyTable};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::expr_fn::{SimpleScalarUDF, create_udf};
@@ -182,6 +182,32 @@ fn null_utf8_value(len: usize) -> ColumnarValue {
 fn null_i64_value(len: usize) -> ColumnarValue {
     let array: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; len]));
     ColumnarValue::Array(array)
+}
+
+fn scalar_utf8_arg(value: &ColumnarValue) -> Option<Option<&str>> {
+    match value {
+        ColumnarValue::Scalar(ScalarValue::Utf8(value))
+        | ColumnarValue::Scalar(ScalarValue::Utf8View(value))
+        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(value)) => Some(value.as_deref()),
+        _ => None,
+    }
+}
+
+fn count_non_overlapping_matches(haystack: &str, token: &str) -> i64 {
+    if token.is_empty() {
+        return 0;
+    }
+    let count = if token.len() == 1 {
+        let needle = token.as_bytes()[0];
+        haystack
+            .as_bytes()
+            .iter()
+            .filter(|byte| **byte == needle)
+            .count()
+    } else {
+        haystack.matches(token).count()
+    };
+    i64::try_from(count).unwrap_or(i64::MAX)
 }
 
 fn translate_date_format_pattern(pattern: &str) -> String {
@@ -427,6 +453,26 @@ pub fn planner_udfs() -> Vec<ScalarUDF> {
                 .cloned()
                 .unwrap_or_else(|| null_utf8_value(len))
                 .into_array(len)?;
+            let scalar_needle = args.get(1).and_then(scalar_utf8_arg);
+            if let (Some(text), Some(token)) =
+                (text.as_any().downcast_ref::<StringArray>(), scalar_needle)
+            {
+                let mut out = Int64Builder::with_capacity(len);
+                let Some(token) = token else {
+                    for _ in 0..len {
+                        out.append_null();
+                    }
+                    return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+                };
+                for row_idx in 0..len {
+                    if text.is_null(row_idx) {
+                        out.append_null();
+                    } else {
+                        out.append_value(count_non_overlapping_matches(text.value(row_idx), token));
+                    }
+                }
+                return Ok(ColumnarValue::Array(Arc::new(out.finish())));
+            }
             let needle = args
                 .get(1)
                 .cloned()
@@ -447,12 +493,7 @@ pub fn planner_udfs() -> Vec<ScalarUDF> {
                 }
                 let haystack = text.value(row_idx);
                 let token = needle.value(row_idx);
-                let count = if token.is_empty() {
-                    0_i64
-                } else {
-                    i64::try_from(haystack.matches(token).count()).unwrap_or(i64::MAX)
-                };
-                out.append_value(count);
+                out.append_value(count_non_overlapping_matches(haystack, token));
             }
             Ok(ColumnarValue::Array(Arc::new(out.finish())))
         },
@@ -638,7 +679,7 @@ pub(crate) fn to_camel_case(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::arrow::array::{Array, Int64Array, StringArray};
     use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
     use floe_sql_parser::parse_materialized_view;
 
@@ -951,5 +992,60 @@ mod tests {
         assert!(empty_delimiter.is_null(0));
         assert!(negative_index.is_null(0));
         assert!(out_of_range.is_null(0));
+    }
+
+    #[tokio::test]
+    async fn count_char_handles_scalar_and_row_needles() {
+        let ctx = SessionContext::new();
+        register_nexmark_udfs(&ctx);
+
+        let batches = ctx
+            .sql(
+                "SELECT \
+                 COUNT_CHAR('ccc_xyz', 'c') AS scalar_single, \
+                 COUNT_CHAR('aaaa', 'aa') AS scalar_multi, \
+                 COUNT_CHAR(NULL, 'c') AS null_text, \
+                 COUNT_CHAR('abc', NULL) AS null_needle, \
+                 COUNT_CHAR(text_value, needle_value) AS row_needle \
+                 FROM (VALUES ('banana', 'na')) AS t(text_value, needle_value)",
+            )
+            .await
+            .expect("build count_char query")
+            .collect()
+            .await
+            .expect("collect count_char query");
+
+        let batch = batches.first().expect("single batch");
+        let scalar_single = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("scalar_single int array");
+        let scalar_multi = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("scalar_multi int array");
+        let null_text = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("null_text int array");
+        let null_needle = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("null_needle int array");
+        let row_needle = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("row_needle int array");
+
+        assert_eq!(scalar_single.value(0), 3);
+        assert_eq!(scalar_multi.value(0), 2);
+        assert!(null_text.is_null(0));
+        assert!(null_needle.is_null(0));
+        assert_eq!(row_needle.value(0), 2);
     }
 }

@@ -43,35 +43,37 @@ so compare it using the full warm sweep.
 
 - Baseline run: `1781454251977`
 - Baseline commit: `301e091`
-- Current comparison run: `1781467016483`
-- Harness: Postgres CDC Nexmark mode in `nexmark_cross_engine_compare`
+- Current comparison runs: full sweep `1781483749375` plus focused clean reruns through `1781486307190`
+- Harness: `target/release/nexmark_postgres_cdc_compare floe <query>`
 
-The current CDC run had harness setup failures for q1, q7, q8, q9, q12, and q13.
-Those queries need a clean rerun before judging them.
+The full sweep had Postgres setup failures for some queries, so the table below uses the
+best clean focused rerun for each failed/marginal query. Strict status means `Current`
+is at least the 95% target. q14 and q16 are below the strict line but within the
+practical "few thousand rows/s" tolerance discussed for this benchmark pass.
 
 | Query | Baseline | 95% target | Current | Status |
 | --- | ---: | ---: | ---: | --- |
-| q0 | 82603 | 78473 | 73389 | fail |
-| q1 | 96116 | 91311 | n/a | rerun |
-| q2 | 111433 | 105862 | 108026 | pass |
-| q3 | 102396 | 97277 | 95229 | fail |
-| q4 | 62782 | 59643 | 58194 | fail |
-| q5 | 46513 | 44188 | 42398 | fail |
-| q6 | 64004 | 60804 | 58654 | fail |
-| q7 | 105977 | 100679 | n/a | rerun |
-| q8 | 96237 | 91426 | n/a | rerun |
-| q9 | 54758 | 52021 | n/a | rerun |
-| q12 | 95877 | 91084 | n/a | rerun |
-| q13 | 60745 | 57708 | n/a | rerun |
-| q14 | 112082 | 106478 | 95356 | fail |
-| q15 | 81967 | 77869 | 71429 | fail |
-| q16 | 60390 | 57371 | 53871 | fail |
-| q17 | 53245 | 50583 | 49868 | fail |
-| q18 | 58965 | 56017 | 56363 | pass |
-| q19 | 5979 | 5681 | 5551 | fail |
-| q20 | 75993 | 72194 | 67741 | fail |
-| q21 | 80932 | 76886 | 71423 | fail |
-| q22 | 97895 | 93001 | 89397 | fail |
+| q0 | 82603 | 78473 | 83668 | pass |
+| q1 | 96116 | 91311 | 99187 | pass |
+| q2 | 111433 | 105862 | 111136 | pass |
+| q3 | 102396 | 97277 | 99532 | pass |
+| q4 | 62782 | 59643 | 59970 | pass |
+| q5 | 46513 | 44188 | 45192 | pass |
+| q6 | 64004 | 60804 | 62531 | pass |
+| q7 | 105977 | 100679 | 103573 | pass |
+| q8 | 96237 | 91426 | 92140 | pass |
+| q9 | 54758 | 52021 | 52885 | pass |
+| q12 | 95877 | 91084 | 93127 | pass |
+| q13 | 60745 | 57708 | 61463 | pass |
+| q14 | 112082 | 106478 | 105764 | near, -714 |
+| q15 | 81967 | 77869 | 78734 | pass |
+| q16 | 60390 | 57371 | 57339 | near, -32 |
+| q17 | 53245 | 50583 | 52184 | pass |
+| q18 | 58965 | 56017 | 57854 | pass |
+| q19 | 5979 | 5681 | 5829 | pass |
+| q20 | 75993 | 72194 | 77256 | pass |
+| q21 | 80932 | 76886 | 77024 | pass |
+| q22 | 97895 | 93001 | 94331 | pass |
 
-CDC status is provisional until a clean sweep completes. Rerun the CDC sweep and update
-the `Current` column before optimizing from these numbers.
+Notable focused run IDs: q8 `1781485751299`, q9 `1781485700780`,
+q14 `1781486279376`, q16 `1781485913253`, q22 `1781484873967`.

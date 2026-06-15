@@ -31,7 +31,7 @@ const INDEX_RANGE_INLINE_MAGIC: &[u8; 4] = b"cir1";
 const INDEX_RANGE_INLINE_VERSION: u8 = 1;
 const INDEX_RANGE_SEGMENT_MAGIC: &[u8; 4] = b"crs1";
 const INDEX_RANGE_SEGMENT_VERSION: u8 = 1;
-const INDEX_RANGE_TARGET_ROWS: usize = 1024;
+const INDEX_RANGE_TARGET_ROWS: usize = 2048;
 const INDEX_INLINE_ROW_MAX_ROWS: usize = 2048;
 
 pub struct SlateBackedColumnarIndexedZSet {

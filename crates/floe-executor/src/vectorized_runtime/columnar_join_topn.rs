@@ -515,7 +515,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
     let right_index_namespace = format!("{right_namespace}/index");
     let right_index_keys =
         vec![right_key_idx.context("partitioned join-topn right key index is missing")?];
-    let mut right_index = SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
+    let mut right_index = SlateBackedColumnarIndexedZSet::new(
         Arc::clone(&table),
         right_index_namespace,
         Arc::clone(&right_source.schema),
