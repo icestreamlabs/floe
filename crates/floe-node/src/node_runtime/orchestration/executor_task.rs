@@ -438,12 +438,9 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                 floe_executor::delta_consolidation::weighted_snapshot_schema(
                                     &definition.to_arrow_schema(),
                                 )?;
-                            weighted_batch_from_diffs(
-                                arrow_delta.record_batch(),
-                                &weighted_schema,
-                                arrow_delta.diffs(),
-                            )
-                            .map(|batch| (arrow_delta.len(), batch))
+                            arrow_delta
+                                .weighted_record_batch(&weighted_schema)
+                                .map(|batch| (arrow_delta.len(), batch))
                         },
                     ) {
                         Ok((row_count, batch)) => {

@@ -57,7 +57,7 @@ use floe_executor::{
     SourceArrowBatchBuilder, SourceArrowBatchMode, SubscribeExecutionConfig, ValidatedPlan,
     VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions, VectorizedMaterializedViewPlan,
     plan_source_requirements, print_columnar_phase_profile, reset_columnar_phase_profile,
-    validate_dbsp_plan, weighted_batch_from_diffs,
+    validate_dbsp_plan,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};

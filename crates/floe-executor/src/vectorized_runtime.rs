@@ -181,6 +181,19 @@ impl VectorizedExecutionRuntimeOptions {
                 .strip_prefix("nexmark_")
                 .is_some_and(|alias| names.contains(alias))
     }
+
+    fn maintains_query_alias_for(&self, source_name: &str) -> bool {
+        if !self.maintain_source_query_tables {
+            return false;
+        }
+        let Some(alias) = source_name.strip_prefix("nexmark_") else {
+            return false;
+        };
+        let Some(names) = self.source_query_table_names.as_ref() else {
+            return true;
+        };
+        names.contains(alias)
+    }
 }
 
 impl std::fmt::Debug for VectorizedExecutionRuntimeOptions {
@@ -430,7 +443,7 @@ impl VectorizedExecutionRuntime {
                 } else {
                     (None, None)
                 };
-            let query_alias_provider = if maintain_query_table {
+            let query_alias_provider = if options.maintains_query_alias_for(definition.name()) {
                 alias_schema
                     .as_ref()
                     .map(|schema| {
@@ -1117,21 +1130,32 @@ impl VectorizedExecutionRuntime {
         source_name: &str,
         delta: RecordBatch,
     ) -> Result<()> {
+        let total_start = profile::start();
         let state = self
             .sources
             .get(source_name)
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
+        let phase_start = profile::start();
         validate_unit_source_delta(&state.schema, &delta)
             .with_context(|| format!("validate weighted source delta for '{source_name}'"))?;
+        profile::record_since("source_delta.validate", phase_start);
+        let phase_start = profile::start();
         if let Some(insert_batch) = insert_only_source_delta_batch(&state.schema, &delta)? {
-            return self.apply_insert_source_batches(
+            profile::record_since("source_delta.insert_only_check", phase_start);
+            let phase_start = profile::start();
+            let result = self.apply_insert_source_batches(
                 source_name,
                 &state,
                 vec![insert_batch.clone()],
                 vec![insert_batch],
             );
+            profile::record_since("source_delta.apply_insert_only", phase_start);
+            profile::record_since("source_delta.total", total_start);
+            return result;
         }
+        profile::record_since("source_delta.insert_only_check", phase_start);
+        let phase_start = profile::start();
         let weighted_batches = self
             .current_weighted_delta_batches
             .entry(source_name.to_string())
@@ -1146,8 +1170,10 @@ impl VectorizedExecutionRuntime {
             )?);
         }
         weighted_batches.push(delta.clone());
+        profile::record_since("source_delta.stage_weighted_delta", phase_start);
 
-        if state.primary_key_columns.is_empty() {
+        let result = if state.primary_key_columns.is_empty() {
+            let phase_start = profile::start();
             if let Some(query_provider) = state.query_provider.as_ref() {
                 let query_next = apply_source_delta(
                     &state.schema,
@@ -1165,6 +1191,8 @@ impl VectorizedExecutionRuntime {
                     alias_provider.set_batches(rename_batches(&query_next, alias_schema)?)?;
                 }
             }
+            profile::record_since("source_delta.apply_unkeyed_query_state", phase_start);
+            let phase_start = profile::start();
             if state.maintain_execution_state {
                 let next = apply_source_delta(
                     &state.schema,
@@ -1181,42 +1209,53 @@ impl VectorizedExecutionRuntime {
                     alias_provider.set_batches(rename_batches(&next, alias_schema)?)?;
                 }
             }
-            return Ok(());
-        }
-
-        let update = prepare_source_delta(&state.schema, &state.primary_key_columns, &delta)
-            .with_context(|| format!("prepare keyed source delta for '{source_name}'"))?;
-        let positive_batches = update
-            .final_positive_batch
-            .as_ref()
-            .map(|batch| vec![batch.clone()])
-            .unwrap_or_default();
-        if let Some(query_provider) = state.query_provider.as_ref() {
-            query_provider.apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
-        }
-        if state.maintain_execution_state {
-            state
-                .provider
-                .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
-            if let (Some(alias_schema), Some(alias_provider)) =
-                (state.alias_schema.as_ref(), state.alias_provider.as_ref())
-            {
+            profile::record_since("source_delta.apply_unkeyed_execution_state", phase_start);
+            Ok(())
+        } else {
+            let phase_start = profile::start();
+            let update = prepare_source_delta(&state.schema, &state.primary_key_columns, &delta)
+                .with_context(|| format!("prepare keyed source delta for '{source_name}'"))?;
+            profile::record_since("source_delta.prepare_keyed_delta", phase_start);
+            let phase_start = profile::start();
+            let positive_batches = update
+                .final_positive_batch
+                .as_ref()
+                .map(|batch| vec![batch.clone()])
+                .unwrap_or_default();
+            if let Some(query_provider) = state.query_provider.as_ref() {
+                query_provider.apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
+            }
+            profile::record_since("source_delta.apply_keyed_query_state", phase_start);
+            let phase_start = profile::start();
+            if state.maintain_execution_state {
+                state
+                    .provider
+                    .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
+                if let (Some(alias_schema), Some(alias_provider)) =
+                    (state.alias_schema.as_ref(), state.alias_provider.as_ref())
+                {
+                    alias_provider.apply_keyed_delta(
+                        &update.touched_keys,
+                        rename_batches(&positive_batches, alias_schema)?,
+                    )?;
+                }
+            }
+            profile::record_since("source_delta.apply_keyed_execution_state", phase_start);
+            let phase_start = profile::start();
+            if let (Some(alias_schema), Some(alias_provider)) = (
+                state.alias_schema.as_ref(),
+                state.query_alias_provider.as_ref(),
+            ) {
                 alias_provider.apply_keyed_delta(
                     &update.touched_keys,
                     rename_batches(&positive_batches, alias_schema)?,
                 )?;
             }
-        }
-        if let (Some(alias_schema), Some(alias_provider)) = (
-            state.alias_schema.as_ref(),
-            state.query_alias_provider.as_ref(),
-        ) {
-            alias_provider.apply_keyed_delta(
-                &update.touched_keys,
-                rename_batches(&positive_batches, alias_schema)?,
-            )?;
-        }
-        Ok(())
+            profile::record_since("source_delta.apply_keyed_query_alias_state", phase_start);
+            Ok(())
+        };
+        profile::record_since("source_delta.total", total_start);
+        result
     }
 
     pub async fn run_tick(&mut self, version: i64) -> Result<()> {

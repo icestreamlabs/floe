@@ -6,24 +6,17 @@ use datafusion::arrow::array::{
     Decimal128Builder, Int64Array, Int64Builder, RecordBatch, StringBuilder,
     TimestampMillisecondArray, TimestampMillisecondBuilder,
 };
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use floe_cdc::CdcTableDeltas;
 use floe_cdc_core::{CdcColumnarColumn, CdcColumnarRowBatch, CdcTableId};
 use floe_core::RowValue;
 use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CdcDeltaOperation {
-    Insert,
-    Delete,
-}
-
 #[derive(Debug, Clone)]
 pub struct CdcArrowDeltaBatch {
     table_id: CdcTableId,
     record_batch: RecordBatch,
-    operations: Vec<CdcDeltaOperation>,
-    diffs: Vec<i64>,
+    diffs: Int64Array,
 }
 
 impl CdcArrowDeltaBatch {
@@ -48,11 +41,10 @@ impl CdcArrowDeltaBatch {
             .iter()
             .map(|column| CdcArrowColumnBuilder::new(column.data_type(), row_count))
             .collect::<Vec<_>>();
-        let mut operations = Vec::with_capacity(row_count);
         let mut diffs = Vec::with_capacity(row_count);
 
         for delta in table_deltas.deltas() {
-            let operation = operation_from_diff(delta.diff())?;
+            validate_diff(delta.diff())?;
             let values = delta.row().values();
             ensure!(
                 values.len() == definition.columns().len(),
@@ -68,7 +60,6 @@ impl CdcArrowDeltaBatch {
             {
                 builder.append(column, value.as_ref())?;
             }
-            operations.push(operation);
             diffs.push(delta.diff());
         }
 
@@ -81,8 +72,7 @@ impl CdcArrowDeltaBatch {
         Ok(Self {
             table_id: table_deltas.table_id().clone(),
             record_batch,
-            operations,
-            diffs,
+            diffs: Int64Array::from(diffs),
         })
     }
 
@@ -110,11 +100,9 @@ impl CdcArrowDeltaBatch {
         Ok(Self {
             table_id: table_id.clone(),
             record_batch,
-            operations: vec![CdcDeltaOperation::Insert; row_count],
-            diffs: vec![1; row_count],
+            diffs: Int64Array::from_value(1, row_count),
         })
     }
-
     pub fn table_id(&self) -> &CdcTableId {
         &self.table_id
     }
@@ -123,11 +111,14 @@ impl CdcArrowDeltaBatch {
         &self.record_batch
     }
 
-    pub fn operations(&self) -> &[CdcDeltaOperation] {
-        &self.operations
+    pub fn weighted_record_batch(&self, weighted_schema: &SchemaRef) -> Result<RecordBatch> {
+        let mut columns = self.record_batch.columns().to_vec();
+        columns.push(Arc::new(self.diffs.clone()) as ArrayRef);
+        RecordBatch::try_new(Arc::clone(weighted_schema), columns)
+            .context("build weighted CDC Arrow delta batch")
     }
 
-    pub fn diffs(&self) -> &[i64] {
+    pub fn diffs(&self) -> &Int64Array {
         &self.diffs
     }
 
@@ -369,10 +360,9 @@ impl CdcArrowColumnBuilder {
     }
 }
 
-fn operation_from_diff(diff: i64) -> Result<CdcDeltaOperation> {
+fn validate_diff(diff: i64) -> Result<()> {
     match diff {
-        1 => Ok(CdcDeltaOperation::Insert),
-        -1 => Ok(CdcDeltaOperation::Delete),
+        1 | -1 => Ok(()),
         _ => bail!("CDC Arrow delta diff must be +1 or -1, got {diff}"),
     }
 }
@@ -431,16 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn builds_arrow_delta_batch_with_operation_metadata() {
+    fn builds_arrow_delta_batch_with_diffs() {
         let batch = CdcArrowDeltaBatch::from_table_deltas(&orders_definition(), &deltas())
             .expect("arrow batch");
 
         assert_eq!(batch.len(), 2);
-        assert_eq!(
-            batch.operations(),
-            &[CdcDeltaOperation::Insert, CdcDeltaOperation::Delete]
-        );
-        assert_eq!(batch.diffs(), &[1, -1]);
+        assert_eq!(diff_values(batch.diffs()), vec![1, -1]);
         assert_eq!(batch.record_batch().num_columns(), 6);
         assert_eq!(batch.record_batch().num_rows(), 2);
     }
@@ -462,8 +448,7 @@ mod tests {
             CdcArrowDeltaBatch::from_table_deltas(&orders_definition(), &deltas).expect("batch");
 
         assert_eq!(batch.len(), 2);
-        assert_eq!(batch.operations(), &[CdcDeltaOperation::Insert; 2]);
-        assert_eq!(batch.diffs(), &[1, 1]);
+        assert_eq!(diff_values(batch.diffs()), vec![1, 1]);
         assert_eq!(batch.record_batch().num_columns(), 6);
         assert_eq!(batch.record_batch().num_rows(), 2);
     }
@@ -480,5 +465,9 @@ mod tests {
         let err = CdcArrowDeltaBatch::from_table_deltas(&orders_definition(), &deltas)
             .expect_err("mismatch should fail");
         assert!(err.to_string().contains("cannot be converted"));
+    }
+
+    fn diff_values(diffs: &Int64Array) -> Vec<i64> {
+        (0..diffs.len()).map(|idx| diffs.value(idx)).collect()
     }
 }

@@ -327,14 +327,25 @@ fn filter_unweighted_delta(
         return Ok(Vec::new());
     }
     let weight_idx = delta.schema().index_of(WEIGHT_COLUMN_NAME)?;
+    if kept_rows == delta.num_rows() {
+        return Ok(vec![drop_weight_column(schema, delta, weight_idx)?]);
+    }
     let filtered = filter_record_batch(delta, keep)?;
-    let columns = filtered
+    Ok(vec![drop_weight_column(schema, &filtered, weight_idx)?])
+}
+
+fn drop_weight_column(
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+    weight_idx: usize,
+) -> Result<RecordBatch> {
+    let columns = batch
         .columns()
         .iter()
         .enumerate()
         .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
         .collect::<Vec<_>>();
-    Ok(vec![RecordBatch::try_new(Arc::clone(schema), columns)?])
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 pub(super) fn insert_only_source_delta_batch(

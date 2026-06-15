@@ -1216,7 +1216,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
             "mv_orders",
-            "SELECT id, note FROM orders WHERE id >= 2",
+            "SELECT id * 2 AS id, note FROM orders WHERE id * 2 >= 4",
             Arc::clone(&output_schema),
         )],
         Arc::clone(&registry),
@@ -1251,7 +1251,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     .await;
     assert_eq!(
         id_note_rows(&snapshot),
-        vec![(2, "b".to_string()), (4, "d".to_string())]
+        vec![(4, "b".to_string()), (8, "d".to_string())]
     );
 
     let weighted_schema =
@@ -1259,12 +1259,12 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     let source_rows = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(Int64Array::from(vec![2, 3])),
-            Arc::new(StringArray::from(vec!["b", "c"])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
         ],
     )
     .expect("source delta rows");
-    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, 1])
+    let weighted = weighted_batch_from_diffs(&source_rows, &weighted_schema, &[-1, -1, 1])
         .expect("weighted source rows");
     runtime
         .apply_weighted_source_delta("orders", weighted)
@@ -1283,12 +1283,12 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     .await;
     assert_eq!(
         id_note_rows(&snapshot),
-        vec![(3, "c".to_string()), (4, "d".to_string())]
+        vec![(6, "c".to_string()), (8, "d".to_string())]
     );
     let delta = handle.arrow_delta_for(2).expect("mv delta");
     assert_eq!(
         weighted_id_note_rows(&delta),
-        vec![(2, "b".to_string(), -1), (3, "c".to_string(), 1)]
+        vec![(4, "b".to_string(), -1), (6, "c".to_string(), 1)]
     );
 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
@@ -1296,7 +1296,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
         &sources,
         vec![VectorizedMaterializedViewPlan::new(
             "mv_orders",
-            "SELECT id, note FROM orders WHERE id >= 2",
+            "SELECT id * 2 AS id, note FROM orders WHERE id * 2 >= 4",
             Arc::clone(&output_schema),
         )],
         Arc::clone(&recovery_registry),
@@ -1323,7 +1323,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     .await;
     assert_eq!(
         id_note_rows(&recovered_snapshot),
-        vec![(3, "c".to_string()), (4, "d".to_string())]
+        vec![(6, "c".to_string()), (8, "d".to_string())]
     );
     let recovered_delta = recovered_handle
         .arrow_delta_for(3)
@@ -9321,15 +9321,22 @@ async fn source_query_tables_can_be_limited_by_name() {
         vec![SourceColumn::new("id", SourceDataType::Int64)],
     )
     .expect("raw_events source definition");
+    let nexmark_bid = SourceDefinition::new(
+        "nexmark_bid",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("nexmark_bid source definition");
     let mut sources = SourceRegistry::new();
     sources.register(orders);
     sources.register(raw_events);
+    sources.register(nexmark_bid);
 
     let runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         Vec::new(),
         Arc::new(MaterializedViewRegistry::new()),
-        VectorizedExecutionRuntimeOptions::default().with_source_query_tables_for(["orders"]),
+        VectorizedExecutionRuntimeOptions::default()
+            .with_source_query_tables_for(["orders", "nexmark_bid"]),
     )
     .await
     .expect("runtime");
@@ -9341,7 +9348,36 @@ async fn source_query_tables_can_be_limited_by_name() {
         .collect::<Vec<_>>();
     names.sort();
 
-    assert_eq!(names, vec!["orders".to_string()]);
+    assert_eq!(names, vec!["nexmark_bid".to_string(), "orders".to_string()]);
+}
+
+#[tokio::test]
+async fn source_query_tables_include_nexmark_aliases_when_unrestricted() {
+    let nexmark_bid = SourceDefinition::new(
+        "nexmark_bid",
+        vec![SourceColumn::new("id", SourceDataType::Int64)],
+    )
+    .expect("nexmark_bid source definition");
+    let mut sources = SourceRegistry::new();
+    sources.register(nexmark_bid);
+
+    let runtime = VectorizedExecutionRuntime::new_with_options(
+        &sources,
+        Vec::new(),
+        Arc::new(MaterializedViewRegistry::new()),
+        VectorizedExecutionRuntimeOptions::default().with_source_query_tables(),
+    )
+    .await
+    .expect("runtime");
+
+    let mut names = runtime
+        .table_providers()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    names.sort();
+
+    assert_eq!(names, vec!["bid".to_string(), "nexmark_bid".to_string()]);
 }
 
 #[test]
