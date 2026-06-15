@@ -987,7 +987,7 @@ impl Harness {
         let _ = Command::new("docker")
             .args([
                 "rm",
-                "-f",
+                "-fv",
                 &self.config.postgres_container,
                 &self.config.redpanda_container,
             ])

@@ -7,7 +7,7 @@ BROKERS="${BROKERS:-127.0.0.1:9092}"
 FLOE_TEST_RELEASE="${FLOE_TEST_RELEASE:-0}"
 
 cleanup() {
-  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker rm -fv "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT

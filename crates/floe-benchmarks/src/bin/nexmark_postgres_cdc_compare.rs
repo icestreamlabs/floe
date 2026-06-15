@@ -1390,7 +1390,7 @@ impl Harness {
 
     fn stop_container(&self, name: &str) {
         if !self.config.keep_containers {
-            let _ = run_status("docker", ["rm", "-f", name], None);
+            let _ = run_status("docker", ["rm", "-fv", name], None);
         }
     }
 }

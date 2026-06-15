@@ -116,7 +116,7 @@ impl Harness {
         ));
         let _ = run_status(
             "docker",
-            ["rm", "-f", &self.config.redpanda_container],
+            ["rm", "-fv", &self.config.redpanda_container],
             None,
         );
         run_status("docker", ["pull", &self.config.redpanda_image], None)

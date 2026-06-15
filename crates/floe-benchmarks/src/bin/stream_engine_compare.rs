@@ -1003,7 +1003,7 @@ impl Harness {
 
     fn docker_rm_force(&self, names: &[&str]) {
         for name in names {
-            let _ = Command::new("docker").args(["rm", "-f", name]).status();
+            let _ = Command::new("docker").args(["rm", "-fv", name]).status();
         }
     }
 

@@ -333,7 +333,7 @@ impl Harness {
     }
 
     pub(super) fn stop_container(&self, container: &str) {
-        let _ = run_status("docker", ["rm", "-f", container], None);
+        let _ = run_status("docker", ["rm", "-fv", container], None);
     }
 
     pub(super) fn stop_floe_process(&mut self) {
