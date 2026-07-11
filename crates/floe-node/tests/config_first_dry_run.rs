@@ -92,7 +92,7 @@ topics = []
 }
 
 #[test]
-fn dry_run_rejects_multiple_materialized_views() -> Result<()> {
+fn dry_run_accepts_multiple_materialized_views() -> Result<()> {
     let sql = r#"
         CREATE MATERIALIZED VIEW mv_a AS SELECT 1;
         CREATE MATERIALIZED VIEW mv_b AS SELECT 2;
@@ -105,15 +105,12 @@ fn dry_run_rejects_multiple_materialized_views() -> Result<()> {
         .arg(sql)
         .output()
         .context("run floe-node multiple MV dry-run")?;
-    assert!(
-        !output.status.success(),
-        "expected multiple MV dry-run to fail"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("at most one materialized view per process"),
-        "expected single-MV invariant error in stderr, got:\n{stderr}"
-    );
+    if !output.status.success() {
+        bail!(
+            "expected multiple MV dry-run to succeed, stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
 
