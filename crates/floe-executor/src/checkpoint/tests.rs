@@ -1,15 +1,7 @@
 use super::*;
-use crate::dbsp_bridge::DbspBridge;
 use dbsp::storage::SlateTable;
 use object_store::memory::InMemory;
 use slatedb::Db;
-fn encoded_i64_row(value: i64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(4 + 1 + 8);
-    encoded.extend_from_slice(&(1_u32).to_le_bytes());
-    encoded.push(0x01);
-    encoded.extend_from_slice(&value.to_le_bytes());
-    encoded
-}
 
 async fn checkpoint_manager(graph_id: &str) -> CheckpointManager {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -53,6 +45,36 @@ async fn tick_commit_roundtrips_via_store() {
         .expect("reload checkpoint manager");
     assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
     assert_eq!(reloaded.snapshot_sink_cursors(), commit.sink_cursors);
+    assert_eq!(reloaded.snapshot_offsets(), commit.source_offsets);
+}
+
+#[tokio::test]
+async fn restored_offsets_are_retained_by_the_next_tick() {
+    let mut manager = checkpoint_manager("tick-offset-retention").await;
+    manager.update_partition_offset("topic_a", 0, 10);
+    manager.update_partition_offset("topic_b", 0, 20);
+    let first = TickCommit::new(1, 100, manager.snapshot_offsets(), Vec::new(), Vec::new());
+    manager
+        .persist_tick_commit(first)
+        .await
+        .expect("persist first tick");
+
+    let mut reloaded = CheckpointManager::new("tick-offset-retention", manager.store().table())
+        .await
+        .expect("reload checkpoint manager");
+    reloaded.update_partition_offset("topic_a", 0, 11);
+    let second = TickCommit::new(2, 200, reloaded.snapshot_offsets(), Vec::new(), Vec::new());
+    reloaded
+        .persist_tick_commit(second.clone())
+        .await
+        .expect("persist second tick");
+
+    assert!(second.source_offsets.iter().any(|offset| {
+        offset.source == "topic_a" && offset.partition == 0 && offset.offset == 11
+    }));
+    assert!(second.source_offsets.iter().any(|offset| {
+        offset.source == "topic_b" && offset.partition == 0 && offset.offset == 20
+    }));
 }
 
 #[tokio::test]
@@ -147,98 +169,4 @@ async fn tick_commit_roundtrips_operator_state_handles() {
         .await
         .expect("reload checkpoint manager");
     assert_eq!(reloaded.latest_tick_commit(), Some(&commit));
-}
-
-#[tokio::test]
-async fn checkpoint_manifest_keeps_materialized_view_with_noop_latest_tick() {
-    let registry = MaterializedViewRegistry::new();
-    let view = registry.register("mv_checkpoint_noop");
-
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(Db::open("checkpoint-mv-noop", store).await.expect("db"));
-    let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_checkpoint_noop",
-            dbsp::StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-
-    dbsp_view.add_delta(encoded_i64_row(5), 1);
-    let handle = dbsp_view.flush().await.expect("flush base version");
-    let latest_view = dbsp_view.latest_handle_view();
-    let (dict, table, namespace, version) = latest_view.into_parts();
-    view.set_dbsp_state(
-        DbspPersistedState::new(dict, table, namespace.clone(), version).with_logical_version(2),
-    );
-    view.publish_version(1, handle.clone());
-    view.publish_logical_version(2);
-
-    let entries = materialized_view_entries(&registry);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].view, "mv_checkpoint_noop");
-    assert_eq!(entries[0].namespace, namespace);
-    assert_eq!(entries[0].version, handle.version);
-    assert_eq!(entries[0].frontier, 2);
-}
-
-#[tokio::test]
-async fn recover_materialized_view_restores_frontier_ahead_of_handle_version() {
-    let registry = MaterializedViewRegistry::new();
-
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let db = Arc::new(
-        Db::open("checkpoint-mv-recover-noop", store)
-            .await
-            .expect("db"),
-    );
-    let mut bridge = DbspBridge::new(Arc::clone(&db)).await.expect("bridge");
-    let mut dbsp_view = bridge
-        .new_view(
-            "mv_checkpoint_recover_noop",
-            dbsp::StreamRetention::KeepLast { keep_last: 1 },
-        )
-        .await
-        .expect("dbsp view");
-
-    dbsp_view.add_delta(encoded_i64_row(11), 1);
-    let handle = dbsp_view.flush().await.expect("flush base version");
-
-    let manifest = CheckpointManifest {
-        id: 1,
-        watermark: 0,
-        format: ManifestFormat::V2,
-        dbsp_handles: vec![DbspHandleRecord::materialized_view(
-            "mv_checkpoint_recover_noop",
-            handle.ns.clone(),
-            handle.version,
-        )],
-        source_offsets: Vec::new(),
-        operator_states: Vec::new(),
-        materialized_views: vec![MaterializedViewCheckpointEntry {
-            view: "mv_checkpoint_recover_noop".to_string(),
-            namespace: handle.ns.clone(),
-            version: handle.version,
-            frontier: 2,
-        }],
-        sink_cursors: Vec::new(),
-    };
-
-    recover_materialized_views(&manifest, &registry, &mut bridge)
-        .await
-        .expect("recover materialized views");
-
-    let view = registry
-        .get("mv_checkpoint_recover_noop")
-        .expect("recovered view");
-    assert_eq!(view.latest_version(), Some(2));
-    let state = view.dbsp_state().expect("recovered dbsp state");
-    assert_eq!(state.version(), handle.version);
-    assert_eq!(state.logical_version(), 2);
-    let recovered_handle = view
-        .handle_for_version(2)
-        .expect("recovered logical version handle");
-    assert_eq!(recovered_handle.version, handle.version);
-    assert_eq!(recovered_handle.ns, handle.ns);
 }

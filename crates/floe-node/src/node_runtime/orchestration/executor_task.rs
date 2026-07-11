@@ -7,13 +7,13 @@ mod event_wait;
 
 use buffers::ExecutorTickBuffers;
 use checkpoint::{
-    CdcOnlyTickCommit, ExecutorCheckpointState, IngestMetrics, PersistExecutorFinalCheckpoint,
-    PersistTickCheckpoint, SourceJournalBatchBuildInput, apply_decoded_source_batches,
+    CdcOnlyTickCommit, ExecutorCheckpointState, IngestMetrics, PersistTickCheckpoint,
+    SourceJournalBatchBuildInput, apply_decoded_source_batches,
     build_kafka_metadata_journal_batches, build_source_journal_batches,
     drain_sink_checkpoint_updates, notify_kafka_commit_senders, persist_cdc_only_tick_commit,
-    persist_executor_final_checkpoint, persist_tick_checkpoint, publish_watermark_debug_state,
-    record_fatal_source_batch_failure, record_fatal_tick_failure, record_ingest_queue_metrics,
-    update_checkpoint_source_offsets, wait_for_tick_materialized_views,
+    persist_tick_checkpoint, publish_watermark_debug_state, record_fatal_source_batch_failure,
+    record_fatal_tick_failure, record_ingest_queue_metrics, update_checkpoint_source_offsets,
+    wait_for_tick_materialized_views,
 };
 pub(super) use context::{
     ExecutorBatchLimits, ExecutorCdcContext, ExecutorCheckpointContext, ExecutorIngestContext,
@@ -1297,13 +1297,6 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                 tick_latency_ms,
             });
         }
-        persist_executor_final_checkpoint(PersistExecutorFinalCheckpoint {
-            checkpoint_manager: &mut checkpoint_manager,
-            watermark: &watermark_for_task,
-            mv_registry: &mv_for_task,
-            runtime_failure: &failure_for_executor,
-        })
-        .await;
         print_columnar_phase_profile("floe-node");
         print_runtime_phase_profile("floe-node");
         executor_running_for_task.store(false, Ordering::Relaxed);

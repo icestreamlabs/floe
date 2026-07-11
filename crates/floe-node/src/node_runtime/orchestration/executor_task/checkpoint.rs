@@ -230,15 +230,10 @@ pub(super) async fn persist_cdc_only_tick_commit(
         &args.state.committed_kafka_offsets,
     );
     let checkpoint_write_start = Instant::now();
-    let checkpoint_result = if let Some(staged_writes) = args.cdc_staged_writes {
-        args.checkpoint_manager
-            .persist_tick_commit_with_staged_writes(tick_commit, staged_writes)
-            .await
-    } else {
-        args.checkpoint_manager
-            .persist_tick_commit(tick_commit)
-            .await
-    };
+    let checkpoint_result = args
+        .checkpoint_manager
+        .persist_tick_commit_with(tick_commit, &[], args.cdc_staged_writes)
+        .await;
     if let Err(err) = checkpoint_result {
         metrics::observe_tick_phase_latency_ms(
             "checkpoint_write",
@@ -485,60 +480,6 @@ pub(super) async fn wait_for_tick_materialized_views(
     }
 }
 
-pub(super) struct FinalCheckpoint<'a> {
-    pub(super) checkpoint_manager: &'a mut CheckpointManager,
-    pub(super) final_frontier: u64,
-    pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
-    pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
-}
-
-pub(super) struct PersistExecutorFinalCheckpoint<'a> {
-    pub(super) checkpoint_manager: &'a mut CheckpointManager,
-    pub(super) watermark: &'a AtomicI64,
-    pub(super) mv_registry: &'a Arc<MaterializedViewRegistry>,
-    pub(super) runtime_failure: &'a Arc<StdMutex<Option<String>>>,
-}
-
-pub(super) async fn persist_executor_final_checkpoint(args: PersistExecutorFinalCheckpoint<'_>) {
-    let final_frontier = args
-        .watermark
-        .load(Ordering::Relaxed)
-        .max(0)
-        .try_into()
-        .unwrap_or(0_u64);
-    persist_final_checkpoint_unless_failed(FinalCheckpoint {
-        checkpoint_manager: args.checkpoint_manager,
-        final_frontier,
-        mv_registry: args.mv_registry,
-        runtime_failure: args.runtime_failure,
-    })
-    .await;
-}
-
-pub(super) async fn persist_final_checkpoint_unless_failed(args: FinalCheckpoint<'_>) {
-    let has_runtime_failure = match args.runtime_failure.lock() {
-        Ok(guard) => guard.is_some(),
-        Err(poisoned) => {
-            tracing::warn!(
-                "runtime failure lock was poisoned while deciding final checkpoint behavior"
-            );
-            poisoned.into_inner().is_some()
-        }
-    };
-    if has_runtime_failure {
-        tracing::warn!("skipping final checkpoint persistence after runtime failure");
-        return;
-    }
-
-    if let Err(err) = args
-        .checkpoint_manager
-        .persist_snapshot(args.final_frontier, args.mv_registry.as_ref())
-        .await
-    {
-        tracing::warn!(error = %err, "final checkpoint persistence failed");
-    }
-}
-
 pub(super) fn build_kafka_metadata_journal_batches(
     source_names_by_id: &[String],
     source_ids: &[usize],
@@ -640,19 +581,12 @@ pub(super) async fn persist_tick_checkpoint(
     let checkpoint_write_start = Instant::now();
     let checkpoint_result = if let Some(err) = vectorized_journal_stage_error {
         Err(err)
-    } else if let Some(staged_writes) = staged_writes_for_checkpoint {
-        args.checkpoint_manager
-            .persist_tick_commit_with_kafka_metadata_and_staged_writes(
-                tick_commit,
-                args.kafka_metadata_journal_batches,
-                staged_writes,
-            )
-            .await
     } else {
         args.checkpoint_manager
-            .persist_tick_commit_with_kafka_metadata(
+            .persist_tick_commit_with(
                 tick_commit,
                 args.kafka_metadata_journal_batches,
+                staged_writes_for_checkpoint,
             )
             .await
     };
