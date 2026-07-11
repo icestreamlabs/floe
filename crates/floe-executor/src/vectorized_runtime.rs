@@ -30,6 +30,7 @@ use source_state::{
 
 const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 const SOURCE_APPEND_ONLY_PROPERTY: &str = "append_only";
+const SOURCE_QUERY_ALIAS_PROPERTY: &str = "query_alias";
 
 mod columnar_constant;
 mod columnar_count;
@@ -187,24 +188,24 @@ impl VectorizedExecutionRuntimeOptions {
         self
     }
 
-    fn maintains_query_table_for(&self, source_name: &str) -> bool {
+    fn maintains_query_table_for(&self, source: &SourceDefinition) -> bool {
         if !self.maintain_source_query_tables {
             return false;
         }
         let Some(names) = self.source_query_table_names.as_ref() else {
             return true;
         };
-        names.contains(source_name)
-            || source_name
-                .strip_prefix("nexmark_")
+        names.contains(source.name())
+            || source
+                .property(SOURCE_QUERY_ALIAS_PROPERTY)
                 .is_some_and(|alias| names.contains(alias))
     }
 
-    fn maintains_query_alias_for(&self, source_name: &str) -> bool {
+    fn maintains_query_alias_for(&self, source: &SourceDefinition) -> bool {
         if !self.maintain_source_query_tables {
             return false;
         }
-        let Some(alias) = source_name.strip_prefix("nexmark_") else {
+        let Some(alias) = source.property(SOURCE_QUERY_ALIAS_PROPERTY) else {
             return false;
         };
         let Some(names) = self.source_query_table_names.as_ref() else {
@@ -241,6 +242,7 @@ struct VectorizedSourceState {
     query_provider: Option<Arc<DynamicStateTableProvider>>,
     maintain_execution_state: bool,
     append_only: bool,
+    alias_name: Option<String>,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
     query_alias_provider: Option<Arc<DynamicStateTableProvider>>,
@@ -473,7 +475,7 @@ impl VectorizedExecutionRuntime {
                 Arc::clone(&schema),
                 key_indices.as_deref(),
             )?);
-            let maintain_query_table = options.maintains_query_table_for(definition.name());
+            let maintain_query_table = options.maintains_query_table_for(definition);
             let query_provider = maintain_query_table
                 .then(|| dynamic_state_provider(Arc::clone(&schema), key_indices.as_deref()))
                 .transpose()?
@@ -484,25 +486,27 @@ impl VectorizedExecutionRuntime {
             )
             .with_context(|| format!("register vectorized source {}", definition.name()))?;
 
-            let (alias_schema, alias_provider) =
-                if let Some(alias) = definition.name().strip_prefix("nexmark_") {
-                    let schema = camel_case_schema(definition);
-                    let provider = Arc::new(dynamic_state_provider(
-                        Arc::clone(&schema),
-                        key_indices.as_deref(),
-                    )?);
-                    ctx.register_table(alias, Arc::clone(&provider) as Arc<dyn TableProvider>)
-                        .with_context(|| {
-                            format!(
-                                "register vectorized source alias {alias} for {}",
-                                definition.name()
-                            )
-                        })?;
-                    (Some(schema), Some(provider))
-                } else {
-                    (None, None)
-                };
-            let query_alias_provider = if options.maintains_query_alias_for(definition.name()) {
+            let alias_name = definition
+                .property(SOURCE_QUERY_ALIAS_PROPERTY)
+                .map(str::to_string);
+            let (alias_schema, alias_provider) = if let Some(alias) = alias_name.as_deref() {
+                let schema = camel_case_schema(definition);
+                let provider = Arc::new(dynamic_state_provider(
+                    Arc::clone(&schema),
+                    key_indices.as_deref(),
+                )?);
+                ctx.register_table(alias, Arc::clone(&provider) as Arc<dyn TableProvider>)
+                    .with_context(|| {
+                        format!(
+                            "register vectorized source alias {alias} for {}",
+                            definition.name()
+                        )
+                    })?;
+                (Some(schema), Some(provider))
+            } else {
+                (None, None)
+            };
+            let query_alias_provider = if options.maintains_query_alias_for(definition) {
                 alias_schema
                     .as_ref()
                     .map(|schema| {
@@ -522,6 +526,7 @@ impl VectorizedExecutionRuntime {
                     query_provider,
                     maintain_execution_state: false,
                     append_only,
+                    alias_name,
                     alias_schema,
                     alias_provider,
                     query_alias_provider,
@@ -1044,7 +1049,7 @@ impl VectorizedExecutionRuntime {
                     Arc::clone(query_provider) as Arc<dyn TableProvider>,
                 ));
             }
-            if let Some(alias) = source_name.strip_prefix("nexmark_")
+            if let Some(alias) = source.alias_name.as_deref()
                 && let Some(alias_provider) = source.query_alias_provider.as_ref()
             {
                 providers.push((
@@ -1389,9 +1394,13 @@ async fn build_incremental_materialized_view_state_from_logical_plan(
     let ctx = incremental_context_with_udfs(udfs);
     let (source_provider, alias_schema, alias_provider) =
         incremental_context_providers(&ctx, source_name, sources)?;
+    let source_alias = sources
+        .get(source_name)
+        .and_then(|source| source.alias_name.as_deref());
     let logical_plan = rebind_incremental_logical_plan(
         logical_plan.clone(),
         source_name,
+        source_alias,
         &source_provider,
         alias_provider.as_ref(),
     )?;
@@ -1432,10 +1441,9 @@ fn incremental_context_providers(
     )
     .with_context(|| format!("register isolated incremental source {source_name}"))?;
 
-    let (alias_schema, alias_provider) = if let (Some(alias), Some(alias_schema)) = (
-        source_name.strip_prefix("nexmark_"),
-        source.alias_schema.as_ref(),
-    ) {
+    let (alias_schema, alias_provider) = if let (Some(alias), Some(alias_schema)) =
+        (source.alias_name.as_deref(), source.alias_schema.as_ref())
+    {
         let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
         ctx.register_table(alias, Arc::clone(&provider) as Arc<dyn TableProvider>)
             .with_context(|| {
@@ -1451,10 +1459,10 @@ fn incremental_context_providers(
 fn rebind_incremental_logical_plan(
     logical_plan: LogicalPlan,
     source_name: &str,
+    source_alias: Option<&str>,
     source_provider: &Arc<DynamicStateTableProvider>,
     alias_provider: Option<&Arc<DynamicStateTableProvider>>,
 ) -> Result<LogicalPlan> {
-    let source_alias = source_name.strip_prefix("nexmark_");
     let transformed = logical_plan.transform_up(|plan| match plan {
         LogicalPlan::TableScan(mut scan) if scan.table_name.table() == source_name => {
             scan.source = provider_as_source(Arc::clone(source_provider) as Arc<dyn TableProvider>);

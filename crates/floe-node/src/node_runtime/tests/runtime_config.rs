@@ -117,10 +117,13 @@ fn source_journal_auto_row_journals_durable_table_sources() {
 #[test]
 fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
     let mut args = default_run_args();
-    args.events_per_second = 77.0;
-    args.ingest_batch_size = 999;
     args.maintenance_paused = true;
     args.slatedb_await_durable = Some(true);
+    let overrides = RunArgOverrides::from_ids([
+        "events_per_second",
+        "ingest_batch_size",
+        "maintenance_paused",
+    ]);
 
     let config = NodeConfig {
         runtime: config::RuntimeConfig {
@@ -139,10 +142,10 @@ fn apply_runtime_config_defaults_preserves_explicit_cli_values() {
         ..NodeConfig::default()
     };
 
-    apply_runtime_config_defaults(&mut args, &config);
+    apply_runtime_config_defaults(&mut args, &config, &overrides);
 
-    assert_eq!(args.events_per_second, 77.0);
-    assert_eq!(args.ingest_batch_size, 999);
+    assert_eq!(args.events_per_second, DEFAULT_EVENTS_PER_SECOND);
+    assert_eq!(args.ingest_batch_size, DEFAULT_INGEST_BATCH_SIZE);
     assert!(args.maintenance_paused);
     assert_eq!(args.slatedb_await_durable, Some(true));
 }

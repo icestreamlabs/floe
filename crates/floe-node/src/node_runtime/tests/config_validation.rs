@@ -593,7 +593,7 @@ fn apply_runtime_config_defaults_uses_config_when_cli_values_are_defaults() {
         ..NodeConfig::default()
     };
 
-    apply_runtime_config_defaults(&mut args, &config);
+    apply_runtime_config_defaults(&mut args, &config, &RunArgOverrides::default());
 
     assert_eq!(args.events_per_second, 25.0);
     assert_eq!(args.max_events, Some(123));

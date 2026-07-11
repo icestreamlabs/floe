@@ -838,10 +838,9 @@ impl UnionDeltaEvaluator {
                         source_name.clone(),
                         Arc::clone(&provider) as Arc<dyn TableProvider>,
                     );
-                    if let (Some(alias), Some(alias_schema)) = (
-                        source_name.strip_prefix("nexmark_"),
-                        source.alias_schema.as_ref(),
-                    ) {
+                    if let (Some(alias), Some(alias_schema)) =
+                        (source.alias_name.as_deref(), source.alias_schema.as_ref())
+                    {
                         let provider =
                             Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
                         provider_by_table.insert(

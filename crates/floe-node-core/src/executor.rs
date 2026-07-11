@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use floe_core::source::SourceDataType;
 use floe_executor::DbspPlanBuilder;
 use floe_executor::dbsp_plan::{
-    CircuitPlan, DbspScalarType, Field, PlannerConfig, TableDescriptor, nexmark_config,
+    CircuitPlan, DbspScalarType, Field, PlannerConfig, TableDescriptor,
 };
 
 use crate::planner::PlannedMaterializedView;
@@ -53,7 +53,7 @@ pub fn available_sources_from_registry(
         .flat_map(|definition| {
             let mut names = Vec::with_capacity(2);
             names.push(definition.name().to_string());
-            if let Some(alias) = definition.name().strip_prefix("nexmark_") {
+            if let Some(alias) = definition.property("query_alias") {
                 names.push(alias.to_string());
             }
             names
@@ -80,17 +80,14 @@ pub fn build_dataflows(
 pub fn planner_config_from_sources(
     registry: &crate::source::SourceRegistry,
 ) -> Result<PlannerConfig> {
-    let mut config = nexmark_config()?;
+    let mut config = PlannerConfig::new();
     for definition in registry.definitions() {
-        if definition.property(SOURCE_PRIMARY_KEY_PROPERTY).is_none() {
-            continue;
-        }
         config.register_owned_table(table_descriptor_from_source(
             definition,
             definition.name().to_string(),
             false,
         )?);
-        if let Some(short_name) = definition.name().strip_prefix("nexmark_") {
+        if let Some(short_name) = definition.property("query_alias") {
             config.register_owned_table(table_descriptor_from_source(
                 definition,
                 short_name.to_string(),

@@ -78,7 +78,7 @@ async fn register_sources(ctx: &SessionContext, sources: &SourceRegistry) -> Res
         ctx.register_table(definition.name(), Arc::clone(&base_table))
             .with_context(|| format!("failed to register source {}", definition.name()))?;
 
-        if let Some(short_name) = definition.name().strip_prefix("nexmark_") {
+        if let Some(short_name) = definition.property("query_alias") {
             let alias_schema = camel_case_schema(definition);
             let alias_table: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(alias_schema));
             ctx.register_table(short_name, Arc::clone(&alias_table))

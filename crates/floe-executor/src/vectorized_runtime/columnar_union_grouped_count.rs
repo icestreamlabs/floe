@@ -288,6 +288,7 @@ fn derived_source_map(
             query_provider: None,
             maintain_execution_state: false,
             append_only: false,
+            alias_name: None,
             alias_schema: None,
             alias_provider: None,
             query_alias_provider: None,

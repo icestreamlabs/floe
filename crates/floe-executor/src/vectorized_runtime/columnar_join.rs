@@ -145,6 +145,7 @@ struct JoinDeltaEvaluator {
 
 struct JoinEvaluatorInput {
     provider: Arc<DynamicStateTableProvider>,
+    alias_name: Option<String>,
     alias_schema: Option<SchemaRef>,
     alias_provider: Option<Arc<DynamicStateTableProvider>>,
 }
@@ -1768,10 +1769,9 @@ impl JoinEvaluatorInput {
                 let source = sources
                     .get(source_name)
                     .ok_or_else(|| anyhow::anyhow!("unknown join source '{source_name}'"))?;
-                if let (Some(_alias), Some(alias_schema)) = (
-                    source_name.strip_prefix("nexmark_"),
-                    source.alias_schema.as_ref(),
-                ) {
+                if let (Some(_alias), Some(alias_schema)) =
+                    (source.alias_name.as_deref(), source.alias_schema.as_ref())
+                {
                     (
                         Some(Arc::clone(alias_schema)),
                         Some(dynamic_join_provider(
@@ -1787,6 +1787,11 @@ impl JoinEvaluatorInput {
         };
         Ok(Self {
             provider,
+            alias_name: input
+                .source_name
+                .as_ref()
+                .and_then(|name| sources.get(name))
+                .and_then(|source| source.alias_name.clone()),
             alias_schema,
             alias_provider,
         })
@@ -1801,7 +1806,7 @@ impl JoinEvaluatorInput {
         if table_name == source_name {
             return Some(Arc::clone(&self.provider) as Arc<dyn TableProvider>);
         }
-        if source_name.strip_prefix("nexmark_") == Some(table_name)
+        if self.alias_name.as_deref() == Some(table_name)
             && let Some(alias_provider) = self.alias_provider.as_ref()
         {
             return Some(Arc::clone(alias_provider) as Arc<dyn TableProvider>);

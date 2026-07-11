@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
-use clap::Parser;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DFSchemaRef;
@@ -100,20 +99,35 @@ static TICK_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INGEST_METRICS_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TICK_LOG_SAMPLE_EVERY: u64 = 128;
 const INGEST_METRICS_SAMPLE_EVERY: u64 = 128;
+#[cfg(test)]
 const DEFAULT_EVENTS_PER_SECOND: f64 = 10.0;
+#[cfg(test)]
 const DEFAULT_MV_RETAIN_LAST: usize = 1;
+#[cfg(test)]
 const DEFAULT_ZSET_COMPACTION_MAX_CHAIN_LEN: usize = 512;
+#[cfg(test)]
 const DEFAULT_ZSET_COMPACTION_MAX_SEGMENTS: usize = 4096;
+#[cfg(test)]
 const DEFAULT_ZSET_COMPACTION_BACKOFF_TICKS: u64 = 1;
+#[cfg(test)]
 const DEFAULT_ZSET_COMPACTION_MAX_CONCURRENT_JOBS: usize = 1;
+#[cfg(test)]
 const DEFAULT_ZSET_GC_GRACE_PERIOD_MS: u64 = 30_000;
+#[cfg(test)]
 const DEFAULT_HTTP_HOST: &str = "127.0.0.1";
+#[cfg(test)]
 const DEFAULT_KAFKA_GROUP_ID: &str = "floe";
+#[cfg(test)]
 const DEFAULT_KAFKA_POLL_MS: u64 = 100;
+#[cfg(test)]
 const DEFAULT_KAFKA_MAX_MESSAGES: usize = 256;
+#[cfg(test)]
 const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 1024;
+#[cfg(test)]
 const DEFAULT_INGEST_BATCH_SIZE: usize = 256;
+#[cfg(test)]
 const DEFAULT_INGEST_BATCH_PER_SOURCE: usize = 64;
+#[cfg(test)]
 const DEFAULT_INGEST_BATCH_PER_CONNECTOR: usize = 64;
 const DEFAULT_PGWIRE_ADDR: &str = "127.0.0.1:6432";
 const DEFAULT_ADMIN_PORT: u16 = 8081;

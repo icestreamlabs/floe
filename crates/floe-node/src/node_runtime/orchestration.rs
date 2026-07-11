@@ -55,7 +55,7 @@ use wal_stream::{NativePostgresCdcConnectorConfig, run_native_postgres_cdc_conne
 pub(crate) async fn run() -> anyhow::Result<()> {
     init_tracing();
     metrics::init();
-    let Some(mut run_args) = parse_run_command()? else {
+    let Some((mut run_args, cli_overrides)) = parse_run_command()? else {
         return Ok(());
     };
 
@@ -66,7 +66,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     };
 
     if let Some(config) = config.as_ref() {
-        apply_runtime_config_defaults(&mut run_args, config);
+        apply_runtime_config_defaults(&mut run_args, config, &cli_overrides);
     }
     let postgres_cdc_settings = config
         .as_ref()

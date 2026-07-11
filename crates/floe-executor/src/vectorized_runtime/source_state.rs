@@ -112,9 +112,9 @@ pub(super) fn resolve_source_table(
         return Some(table_name);
     }
     sources
-        .keys()
-        .find(|source_name| source_name.strip_prefix("nexmark_") == Some(table_name.as_str()))
-        .cloned()
+        .iter()
+        .find(|(_, source)| source.alias_name.as_deref() == Some(table_name.as_str()))
+        .map(|(source_name, _)| source_name.clone())
 }
 
 pub(super) fn source_primary_key_columns(definition: &SourceDefinition) -> Vec<String> {

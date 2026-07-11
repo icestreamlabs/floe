@@ -4,6 +4,7 @@ use super::sse_json::*;
 use super::*;
 use axum::body::Body;
 use axum::http::{Request, header};
+use floe_node_core::source::RoutedIngestPayload;
 use floe_storage::ReplicationPipelineDlqEntryParts;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -83,7 +84,10 @@ async fn http_ingest_waits_for_commit_ack() {
     let response_task = tokio::spawn(async move { app.oneshot(request).await });
 
     let batch = rx.recv().await.expect("batch");
-    assert_eq!(batch.events.len(), 1);
+    let RoutedIngestPayload::Events(events) = batch.payload else {
+        panic!("expected routed events");
+    };
+    assert_eq!(events.len(), 1);
     assert!(!response_task.is_finished());
     batch
         .commit_ack

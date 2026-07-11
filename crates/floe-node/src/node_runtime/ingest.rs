@@ -360,31 +360,7 @@ pub(super) async fn recv_from_ready(
     let Some(batch) = receiver.recv().await else {
         return false;
     };
-    if let Some(queue) = queues.get_mut(batch.connector_id) {
-        let commit_ack = batch.commit_ack;
-        queue.pending.extend(batch.events.into_iter().map(|event| {
-            QueuedAppendIngestItem::Event(QueuedAppendIngestEvent {
-                event,
-                commit_ack: commit_ack.clone(),
-            })
-        }));
-        if let Some(kafka_raw) = batch.kafka_raw {
-            queue.pending.push_back(QueuedAppendIngestItem::KafkaRaw(
-                QueuedKafkaRawIngestBatch {
-                    batch: kafka_raw,
-                    commit_ack: commit_ack.clone(),
-                },
-            ));
-        }
-        if let Some(kafka_arrow) = batch.kafka_arrow {
-            queue.pending.push_back(QueuedAppendIngestItem::KafkaArrow(
-                QueuedKafkaArrowIngestBatch {
-                    batch: kafka_arrow,
-                    commit_ack,
-                },
-            ));
-        }
-    }
+    enqueue_routed_batch(batch, queues);
     true
 }
 
@@ -413,30 +389,36 @@ pub(super) fn drain_ready(
     queues: &mut [ConnectorQueue],
 ) {
     while let Ok(batch) = receiver.try_recv() {
-        if let Some(queue) = queues.get_mut(batch.connector_id) {
-            let commit_ack = batch.commit_ack;
-            queue.pending.extend(batch.events.into_iter().map(|event| {
+        enqueue_routed_batch(batch, queues);
+    }
+}
+
+fn enqueue_routed_batch(
+    batch: core_source::RoutedAppendIngestEventBatch,
+    queues: &mut [ConnectorQueue],
+) {
+    let Some(queue) = queues.get_mut(batch.connector_id) else {
+        return;
+    };
+    let commit_ack = batch.commit_ack;
+    match batch.payload {
+        core_source::RoutedIngestPayload::Events(events) => {
+            queue.pending.extend(events.into_iter().map(|event| {
                 QueuedAppendIngestItem::Event(QueuedAppendIngestEvent {
                     event,
                     commit_ack: commit_ack.clone(),
                 })
             }));
-            if let Some(kafka_raw) = batch.kafka_raw {
-                queue.pending.push_back(QueuedAppendIngestItem::KafkaRaw(
-                    QueuedKafkaRawIngestBatch {
-                        batch: kafka_raw,
-                        commit_ack: commit_ack.clone(),
-                    },
-                ));
-            }
-            if let Some(kafka_arrow) = batch.kafka_arrow {
-                queue.pending.push_back(QueuedAppendIngestItem::KafkaArrow(
-                    QueuedKafkaArrowIngestBatch {
-                        batch: kafka_arrow,
-                        commit_ack,
-                    },
-                ));
-            }
+        }
+        core_source::RoutedIngestPayload::KafkaRaw(batch) => {
+            queue.pending.push_back(QueuedAppendIngestItem::KafkaRaw(
+                QueuedKafkaRawIngestBatch { batch, commit_ack },
+            ));
+        }
+        core_source::RoutedIngestPayload::KafkaArrow(batch) => {
+            queue.pending.push_back(QueuedAppendIngestItem::KafkaArrow(
+                QueuedKafkaArrowIngestBatch { batch, commit_ack },
+            ));
         }
     }
 }

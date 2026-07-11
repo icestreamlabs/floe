@@ -3118,10 +3118,9 @@ impl TopNEvaluator {
             source_name.to_string(),
             Arc::clone(&provider) as Arc<dyn TableProvider>,
         );
-        let (alias_schema, alias_provider) = if let (Some(alias), Some(alias_schema)) = (
-            source_name.strip_prefix("nexmark_"),
-            source.alias_schema.as_ref(),
-        ) {
+        let (alias_schema, alias_provider) = if let (Some(alias), Some(alias_schema)) =
+            (source.alias_name.as_deref(), source.alias_schema.as_ref())
+        {
             let provider = Arc::new(DynamicStateTableProvider::new(Arc::clone(alias_schema)));
             provider_by_table.insert(
                 alias.to_string(),

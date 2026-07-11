@@ -18,6 +18,7 @@ const CONNECTOR_NAME: &str = "nexmark";
 const CONNECTOR_PROPERTY: &str = "connector";
 const ENTITY_PROPERTY: &str = "entity";
 const APPEND_ONLY_PROPERTY: &str = "append_only";
+const QUERY_ALIAS_PROPERTY: &str = "query_alias";
 
 pub const PERSON_SOURCE_NAME: &str = "nexmark_person";
 pub const AUCTION_SOURCE_NAME: &str = "nexmark_auction";
@@ -111,14 +112,17 @@ pub fn definitions() -> Result<Vec<SourceDefinition>> {
     let person = SourceDefinition::new(PERSON_SOURCE_NAME, person_columns())?
         .with_property(CONNECTOR_PROPERTY, CONNECTOR_NAME)
         .with_property(ENTITY_PROPERTY, "person")
+        .with_property(QUERY_ALIAS_PROPERTY, "person")
         .with_property(APPEND_ONLY_PROPERTY, "true");
     let auction = SourceDefinition::new(AUCTION_SOURCE_NAME, auction_columns())?
         .with_property(CONNECTOR_PROPERTY, CONNECTOR_NAME)
         .with_property(ENTITY_PROPERTY, "auction")
+        .with_property(QUERY_ALIAS_PROPERTY, "auction")
         .with_property(APPEND_ONLY_PROPERTY, "true");
     let bid = SourceDefinition::new(BID_SOURCE_NAME, bid_columns())?
         .with_property(CONNECTOR_PROPERTY, CONNECTOR_NAME)
         .with_property(ENTITY_PROPERTY, "bid")
+        .with_property(QUERY_ALIAS_PROPERTY, "bid")
         .with_property(APPEND_ONLY_PROPERTY, "true");
 
     Ok(vec![person, auction, bid])
