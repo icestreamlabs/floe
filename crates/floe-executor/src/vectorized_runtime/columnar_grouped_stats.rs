@@ -2894,20 +2894,9 @@ async fn apply_grouped_stats_delta(
         }
         let new_values =
             apply_aggregate_deltas(columnar, &group_key, &delta.agg_deltas, &mut writes).await?;
-        if compact_enabled {
-            columnar
-                .stats_state
-                .cache_group_count(&group_key, new_row_count)?;
-            let compact_state =
-                compact_state_from_current(columnar, &group_key, new_row_count).await?;
-            columnar
-                .stats_state
-                .write_compact_state(&mut writes, &group_key, compact_state)?;
-        } else {
-            columnar
-                .stats_state
-                .write_group_count(&mut writes, &group_key, new_row_count)?;
-        }
+        columnar
+            .stats_state
+            .write_group_count(&mut writes, &group_key, new_row_count)?;
         profile::record_since("grouped_stats.apply_update_state", phase_start);
 
         let phase_start = profile::start();
@@ -2988,7 +2977,7 @@ async fn apply_compact_grouped_stats_delta(
     for (group_key, delta) in pending {
         let phase_start = profile::start();
         let timing_start = emit_apply_timings.then(Instant::now);
-        let mut state = load_compact_or_legacy_group_state(columnar, &group_key).await?;
+        let mut state = load_compact_group_state(columnar, &group_key).await?;
         if let Some(timing_start) = timing_start {
             load_old += timing_start.elapsed();
         }
@@ -3653,21 +3642,14 @@ async fn apply_append_only_loaded_compact_grouped_stats_compact_delta(
     Ok(output_delta_batches)
 }
 
-async fn load_compact_or_legacy_group_state(
+async fn load_compact_group_state(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     group_key: &[u8],
 ) -> Result<CompactGroupState> {
     if let Some(state) = columnar.stats_state.load_compact_state(group_key).await? {
         return Ok(state);
     }
-    if columnar.stats_state.compact_snapshot_active()? {
-        return empty_compact_group_state(columnar);
-    }
-    if columnar.stats_state.assume_empty {
-        return empty_compact_group_state(columnar);
-    }
-    let row_count = columnar.stats_state.load_group_count(group_key).await?;
-    compact_state_from_current(columnar, group_key, row_count).await
+    empty_compact_group_state(columnar)
 }
 
 async fn compact_state_initial_for_mutation(
@@ -3680,9 +3662,7 @@ async fn compact_state_initial_for_mutation(
     if columnar.stats_state.has_compact_state(group_key)? {
         return Ok(None);
     }
-    load_compact_or_legacy_group_state(columnar, group_key)
-        .await
-        .map(Some)
+    empty_compact_group_state(columnar).map(Some)
 }
 
 fn empty_compact_group_state(
@@ -4120,54 +4100,6 @@ async fn load_aggregate_values(
         });
     }
     Ok(values)
-}
-
-async fn compact_state_from_current(
-    columnar: &ColumnarGroupedStatsMaterializedViewState,
-    group_key: &[u8],
-    row_count: i64,
-) -> Result<CompactGroupState> {
-    let specs = columnar
-        .stats_state
-        .compact_specs
-        .as_ref()
-        .context("grouped-stats compact state requested for non-compact plan")?;
-    let mut aggregates = Vec::with_capacity(specs.len());
-    for (idx, spec) in specs.iter().enumerate() {
-        aggregates.push(match spec.kind {
-            AggregateKind::Count => {
-                CompactAggregateState::I64(columnar.stats_state.load_i64(group_key, idx).await?)
-            }
-            AggregateKind::Sum => {
-                if matches!(spec.value_type, Some(AggregateValueType::Decimal128)) {
-                    bail!("grouped-stats decimal sum is not compactable");
-                }
-                CompactAggregateState::I64(columnar.stats_state.load_i64(group_key, idx).await?)
-            }
-            AggregateKind::Avg => {
-                let (sum, count) = columnar.stats_state.load_pair(group_key, idx).await?;
-                CompactAggregateState::Pair { sum, count }
-            }
-            AggregateKind::Min | AggregateKind::Max => match spec.value_type {
-                Some(
-                    AggregateValueType::Int64
-                    | AggregateValueType::TimestampMillis
-                    | AggregateValueType::DateDays,
-                ) => CompactAggregateState::MinMaxI64(
-                    columnar.stats_state.load_minmax(group_key, idx).await?,
-                ),
-                _ => bail!("grouped-stats aggregate is not compactable"),
-            },
-            AggregateKind::DistinctCount => {
-                bail!("grouped-stats distinct count is not compactable")
-            }
-        });
-    }
-    Ok(CompactGroupState {
-        row_count,
-        minmax_candidates: vec![Vec::new(); aggregates.len()],
-        aggregates,
-    })
 }
 
 async fn apply_aggregate_deltas(
@@ -5274,35 +5206,11 @@ impl SlateGroupedStatsState {
         let key = self.compact_key(group_key)?;
         if state.row_count == 0 {
             batch.delete(key);
-            self.delete_legacy_compacted_state_keys(batch, group_key)?;
         } else {
             batch.put_bytes(
                 Bytes::from(key),
                 Bytes::from(encode_compact_group_state(state)?),
             );
-        }
-        Ok(())
-    }
-
-    fn delete_legacy_compacted_state_keys(
-        &self,
-        batch: &mut WriteBatch,
-        group_key: &[u8],
-    ) -> Result<()> {
-        batch.delete(self.group_key(GROUP_TAG, group_key)?);
-        let Some(specs) = self.compact_specs.as_ref() else {
-            return Ok(());
-        };
-        for (idx, spec) in specs.iter().enumerate() {
-            match spec.kind {
-                AggregateKind::Count | AggregateKind::Sum | AggregateKind::Avg => {
-                    batch.delete(self.aggregate_key(SCALAR_TAG, group_key, idx)?);
-                }
-                AggregateKind::Min | AggregateKind::Max => {
-                    batch.delete(self.aggregate_key(MINMAX_TAG, group_key, idx)?);
-                }
-                AggregateKind::DistinctCount => {}
-            }
         }
         Ok(())
     }
@@ -5824,22 +5732,6 @@ impl SlateGroupedStatsState {
                 values.insert(value);
             }
         }
-        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
-        for (key, value_bytes) in self
-            .table
-            .scan_prefix(&value_prefix, &ScanOptions::default())
-            .await
-            .context("scan grouped-stats legacy append-only distinct value state")?
-        {
-            if decode_i64(&value_bytes)? <= 0 {
-                continue;
-            }
-            let value = decode_i64_sortable(
-                key.get(value_prefix.len()..)
-                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats value key"))?,
-            )?;
-            values.insert(value);
-        }
         Ok(AppendOnlyDistinctPresenceState {
             values,
             next_segment_id,
@@ -5932,22 +5824,6 @@ impl SlateGroupedStatsState {
             for value in decode_append_only_i128_distinct_segment(&bytes)? {
                 values.insert(value);
             }
-        }
-        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
-        for (key, value_bytes) in self
-            .table
-            .scan_prefix(&value_prefix, &ScanOptions::default())
-            .await
-            .context("scan grouped-stats legacy append-only decimal distinct value state")?
-        {
-            if decode_i64(&value_bytes)? <= 0 {
-                continue;
-            }
-            let value = decode_i128_sortable(
-                key.get(value_prefix.len()..)
-                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats i128 value key"))?,
-            )?;
-            values.insert(value);
         }
         Ok(AppendOnlyDistinctPresenceState {
             values,
@@ -6044,24 +5920,6 @@ impl SlateGroupedStatsState {
             for value in decode_append_only_string_distinct_segment(&bytes)? {
                 values.insert(value);
             }
-        }
-        let value_prefix = self.value_key_prefix(group_key, agg_idx)?;
-        for (key, value_bytes) in self
-            .table
-            .scan_prefix(&value_prefix, &ScanOptions::default())
-            .await
-            .context("scan grouped-stats legacy append-only string distinct value state")?
-        {
-            if decode_i64(&value_bytes)? <= 0 {
-                continue;
-            }
-            let value = String::from_utf8(
-                key.get(value_prefix.len()..)
-                    .ok_or_else(|| anyhow::anyhow!("invalid grouped-stats string value key"))?
-                    .to_vec(),
-            )
-            .context("decode grouped-stats string value key")?;
-            values.insert(value);
         }
         Ok(AppendOnlyDistinctPresenceState {
             values,
