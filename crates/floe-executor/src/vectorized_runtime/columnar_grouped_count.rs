@@ -75,7 +75,6 @@ impl ColumnarGroupedCountMaterializedViewState {
 
 struct SlateGroupedCountState {
     table: Arc<dyn KeyValueTable>,
-    key_prefix: Vec<u8>,
     count_log_prefix: Vec<u8>,
     count_sequence_key: Vec<u8>,
     next_count_segment_id: Mutex<u64>,
@@ -1521,7 +1520,6 @@ impl AppendOnlySingleHopOutputBuilder {
 
 impl SlateGroupedCountState {
     async fn new(table: Arc<dyn KeyValueTable>, namespace: &str) -> Result<Self> {
-        let key_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, namespace);
         let count_log_namespace = format!("{namespace}__count_log");
         let count_meta_namespace = format!("{namespace}__count_meta");
         let count_log_prefix =
@@ -1533,7 +1531,6 @@ impl SlateGroupedCountState {
             read_count_sequence(table.as_ref(), &count_sequence_key).await?;
         let state = Self {
             table,
-            key_prefix,
             count_log_prefix,
             count_sequence_key,
             next_count_segment_id: Mutex::new(next_count_segment_id),
@@ -1552,23 +1549,6 @@ impl SlateGroupedCountState {
 
     async fn load_all_counts(&self) -> Result<AHashMap<Vec<u8>, i64>> {
         let mut counts = AHashMap::new();
-        for (key, value) in self
-            .table
-            .scan_prefix(&self.key_prefix, &ScanOptions::default())
-            .await
-            .context("scan grouped-count legacy state")?
-        {
-            if key.as_slice() == self.count_sequence_key.as_slice()
-                || key.starts_with(&self.count_log_prefix)
-            {
-                continue;
-            }
-            let group_key = self.group_key_from_legacy_state_key(&key)?;
-            let count = decode_i64(&value)?;
-            if count != 0 {
-                counts.insert(group_key.to_vec(), count);
-            }
-        }
         let mut log_entries = Vec::new();
         for (key, value_bytes) in self
             .table
@@ -1650,13 +1630,6 @@ impl SlateGroupedCountState {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn legacy_state_key(&self, group_key: &[u8]) -> Vec<u8> {
-        let mut key = self.key_prefix.clone();
-        key.extend_from_slice(group_key);
-        key
-    }
-
     fn count_log_key(&self, segment_id: u64) -> Vec<u8> {
         let mut key = self.count_log_prefix.clone();
         key.extend_from_slice(&segment_id.to_be_bytes());
@@ -1672,13 +1645,6 @@ impl SlateGroupedCountState {
             .try_into()
             .map_err(|_| anyhow::anyhow!("grouped-count log segment id must be 8 bytes"))?;
         Ok(u64::from_be_bytes(bytes))
-    }
-
-    fn group_key_from_legacy_state_key<'a>(&self, key: &'a [u8]) -> Result<&'a [u8]> {
-        if !key.starts_with(&self.key_prefix) {
-            bail!("grouped-count state key prefix mismatch");
-        }
-        Ok(&key[self.key_prefix.len()..])
     }
 }
 
@@ -2272,30 +2238,6 @@ mod tests {
                 .load_counts([b"a".as_slice(), b"b".as_slice(), b"c".as_slice()])
                 .expect("load replayed counts"),
             vec![0, 7, 0]
-        );
-    }
-
-    #[tokio::test]
-    async fn grouped_count_state_reads_legacy_raw_count_keys() {
-        let table = build_table("grouped-count-legacy-state").await;
-        let state = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
-            .await
-            .expect("state");
-        let mut batch = WriteBatch::new();
-        batch.put(state.legacy_state_key(b"legacy"), 11_i64.to_be_bytes());
-        table
-            .write_batch(batch)
-            .await
-            .expect("persist legacy count");
-
-        let reopened = SlateGroupedCountState::new(Arc::clone(&table), "grouped_count")
-            .await
-            .expect("reopen state");
-        assert_eq!(
-            reopened
-                .load_counts([b"legacy".as_slice(), b"missing".as_slice()])
-                .expect("load legacy count"),
-            vec![11, 0]
         );
     }
 }
