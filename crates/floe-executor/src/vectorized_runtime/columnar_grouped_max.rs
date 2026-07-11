@@ -756,9 +756,10 @@ async fn prepare_join_grouped_max_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(join) = columnar.join.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
+    let join = columnar
+        .join
+        .as_mut()
+        .context("grouped-max nested join state missing")?;
     let join_start = Instant::now();
     let tick = Box::pin(run_columnar_join_state_tick_delta_only(
         join.as_mut(),

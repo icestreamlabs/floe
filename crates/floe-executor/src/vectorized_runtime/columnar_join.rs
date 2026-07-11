@@ -1380,9 +1380,10 @@ fn source_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(source_name) = source.source_name.as_deref() else {
-        return ColumnarZSet::empty(Arc::clone(&source.schema));
-    };
+    let source_name = source
+        .source_name
+        .as_deref()
+        .context("incremental join source binding missing")?;
     if let Some(weighted_batches) = weighted_delta_batches.get(source_name) {
         ColumnarZSet::try_new_weighted(Arc::clone(&source.schema), weighted_batches.clone())
             .with_context(|| {

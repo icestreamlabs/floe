@@ -1610,9 +1610,10 @@ async fn prepare_join_grouped_stats_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(join) = columnar.join.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
+    let join = columnar
+        .join
+        .as_mut()
+        .context("grouped-stats nested join state missing")?;
     let join_start = Instant::now();
     let tick = Box::pin(run_columnar_join_state_tick_delta_only(
         join.as_mut(),
@@ -1649,9 +1650,10 @@ async fn prepare_join_topn_grouped_stats_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(join_topn) = columnar.join_topn.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
+    let join_topn = columnar
+        .join_topn
+        .as_mut()
+        .context("grouped-stats nested join-topn state missing")?;
     let tick = Box::pin(run_columnar_join_topn_state_tick(
         join_topn.as_mut(),
         insert_batches,
@@ -1673,9 +1675,10 @@ async fn prepare_grouped_max_grouped_stats_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(grouped_max) = columnar.grouped_max.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
+    let grouped_max = columnar
+        .grouped_max
+        .as_mut()
+        .context("grouped-stats nested grouped-max state missing")?;
     let tick = Box::pin(run_columnar_grouped_max_state_tick_delta_only(
         grouped_max.as_mut(),
         insert_batches,
@@ -1701,9 +1704,10 @@ async fn prepare_grouped_stats_grouped_stats_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(grouped_stats) = columnar.grouped_stats.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
+    let grouped_stats = columnar
+        .grouped_stats
+        .as_mut()
+        .context("grouped-stats nested grouped-stats state missing")?;
     let tick = Box::pin(run_columnar_grouped_stats_state_tick(
         grouped_stats.as_mut(),
         insert_batches,
@@ -1729,9 +1733,10 @@ async fn prepare_topn_grouped_stats_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let Some(topn) = columnar.topn.as_mut() else {
-        return ColumnarZSet::empty(Arc::clone(&columnar.source_schema));
-    };
+    let topn = columnar
+        .topn
+        .as_mut()
+        .context("grouped-stats nested topn state missing")?;
     let tick = Box::pin(run_columnar_topn_state_tick(
         topn.as_mut(),
         insert_batches,
