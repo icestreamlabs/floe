@@ -34,6 +34,12 @@ const INDEX_RANGE_SEGMENT_VERSION: u8 = 1;
 const INDEX_RANGE_TARGET_ROWS: usize = 2048;
 const INDEX_INLINE_ROW_MAX_ROWS: usize = 2048;
 
+type RowPosting = (u32, i64);
+type IndexPostings = Vec<RowPosting>;
+type IndexEntry = (Vec<u8>, IndexPostings);
+type IndexPostingsByKey = HashMap<Vec<u8>, IndexPostings>;
+type IndexEntryChunks = Vec<Vec<IndexEntry>>;
+
 pub struct SlateBackedColumnarIndexedZSet {
     table: Arc<dyn KeyValueTable>,
     namespace: String,
@@ -505,7 +511,7 @@ impl SlateBackedColumnarIndexedZSet {
             .await
             .context("scan columnar index postings for rebuild")?
         {
-            write_batch.delete(key.to_vec());
+            write_batch.delete(&key);
         }
         for segment_id in self
             .segment_store
@@ -524,7 +530,7 @@ impl SlateBackedColumnarIndexedZSet {
             .await
             .context("scan columnar current index for rebuild")?
         {
-            write_batch.delete(key.to_vec());
+            write_batch.delete(&key);
         }
         write_batch.delete(self.current_state_key.clone());
         self.table
@@ -543,10 +549,7 @@ impl SlateBackedColumnarIndexedZSet {
         Ok(())
     }
 
-    fn index_postings_for_batch(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<HashMap<Vec<u8>, Vec<(u32, i64)>>> {
+    fn index_postings_for_batch(&self, batch: &RecordBatch) -> Result<IndexPostingsByKey> {
         validate_weighted_batch(&self.weighted_schema, &self.value_schema, batch)?;
         let key_columns = self
             .key_indices
@@ -557,7 +560,7 @@ impl SlateBackedColumnarIndexedZSet {
             .convert_columns(&key_columns)
             .context("encode columnar index keys")?;
         let weights = weight_column(batch, self.value_schema.fields().len())?;
-        let mut postings: HashMap<Vec<u8>, Vec<(u32, i64)>> = HashMap::new();
+        let mut postings = IndexPostingsByKey::new();
         for row_idx in 0..batch.num_rows() {
             let weight = weights.value(row_idx);
             if weight == 0 {
@@ -933,7 +936,7 @@ async fn read_bool_state(table: &dyn KeyValueTable, state_key: &[u8]) -> Result<
         .get_bytes(state_key)
         .await
         .context("read columnar index boolean state")?
-        .is_some_and(|bytes| bytes.as_ref() == &[1]))
+        .is_some_and(|bytes| bytes.as_ref() == [1]))
 }
 
 fn merge_key_bounds<'a>(
@@ -959,9 +962,7 @@ fn merge_key_bounds<'a>(
     min.zip(max).map(|(min, max)| IndexKeyBounds { min, max })
 }
 
-fn range_posting_chunks(
-    postings: HashMap<Vec<u8>, Vec<(u32, i64)>>,
-) -> Vec<Vec<(Vec<u8>, Vec<(u32, i64)>)>> {
+fn range_posting_chunks(postings: IndexPostingsByKey) -> IndexEntryChunks {
     let mut entries = postings.into_iter().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut chunks = Vec::new();
@@ -1074,7 +1075,7 @@ fn weight_column(batch: &RecordBatch, value_column_count: usize) -> Result<&Int6
 fn encode_bucket_postings_with_inline_rows(
     schema: &SchemaRef,
     batch: &RecordBatch,
-    entries: &[(Vec<u8>, Vec<(u32, i64)>)],
+    entries: &[IndexEntry],
 ) -> Result<Vec<u8>> {
     let mut global_row_indices = entries
         .iter()
@@ -1131,7 +1132,7 @@ fn encode_bucket_postings_with_inline_rows(
 fn encode_range_postings_with_inline_rows(
     schema: &SchemaRef,
     batch: &RecordBatch,
-    entries: &[(Vec<u8>, Vec<(u32, i64)>)],
+    entries: &[IndexEntry],
 ) -> Result<Vec<u8>> {
     let min_key = entries
         .first()
@@ -1165,9 +1166,7 @@ fn encode_range_postings_with_inline_rows(
     Ok(out)
 }
 
-fn encode_range_postings_with_segment_rows(
-    entries: &[(Vec<u8>, Vec<(u32, i64)>)],
-) -> Result<Vec<u8>> {
+fn encode_range_postings_with_segment_rows(entries: &[IndexEntry]) -> Result<Vec<u8>> {
     let min_key = entries
         .first()
         .map(|(key, _)| key.as_slice())
@@ -1195,7 +1194,7 @@ fn encode_range_postings_with_segment_rows(
     Ok(out)
 }
 
-fn encode_bucket_postings(entries: &[(Vec<u8>, Vec<(u32, i64)>)]) -> Result<Vec<u8>> {
+fn encode_bucket_postings(entries: &[IndexEntry]) -> Result<Vec<u8>> {
     let mut capacity = 4;
     for (key, postings) in entries {
         capacity += 8 + key.len() + postings.len() * 12;

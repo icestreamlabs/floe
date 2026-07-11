@@ -1,15 +1,18 @@
 use super::*;
 
+type RowNumberLimit = (String, usize, usize);
+type RowNumberLimitWithResidual = (String, usize, usize, Option<Expr>);
+
 pub(super) fn extract_row_number_limit_with_residual(
     predicate: &Expr,
-) -> Result<Option<(String, usize, usize, Option<Expr>)>, PlannerError> {
+) -> Result<Option<RowNumberLimitWithResidual>, PlannerError> {
     let normalized = normalize_expr(predicate.clone())?;
     extract_row_number_limit_with_residual_from_normalized(normalized)
 }
 
 fn extract_row_number_limit_with_residual_from_normalized(
     expr: Expr,
-) -> Result<Option<(String, usize, usize, Option<Expr>)>, PlannerError> {
+) -> Result<Option<RowNumberLimitWithResidual>, PlannerError> {
     if let Some((column, limit, offset)) = extract_direct_row_number_limit(&expr)? {
         return Ok(Some((column, limit, offset, None)));
     }
@@ -55,9 +58,7 @@ enum RowNumberPredicateKind {
     Equality,
 }
 
-fn extract_direct_row_number_limit(
-    expr: &Expr,
-) -> Result<Option<(String, usize, usize)>, PlannerError> {
+fn extract_direct_row_number_limit(expr: &Expr) -> Result<Option<RowNumberLimit>, PlannerError> {
     let Expr::BinaryExpr(binary) = expr else {
         return Ok(None);
     };
