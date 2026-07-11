@@ -120,8 +120,8 @@ fn append_snapshot_row(
     row_idx: usize,
     value_column_count: usize,
 ) -> Result<()> {
-    for column_idx in 0..value_column_count {
-        builders[column_idx].append_array_value(batch.column(column_idx).as_ref(), row_idx)?;
+    for (column_idx, builder) in builders.iter_mut().enumerate().take(value_column_count) {
+        builder.append_array_value(batch.column(column_idx).as_ref(), row_idx)?;
     }
     Ok(())
 }

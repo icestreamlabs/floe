@@ -540,8 +540,10 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace(
         plan,
         sources,
         udfs,
-        true,
-        false,
+        JoinBuildOptions {
+            persist_source_input_zsets: true,
+            reuse_physical_plan: false,
+        },
     )
     .await
 }
@@ -561,8 +563,10 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace_del
         plan,
         sources,
         udfs,
-        false,
-        false,
+        JoinBuildOptions {
+            persist_source_input_zsets: false,
+            reuse_physical_plan: false,
+        },
     )
     .await
 }
@@ -582,10 +586,17 @@ pub(super) async fn build_columnar_join_materialized_view_state_in_namespace_del
         plan,
         sources,
         udfs,
-        true,
-        true,
+        JoinBuildOptions {
+            persist_source_input_zsets: true,
+            reuse_physical_plan: true,
+        },
     )
     .await
+}
+
+struct JoinBuildOptions {
+    persist_source_input_zsets: bool,
+    reuse_physical_plan: bool,
 }
 
 async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
@@ -595,9 +606,12 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     plan: ColumnarJoinPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
-    persist_source_input_zsets: bool,
-    reuse_physical_plan: bool,
+    options: JoinBuildOptions,
 ) -> Result<ColumnarJoinMaterializedViewState> {
+    let JoinBuildOptions {
+        persist_source_input_zsets,
+        reuse_physical_plan,
+    } = options;
     let ColumnarJoinPlan {
         logical_plan,
         left,
@@ -642,25 +656,23 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
         .context("load join output snapshot")?;
     let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
     let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
-    let output_initialized = output_zset.current_handle().is_some();
-
     let left_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&left);
     let right_evaluator_plan = JoinEvaluatorInputPlan::from_join_input(&right);
 
     let mut left = Box::pin(build_join_input_state(
         Arc::clone(&table),
-        &mv_namespace,
-        "left",
-        left_namespace,
         left,
         sources,
         udfs,
-        output_initialized,
-        join_key_indices
-            .as_ref()
-            .map(|indices| indices.left.as_slice()),
-        persist_source_input_zsets,
-        false,
+        JoinInputBuildOptions {
+            side: "left",
+            namespace: left_namespace,
+            index_key_indices: join_key_indices
+                .as_ref()
+                .map(|indices| indices.left.clone()),
+            persist_source_input_zsets,
+            segment_backed_large_ranges: false,
+        },
     ))
     .await
     .context("build SlateDB-backed left join input state")?;
@@ -668,18 +680,18 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
         persist_source_input_zsets && left.append_only_snapshot_enabled;
     let mut right = Box::pin(build_join_input_state(
         Arc::clone(&table),
-        &mv_namespace,
-        "right",
-        right_namespace,
         right,
         sources,
         udfs,
-        output_initialized,
-        join_key_indices
-            .as_ref()
-            .map(|indices| indices.right.as_slice()),
-        persist_source_input_zsets,
-        right_segment_backed_large_ranges,
+        JoinInputBuildOptions {
+            side: "right",
+            namespace: right_namespace,
+            index_key_indices: join_key_indices
+                .as_ref()
+                .map(|indices| indices.right.clone()),
+            persist_source_input_zsets,
+            segment_backed_large_ranges: right_segment_backed_large_ranges,
+        },
     ))
     .await
     .context("build SlateDB-backed right join input state")?;
@@ -768,19 +780,28 @@ async fn build_join_side_input_zset(
     .with_context(|| format!("initialize SlateDB-backed {side} join input zset for '{input_name}'"))
 }
 
+struct JoinInputBuildOptions {
+    side: &'static str,
+    namespace: String,
+    index_key_indices: Option<Vec<usize>>,
+    persist_source_input_zsets: bool,
+    segment_backed_large_ranges: bool,
+}
+
 async fn build_join_input_state(
     table: Arc<dyn KeyValueTable>,
-    _mv_namespace: &str,
-    side: &str,
-    namespace: String,
     input: ColumnarJoinInputPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
-    _output_initialized: bool,
-    index_key_indices: Option<&[usize]>,
-    persist_source_input_zsets: bool,
-    segment_backed_large_ranges: bool,
+    options: JoinInputBuildOptions,
 ) -> Result<ColumnarJoinSourceState> {
+    let JoinInputBuildOptions {
+        side,
+        namespace,
+        index_key_indices,
+        persist_source_input_zsets,
+        segment_backed_large_ranges,
+    } = options;
     let ColumnarJoinInputPlanKind::Source { source_name } = &input.kind;
     let source_name = source_name.clone();
     let index_namespace = format!("{namespace}/index");
@@ -818,7 +839,7 @@ async fn build_join_input_state(
     let snapshot = snapshot_batches_from_zset(&index_snapshot_zset)?;
     let append_only_snapshot_enabled = source.append_only
         && record_batch_row_count(&snapshot) <= APPEND_ONLY_JOIN_SNAPSHOT_ROW_LIMIT;
-    let input_index = if let Some(key_indices) = index_key_indices {
+    let input_index = if let Some(key_indices) = index_key_indices.as_deref() {
         let mut index = if segment_backed_large_ranges || !persist_source_input_zsets {
             SlateBackedColumnarIndexedZSet::new_with_segment_backed_large_ranges(
                 Arc::clone(&table),
@@ -1063,7 +1084,7 @@ async fn run_columnar_join_state_tick_inner(
         &left_signed.positive,
         &right_state_for_left_delta,
         1,
-        JoinEvaluatorKind::LeftDeltaRightState,
+        JoinEvaluatorKind::DeltaState,
     )
     .await?;
     collect_join_outputs(
@@ -1072,7 +1093,7 @@ async fn run_columnar_join_state_tick_inner(
         &left_signed.negative,
         &right_state_for_left_delta,
         -1,
-        JoinEvaluatorKind::LeftDeltaRightState,
+        JoinEvaluatorKind::DeltaState,
     )
     .await?;
     collect_join_outputs(
@@ -1081,7 +1102,7 @@ async fn run_columnar_join_state_tick_inner(
         &left_state_for_right_delta,
         &right_signed.positive,
         1,
-        JoinEvaluatorKind::LeftStateRightDelta,
+        JoinEvaluatorKind::StateDelta,
     )
     .await?;
     collect_join_outputs(
@@ -1090,7 +1111,7 @@ async fn run_columnar_join_state_tick_inner(
         &left_state_for_right_delta,
         &right_signed.negative,
         -1,
-        JoinEvaluatorKind::LeftStateRightDelta,
+        JoinEvaluatorKind::StateDelta,
     )
     .await?;
     collect_delta_delta_outputs(
@@ -1282,9 +1303,9 @@ async fn run_columnar_join_state_tick_inner(
 }
 
 enum JoinEvaluatorKind {
-    LeftDeltaRightState,
-    LeftStateRightDelta,
-    LeftDeltaRightDelta,
+    DeltaState,
+    StateDelta,
+    DeltaDelta,
 }
 
 async fn collect_delta_delta_outputs(
@@ -1299,7 +1320,7 @@ async fn collect_delta_delta_outputs(
         &left.positive,
         &right.positive,
         1,
-        JoinEvaluatorKind::LeftDeltaRightDelta,
+        JoinEvaluatorKind::DeltaDelta,
     )
     .await?;
     collect_join_outputs(
@@ -1308,7 +1329,7 @@ async fn collect_delta_delta_outputs(
         &left.positive,
         &right.negative,
         -1,
-        JoinEvaluatorKind::LeftDeltaRightDelta,
+        JoinEvaluatorKind::DeltaDelta,
     )
     .await?;
     collect_join_outputs(
@@ -1317,7 +1338,7 @@ async fn collect_delta_delta_outputs(
         &left.negative,
         &right.positive,
         -1,
-        JoinEvaluatorKind::LeftDeltaRightDelta,
+        JoinEvaluatorKind::DeltaDelta,
     )
     .await?;
     collect_join_outputs(
@@ -1326,7 +1347,7 @@ async fn collect_delta_delta_outputs(
         &left.negative,
         &right.negative,
         1,
-        JoinEvaluatorKind::LeftDeltaRightDelta,
+        JoinEvaluatorKind::DeltaDelta,
     )
     .await
 }
@@ -1345,15 +1366,15 @@ async fn collect_join_outputs(
         return Ok(());
     }
     let evaluator = match kind {
-        JoinEvaluatorKind::LeftDeltaRightState => columnar
+        JoinEvaluatorKind::DeltaState => columnar
             .left_delta_right_state
             .as_ref()
             .context("left-delta/right-state join evaluator was not built")?,
-        JoinEvaluatorKind::LeftStateRightDelta => columnar
+        JoinEvaluatorKind::StateDelta => columnar
             .left_state_right_delta
             .as_ref()
             .context("left-state/right-delta join evaluator was not built")?,
-        JoinEvaluatorKind::LeftDeltaRightDelta => &columnar.left_delta_right_delta,
+        JoinEvaluatorKind::DeltaDelta => &columnar.left_delta_right_delta,
     };
     let joined = evaluator
         .evaluate(
@@ -1597,7 +1618,8 @@ fn strip_unit_positive_weight_column(
             .columns()
             .iter()
             .enumerate()
-            .filter_map(|(idx, column)| (idx != weight_idx).then(|| Arc::clone(column)))
+            .filter(|(idx, _)| *idx != weight_idx)
+            .map(|(_, column)| Arc::clone(column))
             .collect::<Vec<_>>();
         output.push(
             RecordBatch::try_new(Arc::clone(schema), columns)

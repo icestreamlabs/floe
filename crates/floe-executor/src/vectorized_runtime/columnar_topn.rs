@@ -1176,14 +1176,16 @@ async fn run_columnar_topn_indexed_source_state_tick(
     if let Some(tick) = run_columnar_topn_indexed_direct_top1_state_tick(
         columnar,
         input_delta,
-        output_schema,
-        previous_snapshot,
-        maintain_output_snapshot,
-        key_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        count_deltas.as_ref(),
-        &previous_partition_counts,
-        count_load_ms,
-        input_changed,
+        DirectTop1TickContext {
+            output_schema,
+            previous_snapshot,
+            maintain_output_snapshot,
+            key_batch_rows: key_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            count_deltas: count_deltas.as_ref(),
+            previous_partition_counts: &previous_partition_counts,
+            count_load_ms,
+            input_changed,
+        },
     )
     .await?
     {
@@ -1440,18 +1442,32 @@ async fn run_columnar_topn_indexed_source_state_tick(
     }))
 }
 
+struct DirectTop1TickContext<'a> {
+    output_schema: &'a SchemaRef,
+    previous_snapshot: &'a [RecordBatch],
+    maintain_output_snapshot: bool,
+    key_batch_rows: usize,
+    count_deltas: Option<&'a HashMap<Vec<u8>, i64>>,
+    previous_partition_counts: &'a HashMap<Vec<u8>, i64>,
+    count_load_ms: u64,
+    input_changed: bool,
+}
+
 async fn run_columnar_topn_indexed_direct_top1_state_tick(
     columnar: &mut ColumnarTopNMaterializedViewState,
     input_delta: &ColumnarZSet,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
-    maintain_output_snapshot: bool,
-    key_batch_rows: usize,
-    count_deltas: Option<&HashMap<Vec<u8>, i64>>,
-    previous_partition_counts: &HashMap<Vec<u8>, i64>,
-    count_load_ms: u64,
-    input_changed: bool,
+    context: DirectTop1TickContext<'_>,
 ) -> Result<Option<ColumnarTopNTick>> {
+    let DirectTop1TickContext {
+        output_schema,
+        previous_snapshot,
+        maintain_output_snapshot,
+        key_batch_rows,
+        count_deltas,
+        previous_partition_counts,
+        count_load_ms,
+        input_changed,
+    } = context;
     if columnar.row_number_limit != Some(1) {
         return Ok(None);
     }
@@ -1688,14 +1704,16 @@ fn build_direct_top1_delta(
     let previous_order_columns = direct_topn_order_columns(direct, previous_output.batches())?;
     let delta_order_columns = direct_topn_order_columns(direct, projected_delta.batches())?;
     let best_positive_rows = match direct_top1_best_positive_rows(
-        output_partition_indices,
-        partition_converter.as_ref(),
-        &value_converter,
-        direct,
-        &previous_order_columns,
-        &delta_order_columns,
-        &current_rows,
         projected_delta,
+        DirectTop1SelectionContext {
+            output_partition_indices,
+            partition_converter: partition_converter.as_ref(),
+            value_converter: &value_converter,
+            direct,
+            previous_order_columns: &previous_order_columns,
+            delta_order_columns: &delta_order_columns,
+            current_rows: &current_rows,
+        },
     )? {
         Some(rows) => rows,
         None => return Ok(None),
@@ -1814,16 +1832,29 @@ fn direct_top1_current_rows(
     Ok(Some(rows_by_partition))
 }
 
+struct DirectTop1SelectionContext<'a> {
+    output_partition_indices: &'a [usize],
+    partition_converter: Option<&'a RowConverter>,
+    value_converter: &'a RowConverter,
+    direct: &'a AppendOnlyDirectTopNState,
+    previous_order_columns: &'a [Vec<DirectTopNOrderArray<'a>>],
+    delta_order_columns: &'a [Vec<DirectTopNOrderArray<'a>>],
+    current_rows: &'a HashMap<Vec<u8>, DirectTop1SelectedRow>,
+}
+
 fn direct_top1_best_positive_rows(
-    output_partition_indices: &[usize],
-    partition_converter: Option<&RowConverter>,
-    value_converter: &RowConverter,
-    direct: &AppendOnlyDirectTopNState,
-    previous_order_columns: &[Vec<DirectTopNOrderArray<'_>>],
-    delta_order_columns: &[Vec<DirectTopNOrderArray<'_>>],
-    current_rows: &HashMap<Vec<u8>, DirectTop1SelectedRow>,
     projected_delta: &ColumnarZSet,
+    context: DirectTop1SelectionContext<'_>,
 ) -> Result<Option<HashMap<Vec<u8>, DirectTop1SelectedRow>>> {
+    let DirectTop1SelectionContext {
+        output_partition_indices,
+        partition_converter,
+        value_converter,
+        direct,
+        previous_order_columns,
+        delta_order_columns,
+        current_rows,
+    } = context;
     let mut best_positive_by_partition: HashMap<Vec<u8>, DirectTop1SelectedRow> = HashMap::new();
     let value_indices = (0..projected_delta.value_column_count()).collect::<Vec<_>>();
     let mut ordinal = 0usize;
@@ -2339,9 +2370,8 @@ fn append_direct_topn_selected_batches(
         let indices = selected
             .iter()
             .enumerate()
-            .filter_map(|(idx, selected)| {
-                selected.then(|| u32::try_from(idx).context("direct topn batch exceeds u32 rows"))
-            })
+            .filter(|(_, selected)| **selected)
+            .map(|(idx, _)| u32::try_from(idx).context("direct topn batch exceeds u32 rows"))
             .collect::<Result<Vec<_>>>()?;
         if indices.is_empty() {
             continue;
@@ -2491,7 +2521,7 @@ impl SlateBackedTopNPartitionCounts {
             .await
             .context("scan topn partition counts for rebuild")?
         {
-            writes.delete(key.to_vec());
+            writes.delete(&key);
         }
         for (partition_key, count) in counts {
             if count > 0 {
@@ -3055,7 +3085,8 @@ fn unit_positive_delta_value_batches(
             .columns()
             .iter()
             .enumerate()
-            .filter_map(|(idx, column)| (idx != weight_idx).then(|| Arc::clone(column)))
+            .filter(|(idx, _)| *idx != weight_idx)
+            .map(|(_, column)| Arc::clone(column))
             .collect::<Vec<_>>();
         if columns.len() != value_schema.fields().len() {
             return Ok(None);

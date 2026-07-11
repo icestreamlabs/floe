@@ -35,8 +35,7 @@ const TICKS: usize = 8;
 const Q4_REPEATED_AUCTION_ROWS: usize = 10_000;
 const Q4_REPEATED_BID_ROWS: usize = 1_000_000;
 const Q4_REPEATED_BID_ROWS_PER_TICK: usize = 8_192;
-const Q4_REPEATED_TICKS: usize =
-    (Q4_REPEATED_BID_ROWS + Q4_REPEATED_BID_ROWS_PER_TICK - 1) / Q4_REPEATED_BID_ROWS_PER_TICK;
+const Q4_REPEATED_TICKS: usize = Q4_REPEATED_BID_ROWS.div_ceil(Q4_REPEATED_BID_ROWS_PER_TICK);
 const Q4_QUERY: &str = r#"SELECT category, AVG(max) FROM (SELECT MAX(b.price) AS max, a.category FROM auction a JOIN bid b ON a.id = b.auction WHERE b."dateTime" BETWEEN a."dateTime" AND a.expires GROUP BY a.id, a.category) per_auction GROUP BY category"#;
 
 #[derive(Clone, Copy)]
@@ -205,7 +204,7 @@ impl Drop for ProfilingKeyValueTable {
             scan_calls,
             scan_nanos as f64 / 1_000_000.0,
         );
-        for idx in 0..PROFILE_CATEGORY_COUNT {
+        for (idx, category_name) in PROFILE_CATEGORY_NAMES.iter().enumerate() {
             let get_calls = self.metrics.get_calls_by_category[idx].load(Ordering::Relaxed);
             let get_nanos = self.metrics.get_nanos_by_category[idx].load(Ordering::Relaxed);
             let scan_calls = self.metrics.scan_calls_by_category[idx].load(Ordering::Relaxed);
@@ -216,7 +215,7 @@ impl Drop for ProfilingKeyValueTable {
             eprintln!(
                 "[key-value-table-profile-category] name={} category={} get_calls={} get_ms={:.3} scan_calls={} scan_ms={:.3}",
                 self.name,
-                PROFILE_CATEGORY_NAMES[idx],
+                category_name,
                 get_calls,
                 get_nanos as f64 / 1_000_000.0,
                 scan_calls,

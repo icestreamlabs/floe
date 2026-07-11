@@ -426,14 +426,14 @@ fn window_aggregate_plan() -> Result<CircuitPlan> {
 }
 
 fn bool_events_table() -> Result<TableDescriptor> {
-    Ok(TableDescriptor::try_new(
+    TableDescriptor::try_new(
         "events",
         vec![
             Field::new("id", DbspScalarType::Int64, false),
             Field::new("active", DbspScalarType::Bool, false),
         ],
         &["id"],
-    )?)
+    )
 }
 
 fn planner() -> DbspPlanBuilder {

@@ -50,6 +50,8 @@ const SUMMARY_LOG_TAG: u8 = b'l';
 const SUMMARY_SEQUENCE_TAG: u8 = b'q';
 const SUMMARY_BUCKET_COUNT: u16 = 16;
 
+type GroupedMaxUpdatesByBucket = HashMap<u16, Vec<(Vec<u8>, Option<i64>)>>;
+
 pub(super) struct ColumnarGroupedMaxPlan {
     input: ColumnarGroupedMaxInputPlan,
     append_only_input: bool,
@@ -868,10 +870,10 @@ async fn grouped_max_append_only_streaming_delta(
             current_maxes.insert(group_key.clone(), new_max);
             if old_max != new_max {
                 if let Some(old_max) = old_max {
-                    builder.append(&batch, row_idx, columnar.max_idx, old_max, -1)?;
+                    builder.append(batch, row_idx, columnar.max_idx, old_max, -1)?;
                 }
                 if let Some(new_max) = new_max {
-                    builder.append(&batch, row_idx, columnar.max_idx, new_max, 1)?;
+                    builder.append(batch, row_idx, columnar.max_idx, new_max, 1)?;
                 }
                 max_updates.push((group_key.clone(), new_max));
             }
@@ -1574,7 +1576,7 @@ impl SlateGroupedMaxState {
         let segment_id = *next_segment_id;
         *next_segment_id = next_segment_id.saturating_add(1);
 
-        let mut buckets: HashMap<u16, Vec<(Vec<u8>, Option<i64>)>> = HashMap::new();
+        let mut buckets = GroupedMaxUpdatesByBucket::new();
         for (group_key, max) in updates {
             buckets
                 .entry(summary_bucket(group_key))

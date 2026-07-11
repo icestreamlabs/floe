@@ -81,7 +81,7 @@ struct ColumnarUnionInputPlan {
 
 enum ColumnarUnionInputPlanKind {
     Source { source_name: String },
-    Constant { logical_plan: LogicalPlan },
+    Constant { logical_plan: Box<LogicalPlan> },
 }
 
 struct UnionDeltaEvaluator {
@@ -217,13 +217,15 @@ pub(super) async fn build_columnar_union_materialized_view_state_in_namespace(
         source_states.push(
             build_union_input_state(
                 Arc::clone(&table),
-                &mv_namespace,
-                idx,
-                namespace,
                 input,
                 sources,
                 udfs,
-                output_initialized,
+                UnionInputBuildContext {
+                    mv_namespace: &mv_namespace,
+                    idx,
+                    namespace,
+                    output_initialized,
+                },
             )
             .await
             .context("build SlateDB-backed union input state")?,
@@ -251,16 +253,26 @@ fn union_input_namespace(mv_namespace: &str, idx: usize, input: &ColumnarUnionIn
     }
 }
 
-async fn build_union_input_state(
-    table: Arc<dyn KeyValueTable>,
-    mv_namespace: &str,
+struct UnionInputBuildContext<'a> {
+    mv_namespace: &'a str,
     idx: usize,
     namespace: String,
+    output_initialized: bool,
+}
+
+async fn build_union_input_state(
+    table: Arc<dyn KeyValueTable>,
     input: ColumnarUnionInputPlan,
     sources: &HashMap<String, VectorizedSourceState>,
     udfs: &[ScalarUDF],
-    output_initialized: bool,
+    context: UnionInputBuildContext<'_>,
 ) -> Result<ColumnarUnionSourceState> {
+    let UnionInputBuildContext {
+        mv_namespace,
+        idx,
+        namespace,
+        output_initialized,
+    } = context;
     let input_zset =
         SlateBackedColumnarZSet::new(Arc::clone(&table), namespace, Arc::clone(&input.schema))
             .await
@@ -310,7 +322,7 @@ async fn build_union_input_state(
             } else if has_persisted_input {
                 persisted_snapshot
             } else {
-                evaluate_constant_union_input(logical_plan, &input.schema, udfs)
+                evaluate_constant_union_input(*logical_plan, &input.schema, udfs)
                     .await
                     .with_context(|| format!("evaluate union constant {idx} input"))?
             };
@@ -1166,7 +1178,7 @@ fn push_union_input_plan(
             input_name,
             schema: df_schema_to_arrow(plan.schema()),
             kind: ColumnarUnionInputPlanKind::Constant {
-                logical_plan: plan.clone(),
+                logical_plan: Box::new(plan.clone()),
             },
         });
         return Ok(());

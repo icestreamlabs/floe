@@ -489,7 +489,7 @@ impl Harness {
             .with_context(|| format!("expected SQL for {engine:?} {query_id}"))?;
         let baseline = self.compute_expected_fingerprint(
             source_target,
-            &expected_baseline_sql,
+            expected_baseline_sql,
             artifact_dir,
             "baseline_expected",
         )?;
@@ -519,7 +519,7 @@ impl Harness {
             self.wait_for_postgres_slot_caught_up(query_id, engine, artifact_dir)?;
         let final_expected = self.compute_expected_fingerprint(
             source_target,
-            &expected_baseline_sql,
+            expected_baseline_sql,
             artifact_dir,
             "final_expected",
         )?;
@@ -545,10 +545,10 @@ impl Harness {
             input_rows: profile.live_ops_total(),
             result_rows: Some(result_rows),
             notes: format!(
-                "cdc_updates_deletes_inserts;baseline_rows={};final_content_sha256={};{}",
+                "cdc_updates_deletes_inserts;baseline_rows={};final_content_sha256={};slot_catchup_ms={slot_catchup_ms};{}",
                 baseline.row_count,
                 final_observed.short_hash(),
-                format!("slot_catchup_ms={slot_catchup_ms};{}", profile.notes())
+                profile.notes()
             ),
         })?;
         Ok(())
@@ -1789,7 +1789,7 @@ DROP TABLE IF EXISTS public.nexmark_person;
 "
     ));
     for source in sources {
-        sql.push_str(&postgres_table_schema_sql(*source));
+        sql.push_str(postgres_table_schema_sql(*source));
     }
     for source in sources {
         sql.push_str(&postgres_insert_initial_sql(
@@ -1799,7 +1799,7 @@ DROP TABLE IF EXISTS public.nexmark_person;
         ));
     }
     for source in sources {
-        sql.push_str(&postgres_expected_view_sql(*source));
+        sql.push_str(postgres_expected_view_sql(*source));
     }
     let tables = sources
         .iter()

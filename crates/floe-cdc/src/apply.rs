@@ -633,49 +633,6 @@ fn decimal_digits(value: i64) -> usize {
     digits
 }
 
-#[cfg(test)]
-mod lookup_plan_tests {
-    use super::*;
-
-    fn lookup_key(table: &CdcTableId, value: i64) -> OldRowLookupKey {
-        let row_key = CdcRowKey::new([RowValue::Int64(value)]).expect("row key");
-        let storage_key = row_key_bytes(table, &row_key).expect("storage key");
-        OldRowLookupKey {
-            storage_key,
-            row_key,
-        }
-    }
-
-    #[test]
-    fn dense_i64_lookup_plan_splits_digit_width_ranges() {
-        let table = CdcTableId::new("orders").expect("table id");
-        let keys = (1..=16_384)
-            .map(|value| lookup_key(&table, value))
-            .collect::<Vec<_>>();
-
-        let plan = plan_old_row_lookups(&keys);
-
-        assert_eq!(plan.point_keys.len(), 99);
-        assert_eq!(plan.dense_ranges.len(), 3);
-        assert_eq!(plan.dense_ranges[0].storage_keys.len(), 900);
-        assert_eq!(plan.dense_ranges[1].storage_keys.len(), 9_000);
-        assert_eq!(plan.dense_ranges[2].storage_keys.len(), 6_385);
-    }
-
-    #[test]
-    fn sparse_i64_lookup_plan_keeps_point_lookups() {
-        let table = CdcTableId::new("orders").expect("table id");
-        let keys = (0..1_000)
-            .map(|idx| lookup_key(&table, 100_000 + idx * 100))
-            .collect::<Vec<_>>();
-
-        let plan = plan_old_row_lookups(&keys);
-
-        assert_eq!(plan.dense_ranges.len(), 0);
-        assert_eq!(plan.point_keys.len(), keys.len());
-    }
-}
-
 async fn load_row_by_storage_key_from_table(
     table: &dyn KeyValueTable,
     storage_key: &[u8],
@@ -782,4 +739,47 @@ fn stage_delete_row(
 ) {
     batch.delete(storage_key.clone());
     overlay.insert(storage_key, None);
+}
+
+#[cfg(test)]
+mod lookup_plan_tests {
+    use super::*;
+
+    fn lookup_key(table: &CdcTableId, value: i64) -> OldRowLookupKey {
+        let row_key = CdcRowKey::new([RowValue::Int64(value)]).expect("row key");
+        let storage_key = row_key_bytes(table, &row_key).expect("storage key");
+        OldRowLookupKey {
+            storage_key,
+            row_key,
+        }
+    }
+
+    #[test]
+    fn dense_i64_lookup_plan_splits_digit_width_ranges() {
+        let table = CdcTableId::new("orders").expect("table id");
+        let keys = (1..=16_384)
+            .map(|value| lookup_key(&table, value))
+            .collect::<Vec<_>>();
+
+        let plan = plan_old_row_lookups(&keys);
+
+        assert_eq!(plan.point_keys.len(), 99);
+        assert_eq!(plan.dense_ranges.len(), 3);
+        assert_eq!(plan.dense_ranges[0].storage_keys.len(), 900);
+        assert_eq!(plan.dense_ranges[1].storage_keys.len(), 9_000);
+        assert_eq!(plan.dense_ranges[2].storage_keys.len(), 6_385);
+    }
+
+    #[test]
+    fn sparse_i64_lookup_plan_keeps_point_lookups() {
+        let table = CdcTableId::new("orders").expect("table id");
+        let keys = (0..1_000)
+            .map(|idx| lookup_key(&table, 100_000 + idx * 100))
+            .collect::<Vec<_>>();
+
+        let plan = plan_old_row_lookups(&keys);
+
+        assert_eq!(plan.dense_ranges.len(), 0);
+        assert_eq!(plan.point_keys.len(), keys.len());
+    }
 }

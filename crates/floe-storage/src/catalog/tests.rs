@@ -286,7 +286,7 @@ async fn replication_pipeline_dlq_stats_count_statuses_without_loading_entries()
             pipeline_name: "pg_orders_to_kafka".to_string(),
             dlq_id: format!("entry-{idx}"),
             source_name: "pg_main".to_string(),
-            source_position: CdcSourcePosition::postgres(&format!("0/{:X}", 0x16B6C50 + idx), None)
+            source_position: CdcSourcePosition::postgres(format!("0/{:X}", 0x16B6C50 + idx), None)
                 .expect("position"),
             transaction_id: Some(CdcTransactionId::new(format!("tx-{idx}")).expect("transaction")),
             error_class: "target_delivery".to_string(),

@@ -683,10 +683,13 @@ mod tests {
         )
         .expect("positive delta");
 
-        let appended =
-            apply_weighted_snapshot_delta(&schema, &[previous.clone()], vec![positive_delta])
-                .await
-                .expect("append positive delta");
+        let appended = apply_weighted_snapshot_delta(
+            &schema,
+            std::slice::from_ref(&previous),
+            vec![positive_delta],
+        )
+        .await
+        .expect("append positive delta");
         let appended_values = appended
             .iter()
             .flat_map(|batch| int64_values(batch, 0))

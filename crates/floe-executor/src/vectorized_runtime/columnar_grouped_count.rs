@@ -816,11 +816,11 @@ fn expand_single_hop_group_batches(
             if emitted == 0 {
                 continue;
             }
-            for group_idx in 0..columnar.count_idx {
+            for (group_idx, builder) in builders.iter_mut().enumerate().take(columnar.count_idx) {
                 if group_idx == hop.group_idx {
                     continue;
                 }
-                builders[group_idx].append_array_value_repeated(
+                builder.append_array_value_repeated(
                     batch.column(group_idx).as_ref(),
                     row_idx,
                     emitted,

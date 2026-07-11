@@ -272,13 +272,13 @@ struct SlateGroupedStatsState {
     group_counts: Mutex<HashMap<Vec<u8>, i64>>,
     i64_values: Mutex<HashMap<(Vec<u8>, usize), i64>>,
     i128_values: Mutex<HashMap<(Vec<u8>, usize), i128>>,
-    pairs: Mutex<HashMap<(Vec<u8>, usize), (i64, i64)>>,
-    minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<i64>>>,
-    i128_minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<i128>>>,
-    value_counts: Mutex<HashMap<(Vec<u8>, usize, i64), i64>>,
-    i128_value_counts: Mutex<HashMap<(Vec<u8>, usize, i128), i64>>,
-    string_minmax_values: Mutex<HashMap<(Vec<u8>, usize), Option<String>>>,
-    string_value_counts: Mutex<HashMap<(Vec<u8>, usize, String), i64>>,
+    pairs: Mutex<GroupAggregateMap<(i64, i64)>>,
+    minmax_values: Mutex<GroupAggregateMap<Option<i64>>>,
+    i128_minmax_values: Mutex<GroupAggregateMap<Option<i128>>>,
+    value_counts: Mutex<GroupAggregateValueMap<i64>>,
+    i128_value_counts: Mutex<GroupAggregateValueMap<i128>>,
+    string_minmax_values: Mutex<GroupAggregateMap<Option<String>>>,
+    string_value_counts: Mutex<GroupAggregateValueMap<String>>,
     append_only_value_presences: Mutex<AppendOnlyDistinctPresenceMap<i64>>,
     append_only_i128_value_presences: Mutex<AppendOnlyDistinctPresenceMap<i128>>,
     append_only_string_value_presences: Mutex<AppendOnlyDistinctPresenceMap<String>>,
@@ -287,6 +287,8 @@ struct SlateGroupedStatsState {
     compact_snapshot_active: Mutex<bool>,
 }
 
+type GroupAggregateMap<T> = HashMap<(Vec<u8>, usize), T>;
+type GroupAggregateValueMap<T> = HashMap<(Vec<u8>, usize, T), i64>;
 type PendingStatsGroupDeltas = HashMap<Vec<u8>, PendingStatsGroupDelta>;
 type CompactGroupStateMap = HashMap<Vec<u8>, CompactGroupState>;
 type GroupAggregateKey = (Vec<u8>, usize);
@@ -901,7 +903,6 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
                 &source_schema,
                 *join_topn_plan,
                 sources,
-                udfs,
             ))
             .await
             .with_context(|| {
@@ -1191,7 +1192,6 @@ async fn build_boxed_join_topn_grouped_stats_input_state(
     output_schema: &SchemaRef,
     plan: ColumnarJoinTopNPlan,
     sources: &HashMap<String, VectorizedSourceState>,
-    udfs: &[ScalarUDF],
 ) -> Result<Box<ColumnarJoinTopNMaterializedViewState>> {
     let left_namespace = format!("{namespace}/left/input");
     let right_namespace = format!("{namespace}/right/input");
@@ -1205,7 +1205,6 @@ async fn build_boxed_join_topn_grouped_stats_input_state(
             output_schema,
             plan,
             sources,
-            udfs,
         )
         .await?,
     ))
@@ -2237,12 +2236,14 @@ fn add_projected_stats_batches_to_pending(
                 for row_idx in 0..batch.num_rows() {
                     add_projected_stats_row_to_pending(
                         columnar,
-                        batch,
-                        row_idx,
-                        group_rows.row(row_idx).data().to_vec(),
-                        &value_arrays,
-                        &filter_arrays,
-                        sign,
+                        ProjectedStatsRow {
+                            batch,
+                            row_idx,
+                            key: group_rows.row(row_idx).data().to_vec(),
+                            value_arrays: &value_arrays,
+                            filter_arrays: &filter_arrays,
+                            sign,
+                        },
                         pending,
                     )?;
                 }
@@ -2251,12 +2252,14 @@ fn add_projected_stats_batches_to_pending(
                 for row_idx in 0..batch.num_rows() {
                     add_projected_stats_row_to_pending(
                         columnar,
-                        batch,
-                        row_idx,
-                        Vec::new(),
-                        &value_arrays,
-                        &filter_arrays,
-                        sign,
+                        ProjectedStatsRow {
+                            batch,
+                            row_idx,
+                            key: Vec::new(),
+                            value_arrays: &value_arrays,
+                            filter_arrays: &filter_arrays,
+                            sign,
+                        },
                         pending,
                     )?;
                 }
@@ -2697,16 +2700,28 @@ fn apply_projected_compact_stats_row_to_loaded_state(
     Ok(())
 }
 
-fn add_projected_stats_row_to_pending(
-    columnar: &ColumnarGroupedStatsMaterializedViewState,
-    batch: &RecordBatch,
+struct ProjectedStatsRow<'a> {
+    batch: &'a RecordBatch,
     row_idx: usize,
     key: Vec<u8>,
-    value_arrays: &[ProjectedValueArray<'_>],
-    filter_arrays: &[Option<&BooleanArray>],
+    value_arrays: &'a [ProjectedValueArray<'a>],
+    filter_arrays: &'a [Option<&'a BooleanArray>],
     sign: i64,
+}
+
+fn add_projected_stats_row_to_pending(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    row: ProjectedStatsRow<'_>,
     pending: &mut PendingStatsGroupDeltas,
 ) -> Result<()> {
+    let ProjectedStatsRow {
+        batch,
+        row_idx,
+        key,
+        value_arrays,
+        filter_arrays,
+        sign,
+    } = row;
     let group = pending
         .entry(key)
         .or_insert_with(|| PendingStatsGroupDelta {
@@ -3999,7 +4014,9 @@ async fn apply_compact_aggregate_deltas(
                     None => bail!("grouped-stats compact aggregate index missing"),
                 };
                 let value_count_idx = spec.value_count_idx.unwrap_or(idx);
-                if !shared_i64_value_counts.contains_key(&value_count_idx) {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    shared_i64_value_counts.entry(value_count_idx)
+                {
                     let mut updated_counts = HashMap::with_capacity(value_deltas.len());
                     for (delta_value, value_delta) in value_deltas {
                         let old_count = columnar
@@ -4021,7 +4038,7 @@ async fn apply_compact_aggregate_deltas(
                             new_count,
                         )?;
                     }
-                    shared_i64_value_counts.insert(value_count_idx, updated_counts);
+                    entry.insert(updated_counts);
                 }
                 let updated_counts =
                     shared_i64_value_counts

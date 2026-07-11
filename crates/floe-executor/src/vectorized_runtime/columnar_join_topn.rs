@@ -13,7 +13,7 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::logical_plan::{Filter, Join, TableScan, Window};
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator, ScalarUDF};
+use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
@@ -108,6 +108,21 @@ struct JoinTopNBestBidEvaluator {
     right: JoinTopNRightIndices,
     partition_left_indices: Vec<usize>,
     output_mapping: Vec<JoinTopNOutputSource>,
+}
+
+#[derive(Clone, Copy)]
+struct RightDeltaOutputContext<'a> {
+    output_schema: &'a SchemaRef,
+    left_batches: &'a [RecordBatch],
+    output_index: &'a JoinTopNCurrentOutputIndex,
+    output_state_indices: &'a JoinTopNOutputStateIndices,
+}
+
+struct RightInsertDeltaContext<'a> {
+    output: RightDeltaOutputContext<'a>,
+    left_rows: &'a HashMap<i64, Vec<JoinTopNLeftRow>>,
+    left_rows_ms: u64,
+    total_start: Option<Instant>,
 }
 
 struct JoinTopNLeftIndices {
@@ -377,7 +392,6 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
     output_schema: &SchemaRef,
     plan: ColumnarJoinTopNPlan,
     sources: &HashMap<String, VectorizedSourceState>,
-    udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinTopNMaterializedViewState> {
     let mv_namespace = namespaces::materialized_view(view_name)?;
     let (left_namespace, right_namespace) = if plan.left_source == plan.right_source {
@@ -412,7 +426,6 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state(
         output_schema,
         plan,
         sources,
-        udfs,
     )
     .await
 }
@@ -425,7 +438,6 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
     output_schema: &SchemaRef,
     plan: ColumnarJoinTopNPlan,
     sources: &HashMap<String, VectorizedSourceState>,
-    _udfs: &[ScalarUDF],
 ) -> Result<ColumnarJoinTopNMaterializedViewState> {
     let left_source = sources
         .get(&plan.left_source)
@@ -705,179 +717,180 @@ pub(super) async fn run_columnar_join_topn_state_tick(
     let right_delta_rows = right_delta.num_rows();
     let mut timings = TickPhaseTimings::default();
 
-    let output_delta_batches = match &columnar.evaluator {
-        JoinTopNEvaluator::PartitionedBestBid(evaluator) => {
-            let phase_start = profile::start();
-            let collect_keys_start = timing_start(timing_enabled);
-            let left_key_idx = columnar
-                .left
-                .key_idx
-                .context("partitioned join-topn left key index is missing")?;
-            let right_key_idx = columnar
-                .right
-                .key_idx
-                .context("partitioned join-topn right key index is missing")?;
-            let mut touched_keys = HashSet::new();
-            collect_i64_keys_from_delta(&left_delta, left_key_idx, &mut touched_keys)?;
-            collect_i64_keys_from_delta(&right_delta, right_key_idx, &mut touched_keys)?;
-            timings.touched_key_count = touched_keys.len();
-            timings.collect_keys_ms = elapsed_ms(collect_keys_start);
-            profile::record_since("join_topn.collect_touched_keys", phase_start);
-
-            if left_delta.is_empty()
-                && right_delta.num_rows() > 0
-                && let Some(output_state_indices) = evaluator.output_state_indices()
-            {
+    let output_delta_batches =
+        match &columnar.evaluator {
+            JoinTopNEvaluator::PartitionedBestBid(evaluator) => {
                 let phase_start = profile::start();
-                let lookup_left_start = timing_start(timing_enabled);
-                let previous_left_lookup;
-                let previous_left =
-                    if let Some(snapshot) = columnar.append_only_left_snapshot.as_ref() {
-                        snapshot.as_slice()
-                    } else {
-                        previous_left_lookup = lookup_indexed_join_topn_state_for_i64_keys(
+                let collect_keys_start = timing_start(timing_enabled);
+                let left_key_idx = columnar
+                    .left
+                    .key_idx
+                    .context("partitioned join-topn left key index is missing")?;
+                let right_key_idx = columnar
+                    .right
+                    .key_idx
+                    .context("partitioned join-topn right key index is missing")?;
+                let mut touched_keys = HashSet::new();
+                collect_i64_keys_from_delta(&left_delta, left_key_idx, &mut touched_keys)?;
+                collect_i64_keys_from_delta(&right_delta, right_key_idx, &mut touched_keys)?;
+                timings.touched_key_count = touched_keys.len();
+                timings.collect_keys_ms = elapsed_ms(collect_keys_start);
+                profile::record_since("join_topn.collect_touched_keys", phase_start);
+
+                if left_delta.is_empty()
+                    && right_delta.num_rows() > 0
+                    && let Some(output_state_indices) = evaluator.output_state_indices()
+                {
+                    let phase_start = profile::start();
+                    let lookup_left_start = timing_start(timing_enabled);
+                    let previous_left_lookup;
+                    let previous_left =
+                        if let Some(snapshot) = columnar.append_only_left_snapshot.as_ref() {
+                            snapshot.as_slice()
+                        } else {
+                            previous_left_lookup =
+                                lookup_indexed_join_topn_state_for_i64_keys(
+                                    columnar.left.input_index.as_deref().context(
+                                        "partitioned join-topn left source index missing",
+                                    )?,
+                                    &touched_keys,
+                                    &columnar.left.schema,
+                                    "left",
+                                )
+                                .await?;
+                            previous_left_lookup.as_slice()
+                        };
+                    timings.lookup_left_ms = elapsed_ms(lookup_left_start);
+                    profile::record_since("join_topn.lookup_previous_left", phase_start);
+                    let phase_start = profile::start();
+                    let append_only_merge_start = timing_start(timing_enabled);
+                    let output_delta = evaluator
+                        .right_delta_output_delta(
+                            &right_delta,
                             columnar
-                                .left
+                                .right
                                 .input_index
                                 .as_deref()
-                                .context("partitioned join-topn left source index missing")?,
-                            &touched_keys,
-                            &columnar.left.schema,
-                            "left",
+                                .context("partitioned join-topn right source index missing")?,
+                            &columnar.right.schema,
+                            &columnar.right.primary_key_columns,
+                            RightDeltaOutputContext {
+                                output_schema,
+                                left_batches: previous_left,
+                                output_index: columnar.current_output_index.as_ref().context(
+                                    "partitioned join-topn current output index missing",
+                                )?,
+                                output_state_indices: &output_state_indices,
+                            },
                         )
-                        .await?;
-                        previous_left_lookup.as_slice()
-                    };
-                timings.lookup_left_ms = elapsed_ms(lookup_left_start);
-                profile::record_since("join_topn.lookup_previous_left", phase_start);
-                let phase_start = profile::start();
-                let append_only_merge_start = timing_start(timing_enabled);
-                let output_delta = evaluator
-                    .right_delta_output_delta(
-                        output_schema,
-                        &previous_left,
-                        &right_delta,
+                        .await
+                        .context("build right-side join-topn output delta")?;
+                    timings.append_only_merge_ms = elapsed_ms(append_only_merge_start);
+                    profile::record_since("join_topn.append_only_right_merge", phase_start);
+                    output_delta
+                } else if right_delta.is_empty()
+                    && columnar_zset_is_delete_only(&left_delta)?
+                    && let Some(output_index) = columnar.current_output_index.as_ref()
+                {
+                    let phase_start = profile::start();
+                    let left_delete_start = timing_start(timing_enabled);
+                    let partition_keys = evaluator.left_delete_partition_keys(&left_delta)?;
+                    let previous_output = output_index
+                        .lookup_snapshot_for_partition_keys(partition_keys.iter())
+                        .await
+                        .context("lookup current join-topn output for left deletes")?;
+                    let output_delta =
+                        negative_output_delta_from_snapshot(output_schema, &previous_output)
+                            .context("build join-topn left-delete output delta")?;
+                    timings.append_only_merge_ms = elapsed_ms(left_delete_start);
+                    profile::record_since("join_topn.left_delete_merge", phase_start);
+                    output_delta
+                } else {
+                    let phase_start = profile::start();
+                    let lookup_left_start = timing_start(timing_enabled);
+                    let previous_left = lookup_indexed_join_topn_state_for_i64_keys(
+                        columnar
+                            .left
+                            .input_index
+                            .as_deref()
+                            .context("partitioned join-topn left source index missing")?,
+                        &touched_keys,
+                        &columnar.left.schema,
+                        "left",
+                    )
+                    .await?;
+                    timings.lookup_left_ms = elapsed_ms(lookup_left_start);
+                    profile::record_since("join_topn.lookup_previous_left", phase_start);
+                    let phase_start = profile::start();
+                    let lookup_right_start = timing_start(timing_enabled);
+                    let previous_right = lookup_indexed_join_topn_state_for_i64_keys(
                         columnar
                             .right
                             .input_index
                             .as_deref()
                             .context("partitioned join-topn right source index missing")?,
+                        &touched_keys,
+                        &columnar.right.schema,
+                        "right",
+                    )
+                    .await?;
+                    timings.lookup_right_ms = elapsed_ms(lookup_right_start);
+                    profile::record_since("join_topn.lookup_previous_right", phase_start);
+                    let phase_start = profile::start();
+                    let apply_input_start = timing_start(timing_enabled);
+                    let next_left = apply_source_snapshot_delta(
+                        &columnar.left.schema,
+                        &columnar.left.primary_key_columns,
+                        &previous_left,
+                        &left_delta,
+                    )
+                    .await?;
+                    let next_right = apply_source_snapshot_delta(
                         &columnar.right.schema,
                         &columnar.right.primary_key_columns,
-                        columnar
-                            .current_output_index
-                            .as_ref()
-                            .context("partitioned join-topn current output index missing")?,
-                        &output_state_indices,
+                        &previous_right,
+                        &right_delta,
+                    )
+                    .await?;
+                    timings.apply_input_ms = elapsed_ms(apply_input_start);
+                    profile::record_since("join_topn.apply_input_delta", phase_start);
+
+                    let (previous_output, next_output) = if touched_keys.is_empty() {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        let phase_start = profile::start();
+                        let evaluate_previous_start = timing_start(timing_enabled);
+                        let previous_output = evaluator
+                            .evaluate(&previous_left, &previous_right)
+                            .await
+                            .context("evaluate previous join-topn partition outputs")?;
+                        timings.evaluate_previous_ms = elapsed_ms(evaluate_previous_start);
+                        profile::record_since("join_topn.evaluate_previous", phase_start);
+                        let phase_start = profile::start();
+                        let evaluate_next_start = timing_start(timing_enabled);
+                        let next_output = evaluator
+                            .evaluate(&next_left, &next_right)
+                            .await
+                            .context("evaluate next join-topn partition outputs")?;
+                        timings.evaluate_next_ms = elapsed_ms(evaluate_next_start);
+                        profile::record_since("join_topn.evaluate_next", phase_start);
+                        (previous_output, next_output)
+                    };
+                    let phase_start = profile::start();
+                    let diff_start = timing_start(timing_enabled);
+                    let diff = diff_bounded_output_batches(
+                        Arc::clone(output_schema),
+                        &previous_output,
+                        &next_output,
                     )
                     .await
-                    .context("build right-side join-topn output delta")?;
-                timings.append_only_merge_ms = elapsed_ms(append_only_merge_start);
-                profile::record_since("join_topn.append_only_right_merge", phase_start);
-                output_delta
-            } else if right_delta.is_empty()
-                && columnar_zset_is_delete_only(&left_delta)?
-                && let Some(output_index) = columnar.current_output_index.as_ref()
-            {
-                let phase_start = profile::start();
-                let left_delete_start = timing_start(timing_enabled);
-                let partition_keys = evaluator.left_delete_partition_keys(&left_delta)?;
-                let previous_output = output_index
-                    .lookup_snapshot_for_partition_keys(partition_keys.iter())
-                    .await
-                    .context("lookup current join-topn output for left deletes")?;
-                let output_delta =
-                    negative_output_delta_from_snapshot(output_schema, &previous_output)
-                        .context("build join-topn left-delete output delta")?;
-                timings.append_only_merge_ms = elapsed_ms(left_delete_start);
-                profile::record_since("join_topn.left_delete_merge", phase_start);
-                output_delta
-            } else {
-                let phase_start = profile::start();
-                let lookup_left_start = timing_start(timing_enabled);
-                let previous_left = lookup_indexed_join_topn_state_for_i64_keys(
-                    columnar
-                        .left
-                        .input_index
-                        .as_deref()
-                        .context("partitioned join-topn left source index missing")?,
-                    &touched_keys,
-                    &columnar.left.schema,
-                    "left",
-                )
-                .await?;
-                timings.lookup_left_ms = elapsed_ms(lookup_left_start);
-                profile::record_since("join_topn.lookup_previous_left", phase_start);
-                let phase_start = profile::start();
-                let lookup_right_start = timing_start(timing_enabled);
-                let previous_right = lookup_indexed_join_topn_state_for_i64_keys(
-                    columnar
-                        .right
-                        .input_index
-                        .as_deref()
-                        .context("partitioned join-topn right source index missing")?,
-                    &touched_keys,
-                    &columnar.right.schema,
-                    "right",
-                )
-                .await?;
-                timings.lookup_right_ms = elapsed_ms(lookup_right_start);
-                profile::record_since("join_topn.lookup_previous_right", phase_start);
-                let phase_start = profile::start();
-                let apply_input_start = timing_start(timing_enabled);
-                let next_left = apply_source_snapshot_delta(
-                    &columnar.left.schema,
-                    &columnar.left.primary_key_columns,
-                    &previous_left,
-                    &left_delta,
-                )
-                .await?;
-                let next_right = apply_source_snapshot_delta(
-                    &columnar.right.schema,
-                    &columnar.right.primary_key_columns,
-                    &previous_right,
-                    &right_delta,
-                )
-                .await?;
-                timings.apply_input_ms = elapsed_ms(apply_input_start);
-                profile::record_since("join_topn.apply_input_delta", phase_start);
-
-                let (previous_output, next_output) = if touched_keys.is_empty() {
-                    (Vec::new(), Vec::new())
-                } else {
-                    let phase_start = profile::start();
-                    let evaluate_previous_start = timing_start(timing_enabled);
-                    let previous_output = evaluator
-                        .evaluate(&previous_left, &previous_right)
-                        .await
-                        .context("evaluate previous join-topn partition outputs")?;
-                    timings.evaluate_previous_ms = elapsed_ms(evaluate_previous_start);
-                    profile::record_since("join_topn.evaluate_previous", phase_start);
-                    let phase_start = profile::start();
-                    let evaluate_next_start = timing_start(timing_enabled);
-                    let next_output = evaluator
-                        .evaluate(&next_left, &next_right)
-                        .await
-                        .context("evaluate next join-topn partition outputs")?;
-                    timings.evaluate_next_ms = elapsed_ms(evaluate_next_start);
-                    profile::record_since("join_topn.evaluate_next", phase_start);
-                    (previous_output, next_output)
-                };
-                let phase_start = profile::start();
-                let diff_start = timing_start(timing_enabled);
-                let diff = diff_bounded_output_batches(
-                    Arc::clone(output_schema),
-                    &previous_output,
-                    &next_output,
-                )
-                .await
-                .context("diff join-topn partition outputs")?;
-                timings.diff_ms = elapsed_ms(diff_start);
-                profile::record_since("join_topn.diff_output", phase_start);
-                diff.batches
+                    .context("diff join-topn partition outputs")?;
+                    timings.diff_ms = elapsed_ms(diff_start);
+                    profile::record_since("join_topn.diff_output", phase_start);
+                    diff.batches
+                }
             }
-        }
-    };
+        };
 
     let phase_start = profile::start();
     let build_output_start = timing_start(timing_enabled);
@@ -1304,7 +1317,7 @@ impl JoinTopNCurrentOutputIndex {
             .await
             .context("scan join-topn current output index for rebuild")?
         {
-            writes.delete(key.to_vec());
+            writes.delete(&key);
             has_writes = true;
         }
         for batch in snapshot {
@@ -2006,15 +2019,18 @@ impl JoinTopNBestBidEvaluator {
 
     async fn right_delta_output_delta(
         &self,
-        output_schema: &SchemaRef,
-        left_batches: &[RecordBatch],
         right_delta: &ColumnarZSet,
         right_index: &SlateBackedColumnarIndexedZSet,
         right_schema: &SchemaRef,
         right_primary_key_columns: &[String],
-        output_index: &JoinTopNCurrentOutputIndex,
-        output_state_indices: &JoinTopNOutputStateIndices,
+        context: RightDeltaOutputContext<'_>,
     ) -> Result<Vec<RecordBatch>> {
+        let RightDeltaOutputContext {
+            output_schema,
+            left_batches,
+            output_index,
+            output_state_indices,
+        } = context;
         let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let total_start = timing_start(timing_enabled);
         let left_rows_start = timing_start(timing_enabled);
@@ -2026,14 +2042,18 @@ impl JoinTopNBestBidEvaluator {
         if columnar_zset_is_insert_only(right_delta)? {
             return self
                 .right_insert_delta_output_delta(
-                    output_schema,
-                    left_batches,
-                    &left_rows,
                     right_delta,
-                    output_index,
-                    output_state_indices,
-                    left_rows_ms,
-                    total_start,
+                    RightInsertDeltaContext {
+                        output: RightDeltaOutputContext {
+                            output_schema,
+                            left_batches,
+                            output_index,
+                            output_state_indices,
+                        },
+                        left_rows: &left_rows,
+                        left_rows_ms,
+                        total_start,
+                    },
                 )
                 .await;
         }
@@ -2223,15 +2243,21 @@ impl JoinTopNBestBidEvaluator {
 
     async fn right_insert_delta_output_delta(
         &self,
-        output_schema: &SchemaRef,
-        left_batches: &[RecordBatch],
-        left_rows: &HashMap<i64, Vec<JoinTopNLeftRow>>,
         right_delta: &ColumnarZSet,
-        output_index: &JoinTopNCurrentOutputIndex,
-        output_state_indices: &JoinTopNOutputStateIndices,
-        left_rows_ms: u64,
-        total_start: Option<Instant>,
+        context: RightInsertDeltaContext<'_>,
     ) -> Result<Vec<RecordBatch>> {
+        let RightInsertDeltaContext {
+            output:
+                RightDeltaOutputContext {
+                    output_schema,
+                    left_batches,
+                    output_index,
+                    output_state_indices,
+                },
+            left_rows,
+            left_rows_ms,
+            total_start,
+        } = context;
         let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
         let candidate_start = timing_start(timing_enabled);
         let candidate_best = self.best_bids_by_partition_with_weight_filter(
@@ -3183,7 +3209,7 @@ fn strip_passthrough_wrappers(mut plan: &LogicalPlan) -> &LogicalPlan {
     }
 }
 
-fn joins_for_plan<'a>(plan: &'a LogicalPlan) -> Vec<&'a Join> {
+fn joins_for_plan(plan: &LogicalPlan) -> Vec<&Join> {
     let mut joins = Vec::new();
     collect_joins(plan, &mut joins);
     joins

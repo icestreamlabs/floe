@@ -278,6 +278,12 @@ struct IncrementalMaterializedViewState {
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 }
 
+type IncrementalContextProviders = (
+    Arc<DynamicStateTableProvider>,
+    Option<SchemaRef>,
+    Option<Arc<DynamicStateTableProvider>>,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterializedViewExecutionMode {
     ColumnarConstant,
@@ -837,7 +843,6 @@ impl VectorizedExecutionRuntime {
                         &mv.output_schema,
                         plan,
                         &source_states,
-                        &udfs,
                     )
                     .await
                     .with_context(|| {
@@ -1426,11 +1431,7 @@ fn incremental_context_providers(
     ctx: &SessionContext,
     source_name: &str,
     sources: &HashMap<String, VectorizedSourceState>,
-) -> Result<(
-    Arc<DynamicStateTableProvider>,
-    Option<SchemaRef>,
-    Option<Arc<DynamicStateTableProvider>>,
-)> {
+) -> Result<IncrementalContextProviders> {
     let source = sources
         .get(source_name)
         .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?;

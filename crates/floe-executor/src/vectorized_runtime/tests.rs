@@ -389,9 +389,9 @@ fn category_avg_rows(batches: &[RecordBatch]) -> Vec<(i64, f64)> {
     rows
 }
 
-fn distinct_stats_rows(
-    batches: &[RecordBatch],
-) -> Vec<(String, String, String, i64, i64, i64, i64, i64)> {
+type DistinctStatsRow = (String, String, String, i64, i64, i64, i64, i64);
+
+fn distinct_stats_rows(batches: &[RecordBatch]) -> Vec<DistinctStatsRow> {
     let mut rows = Vec::new();
     for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
         let channels = string_values(batch, 0);
