@@ -46,14 +46,6 @@ impl ConnectorContext {
         send_batch(&self.sender, events).await
     }
 
-    pub fn supports_kafka_raw_batches(&self) -> bool {
-        self.sender.supports_kafka_raw_batches()
-    }
-
-    pub fn supports_kafka_arrow_batches(&self) -> bool {
-        self.sender.supports_kafka_arrow_batches()
-    }
-
     pub async fn send_kafka_raw_batch(
         &self,
         batch: KafkaRawIngestBatch,

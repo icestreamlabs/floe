@@ -85,6 +85,9 @@ async fn kafka_connector_ingests_messages() {
         .await
         .expect("receive event")
         .expect("missing event");
+    let source::RoutedIngestPayload::Events(batch) = batch.payload else {
+        panic!("connector emitted a non-event payload");
+    };
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].source(), "nexmark_bid");
 

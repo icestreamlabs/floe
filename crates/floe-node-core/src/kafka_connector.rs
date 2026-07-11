@@ -715,9 +715,9 @@ impl Connector for KafkaConnector {
             .consumer
             .as_ref()
             .context("kafka connector is not initialized")?;
-        let arrow_decode = self.arrow_decode_config(ctx).cloned();
+        let arrow_decode = self.arrow_decode_config().cloned();
         let raw_source = if arrow_decode.is_none() {
-            self.raw_default_source(ctx).map(str::to_string)
+            self.raw_default_source().map(str::to_string)
         } else {
             None
         };
@@ -882,7 +882,7 @@ impl Connector for KafkaConnector {
                     message_us = metrics.message_us,
                     send_us = metrics.send_us,
                     raw_fast_path = raw_source.is_some(),
-                    arrow_fast_path = self.arrow_decode_config(ctx).is_some(),
+                    arrow_fast_path = self.arrow_decode_config().is_some(),
                     time_to_first_batch_ms,
                     "kafka connector emitted first batch"
                 );
@@ -890,7 +890,7 @@ impl Connector for KafkaConnector {
                 tracing::info!(
                     emitted,
                     raw_fast_path = raw_source.is_some(),
-                    arrow_fast_path = self.arrow_decode_config(ctx).is_some(),
+                    arrow_fast_path = self.arrow_decode_config().is_some(),
                     time_to_first_batch_ms,
                     "kafka connector emitted first batch"
                 );
@@ -1037,21 +1037,15 @@ fn parse_debezium_events(
 }
 
 impl KafkaConnector {
-    fn arrow_decode_config<'a>(
-        &'a self,
-        ctx: &ConnectorContext,
-    ) -> Option<&'a KafkaArrowDecodeConfig> {
-        if self.message_format != KafkaMessageFormat::FloeJson
-            || !ctx.supports_kafka_arrow_batches()
-        {
+    fn arrow_decode_config(&self) -> Option<&KafkaArrowDecodeConfig> {
+        if self.message_format != KafkaMessageFormat::FloeJson {
             return None;
         }
         self.config.arrow_decode.as_ref()
     }
 
-    fn raw_default_source<'a>(&'a self, ctx: &ConnectorContext) -> Option<&'a str> {
-        if self.message_format != KafkaMessageFormat::FloeJson || !ctx.supports_kafka_raw_batches()
-        {
+    fn raw_default_source(&self) -> Option<&str> {
+        if self.message_format != KafkaMessageFormat::FloeJson {
             return None;
         }
         self.config.default_source.as_deref()

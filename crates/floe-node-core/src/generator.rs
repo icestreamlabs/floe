@@ -247,7 +247,10 @@ mod tests {
 
         let mut collected = Vec::new();
         while let Some(batch) = rx.recv().await {
-            collected.extend(batch.into_iter().map(|event| event.source().to_owned()));
+            let source::RoutedIngestPayload::Events(events) = batch.payload else {
+                panic!("generator emitted a non-event payload");
+            };
+            collected.extend(events.into_iter().map(|event| event.source().to_owned()));
         }
 
         assert_eq!(collected.len(), 5);

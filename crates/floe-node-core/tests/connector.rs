@@ -22,6 +22,9 @@ async fn nexmark_connector_emits_events() {
 
     let mut events = Vec::new();
     while let Some(batch) = rx.recv().await {
+        let source::RoutedIngestPayload::Events(batch) = batch.payload else {
+            panic!("connector emitted a non-event payload");
+        };
         events.extend(batch);
     }
 

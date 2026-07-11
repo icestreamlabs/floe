@@ -27,45 +27,10 @@ fn parse_events_uses_default_source() {
 }
 
 #[tokio::test]
-async fn http_ingest_accepts_events() {
-    let (tx, mut rx) = mpsc::channel::<Vec<AppendIngestEvent>>(4);
-    let state = HttpIngestState {
-        sender: AppendIngestEventSender::Direct {
-            sender: tx,
-            pending: Default::default(),
-        },
-        default_source: Some("nexmark_bid".to_string()),
-        cancel: CancellationToken::new(),
-        health: None,
-    };
-    let app = Router::new()
-        .route("/ingest", post(ingest))
-        .with_state(state);
-
-    let payload = json!({"auction": 1});
-    let request = Request::builder()
-        .method("POST")
-        .uri("/ingest")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(payload.to_string()))
-        .expect("request");
-    let response = app.oneshot(request).await.expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let batch = rx.recv().await.expect("batch");
-    assert_eq!(batch.len(), 1);
-    assert_eq!(batch[0].source(), "nexmark_bid");
-}
-
-#[tokio::test]
 async fn http_ingest_waits_for_commit_ack() {
     let (tx, mut rx) = mpsc::channel(4);
     let state = HttpIngestState {
-        sender: AppendIngestEventSender::Routed {
-            connector_id: 0,
-            sender: tx,
-            pending: Default::default(),
-        },
+        sender: floe_node_core::source::routed_sender(0, tx, Default::default()),
         default_source: Some("nexmark_bid".to_string()),
         cancel: CancellationToken::new(),
         health: None,
@@ -104,12 +69,9 @@ async fn http_ingest_waits_for_commit_ack() {
 
 #[tokio::test]
 async fn healthz_reports_unavailable_when_executor_stops() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (sender, _rx) = floe_node_core::source::channel(1);
     let state = HttpIngestState {
-        sender: AppendIngestEventSender::Direct {
-            sender: tx,
-            pending: Default::default(),
-        },
+        sender,
         default_source: Some("nexmark_bid".to_string()),
         cancel: CancellationToken::new(),
         health: Some(HttpIngestHealth {
@@ -142,7 +104,7 @@ async fn healthz_reports_unavailable_when_executor_stops() {
 
 #[tokio::test]
 async fn debug_watermarks_returns_snapshot() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (sender, _rx) = floe_node_core::source::channel(1);
     let snapshot = Arc::new(RwLock::new(WatermarkDebugState {
         global_watermark_ms: Some(42),
         policy: "min_active_sources".to_string(),
@@ -154,10 +116,7 @@ async fn debug_watermarks_returns_snapshot() {
         }],
     }));
     let state = HttpIngestState {
-        sender: AppendIngestEventSender::Direct {
-            sender: tx,
-            pending: Default::default(),
-        },
+        sender,
         default_source: Some("nexmark_bid".to_string()),
         cancel: CancellationToken::new(),
         health: Some(HttpIngestHealth {

@@ -143,7 +143,7 @@ async fn read_object(
 mod tests {
     use super::*;
     use crate::connector::Connector;
-    use crate::source::channel;
+    use crate::source::{RoutedIngestPayload, channel};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -198,6 +198,9 @@ mod tests {
         let first = connector.tick(&ctx).await.expect("first tick");
         assert_eq!(first, ConnectorTick::Emitted(1));
         let first_batch = rx.recv().await.expect("first batch");
+        let RoutedIngestPayload::Events(first_batch) = first_batch.payload else {
+            panic!("expected event batch");
+        };
         assert_eq!(first_batch.len(), 1);
         assert_eq!(first_batch[0].source(), "nexmark_bid");
         assert_eq!(
@@ -208,6 +211,9 @@ mod tests {
         let second = connector.tick(&ctx).await.expect("second tick");
         assert_eq!(second, ConnectorTick::Emitted(1));
         let second_batch = rx.recv().await.expect("second batch");
+        let RoutedIngestPayload::Events(second_batch) = second_batch.payload else {
+            panic!("expected event batch");
+        };
         assert_eq!(
             second_batch[0].resume_token(),
             Some(&AppendIngestResumeToken::ObjectStore { cursor: 1 })

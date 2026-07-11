@@ -8,7 +8,6 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub type AppendIngestEventBatch = Vec<AppendIngestEvent>;
-pub type AppendIngestEventReceiver = mpsc::Receiver<AppendIngestEventBatch>;
 pub type RoutedAppendIngestEventReceiver = mpsc::Receiver<RoutedAppendIngestEventBatch>;
 
 #[derive(Debug)]
@@ -181,27 +180,10 @@ impl PendingAppendIngestEventCounter {
 }
 
 #[derive(Clone)]
-pub enum AppendIngestEventSender {
-    Direct {
-        sender: mpsc::Sender<AppendIngestEventBatch>,
-        pending: PendingAppendIngestEventCounter,
-    },
-    Routed {
-        connector_id: usize,
-        sender: mpsc::Sender<RoutedAppendIngestEventBatch>,
-        pending: PendingAppendIngestEventCounter,
-    },
-}
-
-pub fn channel(capacity: usize) -> (AppendIngestEventSender, AppendIngestEventReceiver) {
-    let (sender, receiver) = mpsc::channel(capacity);
-    (
-        AppendIngestEventSender::Direct {
-            sender,
-            pending: PendingAppendIngestEventCounter::default(),
-        },
-        receiver,
-    )
+pub struct AppendIngestEventSender {
+    connector_id: usize,
+    sender: mpsc::Sender<RoutedAppendIngestEventBatch>,
+    pending: PendingAppendIngestEventCounter,
 }
 
 pub fn routed_channel(
@@ -213,12 +195,20 @@ pub fn routed_channel(
     mpsc::channel(capacity)
 }
 
+pub fn channel(capacity: usize) -> (AppendIngestEventSender, RoutedAppendIngestEventReceiver) {
+    let (sender, receiver) = routed_channel(capacity);
+    (
+        routed_sender(0, sender, PendingAppendIngestEventCounter::default()),
+        receiver,
+    )
+}
+
 pub fn routed_sender(
     connector_id: usize,
     sender: mpsc::Sender<RoutedAppendIngestEventBatch>,
     pending: PendingAppendIngestEventCounter,
 ) -> AppendIngestEventSender {
-    AppendIngestEventSender::Routed {
+    AppendIngestEventSender {
         connector_id,
         sender,
         pending,
@@ -227,18 +217,7 @@ pub fn routed_sender(
 
 impl AppendIngestEventSender {
     pub fn pending_events(&self) -> usize {
-        match self {
-            AppendIngestEventSender::Direct { pending, .. }
-            | AppendIngestEventSender::Routed { pending, .. } => pending.pending(),
-        }
-    }
-
-    pub fn supports_kafka_raw_batches(&self) -> bool {
-        matches!(self, AppendIngestEventSender::Routed { .. })
-    }
-
-    pub fn supports_kafka_arrow_batches(&self) -> bool {
-        matches!(self, AppendIngestEventSender::Routed { .. })
+        self.pending.pending()
     }
 }
 
@@ -256,42 +235,25 @@ pub async fn send_batch(
     if events.is_empty() {
         return Ok(());
     }
-    match sender {
-        AppendIngestEventSender::Direct { sender, pending } => {
-            let count = events.len();
-            pending.record_enqueue(count);
-            if let Err(err) = sender.send(events).await {
-                pending.record_dequeue(count);
-                return Err(err);
-            }
-            Ok(())
-        }
-        AppendIngestEventSender::Routed {
-            connector_id,
-            sender,
-            pending,
-        } => {
-            let count = events.len();
-            pending.record_enqueue(count);
-            if let Err(err) = sender
-                .send(RoutedAppendIngestEventBatch {
-                    connector_id: *connector_id,
-                    payload: RoutedIngestPayload::Events(events),
-                    commit_ack: None,
-                })
-                .await
-            {
-                pending.record_dequeue(count);
-                let RoutedIngestPayload::Events(events) = err.0.payload else {
-                    unreachable!("event send returned a different ingest payload")
-                };
-                return Err(SendError(events));
-            }
-            Ok(())
-        }
+    let count = events.len();
+    sender.pending.record_enqueue(count);
+    if let Err(err) = sender
+        .sender
+        .send(RoutedAppendIngestEventBatch {
+            connector_id: sender.connector_id,
+            payload: RoutedIngestPayload::Events(events),
+            commit_ack: None,
+        })
+        .await
+    {
+        sender.pending.record_dequeue(count);
+        let RoutedIngestPayload::Events(events) = err.0.payload else {
+            unreachable!("event send returned a different ingest payload")
+        };
+        return Err(SendError(events));
     }
+    Ok(())
 }
-
 pub async fn send_batch_with_commit_ack(
     sender: &AppendIngestEventSender,
     events: AppendIngestEventBatch,
@@ -301,45 +263,26 @@ pub async fn send_batch_with_commit_ack(
         let _ = tx.send(Ok(()));
         return Ok(rx);
     }
-    match sender {
-        AppendIngestEventSender::Direct { sender, pending } => {
-            let count = events.len();
-            pending.record_enqueue(count);
-            if let Err(err) = sender.send(events).await {
-                pending.record_dequeue(count);
-                return Err(err);
-            }
-            let (tx, rx) = oneshot::channel();
-            let _ = tx.send(Ok(()));
-            Ok(rx)
-        }
-        AppendIngestEventSender::Routed {
-            connector_id,
-            sender,
-            pending,
-        } => {
-            let count = events.len();
-            let (ack_tx, ack_rx) = oneshot::channel();
-            pending.record_enqueue(count);
-            if let Err(err) = sender
-                .send(RoutedAppendIngestEventBatch {
-                    connector_id: *connector_id,
-                    payload: RoutedIngestPayload::Events(events),
-                    commit_ack: Some(CommitAck::new(count, ack_tx)),
-                })
-                .await
-            {
-                pending.record_dequeue(count);
-                let RoutedIngestPayload::Events(events) = err.0.payload else {
-                    unreachable!("acknowledged event send returned a different ingest payload")
-                };
-                return Err(SendError(events));
-            }
-            Ok(ack_rx)
-        }
+    let count = events.len();
+    let (ack_tx, ack_rx) = oneshot::channel();
+    sender.pending.record_enqueue(count);
+    if let Err(err) = sender
+        .sender
+        .send(RoutedAppendIngestEventBatch {
+            connector_id: sender.connector_id,
+            payload: RoutedIngestPayload::Events(events),
+            commit_ack: Some(CommitAck::new(count, ack_tx)),
+        })
+        .await
+    {
+        sender.pending.record_dequeue(count);
+        let RoutedIngestPayload::Events(events) = err.0.payload else {
+            unreachable!("acknowledged event send returned a different ingest payload")
+        };
+        return Err(SendError(events));
     }
+    Ok(ack_rx)
 }
-
 pub async fn send_kafka_raw_batch(
     sender: &AppendIngestEventSender,
     batch: KafkaRawIngestBatch,
@@ -347,34 +290,25 @@ pub async fn send_kafka_raw_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    match sender {
-        AppendIngestEventSender::Direct { .. } => Err(SendError(batch)),
-        AppendIngestEventSender::Routed {
-            connector_id,
-            sender,
-            pending,
-        } => {
-            let count = batch.len();
-            pending.record_enqueue(count);
-            if let Err(err) = sender
-                .send(RoutedAppendIngestEventBatch {
-                    connector_id: *connector_id,
-                    payload: RoutedIngestPayload::KafkaRaw(batch),
-                    commit_ack: None,
-                })
-                .await
-            {
-                pending.record_dequeue(count);
-                let RoutedIngestPayload::KafkaRaw(batch) = err.0.payload else {
-                    unreachable!("raw Kafka send returned a different ingest payload")
-                };
-                return Err(SendError(batch));
-            }
-            Ok(())
-        }
+    let count = batch.len();
+    sender.pending.record_enqueue(count);
+    if let Err(err) = sender
+        .sender
+        .send(RoutedAppendIngestEventBatch {
+            connector_id: sender.connector_id,
+            payload: RoutedIngestPayload::KafkaRaw(batch),
+            commit_ack: None,
+        })
+        .await
+    {
+        sender.pending.record_dequeue(count);
+        let RoutedIngestPayload::KafkaRaw(batch) = err.0.payload else {
+            unreachable!("raw Kafka send returned a different ingest payload")
+        };
+        return Err(SendError(batch));
     }
+    Ok(())
 }
-
 pub async fn send_kafka_arrow_batch(
     sender: &AppendIngestEventSender,
     batch: KafkaArrowIngestBatch,
@@ -382,30 +316,22 @@ pub async fn send_kafka_arrow_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    match sender {
-        AppendIngestEventSender::Direct { .. } => Err(SendError(batch)),
-        AppendIngestEventSender::Routed {
-            connector_id,
-            sender,
-            pending,
-        } => {
-            let count = batch.len();
-            pending.record_enqueue(count);
-            if let Err(err) = sender
-                .send(RoutedAppendIngestEventBatch {
-                    connector_id: *connector_id,
-                    payload: RoutedIngestPayload::KafkaArrow(batch),
-                    commit_ack: None,
-                })
-                .await
-            {
-                pending.record_dequeue(count);
-                let RoutedIngestPayload::KafkaArrow(batch) = err.0.payload else {
-                    unreachable!("Arrow Kafka send returned a different ingest payload")
-                };
-                return Err(SendError(batch));
-            }
-            Ok(())
-        }
+    let count = batch.len();
+    sender.pending.record_enqueue(count);
+    if let Err(err) = sender
+        .sender
+        .send(RoutedAppendIngestEventBatch {
+            connector_id: sender.connector_id,
+            payload: RoutedIngestPayload::KafkaArrow(batch),
+            commit_ack: None,
+        })
+        .await
+    {
+        sender.pending.record_dequeue(count);
+        let RoutedIngestPayload::KafkaArrow(batch) = err.0.payload else {
+            unreachable!("Arrow Kafka send returned a different ingest payload")
+        };
+        return Err(SendError(batch));
     }
+    Ok(())
 }
