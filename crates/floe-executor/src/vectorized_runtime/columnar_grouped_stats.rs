@@ -1949,11 +1949,13 @@ async fn grouped_stats_append_only_direct_count_compact_delta(
                             let group_key = group_rows.row(row_idx).data().to_vec();
                             apply_projected_compact_stats_row_to_loaded_state(
                                 columnar,
-                                batch,
-                                row_idx,
-                                group_key,
-                                &value_arrays,
-                                &filter_arrays,
+                                ProjectedCompactStatsRow {
+                                    batch,
+                                    row_idx,
+                                    group_key,
+                                    value_arrays: &value_arrays,
+                                    filter_arrays: &filter_arrays,
+                                },
                                 values,
                                 &mut touched,
                                 &mut direct_builder,
@@ -1965,11 +1967,13 @@ async fn grouped_stats_append_only_direct_count_compact_delta(
                         for row_idx in 0..batch.num_rows() {
                             apply_projected_compact_stats_row_to_loaded_state(
                                 columnar,
-                                batch,
-                                row_idx,
-                                Vec::new(),
-                                &value_arrays,
-                                &filter_arrays,
+                                ProjectedCompactStatsRow {
+                                    batch,
+                                    row_idx,
+                                    group_key: Vec::new(),
+                                    value_arrays: &value_arrays,
+                                    filter_arrays: &filter_arrays,
+                                },
                                 values,
                                 &mut touched,
                                 &mut direct_builder,
@@ -2070,6 +2074,10 @@ async fn grouped_stats_append_only_streaming_direct_count_compact_delta(
     let mut writes = WriteBatch::new();
     let mut append_only_compact_log =
         AppendOnlyCompactGroupStateLogBuilder::with_capacity(input_row_count);
+    let write_policy = CompactStateWritePolicy {
+        snapshot: write_compact_snapshot,
+        append_only_log: write_append_only_compact_log,
+    };
 
     columnar
         .stats_state
@@ -2098,17 +2106,18 @@ async fn grouped_stats_append_only_streaming_direct_count_compact_delta(
                             let group_key = group_rows.row(row_idx).data().to_vec();
                             apply_projected_compact_stats_row_streaming(
                                 columnar,
-                                batch,
-                                row_idx,
-                                group_key,
-                                &value_arrays,
-                                &filter_arrays,
+                                ProjectedCompactStatsRow {
+                                    batch,
+                                    row_idx,
+                                    group_key,
+                                    value_arrays: &value_arrays,
+                                    filter_arrays: &filter_arrays,
+                                },
                                 values,
                                 &mut direct_builder,
                                 &mut writes,
                                 &mut append_only_compact_log,
-                                write_compact_snapshot,
-                                write_append_only_compact_log,
+                                write_policy,
                             )?;
                         }
                     }
@@ -2116,17 +2125,18 @@ async fn grouped_stats_append_only_streaming_direct_count_compact_delta(
                         for row_idx in 0..batch.num_rows() {
                             apply_projected_compact_stats_row_streaming(
                                 columnar,
-                                batch,
-                                row_idx,
-                                Vec::new(),
-                                &value_arrays,
-                                &filter_arrays,
+                                ProjectedCompactStatsRow {
+                                    batch,
+                                    row_idx,
+                                    group_key: Vec::new(),
+                                    value_arrays: &value_arrays,
+                                    filter_arrays: &filter_arrays,
+                                },
                                 values,
                                 &mut direct_builder,
                                 &mut writes,
                                 &mut append_only_compact_log,
-                                write_compact_snapshot,
-                                write_append_only_compact_log,
+                                write_policy,
                             )?;
                         }
                     }
@@ -2400,21 +2410,36 @@ fn add_projected_compact_stats_row_to_pending(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_projected_compact_stats_row_streaming(
-    columnar: &ColumnarGroupedStatsMaterializedViewState,
-    batch: &RecordBatch,
+struct ProjectedCompactStatsRow<'arrays, 'batch> {
+    batch: &'batch RecordBatch,
     row_idx: usize,
     group_key: Vec<u8>,
-    value_arrays: &[ProjectedValueArray<'_>],
-    filter_arrays: &[Option<&BooleanArray>],
+    value_arrays: &'arrays [ProjectedValueArray<'batch>],
+    filter_arrays: &'arrays [Option<&'batch BooleanArray>],
+}
+
+#[derive(Clone, Copy)]
+struct CompactStateWritePolicy {
+    snapshot: bool,
+    append_only_log: bool,
+}
+
+fn apply_projected_compact_stats_row_streaming(
+    columnar: &ColumnarGroupedStatsMaterializedViewState,
+    row: ProjectedCompactStatsRow<'_, '_>,
     values: &mut CompactGroupStateMap,
     direct_builder: &mut WeightedStatsOutputBuilder,
     writes: &mut WriteBatch,
     append_only_compact_log: &mut AppendOnlyCompactGroupStateLogBuilder,
-    write_compact_snapshot: bool,
-    write_append_only_compact_log: bool,
+    write_policy: CompactStateWritePolicy,
 ) -> Result<()> {
+    let ProjectedCompactStatsRow {
+        batch,
+        row_idx,
+        group_key,
+        value_arrays,
+        filter_arrays,
+    } = row;
     let state = match values.entry(group_key.clone()) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => entry.insert(empty_compact_group_state(columnar)?),
@@ -2536,8 +2561,8 @@ fn apply_projected_compact_stats_row_streaming(
     profile::record_since("grouped_stats.apply_build_rows", phase_start);
 
     let phase_start = profile::start();
-    if !write_compact_snapshot {
-        if write_append_only_compact_log {
+    if !write_policy.snapshot {
+        if write_policy.append_only_log {
             append_only_compact_log.append(&group_key, state)?;
         } else {
             columnar
@@ -2549,19 +2574,21 @@ fn apply_projected_compact_stats_row_streaming(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_projected_compact_stats_row_to_loaded_state(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
-    batch: &RecordBatch,
-    row_idx: usize,
-    key: Vec<u8>,
-    value_arrays: &[ProjectedValueArray<'_>],
-    filter_arrays: &[Option<&BooleanArray>],
+    row: ProjectedCompactStatsRow<'_, '_>,
     values: &mut CompactGroupStateMap,
     touched: &mut HashMap<Vec<u8>, DirectCompactTouchedGroup>,
     direct_builder: &mut WeightedStatsOutputBuilder,
     old_aggregate_builder: &mut AggregateStatsOutputBuilder,
 ) -> Result<()> {
+    let ProjectedCompactStatsRow {
+        batch,
+        row_idx,
+        group_key: key,
+        value_arrays,
+        filter_arrays,
+    } = row;
     let first_touch = !touched.contains_key(&key);
     let state = match values.entry(key.clone()) {
         Entry::Occupied(entry) => entry.into_mut(),
