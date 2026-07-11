@@ -33,7 +33,7 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
     build_incremental_materialized_view_state_from_logical_plan, collect_incremental_output,
-    profile,
+    direct_project_record_batches, direct_projection_indices, profile,
 };
 
 pub(super) struct ColumnarGroupedCountPlan {
@@ -57,6 +57,7 @@ pub(super) struct ColumnarGroupedCountMaterializedViewState {
     append_only_single_hop: Option<AppendOnlySingleHopCountState>,
     aggregate_delta: Option<IncrementalMaterializedViewState>,
     hop_group_projection_delta: Option<IncrementalMaterializedViewState>,
+    hop_group_direct_projection: Option<Vec<usize>>,
     aggregate_schema: SchemaRef,
     group_schema: SchemaRef,
     hop_group_projection_schema: Option<SchemaRef>,
@@ -343,6 +344,9 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
             .context("build grouped-count vectorized aggregate delta plan")?;
             (Some(aggregate_delta), None)
         };
+    let hop_group_direct_projection = plan.hop_group_projection.as_ref().and_then(|projection| {
+        direct_projection_indices(&LogicalPlan::Projection(projection.clone()), &source.schema)
+    });
     let count_state = SlateGroupedCountState::new(Arc::clone(&table), &state_namespace)
         .await
         .context("initialize SlateDB-backed grouped-count state")?;
@@ -367,6 +371,7 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
         append_only_single_hop,
         aggregate_delta,
         hop_group_projection_delta,
+        hop_group_direct_projection,
         aggregate_schema: plan.aggregate_schema,
         group_schema: plan.group_schema,
         hop_group_projection_schema: plan.hop_group_projection_schema,
@@ -621,14 +626,10 @@ async fn append_only_single_hop_output_delta_batches(
         return Ok(Some(Vec::new()));
     }
 
-    let projection_schema = columnar
-        .hop_group_projection_schema
-        .as_ref()
-        .context("grouped-count HOP projection schema missing")?;
-    let positive_groups = collect_incremental_output(
+    let positive_groups = collect_hop_group_projection_output(
+        columnar,
         hop_projection_delta,
         &positive_source_batches,
-        projection_schema,
     )
     .await?;
     let hop = columnar
@@ -666,21 +667,17 @@ async fn grouped_count_pending_delta(
     }
 
     if let Some(hop_projection_delta) = columnar.hop_group_projection_delta.as_ref() {
-        let projection_schema = columnar
-            .hop_group_projection_schema
-            .as_ref()
-            .context("grouped-count HOP projection schema missing")?;
-        let positive_groups = collect_incremental_output(
+        let positive_groups = collect_hop_group_projection_output(
+            columnar,
             hop_projection_delta,
             &positive_source_batches,
-            projection_schema,
         )
         .await?;
         add_hop_group_batches_to_pending(columnar, &positive_groups, 1, &mut pending)?;
-        let negative_groups = collect_incremental_output(
+        let negative_groups = collect_hop_group_projection_output(
+            columnar,
             hop_projection_delta,
             &negative_source_batches,
-            projection_schema,
         )
         .await?;
         add_hop_group_batches_to_pending(columnar, &negative_groups, -1, &mut pending)?;
@@ -706,6 +703,26 @@ async fn grouped_count_pending_delta(
     }
     pending.retain(|_, delta| delta.delta != 0);
     Ok(pending)
+}
+
+async fn collect_hop_group_projection_output(
+    columnar: &ColumnarGroupedCountMaterializedViewState,
+    projection_delta: &IncrementalMaterializedViewState,
+    source_batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    let projection_schema = columnar
+        .hop_group_projection_schema
+        .as_ref()
+        .context("grouped-count HOP projection schema missing")?;
+    if let Some(indices) = columnar.hop_group_direct_projection.as_ref() {
+        return direct_project_record_batches(
+            source_batches,
+            projection_schema,
+            indices,
+            "grouped-count HOP",
+        );
+    }
+    collect_incremental_output(projection_delta, source_batches, projection_schema).await
 }
 
 fn add_hop_group_batches_to_pending(
