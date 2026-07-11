@@ -543,7 +543,6 @@ impl VectorizedExecutionRuntime {
 
         let mut mv_states = Vec::with_capacity(materialized_views.len());
         for mv in materialized_views {
-            registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
             #[cfg(not(test))]
             let logical_plan = mv.logical_plan.clone();
             #[cfg(test)]
@@ -1029,6 +1028,8 @@ impl VectorizedExecutionRuntime {
                 );
             };
             let previous_snapshot = operator.initial_snapshot();
+            registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
+            registry.register(mv.view_name.clone());
             mv_states.push(VectorizedMaterializedViewState {
                 view_name: mv.view_name,
                 output_schema: mv.output_schema,

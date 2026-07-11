@@ -1227,6 +1227,10 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
         runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarStateless
     );
+    assert!(
+        registry.get("mv_orders").is_some(),
+        "materialized view handle must exist before the first tick"
+    );
 
     runtime
         .append_source_batches_for_execution_and_query(
