@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -37,7 +37,7 @@ const INDEX_INLINE_ROW_MAX_ROWS: usize = 2048;
 type RowPosting = (u32, i64);
 type IndexPostings = Vec<RowPosting>;
 type IndexEntry = (Vec<u8>, IndexPostings);
-type IndexPostingsByKey = HashMap<Vec<u8>, IndexPostings>;
+type IndexPostingsByKey = AHashMap<Vec<u8>, IndexPostings>;
 type IndexEntryChunks = Vec<Vec<IndexEntry>>;
 
 pub struct SlateBackedColumnarIndexedZSet {
@@ -70,7 +70,7 @@ struct IndexKeyBounds {
 }
 
 struct LookupKeySet {
-    buckets: HashMap<u16, HashSet<Vec<u8>>>,
+    buckets: AHashMap<u16, AHashSet<Vec<u8>>>,
     bounds: Option<IndexKeyBounds>,
     len: usize,
 }
@@ -387,7 +387,7 @@ impl SlateBackedColumnarIndexedZSet {
     ) -> Result<ColumnarZSet> {
         let phase_start = profile::start();
         let mut inline_batches = Vec::new();
-        let mut refs_by_segment: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut refs_by_segment: AHashMap<u64, Vec<u32>> = AHashMap::new();
         self.lookup_key_ranges(lookup_keys, &mut inline_batches, &mut refs_by_segment)
             .await?;
         if !self.range_lookup_only {
@@ -417,7 +417,7 @@ impl SlateBackedColumnarIndexedZSet {
 
     async fn lookup_key_buckets(
         &self,
-        key_buckets: &HashMap<u16, HashSet<Vec<u8>>>,
+        key_buckets: &AHashMap<u16, AHashSet<Vec<u8>>>,
         inline_batches: &mut Vec<RecordBatch>,
     ) -> Result<()> {
         for (bucket, wanted_keys) in key_buckets {
@@ -446,12 +446,12 @@ impl SlateBackedColumnarIndexedZSet {
         &self,
         lookup_keys: &LookupKeySet,
         inline_batches: &mut Vec<RecordBatch>,
-        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
+        refs_by_segment: &mut AHashMap<u64, Vec<u32>>,
     ) -> Result<()> {
         let Some(bounds) = lookup_keys.bounds.as_ref() else {
             return Ok(());
         };
-        let mut wanted_keys = HashSet::new();
+        let mut wanted_keys = AHashSet::new();
         for keys in lookup_keys.buckets.values() {
             wanted_keys.extend(keys.iter().cloned());
         }
@@ -564,7 +564,7 @@ impl SlateBackedColumnarIndexedZSet {
     async fn current_mutations_for_postings(
         &self,
         batch: &RecordBatch,
-        postings: &HashMap<Vec<u8>, Vec<(u32, i64)>>,
+        postings: &AHashMap<Vec<u8>, Vec<(u32, i64)>>,
     ) -> Result<Vec<CurrentIndexMutation>> {
         let mut mutations = Vec::with_capacity(postings.len());
         for (lookup_key, row_refs) in postings {
@@ -617,7 +617,7 @@ impl SlateBackedColumnarIndexedZSet {
         lookup_keys: &LookupKeySet,
     ) -> Result<ColumnarZSet> {
         let mut batches = Vec::new();
-        let mut missing_buckets: HashMap<u16, HashSet<Vec<u8>>> = HashMap::new();
+        let mut missing_buckets: AHashMap<u16, AHashSet<Vec<u8>>> = AHashMap::new();
         let mut missing_len = 0_usize;
         for (bucket, keys) in &lookup_keys.buckets {
             for lookup_key in keys {
@@ -666,7 +666,7 @@ impl SlateBackedColumnarIndexedZSet {
         lookup_keys: &LookupKeySet,
         current: &ColumnarZSet,
     ) -> Result<()> {
-        let mut postings: HashMap<Vec<u8>, Vec<(u32, i64)>> = HashMap::new();
+        let mut postings: AHashMap<Vec<u8>, Vec<(u32, i64)>> = AHashMap::new();
         let current_batch = if current.is_empty() {
             None
         } else {
@@ -705,7 +705,7 @@ impl SlateBackedColumnarIndexedZSet {
     }
 
     fn lookup_keys_from_batches(&self, key_batches: &[RecordBatch]) -> Result<LookupKeySet> {
-        let mut buckets: HashMap<u16, HashSet<Vec<u8>>> = HashMap::new();
+        let mut buckets: AHashMap<u16, AHashSet<Vec<u8>>> = AHashMap::new();
         let mut min = None::<Vec<u8>>;
         let mut max = None::<Vec<u8>>;
         let mut len = 0_usize;
@@ -864,7 +864,7 @@ fn validate_key_indices(value_schema: &SchemaRef, key_indices: &[usize]) -> Resu
     if key_indices.is_empty() {
         bail!("columnar indexed zset requires at least one key column");
     }
-    let mut seen = HashSet::new();
+    let mut seen = AHashSet::new();
     for idx in key_indices {
         if *idx >= value_schema.fields().len() {
             bail!("columnar indexed zset key column {idx} out of bounds");
@@ -1074,7 +1074,7 @@ fn encode_bucket_postings_with_inline_rows(
                 u32::try_from(local_idx).context("columnar index bucket row index exceeds u32")?;
             Ok((*global_idx, local_idx))
         })
-        .collect::<Result<HashMap<_, _>>>()?;
+        .collect::<Result<AHashMap<_, _>>>()?;
     let local_entries = entries
         .iter()
         .map(|(key, postings)| {
@@ -1200,7 +1200,7 @@ fn encode_bucket_postings(entries: &[IndexEntry]) -> Result<Vec<u8>> {
 
 fn decode_bucket_lookup_rows(
     bytes: &[u8],
-    wanted_keys: &HashSet<Vec<u8>>,
+    wanted_keys: &AHashSet<Vec<u8>>,
     schema: &SchemaRef,
 ) -> Result<Vec<RecordBatch>> {
     if !bytes.starts_with(INDEX_BUCKET_INLINE_MAGIC) {
@@ -1261,7 +1261,7 @@ fn decode_bucket_lookup_rows(
 
 fn decode_range_lookup_rows(
     bytes: &[u8],
-    wanted_keys: &HashSet<Vec<u8>>,
+    wanted_keys: &AHashSet<Vec<u8>>,
     lookup_bounds: &IndexKeyBounds,
     schema: &SchemaRef,
 ) -> Result<RangeLookupRows> {
@@ -1334,7 +1334,7 @@ fn decode_range_lookup_rows(
 
 fn decode_bucket_postings_for_keys(
     bytes: &[u8],
-    wanted_keys: &HashSet<Vec<u8>>,
+    wanted_keys: &AHashSet<Vec<u8>>,
     mut emit: impl FnMut(u32, i64) -> Result<()>,
 ) -> Result<()> {
     let mut cursor = 0;

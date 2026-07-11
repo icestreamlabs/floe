@@ -1,12 +1,12 @@
 use std::any::Any;
-use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
-use datafusion::arrow::array::ArrayRef;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt64Array};
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::{Session, TableProvider};
@@ -39,6 +39,13 @@ pub(crate) struct DynamicStateTableProvider {
     key_indices: Option<Arc<[usize]>>,
     keyed_state: Option<Arc<RwLock<DynamicKeyedState>>>,
     exec: Arc<DynamicStateExec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DynamicStateKey {
+    Int64(Option<i64>),
+    UInt64(Option<u64>),
+    Encoded(Vec<u8>),
 }
 
 impl DynamicStateTableProvider {
@@ -129,7 +136,7 @@ impl DynamicStateTableProvider {
 
     pub(crate) fn apply_keyed_delta(
         &self,
-        touched_keys: &HashSet<Vec<u8>>,
+        touched_keys: &AHashSet<DynamicStateKey>,
         positive_batches: Vec<RecordBatch>,
     ) -> Result<()> {
         let Some(key_indices) = self.key_indices.as_deref() else {
@@ -144,7 +151,6 @@ impl DynamicStateTableProvider {
             .keyed_state
             .as_ref()
             .context("dynamic state keyed storage is not initialized")?;
-        let converter = key_row_converter(&self.schema, key_indices).map_err(anyhow::Error::new)?;
         let mut keyed_state = keyed_state
             .write()
             .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
@@ -154,7 +160,7 @@ impl DynamicStateTableProvider {
         if !touched_keys.is_empty() {
             keyed_state.invalidate_snapshot();
         }
-        keyed_state.insert_state_batches(&converter, key_indices, state_batches)
+        keyed_state.insert_state_batches(&self.schema, key_indices, state_batches)
     }
 
     pub(crate) fn snapshot(&self) -> Result<Arc<Vec<RecordBatch>>> {
@@ -214,13 +220,12 @@ impl DynamicStateTableProvider {
             .keyed_state
             .as_ref()
             .context("dynamic state keyed storage is not initialized")?;
-        let converter = key_row_converter(&self.schema, key_indices).map_err(anyhow::Error::new)?;
         let mut keyed_state = keyed_state
             .write()
             .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
         keyed_state.rows.clear();
         keyed_state.invalidate_snapshot();
-        keyed_state.insert_state_batches(&converter, key_indices, state_batches)
+        keyed_state.insert_state_batches(&self.schema, key_indices, state_batches)
     }
 
     fn upsert_keyed_state(&self, state_batches: Vec<RecordBatch>) -> Result<()> {
@@ -232,11 +237,10 @@ impl DynamicStateTableProvider {
             .keyed_state
             .as_ref()
             .context("dynamic state keyed storage is not initialized")?;
-        let converter = key_row_converter(&self.schema, key_indices).map_err(anyhow::Error::new)?;
         let mut keyed_state = keyed_state
             .write()
             .map_err(|_| anyhow::anyhow!("dynamic state keyed storage lock poisoned"))?;
-        keyed_state.insert_state_batches(&converter, key_indices, state_batches)
+        keyed_state.insert_state_batches(&self.schema, key_indices, state_batches)
     }
 }
 
@@ -328,13 +332,13 @@ struct DynamicStateSnapshot {
 
 #[derive(Debug, Clone)]
 struct DynamicStateRow {
-    batch: RecordBatch,
+    batch: Arc<RecordBatch>,
     row_idx: usize,
 }
 
 #[derive(Debug, Default)]
 struct DynamicKeyedState {
-    rows: BTreeMap<Vec<u8>, DynamicStateRow>,
+    rows: AHashMap<DynamicStateKey, DynamicStateRow>,
     snapshot: Option<Arc<DynamicStateSnapshot>>,
 }
 
@@ -360,7 +364,7 @@ impl DynamicKeyedState {
 
     fn insert_state_batches(
         &mut self,
-        converter: &RowConverter,
+        schema: &SchemaRef,
         key_indices: &[usize],
         state_batches: Vec<RecordBatch>,
     ) -> Result<()> {
@@ -369,14 +373,13 @@ impl DynamicKeyedState {
         }
         self.invalidate_snapshot();
         for entry in state_batches {
-            let rows = converter
-                .convert_columns(&project_columns(&entry, key_indices))
-                .context("encode dynamic source keys")?;
-            for row_idx in 0..entry.num_rows() {
+            let keys = encode_dynamic_state_keys(schema, key_indices, &entry)?;
+            let entry = Arc::new(entry);
+            for (row_idx, key) in keys.into_iter().enumerate() {
                 self.rows.insert(
-                    rows.row(row_idx).data().to_vec(),
+                    key,
                     DynamicStateRow {
-                        batch: entry.clone(),
+                        batch: Arc::clone(&entry),
                         row_idx,
                     },
                 );
@@ -564,29 +567,12 @@ fn state_batch_keys(
     schema: &SchemaRef,
     key_indices: &[usize],
     batches: &[RecordBatch],
-) -> Result<HashSet<Vec<u8>>> {
-    let converter = key_row_converter(schema, key_indices).map_err(anyhow::Error::new)?;
-    let mut keys = HashSet::new();
+) -> Result<AHashSet<DynamicStateKey>> {
+    let mut keys = AHashSet::new();
     for batch in batches {
-        collect_batch_keys(&converter, key_indices, batch, &mut keys)?;
+        keys.extend(encode_dynamic_state_keys(schema, key_indices, batch)?);
     }
     Ok(keys)
-}
-
-#[cfg(test)]
-fn collect_batch_keys(
-    converter: &RowConverter,
-    key_indices: &[usize],
-    batch: &RecordBatch,
-    keys: &mut HashSet<Vec<u8>>,
-) -> Result<()> {
-    let rows = converter
-        .convert_columns(&project_columns(batch, key_indices))
-        .context("encode dynamic source keys")?;
-    for row_idx in 0..batch.num_rows() {
-        keys.insert(rows.row(row_idx).data().to_vec());
-    }
-    Ok(())
 }
 
 fn compact_keyed_state_rows<'a>(
@@ -647,6 +633,53 @@ fn key_row_converter(schema: &SchemaRef, key_indices: &[usize]) -> DFResult<RowC
         .map(|idx| SortField::new(schema.field(*idx).data_type().clone()))
         .collect::<Vec<_>>();
     RowConverter::new(fields).map_err(to_datafusion_error)
+}
+
+pub(crate) fn encode_dynamic_state_keys(
+    schema: &SchemaRef,
+    key_indices: &[usize],
+    batch: &RecordBatch,
+) -> Result<Vec<DynamicStateKey>> {
+    if let [key_idx] = key_indices {
+        match schema.field(*key_idx).data_type() {
+            DataType::Int64 => {
+                let values = batch
+                    .column(*key_idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .context("dynamic state Int64 key column has the wrong Arrow type")?;
+                return Ok((0..values.len())
+                    .map(|row_idx| {
+                        DynamicStateKey::Int64(
+                            (!values.is_null(row_idx)).then(|| values.value(row_idx)),
+                        )
+                    })
+                    .collect());
+            }
+            DataType::UInt64 => {
+                let values = batch
+                    .column(*key_idx)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .context("dynamic state UInt64 key column has the wrong Arrow type")?;
+                return Ok((0..values.len())
+                    .map(|row_idx| {
+                        DynamicStateKey::UInt64(
+                            (!values.is_null(row_idx)).then(|| values.value(row_idx)),
+                        )
+                    })
+                    .collect());
+            }
+            _ => {}
+        }
+    }
+    let converter = key_row_converter(schema, key_indices).map_err(anyhow::Error::new)?;
+    let rows = converter
+        .convert_columns(&project_columns(batch, key_indices))
+        .context("encode dynamic source keys")?;
+    Ok((0..batch.num_rows())
+        .map(|row_idx| DynamicStateKey::Encoded(rows.row(row_idx).data().to_vec()))
+        .collect())
 }
 
 fn project_columns(batch: &RecordBatch, indices: &[usize]) -> Vec<ArrayRef> {
@@ -764,7 +797,7 @@ mod tests {
         .expect("record batch")
     }
 
-    fn touched_key(schema: &SchemaRef, id: i64) -> HashSet<Vec<u8>> {
+    fn touched_key(schema: &SchemaRef, id: i64) -> AHashSet<DynamicStateKey> {
         let probe = batch(Arc::clone(schema), &[(id, 0)]);
         state_batch_keys(schema, &[0], &[probe]).expect("encode key")
     }

@@ -1108,10 +1108,6 @@ impl VectorizedExecutionRuntime {
             .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
             .clone();
         let phase_start = profile::start();
-        validate_unit_source_delta(&state.schema, &delta)
-            .with_context(|| format!("validate weighted source delta for '{source_name}'"))?;
-        profile::record_since("source_delta.validate", phase_start);
-        let phase_start = profile::start();
         if let Some(insert_batch) = insert_only_source_delta_batch(&state.schema, &delta)? {
             profile::record_since("source_delta.insert_only_check", phase_start);
             let phase_start = profile::start();
@@ -1126,6 +1122,10 @@ impl VectorizedExecutionRuntime {
             return result;
         }
         profile::record_since("source_delta.insert_only_check", phase_start);
+        let phase_start = profile::start();
+        validate_unit_source_delta(&state.schema, &delta)
+            .with_context(|| format!("validate weighted source delta for '{source_name}'"))?;
+        profile::record_since("source_delta.validate", phase_start);
         let phase_start = profile::start();
         let weighted_batches = self
             .current_weighted_delta_batches

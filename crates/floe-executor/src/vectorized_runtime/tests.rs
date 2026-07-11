@@ -67,6 +67,31 @@ fn test_hop_udf() -> ScalarUDF {
     ))
 }
 
+fn test_tumble_udf() -> ScalarUDF {
+    let passthrough_ts: ScalarFunctionImplementation = Arc::new(
+        |args: &[ColumnarValue]| -> DataFusionResult<ColumnarValue> {
+            if let Some(first) = args.first() {
+                return Ok(first.clone());
+            }
+            Ok(ColumnarValue::Array(Arc::new(
+                TimestampMillisecondArray::from(vec![None::<i64>]),
+            )))
+        },
+    );
+    ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+        "tumble",
+        Signature::one_of(
+            vec![TypeSignature::Exact(vec![
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Int64,
+            ])],
+            Volatility::Immutable,
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        passthrough_ts,
+    ))
+}
+
 fn date_days_values(batch: &RecordBatch, column_idx: usize) -> Vec<i32> {
     let values = batch
         .column(column_idx)
@@ -2859,6 +2884,120 @@ async fn append_only_hop_grouped_count_recovers_compact_state() {
             (1, 3, 1),
         ]
     );
+}
+
+#[tokio::test]
+async fn append_only_tumble_grouped_count_uses_compact_state() {
+    let definition = SourceDefinition::new(
+        "bids",
+        vec![
+            SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+            SourceColumn::new_nullable("dateTime", SourceDataType::TimestampMillis, false),
+        ],
+    )
+    .expect("source definition")
+    .with_property("append_only", "true");
+    let schema = definition.to_arrow_schema();
+    let initial = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 2000, 11_000])),
+        ],
+    )
+    .expect("initial source batch");
+
+    let mut sources = SourceRegistry::new();
+    sources.register(definition);
+    let table = build_operator_state_table("vectorized-columnar-grouped-count-tumble-append").await;
+    let registry = Arc::new(MaterializedViewRegistry::new());
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("bidder", DataType::Int64, false),
+        Field::new("count", DataType::Int64, false),
+    ]));
+    let mut runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::from_sql(
+            "mv_bid_counts",
+            r#"SELECT bidder, COUNT(*) AS count FROM bids GROUP BY bidder, TUMBLE("dateTime", 10000)"#,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&registry),
+        vec![test_tumble_udf()],
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(Arc::clone(&table)),
+    )
+    .await
+    .expect("runtime");
+
+    runtime
+        .append_source_batches_for_execution_and_query("bids", vec![initial.clone()], vec![initial])
+        .await
+        .expect("append initial source rows");
+    runtime.run_tick(1).await.expect("initial tick");
+
+    let handle = registry.get("mv_bid_counts").expect("materialized view");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 1).await;
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 2), (2, 1)]);
+
+    let mv_namespace = namespaces::materialized_view("mv_bid_counts").expect("MV namespace");
+    let fast_log_namespace =
+        format!("{mv_namespace}/columnar/grouped_count/state__append_only_single_hop_count_log");
+    let fast_log_prefix = keyspace::namespace_prefix(keyspace::prefix::INDEX, &fast_log_namespace);
+    assert!(
+        !table
+            .scan_prefix(&fast_log_prefix, &ScanOptions::default())
+            .await
+            .expect("scan compact TUMBLE state log")
+            .is_empty(),
+        "TUMBLE count should use the typed append-only fixed-window state"
+    );
+
+    let recovery_registry = Arc::new(MaterializedViewRegistry::new());
+    let mut recovered = VectorizedExecutionRuntime::new_with_udfs_and_options(
+        &sources,
+        vec![VectorizedMaterializedViewPlan::from_sql(
+            "mv_bid_counts",
+            r#"SELECT bidder, COUNT(*) AS count FROM bids GROUP BY bidder, TUMBLE("dateTime", 10000)"#,
+            Arc::clone(&output_schema),
+        )],
+        Arc::clone(&recovery_registry),
+        vec![test_tumble_udf()],
+        VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
+    )
+    .await
+    .expect("recovered runtime");
+    recovered.run_tick(2).await.expect("recovered empty tick");
+
+    let duplicate = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(TimestampMillisecondArray::from(vec![1000])),
+        ],
+    )
+    .expect("duplicate source batch");
+    recovered
+        .append_source_batches_for_execution_and_query(
+            "bids",
+            vec![duplicate.clone()],
+            vec![duplicate],
+        )
+        .await
+        .expect("append duplicate source row");
+    recovered.run_tick(3).await.expect("post-recovery tick");
+
+    let recovered_handle = recovery_registry
+        .get("mv_bid_counts")
+        .expect("recovered materialized view");
+    let snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 3)
+            .await;
+    assert_eq!(id_count_rows(&snapshot), vec![(1, 3), (2, 1)]);
+    let delta = recovered_handle
+        .arrow_delta_for(3)
+        .expect("post-recovery delta");
+    assert_eq!(weighted_id_count_rows(&delta), vec![(1, 2, -1), (1, 3, 1)]);
 }
 
 #[tokio::test]

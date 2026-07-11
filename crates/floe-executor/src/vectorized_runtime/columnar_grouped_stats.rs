@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use datafusion::arrow::array::{
@@ -269,9 +270,9 @@ struct SlateGroupedStatsState {
     next_append_only_compact_segment_id: Mutex<u64>,
     assume_empty: bool,
     compact_specs: Option<Vec<AggregateSpec>>,
-    group_counts: Mutex<HashMap<Vec<u8>, i64>>,
-    i64_values: Mutex<HashMap<(Vec<u8>, usize), i64>>,
-    i128_values: Mutex<HashMap<(Vec<u8>, usize), i128>>,
+    group_counts: Mutex<AHashMap<Vec<u8>, i64>>,
+    i64_values: Mutex<AHashMap<(Vec<u8>, usize), i64>>,
+    i128_values: Mutex<AHashMap<(Vec<u8>, usize), i128>>,
     pairs: Mutex<GroupAggregateMap<(i64, i64)>>,
     minmax_values: Mutex<GroupAggregateMap<Option<i64>>>,
     i128_minmax_values: Mutex<GroupAggregateMap<Option<i128>>>,
@@ -287,16 +288,16 @@ struct SlateGroupedStatsState {
     compact_snapshot_active: Mutex<bool>,
 }
 
-type GroupAggregateMap<T> = HashMap<(Vec<u8>, usize), T>;
-type GroupAggregateValueMap<T> = HashMap<(Vec<u8>, usize, T), i64>;
-type PendingStatsGroupDeltas = HashMap<Vec<u8>, PendingStatsGroupDelta>;
-type CompactGroupStateMap = HashMap<Vec<u8>, CompactGroupState>;
+type GroupAggregateMap<T> = AHashMap<(Vec<u8>, usize), T>;
+type GroupAggregateValueMap<T> = AHashMap<GroupAggregateKey, AHashMap<T, i64>>;
+type PendingStatsGroupDeltas = AHashMap<Vec<u8>, PendingStatsGroupDelta>;
+type CompactGroupStateMap = AHashMap<Vec<u8>, CompactGroupState>;
 type GroupAggregateKey = (Vec<u8>, usize);
 type AppendOnlyDistinctPresenceMap<T> =
-    HashMap<GroupAggregateKey, AppendOnlyDistinctPresenceState<T>>;
+    AHashMap<GroupAggregateKey, AppendOnlyDistinctPresenceState<T>>;
 
 struct AppendOnlyDistinctPresenceState<T> {
-    values: HashSet<T>,
+    values: AHashSet<T>,
     next_segment_id: u64,
 }
 
@@ -341,7 +342,7 @@ struct PendingCompactStatsGroupDelta {
     row_idx: usize,
 }
 
-type PendingCompactStatsGroupDeltas = HashMap<Vec<u8>, PendingCompactStatsGroupDelta>;
+type PendingCompactStatsGroupDeltas = AHashMap<Vec<u8>, PendingCompactStatsGroupDelta>;
 
 struct DirectCompactTouchedGroup {
     batch: RecordBatch,
@@ -1929,7 +1930,7 @@ async fn grouped_stats_append_only_direct_count_compact_delta(
         .stats_state
         .mutate_loaded_compact_states(|values| {
             let mut touched =
-                HashMap::<Vec<u8>, DirectCompactTouchedGroup>::with_capacity(input_row_count);
+                AHashMap::<Vec<u8>, DirectCompactTouchedGroup>::with_capacity(input_row_count);
             let converter = if columnar.group_count == 0 {
                 None
             } else {
@@ -2583,7 +2584,7 @@ fn apply_projected_compact_stats_row_to_loaded_state(
     columnar: &ColumnarGroupedStatsMaterializedViewState,
     row: ProjectedCompactStatsRow<'_, '_>,
     values: &mut CompactGroupStateMap,
-    touched: &mut HashMap<Vec<u8>, DirectCompactTouchedGroup>,
+    touched: &mut AHashMap<Vec<u8>, DirectCompactTouchedGroup>,
     direct_builder: &mut WeightedStatsOutputBuilder,
     old_aggregate_builder: &mut AggregateStatsOutputBuilder,
 ) -> Result<()> {
@@ -4897,6 +4898,25 @@ fn filter_allows(filter: &Option<&BooleanArray>, row_idx: usize) -> bool {
     }
 }
 
+fn update_cached_value_count<T: Eq + std::hash::Hash>(
+    cache: &mut GroupAggregateValueMap<T>,
+    aggregate_key: GroupAggregateKey,
+    value: T,
+    count: i64,
+) {
+    if count != 0 {
+        cache.entry(aggregate_key).or_default().insert(value, count);
+        return;
+    }
+    let remove_aggregate = cache.get_mut(&aggregate_key).is_some_and(|values| {
+        values.remove(&value);
+        values.is_empty()
+    });
+    if remove_aggregate {
+        cache.remove(&aggregate_key);
+    }
+}
+
 impl SlateGroupedStatsState {
     fn new(
         table: Arc<dyn KeyValueTable>,
@@ -4918,19 +4938,19 @@ impl SlateGroupedStatsState {
             next_append_only_compact_segment_id: Mutex::new(0),
             assume_empty,
             compact_specs,
-            group_counts: Mutex::new(HashMap::new()),
-            i64_values: Mutex::new(HashMap::new()),
-            i128_values: Mutex::new(HashMap::new()),
-            pairs: Mutex::new(HashMap::new()),
-            minmax_values: Mutex::new(HashMap::new()),
-            i128_minmax_values: Mutex::new(HashMap::new()),
-            value_counts: Mutex::new(HashMap::new()),
-            i128_value_counts: Mutex::new(HashMap::new()),
-            string_minmax_values: Mutex::new(HashMap::new()),
-            string_value_counts: Mutex::new(HashMap::new()),
-            append_only_value_presences: Mutex::new(HashMap::new()),
-            append_only_i128_value_presences: Mutex::new(HashMap::new()),
-            append_only_string_value_presences: Mutex::new(HashMap::new()),
+            group_counts: Mutex::new(AHashMap::new()),
+            i64_values: Mutex::new(AHashMap::new()),
+            i128_values: Mutex::new(AHashMap::new()),
+            pairs: Mutex::new(AHashMap::new()),
+            minmax_values: Mutex::new(AHashMap::new()),
+            i128_minmax_values: Mutex::new(AHashMap::new()),
+            value_counts: Mutex::new(AHashMap::new()),
+            i128_value_counts: Mutex::new(AHashMap::new()),
+            string_minmax_values: Mutex::new(AHashMap::new()),
+            string_value_counts: Mutex::new(AHashMap::new()),
+            append_only_value_presences: Mutex::new(AHashMap::new()),
+            append_only_i128_value_presences: Mutex::new(AHashMap::new()),
+            append_only_string_value_presences: Mutex::new(AHashMap::new()),
             compact_values: Mutex::new(CompactGroupStateMap::new()),
             compact_snapshot_loaded: Mutex::new(false),
             compact_snapshot_active: Mutex::new(false),
@@ -5639,12 +5659,13 @@ impl SlateGroupedStatsState {
     }
 
     async fn load_value_count(&self, group_key: &[u8], agg_idx: usize, value: i64) -> Result<i64> {
-        let cache_key = (group_key.to_vec(), agg_idx, value);
+        let cache_key = (group_key.to_vec(), agg_idx);
         if let Some(count) = self
             .value_counts
             .lock()
             .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?
             .get(&cache_key)
+            .and_then(|values| values.get(&value))
             .copied()
         {
             return Ok(count);
@@ -5655,10 +5676,14 @@ impl SlateGroupedStatsState {
         let count = self
             .load_key_i64(&self.value_key(group_key, agg_idx, value)?)
             .await?;
-        self.value_counts
-            .lock()
-            .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?
-            .insert(cache_key, count);
+        if count != 0 {
+            self.value_counts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?
+                .entry(cache_key)
+                .or_default()
+                .insert(value, count);
+        }
         Ok(count)
     }
 
@@ -5671,10 +5696,16 @@ impl SlateGroupedStatsState {
         count: i64,
     ) -> Result<()> {
         self.write_key_i64(batch, self.value_key(group_key, agg_idx, value)?, count);
-        self.value_counts
+        let mut value_counts = self
+            .value_counts
             .lock()
-            .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?
-            .insert((group_key.to_vec(), agg_idx, value), count);
+            .map_err(|_| anyhow::anyhow!("grouped-stats value count cache poisoned"))?;
+        update_cached_value_count(
+            &mut value_counts,
+            (group_key.to_vec(), agg_idx),
+            value,
+            count,
+        );
         Ok(())
     }
 
@@ -5711,7 +5742,7 @@ impl SlateGroupedStatsState {
                 .map_err(|_| anyhow::anyhow!("grouped-stats append-only value cache poisoned"))?;
             let state = presences.entry(cache_key).or_insert_with(|| {
                 loaded.unwrap_or_else(|| AppendOnlyDistinctPresenceState {
-                    values: HashSet::new(),
+                    values: AHashSet::new(),
                     next_segment_id: 0,
                 })
             });
@@ -5749,7 +5780,7 @@ impl SlateGroupedStatsState {
         group_key: &[u8],
         agg_idx: usize,
     ) -> Result<AppendOnlyDistinctPresenceState<i64>> {
-        let mut values = HashSet::new();
+        let mut values = AHashSet::new();
         let mut next_segment_id = 0_u64;
         let segment_prefix = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
         for (key, bytes) in self
@@ -5804,7 +5835,7 @@ impl SlateGroupedStatsState {
             })?;
             let state = presences.entry(cache_key).or_insert_with(|| {
                 loaded.unwrap_or_else(|| AppendOnlyDistinctPresenceState {
-                    values: HashSet::new(),
+                    values: AHashSet::new(),
                     next_segment_id: 0,
                 })
             });
@@ -5842,7 +5873,7 @@ impl SlateGroupedStatsState {
         group_key: &[u8],
         agg_idx: usize,
     ) -> Result<AppendOnlyDistinctPresenceState<i128>> {
-        let mut values = HashSet::new();
+        let mut values = AHashSet::new();
         let mut next_segment_id = 0_u64;
         let segment_prefix = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
         for (key, bytes) in self
@@ -5900,7 +5931,7 @@ impl SlateGroupedStatsState {
                 })?;
             let state = presences.entry(cache_key).or_insert_with(|| {
                 loaded.unwrap_or_else(|| AppendOnlyDistinctPresenceState {
-                    values: HashSet::new(),
+                    values: AHashSet::new(),
                     next_segment_id: 0,
                 })
             });
@@ -5938,7 +5969,7 @@ impl SlateGroupedStatsState {
         group_key: &[u8],
         agg_idx: usize,
     ) -> Result<AppendOnlyDistinctPresenceState<String>> {
-        let mut values = HashSet::new();
+        let mut values = AHashSet::new();
         let mut next_segment_id = 0_u64;
         let segment_prefix = self.append_only_distinct_segment_prefix(group_key, agg_idx)?;
         for (key, bytes) in self
@@ -5965,12 +5996,13 @@ impl SlateGroupedStatsState {
         agg_idx: usize,
         value: i128,
     ) -> Result<i64> {
-        let cache_key = (group_key.to_vec(), agg_idx, value);
+        let cache_key = (group_key.to_vec(), agg_idx);
         if let Some(count) = self
             .i128_value_counts
             .lock()
             .map_err(|_| anyhow::anyhow!("grouped-stats i128 value count cache poisoned"))?
             .get(&cache_key)
+            .and_then(|values| values.get(&value))
             .copied()
         {
             return Ok(count);
@@ -5981,10 +6013,14 @@ impl SlateGroupedStatsState {
         let count = self
             .load_key_i64(&self.i128_value_key(group_key, agg_idx, value)?)
             .await?;
-        self.i128_value_counts
-            .lock()
-            .map_err(|_| anyhow::anyhow!("grouped-stats i128 value count cache poisoned"))?
-            .insert(cache_key, count);
+        if count != 0 {
+            self.i128_value_counts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats i128 value count cache poisoned"))?
+                .entry(cache_key)
+                .or_default()
+                .insert(value, count);
+        }
         Ok(count)
     }
 
@@ -6001,10 +6037,16 @@ impl SlateGroupedStatsState {
             self.i128_value_key(group_key, agg_idx, value)?,
             count,
         );
-        self.i128_value_counts
+        let mut value_counts = self
+            .i128_value_counts
             .lock()
-            .map_err(|_| anyhow::anyhow!("grouped-stats i128 value count cache poisoned"))?
-            .insert((group_key.to_vec(), agg_idx, value), count);
+            .map_err(|_| anyhow::anyhow!("grouped-stats i128 value count cache poisoned"))?;
+        update_cached_value_count(
+            &mut value_counts,
+            (group_key.to_vec(), agg_idx),
+            value,
+            count,
+        );
         Ok(())
     }
 
@@ -6014,12 +6056,13 @@ impl SlateGroupedStatsState {
         agg_idx: usize,
         value: &str,
     ) -> Result<i64> {
-        let cache_key = (group_key.to_vec(), agg_idx, value.to_string());
+        let cache_key = (group_key.to_vec(), agg_idx);
         if let Some(count) = self
             .string_value_counts
             .lock()
             .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
             .get(&cache_key)
+            .and_then(|values| values.get(value))
             .copied()
         {
             return Ok(count);
@@ -6030,10 +6073,14 @@ impl SlateGroupedStatsState {
         let count = self
             .load_key_i64(&self.string_value_key(group_key, agg_idx, value)?)
             .await?;
-        self.string_value_counts
-            .lock()
-            .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
-            .insert(cache_key, count);
+        if count != 0 {
+            self.string_value_counts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
+                .entry(cache_key)
+                .or_default()
+                .insert(value.to_string(), count);
+        }
         Ok(count)
     }
 
@@ -6050,10 +6097,16 @@ impl SlateGroupedStatsState {
             self.string_value_key(group_key, agg_idx, value)?,
             count,
         );
-        self.string_value_counts
+        let mut value_counts = self
+            .string_value_counts
             .lock()
-            .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?
-            .insert((group_key.to_vec(), agg_idx, value.to_string()), count);
+            .map_err(|_| anyhow::anyhow!("grouped-stats string value count cache poisoned"))?;
+        update_cached_value_count(
+            &mut value_counts,
+            (group_key.to_vec(), agg_idx),
+            value.to_string(),
+            count,
+        );
         Ok(())
     }
 

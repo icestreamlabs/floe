@@ -1,23 +1,24 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, anyhow, bail};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array};
+use datafusion::arrow::array::{Array, BooleanArray, BooleanBuilder, Int64Array};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{RowConverter, SortField};
 use dbsp::circuit::WEIGHT_COLUMN_NAME;
 
 use crate::delta_consolidation::{DeltaConsolidator, add_weight_column_to_batches};
 use crate::scalar_array_builder::ScalarColumnBuilder;
-use crate::table_provider::DynamicStateTableProvider;
+use crate::table_provider::{
+    DynamicStateKey, DynamicStateTableProvider, encode_dynamic_state_keys,
+};
 
 const SNAPSHOT_DELTA_APPLY_BATCH_ROWS: usize = 4096;
 
 pub(super) struct SourceDeltaUpdate {
     pub key_indices: Vec<usize>,
-    pub touched_keys: HashSet<Vec<u8>>,
+    pub touched_keys: AHashSet<DynamicStateKey>,
     pub final_positive_batch: Option<RecordBatch>,
 }
 
@@ -414,8 +415,8 @@ fn source_key_indices(schema: &SchemaRef, primary_key_columns: &[String]) -> Res
 }
 
 struct SourceDeltaKeyEffects {
-    touched_keys: HashSet<Vec<u8>>,
-    final_positive_rows: HashSet<usize>,
+    touched_keys: AHashSet<DynamicStateKey>,
+    final_positive_rows: AHashSet<usize>,
 }
 
 fn source_delta_key_effects(
@@ -429,13 +430,9 @@ fn source_delta_key_effects(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| anyhow!("source delta weight column must be Int64"))?;
-    let converter = key_row_converter(schema, key_indices)?;
-    let rows = converter
-        .convert_columns(&project_columns(delta, key_indices))
-        .context("encode source delta keys")?;
-    let mut touched_keys = HashSet::new();
-    let mut final_positive_row_by_key: HashMap<Vec<u8>, Option<usize>> = HashMap::new();
-    for row_idx in 0..weights.len() {
+    let keys = encode_dynamic_state_keys(schema, key_indices, delta)?;
+    let mut final_positive_row_by_key: AHashMap<DynamicStateKey, Option<usize>> = AHashMap::new();
+    for (row_idx, key) in keys.into_iter().enumerate() {
         if weights.is_null(row_idx) {
             continue;
         }
@@ -443,14 +440,14 @@ fn source_delta_key_effects(
         if weight == 0 {
             continue;
         }
-        let key = rows.row(row_idx).data().to_vec();
-        touched_keys.insert(key.clone());
         final_positive_row_by_key.insert(key, (weight > 0).then_some(row_idx));
     }
     let final_positive_rows = final_positive_row_by_key
-        .into_values()
+        .values()
         .flatten()
-        .collect::<HashSet<_>>();
+        .copied()
+        .collect::<AHashSet<_>>();
+    let touched_keys = final_positive_row_by_key.into_keys().collect();
     Ok(SourceDeltaKeyEffects {
         touched_keys,
         final_positive_rows,
@@ -460,22 +457,19 @@ fn source_delta_key_effects(
 fn filter_touched_source_rows(
     schema: &SchemaRef,
     key_indices: &[usize],
-    touched_keys: &HashSet<Vec<u8>>,
+    touched_keys: &AHashSet<DynamicStateKey>,
     snapshot: &[RecordBatch],
 ) -> Result<Vec<RecordBatch>> {
-    let converter = key_row_converter(schema, key_indices)?;
     let mut next = Vec::with_capacity(snapshot.len());
     for batch in snapshot {
         if batch.num_rows() == 0 {
             continue;
         }
-        let rows = converter
-            .convert_columns(&project_columns(batch, key_indices))
-            .context("encode source state keys")?;
+        let keys = encode_dynamic_state_keys(schema, key_indices, batch)?;
         let mut keep = BooleanBuilder::with_capacity(batch.num_rows());
         let mut kept_rows = 0usize;
-        for row_idx in 0..batch.num_rows() {
-            let keep_row = !touched_keys.contains(rows.row(row_idx).data());
+        for key in keys {
+            let keep_row = !touched_keys.contains(&key);
             if keep_row {
                 kept_rows = kept_rows.saturating_add(1);
             }
@@ -494,7 +488,7 @@ fn final_positive_delta_batch(
     schema: &SchemaRef,
     delta: &RecordBatch,
     weight_idx: usize,
-    final_positive_rows: &HashSet<usize>,
+    final_positive_rows: &AHashSet<usize>,
 ) -> Result<Option<RecordBatch>> {
     if final_positive_rows.is_empty() {
         return Ok(None);
@@ -524,21 +518,6 @@ fn final_positive_delta_batch(
         .filter_map(|(idx, column)| (idx != weight_idx).then_some(Arc::clone(column)))
         .collect::<Vec<_>>();
     Ok(Some(RecordBatch::try_new(Arc::clone(schema), columns)?))
-}
-
-fn key_row_converter(schema: &SchemaRef, key_indices: &[usize]) -> Result<RowConverter> {
-    let fields = key_indices
-        .iter()
-        .map(|idx| SortField::new(schema.field(*idx).data_type().clone()))
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).context("build Arrow row converter for source keys")
-}
-
-fn project_columns(batch: &RecordBatch, indices: &[usize]) -> Vec<ArrayRef> {
-    indices
-        .iter()
-        .map(|idx| Arc::clone(batch.column(*idx)))
-        .collect()
 }
 
 #[cfg(test)]

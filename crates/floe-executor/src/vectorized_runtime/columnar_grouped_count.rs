@@ -1770,7 +1770,7 @@ fn hop_group_projection_for_aggregate(
     let mut hop_groups = Vec::new();
     let mut projection_expr = Vec::with_capacity(aggregate.group_expr.len());
     for (group_idx, expr) in aggregate.group_expr.iter().enumerate() {
-        if let Some((time_expr, slide_ms, size_ms)) = hop_group_expr(expr)? {
+        if let Some((time_expr, slide_ms, size_ms)) = fixed_window_group_expr(expr)? {
             hop_groups.push(HopGroup {
                 group_idx,
                 slide_ms,
@@ -1803,10 +1803,20 @@ fn hop_group_projection_for_aggregate(
     Ok((hop_groups, Some(projection), Some(projection_schema)))
 }
 
-fn hop_group_expr(expr: &Expr) -> Result<Option<(Expr, i64, i64)>> {
+fn fixed_window_group_expr(expr: &Expr) -> Result<Option<(Expr, i64, i64)>> {
     let Expr::ScalarFunction(function) = strip_alias(expr) else {
         return Ok(None);
     };
+    if function.name().eq_ignore_ascii_case("tumble") {
+        if function.args.len() < 2 {
+            bail!("TUMBLE group expression requires time and size arguments");
+        }
+        let size_ms = literal_i64(&function.args[1]).context("parse TUMBLE size milliseconds")?;
+        if size_ms <= 0 {
+            bail!("TUMBLE size must be positive");
+        }
+        return Ok(Some((function.args[0].clone(), size_ms, size_ms)));
+    }
     if !function.name().eq_ignore_ascii_case("hop") {
         return Ok(None);
     }
