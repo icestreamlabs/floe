@@ -5661,7 +5661,8 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
     runtime.run_tick(1).await.expect("initial tick");
 
     let handle = registry.get("mv_west_orders").expect("materialized view");
-    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 1).await;
     assert_eq!(join_rows(&snapshot), vec![(1, "west".to_string(), 50)]);
 
     let customer_insert = RecordBatch::try_new(
@@ -5682,7 +5683,8 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
         .expect("append customer insert");
     runtime.run_tick(2).await.expect("right delta tick");
 
-    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 2).await;
     assert_eq!(
         join_rows(&snapshot),
         vec![(1, "west".to_string(), 50), (3, "west".to_string(), 70)]
@@ -5715,9 +5717,9 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
     let recovered_handle = recovery_registry
         .get("mv_west_orders")
         .expect("recovered materialized view");
-    let recovered_snapshot = recovered_handle
-        .arrow_snapshot_for(3)
-        .expect("recovered snapshot");
+    let recovered_snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 3)
+            .await;
     assert_eq!(
         join_rows(&recovered_snapshot),
         vec![(1, "west".to_string(), 50), (3, "west".to_string(), 70)]
@@ -5746,9 +5748,9 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
         .expect("append order insert");
     recovered.run_tick(4).await.expect("left delta tick");
 
-    let snapshot = recovered_handle
-        .arrow_snapshot_for(4)
-        .expect("post-insert snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 4)
+            .await;
     assert_eq!(
         join_rows(&snapshot),
         vec![
@@ -5783,9 +5785,9 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
         .expect("apply customer retract");
     recovered.run_tick(5).await.expect("right retract tick");
 
-    let snapshot = recovered_handle
-        .arrow_snapshot_for(5)
-        .expect("post-retract snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 5)
+            .await;
     assert_eq!(
         join_rows(&snapshot),
         vec![(3, "west".to_string(), 70), (4, "west".to_string(), 80)]
@@ -5891,7 +5893,8 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
     let handle = registry
         .get("mv_ordered_west_orders")
         .expect("materialized view");
-    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 1).await;
     assert_eq!(join_rows(&snapshot), vec![(1, "west".to_string(), 50)]);
 
     let customer_insert = RecordBatch::try_new(
@@ -5912,7 +5915,8 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
         .expect("append customer insert");
     runtime.run_tick(2).await.expect("right delta tick");
 
-    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 2).await;
     assert_eq!(
         join_rows(&snapshot),
         vec![(1, "west".to_string(), 50), (3, "west".to_string(), 70)]
@@ -5946,9 +5950,9 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
     let recovered_handle = recovery_registry
         .get("mv_ordered_west_orders")
         .expect("recovered materialized view");
-    let recovered_snapshot = recovered_handle
-        .arrow_snapshot_for(3)
-        .expect("recovered snapshot");
+    let recovered_snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 3)
+            .await;
     assert_eq!(
         join_rows(&recovered_snapshot),
         vec![(1, "west".to_string(), 50), (3, "west".to_string(), 70)]
@@ -5977,9 +5981,9 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
         .expect("append order insert");
     recovered.run_tick(4).await.expect("left delta tick");
 
-    let snapshot = recovered_handle
-        .arrow_snapshot_for(4)
-        .expect("post-insert snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 4)
+            .await;
     assert_eq!(
         join_rows(&snapshot),
         vec![
@@ -6090,7 +6094,8 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
     let handle = registry
         .get("mv_customer_amount_orders")
         .expect("materialized view");
-    let snapshot = handle.arrow_snapshot_for(1).expect("mv snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 1).await;
     assert_eq!(
         join_rows(&snapshot),
         vec![(1, "west".to_string(), 50), (2, "east".to_string(), 60)]
@@ -6115,7 +6120,8 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
         .expect("append customer insert");
     runtime.run_tick(2).await.expect("insert tick");
 
-    let snapshot = handle.arrow_snapshot_for(2).expect("mv snapshot");
+    let snapshot =
+        materialized_view_snapshot_for(handle.as_ref(), Arc::clone(&output_schema), 2).await;
     assert_eq!(
         join_rows(&snapshot),
         vec![
@@ -6152,9 +6158,9 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
     let recovered_handle = recovery_registry
         .get("mv_customer_amount_orders")
         .expect("recovered materialized view");
-    let recovered_snapshot = recovered_handle
-        .arrow_snapshot_for(3)
-        .expect("recovered snapshot");
+    let recovered_snapshot =
+        materialized_view_snapshot_for(recovered_handle.as_ref(), Arc::clone(&output_schema), 3)
+            .await;
     assert_eq!(
         join_rows(&recovered_snapshot),
         vec![
@@ -6458,8 +6464,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
             SourceColumn::new_nullable("extra", SourceDataType::Utf8, false),
         ],
     )
-    .expect("bid source definition")
-    .with_property(SOURCE_PRIMARY_KEY_PROPERTY, "id");
+    .expect("bid source definition");
     let auction_schema = auctions.to_arrow_schema();
     let bid_schema = bids.to_arrow_schema();
     let initial_auctions = RecordBatch::try_new(
@@ -8735,12 +8740,16 @@ async fn row_number_predicate_variants_use_slate_backed_columnar_operator_increm
     let equality = registry
         .get("mv_second_ranked_bids")
         .expect("equality materialized view");
+    let reversed_snapshot =
+        materialized_view_snapshot_for(reversed.as_ref(), Arc::clone(&output_schema), 1).await;
+    let equality_snapshot =
+        materialized_view_snapshot_for(equality.as_ref(), Arc::clone(&output_schema), 1).await;
     assert_eq!(
-        bid_topn_rows(&reversed.arrow_snapshot_for(1).expect("reversed snapshot")),
+        bid_topn_rows(&reversed_snapshot),
         vec![(1, 20, 20), (1, 30, 30), (2, 40, 15), (2, 50, 5)]
     );
     assert_eq!(
-        bid_topn_rows(&equality.arrow_snapshot_for(1).expect("equality snapshot")),
+        bid_topn_rows(&equality_snapshot),
         vec![(1, 20, 20), (2, 50, 5)]
     );
 
@@ -8760,12 +8769,13 @@ async fn row_number_predicate_variants_use_slate_backed_columnar_operator_increm
     runtime.run_tick(2).await.expect("insert tick");
 
     let expected_snapshot = vec![(1, 30, 30), (1, 99, 25), (2, 40, 15), (2, 50, 5)];
+    let reversed_snapshot =
+        materialized_view_snapshot_for(reversed.as_ref(), Arc::clone(&output_schema), 2).await;
+    let equality_snapshot =
+        materialized_view_snapshot_for(equality.as_ref(), Arc::clone(&output_schema), 2).await;
+    assert_eq!(bid_topn_rows(&reversed_snapshot), expected_snapshot);
     assert_eq!(
-        bid_topn_rows(&reversed.arrow_snapshot_for(2).expect("reversed snapshot")),
-        expected_snapshot
-    );
-    assert_eq!(
-        bid_topn_rows(&equality.arrow_snapshot_for(2).expect("equality snapshot")),
+        bid_topn_rows(&equality_snapshot),
         vec![(1, 99, 25), (2, 50, 5)]
     );
     let expected_delta = vec![(1, 20, 20, -1), (1, 99, 25, 1)];
@@ -9351,12 +9361,13 @@ async fn source_query_tables_can_be_limited_by_name() {
 }
 
 #[tokio::test]
-async fn source_query_tables_include_nexmark_aliases_when_unrestricted() {
+async fn source_query_tables_include_explicit_aliases_when_unrestricted() {
     let nexmark_bid = SourceDefinition::new(
         "nexmark_bid",
         vec![SourceColumn::new("id", SourceDataType::Int64)],
     )
-    .expect("nexmark_bid source definition");
+    .expect("nexmark_bid source definition")
+    .with_property(SOURCE_QUERY_ALIAS_PROPERTY, "bid");
     let mut sources = SourceRegistry::new();
     sources.register(nexmark_bid);
 

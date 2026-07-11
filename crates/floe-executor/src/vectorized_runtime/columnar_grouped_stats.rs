@@ -1904,12 +1904,7 @@ async fn grouped_stats_append_only_direct_count_compact_delta(
     }
 
     let output_row_capacity = input_row_count.saturating_mul(2).max(1024);
-    let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
-        columnar.output_zset.value_schema(),
-        &columnar.output_mapping,
-        &columnar.output_casts,
-        output_row_capacity,
-    )?;
+    let mut direct_builder = WeightedStatsOutputBuilder::for_state(columnar, output_row_capacity)?;
     let mut old_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
         Arc::clone(&columnar.aggregate_schema),
         columnar.group_count,
@@ -2071,12 +2066,7 @@ async fn grouped_stats_append_only_streaming_direct_count_compact_delta(
     write_append_only_compact_log: bool,
 ) -> Result<Vec<RecordBatch>> {
     let output_row_capacity = input_row_count.saturating_mul(2).max(1024);
-    let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
-        columnar.output_zset.value_schema(),
-        &columnar.output_mapping,
-        &columnar.output_casts,
-        output_row_capacity,
-    )?;
+    let mut direct_builder = WeightedStatsOutputBuilder::for_state(columnar, output_row_capacity)?;
     let mut writes = WriteBatch::new();
     let mut append_only_compact_log =
         AppendOnlyCompactGroupStateLogBuilder::with_capacity(input_row_count);
@@ -2853,12 +2843,7 @@ async fn apply_grouped_stats_delta(
     pending: PendingStatsGroupDeltas,
 ) -> Result<Vec<RecordBatch>> {
     let output_row_capacity = pending.len().saturating_mul(2).max(1024);
-    let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
-        columnar.output_zset.value_schema(),
-        &columnar.output_mapping,
-        &columnar.output_casts,
-        output_row_capacity,
-    )?;
+    let mut direct_builder = WeightedStatsOutputBuilder::for_state(columnar, output_row_capacity)?;
     let mut old_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
         Arc::clone(&columnar.aggregate_schema),
         columnar.group_count,
@@ -3310,12 +3295,7 @@ async fn apply_append_only_compact_grouped_stats_compact_delta(
     pending: PendingCompactStatsGroupDeltas,
 ) -> Result<Vec<RecordBatch>> {
     let output_row_capacity = pending.len().saturating_mul(2).max(1024);
-    let mut direct_builder = WeightedStatsOutputBuilder::with_capacity(
-        columnar.output_zset.value_schema(),
-        &columnar.output_mapping,
-        &columnar.output_casts,
-        output_row_capacity,
-    )?;
+    let mut direct_builder = WeightedStatsOutputBuilder::for_state(columnar, output_row_capacity)?;
     let mut old_aggregate_builder = AggregateStatsOutputBuilder::with_capacity(
         Arc::clone(&columnar.aggregate_schema),
         columnar.group_count,
@@ -6746,6 +6726,28 @@ struct WeightedStatsOutputBuilder {
 }
 
 impl WeightedStatsOutputBuilder {
+    fn for_state(
+        columnar: &ColumnarGroupedStatsMaterializedViewState,
+        capacity: usize,
+    ) -> Result<Self> {
+        if columnar.post_aggregate.is_some() {
+            return Ok(Self {
+                weighted_schema: weighted_snapshot_schema(&columnar.output_zset.value_schema())?,
+                output_mapping: Vec::new(),
+                output_casts: Vec::new(),
+                builders: Vec::new(),
+                weights: Int64Builder::with_capacity(0),
+                rows: 0,
+            });
+        }
+        Self::with_capacity(
+            columnar.output_zset.value_schema(),
+            &columnar.output_mapping,
+            &columnar.output_casts,
+            capacity,
+        )
+    }
+
     fn with_capacity(
         schema: SchemaRef,
         output_mapping: &[usize],
@@ -6781,6 +6783,9 @@ impl WeightedStatsOutputBuilder {
         aggregate_values: &[AggregateValue],
         weight: i64,
     ) -> Result<()> {
+        if self.builders.is_empty() {
+            bail!("direct grouped-stats output is disabled for a post-aggregate plan");
+        }
         for (output_idx, source_idx) in self.output_mapping.iter().copied().enumerate() {
             let output_cast = self.output_casts[output_idx];
             if source_idx < group_count {
@@ -6811,6 +6816,9 @@ impl WeightedStatsOutputBuilder {
         state: &CompactGroupState,
         weight: i64,
     ) -> Result<()> {
+        if self.builders.is_empty() {
+            bail!("direct grouped-stats output is disabled for a post-aggregate plan");
+        }
         for (output_idx, source_idx) in self.output_mapping.iter().copied().enumerate() {
             let output_cast = self.output_casts[output_idx];
             if source_idx < group_count {
