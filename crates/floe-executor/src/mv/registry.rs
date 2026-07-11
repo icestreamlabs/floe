@@ -11,9 +11,6 @@ use dbsp::LogicalWorkSnapshot;
 use dbsp::handles::ZSetHandle;
 use dbsp::storage::KeyValueTable;
 use tokio::sync::watch;
-use tracing::field;
-
-pub use super::dbsp_state::DbspPersistedState;
 
 fn read_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockReadGuard<'a, T> {
     match lock.read() {
@@ -108,15 +105,21 @@ pub struct MaterializedViewHandle {
     state_row_count_version: RwLock<Option<i64>>,
     state_authoritative: RwLock<bool>,
     watermark: RwLock<Option<Timestamp>>,
-    arrow_snapshots: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
+    snapshots: RwLock<BTreeMap<i64, MaterializedViewSnapshot>>,
     arrow_deltas: RwLock<BTreeMap<i64, Arc<Vec<RecordBatch>>>>,
-    dbsp_state: RwLock<Option<DbspPersistedState>>,
-    columnar_storage: RwLock<Option<ColumnarMaterializedViewStorage>>,
     published_versions: PublishedVersionIndex,
-    versions: RwLock<HashMap<i64, ZSetHandle>>,
     logical_work: RwLock<BTreeMap<i64, LogicalWorkSnapshot>>,
     commit_visibility_barrier: RwLock<bool>,
     retention_keep_last: Option<usize>,
+}
+
+#[derive(Clone)]
+enum MaterializedViewSnapshot {
+    Arrow(Arc<Vec<RecordBatch>>),
+    Columnar {
+        handle: ZSetHandle,
+        storage: ColumnarMaterializedViewStorage,
+    },
 }
 
 #[derive(Clone)]
@@ -230,12 +233,9 @@ impl MaterializedViewHandle {
             state_row_count_version: RwLock::new(None),
             state_authoritative: RwLock::new(false),
             watermark: RwLock::new(None),
-            arrow_snapshots: RwLock::new(BTreeMap::new()),
+            snapshots: RwLock::new(BTreeMap::new()),
             arrow_deltas: RwLock::new(BTreeMap::new()),
-            dbsp_state: RwLock::new(None),
-            columnar_storage: RwLock::new(None),
             published_versions: PublishedVersionIndex::new(tx),
-            versions: RwLock::new(HashMap::new()),
             logical_work: RwLock::new(BTreeMap::new()),
             commit_visibility_barrier: RwLock::new(true),
             retention_keep_last,
@@ -329,9 +329,8 @@ impl MaterializedViewHandle {
             .try_into()
             .unwrap_or(i64::MAX);
         {
-            let mut snapshots =
-                write_lock(&self.arrow_snapshots, "materialized view arrow snapshots");
-            snapshots.insert(version, Arc::new(snapshot));
+            write_lock(&self.snapshots, "materialized view snapshots")
+                .insert(version, MaterializedViewSnapshot::Arrow(Arc::new(snapshot)));
         }
         {
             let mut deltas = write_lock(&self.arrow_deltas, "materialized view arrow deltas");
@@ -357,9 +356,12 @@ impl MaterializedViewHandle {
     }
 
     pub fn arrow_snapshot_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
-        read_lock(&self.arrow_snapshots, "materialized view arrow snapshots")
+        read_lock(&self.snapshots, "materialized view snapshots")
             .get(&version)
-            .cloned()
+            .and_then(|snapshot| match snapshot {
+                MaterializedViewSnapshot::Arrow(batches) => Some(Arc::clone(batches)),
+                MaterializedViewSnapshot::Columnar { .. } => None,
+            })
     }
 
     pub fn arrow_delta_for(&self, version: i64) -> Option<Arc<Vec<RecordBatch>>> {
@@ -373,45 +375,18 @@ impl MaterializedViewHandle {
             .map(|batches| batches.iter().map(RecordBatch::num_rows).sum())
     }
 
-    pub fn set_columnar_storage(&self, storage: ColumnarMaterializedViewStorage) {
-        *write_lock(&self.columnar_storage, "materialized view columnar storage") = Some(storage);
-    }
-
-    pub fn columnar_storage(&self) -> Option<ColumnarMaterializedViewStorage> {
-        read_lock(&self.columnar_storage, "materialized view columnar storage").clone()
-    }
-
-    pub fn set_dbsp_state(&self, state: DbspPersistedState) {
-        let span = tracing::debug_span!(
-            "materialize",
-            view = %self.name,
-            namespace = %state.namespace(),
-            version = field::Empty
-        );
-        let _enter = span.enter();
-        span.record("version", state.version());
-        tracing::debug!("materialized view DBSP state updated");
-        *write_lock(&self.dbsp_state, "materialized view DBSP state") = Some(state);
-    }
-
-    pub fn dbsp_state(&self) -> Option<DbspPersistedState> {
-        read_lock(&self.dbsp_state, "materialized view DBSP state").clone()
-    }
-
-    pub fn publish_version(&self, version: i64, handle: ZSetHandle) {
-        let namespace = handle.ns.clone();
-        {
-            let mut guard = write_lock(&self.versions, "materialized view versions");
-            guard.insert(version, handle);
-        }
-        self.record_latest_version(version);
-        self.prune_retained_versions();
-        tracing::debug!(
-            view = %self.name,
-            version,
-            namespace = %namespace,
-            "materialized view version recorded"
-        );
+    pub(crate) fn columnar_storage_for(
+        &self,
+        version: i64,
+    ) -> Option<(ZSetHandle, ColumnarMaterializedViewStorage)> {
+        read_lock(&self.snapshots, "materialized view snapshots")
+            .get(&version)
+            .and_then(|snapshot| match snapshot {
+                MaterializedViewSnapshot::Columnar { handle, storage } => {
+                    Some((handle.clone(), storage.clone()))
+                }
+                MaterializedViewSnapshot::Arrow(_) => None,
+            })
     }
 
     pub fn publish_columnar_version(
@@ -422,11 +397,13 @@ impl MaterializedViewHandle {
         row_count: usize,
         delta: Vec<RecordBatch>,
     ) {
-        self.set_columnar_storage(storage);
-        {
-            let mut guard = write_lock(&self.versions, "materialized view versions");
-            guard.insert(version, handle.clone());
-        }
+        write_lock(&self.snapshots, "materialized view snapshots").insert(
+            version,
+            MaterializedViewSnapshot::Columnar {
+                handle: handle.clone(),
+                storage,
+            },
+        );
         {
             let mut deltas = write_lock(&self.arrow_deltas, "materialized view arrow deltas");
             deltas.insert(version, Arc::new(delta));
@@ -453,16 +430,6 @@ impl MaterializedViewHandle {
             namespace = %handle.ns,
             rows = row_count,
             "materialized view columnar version recorded"
-        );
-    }
-
-    pub fn publish_logical_version(&self, version: i64) {
-        self.record_latest_version(version);
-        self.prune_retained_versions();
-        tracing::debug!(
-            view = %self.name,
-            version,
-            "materialized view logical version recorded"
         );
     }
 
@@ -528,20 +495,6 @@ impl MaterializedViewHandle {
         )
     }
 
-    pub fn handle_for_version(&self, version: i64) -> Option<ZSetHandle> {
-        read_lock(&self.versions, "materialized view versions")
-            .get(&version)
-            .cloned()
-    }
-
-    pub fn handle_at_or_before_version(&self, version: i64) -> Option<ZSetHandle> {
-        read_lock(&self.versions, "materialized view versions")
-            .iter()
-            .filter(|(candidate, _)| **candidate <= version)
-            .max_by_key(|(candidate, _)| *candidate)
-            .map(|(_, handle)| handle.clone())
-    }
-
     fn prune_retained_versions(&self) {
         let Some(keep_last) = self.retention_keep_last else {
             return;
@@ -553,12 +506,10 @@ impl MaterializedViewHandle {
         if removed_versions.is_empty() {
             return;
         }
-        let mut handles = write_lock(&self.versions, "materialized view versions");
         let mut logical_work = write_lock(&self.logical_work, "materialized view logical work");
-        let mut snapshots = write_lock(&self.arrow_snapshots, "materialized view arrow snapshots");
+        let mut snapshots = write_lock(&self.snapshots, "materialized view snapshots");
         let mut deltas = write_lock(&self.arrow_deltas, "materialized view arrow deltas");
         for version in removed_versions {
-            handles.remove(&version);
             logical_work.remove(&version);
             snapshots.remove(&version);
             deltas.remove(&version);

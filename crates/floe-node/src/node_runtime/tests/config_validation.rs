@@ -354,7 +354,7 @@ fn runtime_failure_recovers_poisoned_state_lock() {
 fn collect_mv_versions_for_commit_uses_logical_overlay_versions() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let handle = registry.register("mv_overlay".to_string());
-    handle.publish_logical_version(7);
+    handle.publish_arrow_version(7, Vec::new(), Vec::new());
 
     let mut last_versions = HashMap::new();
     let committed = collect_mv_versions_for_commit(&registry, &mut last_versions);
@@ -377,7 +377,7 @@ fn collect_mv_versions_for_commit_uses_logical_overlay_versions() {
 async fn mv_visibility_wait_returns_immediately_for_visible_versions() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let handle = registry.register("mv_visible".to_string());
-    handle.publish_logical_version(4);
+    handle.publish_arrow_version(4, Vec::new(), Vec::new());
     let cancel = CancellationToken::new();
 
     let waited = wait_for_materialized_views_visible(&registry, 4, &cancel)
@@ -404,14 +404,14 @@ async fn mv_visibility_wait_blocks_until_target_version_is_published() {
         "wait should remain pending before any version is published"
     );
 
-    handle.publish_logical_version(2);
+    handle.publish_arrow_version(2, Vec::new(), Vec::new());
     tokio::task::yield_now().await;
     assert!(
         !wait_task.is_finished(),
         "wait should remain pending before target version is published"
     );
 
-    handle.publish_logical_version(3);
+    handle.publish_arrow_version(3, Vec::new(), Vec::new());
     assert_eq!(wait_task.await.expect("join visibility wait").unwrap(), 1);
 }
 

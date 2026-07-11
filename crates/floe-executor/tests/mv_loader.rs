@@ -64,11 +64,6 @@ async fn load_or_register_mv_registers_arrow_only_view() {
         .await
         .expect("load overlay-only mv");
 
-    assert!(
-        handle.dbsp_state().is_none(),
-        "Arrow-only MV should not force SlateDB state hydration"
-    );
-
     let df = session
         .sql("SELECT auction, bidder, price FROM mv_q1 ORDER BY auction")
         .await
@@ -140,7 +135,7 @@ async fn mv_loader_supports_as_of_filter() {
 }
 
 #[tokio::test]
-async fn mv_loader_does_not_hydrate_dbsp_state_after_registry_restart() {
+async fn mv_loader_does_not_restore_unpublished_versions_after_registry_restart() {
     let fixture = build_q1_fixture("mv-loader-restart", vec![(1, 2, 100), (2, 3, 140)]).await;
     let schema = Arc::clone(&fixture.schema);
     let restarted_registry = Arc::new(MaterializedViewRegistry::new());

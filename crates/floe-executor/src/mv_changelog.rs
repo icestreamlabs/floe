@@ -14,9 +14,6 @@ use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::encoded_batch::{
-    encoded_deltas_to_weighted_arrow_batches, encoded_snapshot_to_arrow_batches,
-};
 use crate::metrics;
 use crate::mv::registry::{MaterializedViewHandle, MaterializedViewRegistry};
 use crate::mv::runtime::MaterializedView;
@@ -369,9 +366,9 @@ async fn materialize_snapshot_batches<M: MaterializedView>(
     {
         return arrow_snapshot_batches_to_changelog(snapshot, schema, version, version_time);
     }
-    let snapshot = mv.snapshot_for(version).await?;
-    let batches = encoded_snapshot_to_arrow_batches(&snapshot, Arc::clone(&schema), None)?;
-    snapshot_batches_to_changelog(batches, schema, version, version_time)
+    Err(anyhow!(
+        "materialized view version {version} has no Arrow or columnar snapshot"
+    ))
 }
 
 async fn materialize_delta_batches<M: MaterializedView>(
@@ -384,15 +381,10 @@ async fn materialize_delta_batches<M: MaterializedView>(
     if let Some(delta) = mv.arrow_delta_for(version) {
         return arrow_delta_batches_to_changelog(delta, schema, version, version_time);
     }
-    let delta = mv.delta_for(version).await?;
-    let batches = encoded_deltas_to_weighted_arrow_batches(&delta, Arc::clone(&schema))?;
-    tracing::debug!(
-        version,
-        rows = delta.len(),
-        total_ms = total_start.elapsed().as_millis() as u64,
-        "mv changelog materialized encoded delta"
-    );
-    arrow_delta_batches_to_changelog(Arc::new(batches), schema, version, version_time)
+    Err(anyhow!(
+        "materialized view version {version} has no Arrow delta after {} ms",
+        total_start.elapsed().as_millis()
+    ))
 }
 
 fn arrow_snapshot_batches_to_changelog(

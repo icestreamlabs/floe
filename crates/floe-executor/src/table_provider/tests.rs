@@ -124,7 +124,7 @@ async fn materialized_view_provider_emits_rows() {
 }
 
 #[tokio::test]
-async fn materialized_view_provider_hides_unpublished_dbsp_state() {
+async fn materialized_view_provider_returns_empty_for_unpublished_view() {
     let registry = Arc::new(MaterializedViewRegistry::new());
     registry.register("mv_unpublished_state");
 
@@ -325,7 +325,7 @@ async fn materialized_view_provider_invalidates_stale_authoritative_count_after_
 {
     let registry = Arc::new(MaterializedViewRegistry::new());
     let view = registry.register("mv_stale_count_recovery");
-    view.publish_logical_version(0);
+    view.publish_arrow_version(0, Vec::new(), Vec::new());
     assert!(view.seed_authoritative_row_count_if_latest(0, 0));
 
     let schema = id_schema(true);

@@ -11,9 +11,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use dbsp::collections::SlateBackedColumnarZSet;
 
 use crate::columnar_snapshot::{columnar_zset_positive_row_count, columnar_zset_to_arrow_snapshot};
-use crate::encoded_batch::{encoded_snapshot_row_count, encoded_snapshot_to_arrow_batches};
 use crate::mv::registry::MaterializedViewRegistry;
-use crate::mv::runtime::MaterializedView;
 
 use super::MV_VERSION_COLUMN;
 use super::SnapshotScanExec;
@@ -122,15 +120,16 @@ impl MaterializedViewTableProvider {
                 mv_version_index,
             );
         }
-        if let Some((snapshot, version)) = self.load_encoded_snapshot(as_of_version, limit).await? {
-            return build_batches_from_arrow_snapshot(
-                snapshot,
-                Arc::clone(&self.schema),
-                projection,
-                limit,
-                version,
-                mv_version_index,
-            );
+        if let Some(view) = self.registry.get(&self.view_name)
+            && let Some(version) = as_of_version.or_else(|| {
+                view.latest_version()
+                    .and_then(|version| u64::try_from(version).ok())
+            })
+        {
+            return Err(DataFusionError::Execution(format!(
+                "materialized view '{}' version {version} has no Arrow or columnar snapshot",
+                self.view_name
+            )));
         }
         build_batches_from_arrow_snapshot(
             Arc::new(Vec::new()),
@@ -197,10 +196,7 @@ impl MaterializedViewTableProvider {
         };
         let target_version_i64 = i64::try_from(target_version)
             .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        let Some(handle) = view.handle_for_version(target_version_i64) else {
-            return Ok(None);
-        };
-        let Some(storage) = view.columnar_storage() else {
+        let Some((handle, storage)) = view.columnar_storage_for(target_version_i64) else {
             return Ok(None);
         };
         if storage.schema().as_ref() != self.data_schema.as_ref() {
@@ -235,44 +231,6 @@ impl MaterializedViewTableProvider {
             "materialized view loaded rows"
         );
         Ok(Some((Arc::new(batches), target_version)))
-    }
-
-    async fn load_encoded_snapshot(
-        &self,
-        as_of_version: Option<u64>,
-        limit: Option<usize>,
-    ) -> DFResult<Option<(Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>, u64)>> {
-        let Some(view) = self.registry.get(&self.view_name) else {
-            return Ok(None);
-        };
-        let latest_visible_version = view
-            .latest_version()
-            .and_then(|version| u64::try_from(version).ok());
-        let Some(target_version) = as_of_version.or(latest_visible_version) else {
-            return Ok(None);
-        };
-        let target_version_i64 = i64::try_from(target_version)
-            .map_err(|err| DataFusionError::Execution(err.to_string()))?;
-        let snapshot = view
-            .snapshot_for(target_version_i64)
-            .await
-            .map_err(super::helpers::to_datafusion_error)?;
-        let row_count = encoded_snapshot_row_count(&snapshot);
-        let batches = encoded_snapshot_to_arrow_batches(&snapshot, self.data_schema(), limit)
-            .map_err(super::helpers::to_datafusion_error)?;
-        view.seed_authoritative_row_count_if_latest(target_version, row_count);
-        tracing::info!(
-            view = %self.view_name,
-            version = target_version,
-            rows = row_count.min(limit.unwrap_or(usize::MAX)),
-            storage = "encoded_snapshot",
-            "materialized view loaded rows"
-        );
-        Ok(Some((Arc::new(batches), target_version)))
-    }
-
-    fn data_schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
-        Arc::clone(&self.data_schema)
     }
 
     fn fast_count_batches(
