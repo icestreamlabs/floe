@@ -367,7 +367,7 @@ impl SlateBackedColumnarIndexedZSet {
         if self.current_lookup_enabled {
             let phase_start = profile::start();
             let output = self
-                .lookup_current_key_batches_with_historical_fallback(&lookup_keys)
+                .lookup_current_key_batches_with_historical_backfill(&lookup_keys)
                 .await;
             profile::record_since("columnar_index.lookup.current", phase_start);
             profile::record_since("columnar_index.lookup.total", total_start);
@@ -615,7 +615,7 @@ impl SlateBackedColumnarIndexedZSet {
             .map(Some)
     }
 
-    async fn lookup_current_key_batches_with_historical_fallback(
+    async fn lookup_current_key_batches_with_historical_backfill(
         &self,
         lookup_keys: &LookupKeySet,
     ) -> Result<ColumnarZSet> {

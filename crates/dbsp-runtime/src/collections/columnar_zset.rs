@@ -873,21 +873,6 @@ impl SlateBackedColumnarI64ZSet {
         self.load_manifest_record(version).await
     }
 
-    #[allow(dead_code)]
-    pub async fn materialize_all_segments_for_debug(&self) -> Result<HashMap<Vec<i64>, i64>> {
-        let mut aggregate = HashMap::new();
-        let mut segment_ids = self
-            .segment_store
-            .list_segment_ids()
-            .await
-            .context("list columnar zset segments")?;
-        segment_ids.sort_unstable();
-        for segment_id in segment_ids {
-            apply_delta_to_map(&mut aggregate, self.read_segment_delta(segment_id).await?)?;
-        }
-        Ok(aggregate)
-    }
-
     fn validate_delta(&self, delta: &ColumnarI64ZSet) -> Result<()> {
         if delta.schema.as_ref() != self.schema.as_ref() {
             bail!("columnar zset delta schema mismatch");
