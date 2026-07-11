@@ -391,12 +391,8 @@ impl SlateBackedColumnarIndexedZSet {
         self.lookup_key_ranges(lookup_keys, &mut inline_batches, &mut refs_by_segment)
             .await?;
         if !self.range_lookup_only {
-            self.lookup_key_buckets(
-                &lookup_keys.buckets,
-                &mut inline_batches,
-                &mut refs_by_segment,
-            )
-            .await?;
+            self.lookup_key_buckets(&lookup_keys.buckets, &mut inline_batches)
+                .await?;
         }
         profile::record_since("columnar_index.lookup.collect_postings", phase_start);
 
@@ -426,22 +422,15 @@ impl SlateBackedColumnarIndexedZSet {
         &self,
         key_buckets: &HashMap<u16, HashSet<Vec<u8>>>,
         inline_batches: &mut Vec<RecordBatch>,
-        refs_by_segment: &mut HashMap<u64, Vec<u32>>,
     ) -> Result<()> {
         for (bucket, wanted_keys) in key_buckets {
             let mut visit_entry = |entry_key: &[u8], entry_value: &[u8]| -> Result<()> {
-                let segment_id = self.segment_id_from_bucket_key(entry_key)?;
-                match decode_bucket_lookup_rows(entry_value, wanted_keys, &self.weighted_schema)? {
-                    BucketLookupRows::Inline(batches) => inline_batches.extend(batches),
-                    BucketLookupRows::Legacy(row_indices) => {
-                        if !row_indices.is_empty() {
-                            refs_by_segment
-                                .entry(segment_id)
-                                .or_default()
-                                .extend(row_indices);
-                        }
-                    }
-                }
+                self.segment_id_from_bucket_key(entry_key)?;
+                inline_batches.extend(decode_bucket_lookup_rows(
+                    entry_value,
+                    wanted_keys,
+                    &self.weighted_schema,
+                )?);
                 Ok(())
             };
             self.table
@@ -860,11 +849,6 @@ enum CurrentIndexMutation {
     Put { key: Vec<u8>, value: Vec<u8> },
 }
 
-enum BucketLookupRows {
-    Inline(Vec<RecordBatch>),
-    Legacy(Vec<u32>),
-}
-
 enum RangeLookupRows {
     Inline(Vec<RecordBatch>),
     SegmentRefs(Vec<u32>),
@@ -1221,16 +1205,9 @@ fn decode_bucket_lookup_rows(
     bytes: &[u8],
     wanted_keys: &HashSet<Vec<u8>>,
     schema: &SchemaRef,
-) -> Result<BucketLookupRows> {
+) -> Result<Vec<RecordBatch>> {
     if !bytes.starts_with(INDEX_BUCKET_INLINE_MAGIC) {
-        let mut row_indices = Vec::new();
-        decode_bucket_postings_for_keys(bytes, wanted_keys, |row_index, weight| {
-            if weight != 0 {
-                row_indices.push(row_index);
-            }
-            Ok(())
-        })?;
-        return Ok(BucketLookupRows::Legacy(row_indices));
+        bail!("columnar index inline bucket payload magic mismatch");
     }
 
     let mut cursor = INDEX_BUCKET_INLINE_MAGIC.len();
@@ -1270,7 +1247,7 @@ fn decode_bucket_lookup_rows(
         Ok(())
     })?;
     if local_row_indices.is_empty() {
-        return Ok(BucketLookupRows::Inline(Vec::new()));
+        return Ok(Vec::new());
     }
 
     let (decoded_schema, batches) =
@@ -1282,10 +1259,7 @@ fn decode_bucket_lookup_rows(
         [batch] => batch.clone(),
         _ => concat_batches(schema, &batches).context("concat columnar index inline rows")?,
     };
-    Ok(BucketLookupRows::Inline(vec![take_batch_rows(
-        &batch,
-        &local_row_indices,
-    )?]))
+    Ok(vec![take_batch_rows(&batch, &local_row_indices)?])
 }
 
 fn decode_range_lookup_rows(
@@ -1344,10 +1318,11 @@ fn decode_range_lookup_rows(
         };
     }
     if inline_rows {
-        match decode_bucket_lookup_rows(payload, wanted_keys, schema)? {
-            BucketLookupRows::Inline(batches) => Ok(RangeLookupRows::Inline(batches)),
-            BucketLookupRows::Legacy(_) => bail!("columnar range index nested legacy payload"),
-        }
+        Ok(RangeLookupRows::Inline(decode_bucket_lookup_rows(
+            payload,
+            wanted_keys,
+            schema,
+        )?))
     } else {
         let mut row_indices = Vec::new();
         decode_bucket_postings_for_keys(payload, wanted_keys, |row_index, weight| {
