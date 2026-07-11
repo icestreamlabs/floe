@@ -56,38 +56,31 @@ where
             return Err(anyhow!("timestamp cannot be negative"));
         }
 
-        loop {
-            let (fetch_key, fallback_value) = {
-                let state = self.read_state();
-                if let Some(value) = state.pending_data.get(&timestamp) {
-                    return Ok(value.clone());
-                } else if let Some(value) = state.data_cache.get(&timestamp) {
-                    return Ok(value.clone());
-                } else {
-                    (
-                        Some(self.core.encode_data_key(timestamp)?),
-                        Some(state.default_at(timestamp)),
-                    )
-                }
-            };
-
-            if let Some(key) = fetch_key {
-                if let Some(bytes) = self.core.table.get_bytes(&key).await? {
-                    let value: T = encoding::decode(bytes.as_ref())
-                        .context("unable to decode stream value")?;
-                    {
-                        let mut state = self.write_state();
-                        state.data_cache.insert(timestamp, value.clone());
-                    }
-                    return Ok(value);
-                } else if let Some(value) = self.derived_value_at(timestamp).await? {
-                    self.set_value_at_in_place(timestamp, value.clone());
-                    return Ok(value);
-                } else if let Some(default_value) = fallback_value {
-                    return Ok(default_value);
-                }
+        let default_value = {
+            let state = self.read_state();
+            if let Some(value) = state.pending_data.get(&timestamp) {
+                return Ok(value.clone());
             }
+            if let Some(value) = state.data_cache.get(&timestamp) {
+                return Ok(value.clone());
+            }
+            state.default_at(timestamp)
+        };
+
+        let key = self.core.encode_data_key(timestamp)?;
+        if let Some(bytes) = self.core.table.get_bytes(&key).await? {
+            let value: T =
+                encoding::decode(bytes.as_ref()).context("unable to decode stream value")?;
+            self.write_state()
+                .data_cache
+                .insert(timestamp, value.clone());
+            return Ok(value);
         }
+        if let Some(value) = self.derived_value_at(timestamp).await? {
+            self.set_value_at_in_place(timestamp, value.clone());
+            return Ok(value);
+        }
+        Ok(default_value)
     }
 
     pub async fn latest(&mut self) -> Result<T> {
