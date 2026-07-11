@@ -44,6 +44,36 @@ struct StateColumns {
     counts: Int64Array,
 }
 
+struct CountRowsBuilder {
+    keys: Int64Builder,
+    counts: Int64Builder,
+    weights: Int64Builder,
+}
+
+impl CountRowsBuilder {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            keys: Int64Builder::with_capacity(capacity),
+            counts: Int64Builder::with_capacity(capacity),
+            weights: Int64Builder::with_capacity(capacity),
+        }
+    }
+
+    fn append(&mut self, key: i64, count: i64, weight: i64) {
+        self.keys.append_value(key);
+        self.counts.append_value(count);
+        self.weights.append_value(weight);
+    }
+
+    fn finish(mut self) -> Result<ColumnarI64ZSet> {
+        count_zset_from_arrays(
+            self.keys.finish(),
+            self.counts.finish(),
+            self.weights.finish(),
+        )
+    }
+}
+
 impl SlateBackedColumnarCountByKeyOp {
     pub async fn new(table: Arc<dyn KeyValueTable>, namespace: impl Into<String>) -> Result<Self> {
         let namespace = namespace.into();
@@ -308,15 +338,9 @@ fn count_update_from_sorted_combined_kernel(
     }
 
     let group_capacity = sorted_keys.len();
-    let mut snapshot_keys = Int64Builder::with_capacity(group_capacity);
-    let mut snapshot_counts = Int64Builder::with_capacity(group_capacity);
-    let mut snapshot_weights = Int64Builder::with_capacity(group_capacity);
-    let mut state_keys = Int64Builder::with_capacity(group_capacity.saturating_mul(2));
-    let mut state_counts = Int64Builder::with_capacity(group_capacity.saturating_mul(2));
-    let mut state_weights = Int64Builder::with_capacity(group_capacity.saturating_mul(2));
-    let mut output_keys = Int64Builder::with_capacity(group_capacity.saturating_mul(2));
-    let mut output_counts = Int64Builder::with_capacity(group_capacity.saturating_mul(2));
-    let mut output_weights = Int64Builder::with_capacity(group_capacity.saturating_mul(2));
+    let mut snapshot = CountRowsBuilder::with_capacity(group_capacity);
+    let mut state = CountRowsBuilder::with_capacity(group_capacity.saturating_mul(2));
+    let mut output = CountRowsBuilder::with_capacity(group_capacity.saturating_mul(2));
 
     let mut current_key = sorted_keys.value(0);
     let mut old = 0_i64;
@@ -326,15 +350,9 @@ fn count_update_from_sorted_combined_kernel(
         let key = sorted_keys.value(row_idx);
         if key != current_key {
             append_count_update_group(
-                &mut snapshot_keys,
-                &mut snapshot_counts,
-                &mut snapshot_weights,
-                &mut state_keys,
-                &mut state_counts,
-                &mut state_weights,
-                &mut output_keys,
-                &mut output_counts,
-                &mut output_weights,
+                &mut snapshot,
+                &mut state,
+                &mut output,
                 current_key,
                 old,
                 delta,
@@ -347,36 +365,18 @@ fn count_update_from_sorted_combined_kernel(
         delta = delta.saturating_add(sorted_deltas.value(row_idx));
     }
     append_count_update_group(
-        &mut snapshot_keys,
-        &mut snapshot_counts,
-        &mut snapshot_weights,
-        &mut state_keys,
-        &mut state_counts,
-        &mut state_weights,
-        &mut output_keys,
-        &mut output_counts,
-        &mut output_weights,
+        &mut snapshot,
+        &mut state,
+        &mut output,
         current_key,
         old,
         delta,
     );
 
     Ok(CountUpdate {
-        state_snapshot: count_zset_from_arrays(
-            snapshot_keys.finish(),
-            snapshot_counts.finish(),
-            snapshot_weights.finish(),
-        )?,
-        state_delta: count_zset_from_arrays(
-            state_keys.finish(),
-            state_counts.finish(),
-            state_weights.finish(),
-        )?,
-        output_delta: count_zset_from_arrays(
-            output_keys.finish(),
-            output_counts.finish(),
-            output_weights.finish(),
-        )?,
+        state_snapshot: snapshot.finish()?,
+        state_delta: state.finish()?,
+        output_delta: output.finish()?,
     })
 }
 
@@ -393,17 +393,10 @@ fn append_grouped_weight(
     weights.append_value(weight);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn append_count_update_group(
-    snapshot_keys: &mut Int64Builder,
-    snapshot_counts: &mut Int64Builder,
-    snapshot_weights: &mut Int64Builder,
-    state_keys: &mut Int64Builder,
-    state_counts: &mut Int64Builder,
-    state_weights: &mut Int64Builder,
-    output_keys: &mut Int64Builder,
-    output_counts: &mut Int64Builder,
-    output_weights: &mut Int64Builder,
+    snapshot: &mut CountRowsBuilder,
+    state: &mut CountRowsBuilder,
+    output: &mut CountRowsBuilder,
     key: i64,
     old: i64,
     delta: i64,
@@ -412,24 +405,17 @@ fn append_count_update_group(
 
     if old != new {
         if old != 0 {
-            append_count_row(state_keys, state_counts, state_weights, key, old, -1);
-            append_count_row(output_keys, output_counts, output_weights, key, old, -1);
+            state.append(key, old, -1);
+            output.append(key, old, -1);
         }
         if new != 0 {
-            append_count_row(state_keys, state_counts, state_weights, key, new, 1);
-            append_count_row(output_keys, output_counts, output_weights, key, new, 1);
+            state.append(key, new, 1);
+            output.append(key, new, 1);
         }
     }
 
     if new != 0 {
-        append_count_row(
-            snapshot_keys,
-            snapshot_counts,
-            snapshot_weights,
-            key,
-            new,
-            1,
-        );
+        snapshot.append(key, new, 1);
     }
 }
 
@@ -464,19 +450,6 @@ fn count_zset_from_arrays(
     )
     .context("build columnar count zset batch")?;
     ColumnarI64ZSet::try_new(schema, 2, vec![batch])
-}
-
-fn append_count_row(
-    keys: &mut Int64Builder,
-    counts: &mut Int64Builder,
-    weights: &mut Int64Builder,
-    key: i64,
-    count: i64,
-    weight: i64,
-) {
-    keys.append_value(key);
-    counts.append_value(count);
-    weights.append_value(weight);
 }
 
 fn repeated_i64(value: i64, len: usize) -> Int64Array {
