@@ -622,25 +622,8 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
         resolve_join_key_indices(&left.schema, &right.schema, &join_key_pairs)
             .context("resolve columnar join index keys")?,
     );
-    let shared_source_input =
-        left.is_source() && right.is_source() && left.source_name() == right.source_name();
-    let (left_namespace, right_namespace) = if shared_source_input {
-        (
-            format!(
-                "{mv_namespace}/columnar/join/left/{}/input",
-                left.input_name
-            ),
-            format!(
-                "{mv_namespace}/columnar/join/right/{}/input",
-                right.input_name
-            ),
-        )
-    } else {
-        (
-            join_input_namespace(&mv_namespace, "left", &left),
-            join_input_namespace(&mv_namespace, "right", &right),
-        )
-    };
+    let left_namespace = join_input_namespace(&mv_namespace, &left);
+    let right_namespace = join_input_namespace(&mv_namespace, &right);
     let output_namespace = format!("{mv_namespace}/columnar/join/output");
 
     let output_zset = SlateBackedColumnarZSet::new(
@@ -759,8 +742,7 @@ async fn build_columnar_join_materialized_view_state_in_namespace_with_options(
     })
 }
 
-fn join_input_namespace(mv_namespace: &str, side: &str, input: &ColumnarJoinInputPlan) -> String {
-    let _ = side;
+fn join_input_namespace(mv_namespace: &str, input: &ColumnarJoinInputPlan) -> String {
     format!("{mv_namespace}/columnar/join/{}/input", input.input_name)
 }
 

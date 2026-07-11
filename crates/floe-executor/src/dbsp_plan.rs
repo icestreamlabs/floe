@@ -531,7 +531,6 @@ fn direct_projection_column_index(expr: &Expr, schema: &RowSchema) -> Option<usi
 }
 
 fn resolve_schema_column_index(schema: &RowSchema, column: &Column) -> Option<usize> {
-    let _ = &column.relation;
     schema.field_index(column.name.as_str())
 }
 

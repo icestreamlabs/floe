@@ -769,7 +769,7 @@ async fn assert_incremental_plan_rejected(
 }
 
 #[tokio::test]
-async fn fallback_only_shapes_are_rejected_without_incremental_operators() {
+async fn unsupported_shapes_are_rejected_without_incremental_operators() {
     let mut sources = SourceRegistry::new();
     sources.register(
         SourceDefinition::new(
