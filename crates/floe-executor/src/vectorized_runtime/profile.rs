@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Default)]
@@ -10,6 +10,13 @@ struct PhaseMetric {
 
 static PHASE_PROFILE: OnceLock<Mutex<BTreeMap<&'static str, PhaseMetric>>> = OnceLock::new();
 static PHASE_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn phase_profile() -> MutexGuard<'static, BTreeMap<&'static str, PhaseMetric>> {
+    PHASE_PROFILE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(super) fn enabled() -> bool {
     *PHASE_PROFILE_ENABLED
@@ -31,10 +38,7 @@ pub(super) fn record(label: &'static str, elapsed: Duration) {
     if !enabled() {
         return;
     }
-    let mut profile = PHASE_PROFILE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("columnar phase profile mutex poisoned");
+    let mut profile = phase_profile();
     let metric = profile.entry(label).or_default();
     metric.calls += 1;
     metric.elapsed += elapsed;
@@ -44,21 +48,14 @@ pub fn reset_columnar_phase_profile() {
     if !enabled() {
         return;
     }
-    PHASE_PROFILE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("columnar phase profile mutex poisoned")
-        .clear();
+    phase_profile().clear();
 }
 
 pub fn print_columnar_phase_profile(name: &str) {
     if !enabled() {
         return;
     }
-    let profile = PHASE_PROFILE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("columnar phase profile mutex poisoned");
+    let profile = phase_profile();
     let mut metrics = profile.iter().collect::<Vec<_>>();
     metrics.sort_by(|(_, left), (_, right)| right.elapsed.cmp(&left.elapsed));
     for (label, metric) in metrics {

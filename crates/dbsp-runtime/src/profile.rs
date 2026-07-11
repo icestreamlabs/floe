@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Default)]
@@ -10,6 +10,13 @@ struct PhaseMetric {
 
 static RUNTIME_PHASE_PROFILE: OnceLock<Mutex<BTreeMap<&'static str, PhaseMetric>>> =
     OnceLock::new();
+
+fn phase_profile() -> MutexGuard<'static, BTreeMap<&'static str, PhaseMetric>> {
+    RUNTIME_PHASE_PROFILE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(crate) fn enabled() -> bool {
     std::env::var_os("FLOE_PROFILE_COLUMNAR_PHASES").is_some()
@@ -30,10 +37,7 @@ pub(crate) fn record(label: &'static str, elapsed: Duration) {
     if !enabled() {
         return;
     }
-    let mut profile = RUNTIME_PHASE_PROFILE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("runtime phase profile mutex poisoned");
+    let mut profile = phase_profile();
     let metric = profile.entry(label).or_default();
     metric.calls += 1;
     metric.elapsed += elapsed;
@@ -43,21 +47,14 @@ pub fn reset_runtime_phase_profile() {
     if !enabled() {
         return;
     }
-    RUNTIME_PHASE_PROFILE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("runtime phase profile mutex poisoned")
-        .clear();
+    phase_profile().clear();
 }
 
 pub fn print_runtime_phase_profile(name: &str) {
     if !enabled() {
         return;
     }
-    let profile = RUNTIME_PHASE_PROFILE
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .expect("runtime phase profile mutex poisoned");
+    let profile = phase_profile();
     let mut metrics = profile.iter().collect::<Vec<_>>();
     metrics.sort_by(|(_, left), (_, right)| right.elapsed.cmp(&left.elapsed));
     for (label, metric) in metrics {
