@@ -34,19 +34,36 @@ pub(super) struct SpawnConnectorTasksConfig<'a> {
     pub(super) postgres_cdc_settings: floe_config::PostgresCdcConfig,
 }
 
-fn kafka_arrow_decode_config(
-    default_source: Option<&str>,
-    message_format: Option<&str>,
-    definitions: &[SourceDefinition],
-    required_columns_by_source_id: &[Option<Arc<[bool]>>],
-    query_batches_by_source_id: &[bool],
-    materialized_source_ids: &[bool],
-    kafka_metadata_journal_source_ids: &[usize],
+struct KafkaArrowDecodeRequest<'a> {
+    default_source: Option<&'a str>,
+    message_format: Option<&'a str>,
+    definitions: &'a [SourceDefinition],
+    required_columns_by_source_id: &'a [Option<Arc<[bool]>>],
+    query_batches_by_source_id: &'a [bool],
+    materialized_source_ids: &'a [bool],
+    kafka_metadata_journal_source_ids: &'a [usize],
     max_messages_per_tick: usize,
     max_batch: usize,
     max_per_source: usize,
     max_per_connector: usize,
+}
+
+fn kafka_arrow_decode_config(
+    request: KafkaArrowDecodeRequest<'_>,
 ) -> Option<floe_node_core::kafka_connector::KafkaArrowDecodeConfig> {
+    let KafkaArrowDecodeRequest {
+        default_source,
+        message_format,
+        definitions,
+        required_columns_by_source_id,
+        query_batches_by_source_id,
+        materialized_source_ids,
+        kafka_metadata_journal_source_ids,
+        max_messages_per_tick,
+        max_batch,
+        max_per_source,
+        max_per_connector,
+    } = request;
     let source = default_source?;
     let format_is_floe_json = message_format
         .map(|format| format.eq_ignore_ascii_case("floe_json"))
@@ -208,19 +225,19 @@ pub(super) fn spawn_connector_tasks(
                 };
                 let (commit_tx, commit_rx) = watch::channel(KafkaOffsetCommit::default());
                 kafka_commit_senders.push(commit_tx);
-                let arrow_decode = kafka_arrow_decode_config(
-                    default_source.as_deref(),
-                    format.as_deref(),
-                    &definitions,
-                    &required_columns_by_source_id,
-                    &query_batches_by_source_id,
-                    &materialized_source_ids,
-                    &kafka_metadata_journal_source_ids,
+                let arrow_decode = kafka_arrow_decode_config(KafkaArrowDecodeRequest {
+                    default_source: default_source.as_deref(),
+                    message_format: format.as_deref(),
+                    definitions: &definitions,
+                    required_columns_by_source_id: &required_columns_by_source_id,
+                    query_batches_by_source_id: &query_batches_by_source_id,
+                    materialized_source_ids: &materialized_source_ids,
+                    kafka_metadata_journal_source_ids: &kafka_metadata_journal_source_ids,
                     max_messages_per_tick,
-                    run_args.ingest_batch_size,
-                    run_args.ingest_batch_per_source,
-                    run_args.ingest_batch_per_connector,
-                );
+                    max_batch: run_args.ingest_batch_size,
+                    max_per_source: run_args.ingest_batch_per_source,
+                    max_per_connector: run_args.ingest_batch_per_connector,
+                });
                 let definitions = definitions.clone();
                 let failure_state = Arc::clone(&failure_state);
                 connector_handles.push(tokio::spawn(async move {

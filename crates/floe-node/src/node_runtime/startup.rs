@@ -320,12 +320,15 @@ pub(super) fn connectors_from_cli(args: &cli::RunArgs) -> Vec<ConnectorConfig> {
             default_source: args.input_source.clone(),
         });
     }
-    connectors.push(ConnectorConfig::Generator {
+    connectors
+}
+
+pub(super) fn default_generator_connector_from_cli(args: &cli::RunArgs) -> ConnectorConfig {
+    ConnectorConfig::Generator {
         name: None,
         events_per_second: Some(args.events_per_second),
         max_events: args.max_events,
-    });
-    connectors
+    }
 }
 
 pub(super) fn merge_sql_connectors(

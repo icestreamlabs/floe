@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn explicit_cli_connector_does_not_add_generator() {
+    let mut args = default_run_args();
+    args.kafka_brokers = Some("localhost:9092".to_string());
+    args.kafka_topics = vec!["events".to_string()];
+
+    let connectors = connectors_from_cli(&args);
+
+    assert_eq!(connectors.len(), 1);
+    assert!(matches!(connectors[0], ConnectorConfig::Kafka { .. }));
+}
+
+#[test]
+fn default_generator_is_created_separately_from_explicit_connectors() {
+    let mut args = default_run_args();
+    args.events_per_second = 25.0;
+    args.max_events = Some(100);
+
+    assert!(connectors_from_cli(&args).is_empty());
+    assert!(matches!(
+        default_generator_connector_from_cli(&args),
+        ConnectorConfig::Generator {
+            events_per_second: Some(25.0),
+            max_events: Some(100),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn source_journal_auto_skips_replayable_connector_sources() {
     let kafka = SourceDefinition::new(
         "kafka_source",

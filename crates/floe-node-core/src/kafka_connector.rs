@@ -768,11 +768,9 @@ impl Connector for KafkaConnector {
                     tracing::warn!(error = %err, "failed to receive kafka message");
                 }
             }
-        } else {
-            if let Some(poll_start) = poll_start {
-                metrics.poll_blocking_us = elapsed_us(poll_start);
-                metrics.empty_blocking_polls = metrics.empty_blocking_polls.saturating_add(1);
-            }
+        } else if let Some(poll_start) = poll_start {
+            metrics.poll_blocking_us = elapsed_us(poll_start);
+            metrics.empty_blocking_polls = metrics.empty_blocking_polls.saturating_add(1);
         }
 
         while emitted < self.config.max_messages_per_tick {
@@ -1113,15 +1111,15 @@ impl KafkaConnector {
                 if let Some(parse_start) = parse_start {
                     metrics.parse_us = metrics.parse_us.saturating_add(elapsed_us(parse_start));
                 }
-                tracing::warn!(
-                    source = %arrow_stager.config.source,
-                    topic = message.topic(),
-                    partition = message.partition(),
-                    offset = message.offset(),
-                    error = %err,
-                    "failed to decode kafka payload into Arrow"
-                );
-                Ok(0)
+                Err(err).with_context(|| {
+                    format!(
+                        "failed to decode kafka payload into Arrow for source '{}' at {}[{}] offset {}",
+                        arrow_stager.config.source,
+                        message.topic(),
+                        message.partition(),
+                        message.offset()
+                    )
+                })
             }
         }
     }

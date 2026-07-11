@@ -712,21 +712,36 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                             .or_insert(0);
                         *entry = (*entry).max(record.offset);
 
-                        let event_ts =
-                            match builder.append_json_payload(source_name, &record.payload) {
-                                Ok(event_ts) => event_ts,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        source = %source_name,
-                                        topic = %record.topic,
-                                        partition = record.partition,
-                                        offset = record.offset,
-                                        error = %err,
-                                        "failed to decode raw kafka payload into Arrow"
-                                    );
-                                    continue;
+                        let event_ts = match builder
+                            .append_json_payload(source_name, &record.payload)
+                        {
+                            Ok(event_ts) => event_ts,
+                            Err(err) => {
+                                let message = format!(
+                                    "failed to decode raw Kafka payload for '{source_name}' at {}[{}] offset {}: {err}",
+                                    record.topic, record.partition, record.offset
+                                );
+                                tracing::error!(
+                                    source = %source_name,
+                                    topic = %record.topic,
+                                    partition = record.partition,
+                                    offset = record.offset,
+                                    error = %err,
+                                    "failed to decode raw Kafka payload into Arrow"
+                                );
+                                if let Some(ack) = commit_ack.as_ref() {
+                                    ack.record_failed(message.clone()).await;
                                 }
-                            };
+                                record_fatal_source_batch_failure(
+                                    commit_acks_by_source,
+                                    &failure_for_executor,
+                                    &executor_cancel,
+                                    message,
+                                )
+                                .await;
+                                break 'executor;
+                            }
+                        };
                         if kafka_metadata_journal_source_ids_for_task.contains(&source_id) {
                             observe_kafka_source_journal_raw_payload(
                                 &mut tick_kafka_source_ranges[source_id],
@@ -821,18 +836,25 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                     let event_ts = match builder.append_event(&event) {
                         Ok(event_ts) => event_ts,
                         Err(err) => {
-                            tracing::warn!(
+                            let message = format!(
+                                "failed to decode append ingest event for '{source_name}': {err}"
+                            );
+                            tracing::error!(
                                 source = %source_name,
                                 error = %err,
                                 "failed to decode append ingest event into Arrow"
                             );
-                            if let Some(ack) = commit_ack {
-                                ack.record_failed(format!(
-                                    "failed to decode append ingest event for '{source_name}': {err}"
-                                ))
-                                .await;
+                            if let Some(ack) = commit_ack.as_ref() {
+                                ack.record_failed(message.clone()).await;
                             }
-                            continue;
+                            record_fatal_source_batch_failure(
+                                commit_acks_by_source,
+                                &failure_for_executor,
+                                &executor_cancel,
+                                message,
+                            )
+                            .await;
+                            break 'executor;
                         }
                     };
                     if kafka_metadata_journal_source_ids_for_task.contains(&source_id)

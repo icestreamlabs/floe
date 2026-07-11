@@ -350,6 +350,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     }
 
     merge_sql_connectors(&mut connector_specs, sql_connector_specs)?;
+    if config.is_none() && connector_specs.is_empty() {
+        connector_specs =
+            normalize_connectors(vec![default_generator_connector_from_cli(&run_args)])?;
+    }
     merge_sql_sinks(&mut sink_specs, sql_sink_specs, &materialized_view_map)?;
 
     if let Some(storage) = storage.as_ref() {
