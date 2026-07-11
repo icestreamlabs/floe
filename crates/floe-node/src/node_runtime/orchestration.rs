@@ -559,7 +559,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let source_query_table_names = if run_args.disable_pgwire {
         BTreeSet::new()
     } else {
-        durable_table_source_names.clone()
+        durable_table_source_names
+            .union(&source_journal_required_sources)
+            .cloned()
+            .collect()
     };
     let mut vectorized_runtime_options = VectorizedExecutionRuntimeOptions::default()
         .with_operator_state_table(checkpoint_manager.store().table())
