@@ -1821,8 +1821,6 @@ dependencies = [
  "dbsp-runtime",
  "dbsp-storage",
  "object_store",
- "rand 0.8.5",
- "rkyv 0.8.12",
  "slatedb",
  "tokio",
 ]

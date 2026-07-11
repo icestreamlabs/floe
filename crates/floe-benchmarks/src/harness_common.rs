@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -126,6 +124,14 @@ where
     ensure_status(status)
 }
 
+pub fn run_status_vec(
+    program: impl AsRef<OsStr>,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<()> {
+    run_status(program, args, cwd)
+}
+
 pub fn run_capture<I, S>(program: impl AsRef<OsStr>, args: I, cwd: Option<&Path>) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -223,6 +229,46 @@ where
         }
         thread::park_timeout(interval.min(remaining));
     }
+}
+
+pub fn wait_before_retry(deadline: Instant, interval: Duration) -> bool {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return false;
+    };
+    if remaining.is_zero() {
+        return false;
+    }
+    thread::park_timeout(interval.min(remaining));
+    deadline > Instant::now()
+}
+
+pub fn validate_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        anyhow::bail!("empty SQL identifier");
+    };
+    ensure!(
+        first == '_' || first.is_ascii_alphabetic(),
+        "invalid SQL identifier '{identifier}'"
+    );
+    ensure!(
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()),
+        "invalid SQL identifier '{identifier}'"
+    );
+    Ok(())
+}
+
+pub fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+pub fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+pub fn seconds_cell(ms: Option<u128>) -> String {
+    ms.map(|ms| format!("{:.3}", ms as f64 / 1000.0))
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 pub fn terminate_child_process_group(child: &mut Child, graceful_timeout: Duration) {

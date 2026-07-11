@@ -169,22 +169,6 @@ pub(in crate::node_runtime) async fn postgres_cdc_runtime_plan(
     }))
 }
 
-pub(super) fn postgres_schema_evolution_policy_from_catalog(
-    policy: CatalogPostgresCdcSchemaEvolutionPolicy,
-) -> PostgresSchemaEvolutionPolicy {
-    match policy {
-        CatalogPostgresCdcSchemaEvolutionPolicy::FailFast => {
-            PostgresSchemaEvolutionPolicy::FailFast
-        }
-        CatalogPostgresCdcSchemaEvolutionPolicy::IgnoreCompatible => {
-            PostgresSchemaEvolutionPolicy::IgnoreCompatible
-        }
-        CatalogPostgresCdcSchemaEvolutionPolicy::ApplyCompatibleAdditions => {
-            PostgresSchemaEvolutionPolicy::ApplyCompatibleAdditions
-        }
-    }
-}
-
 fn replication_pipeline_schema_from_registry(
     upstream_table: &str,
     registry: &SourceRegistry,

@@ -15,7 +15,7 @@ The facade itself is mostly `src/lib.rs` plus Criterion benches in `benches/`.
 ## Where To Make Changes
 If behavior changes are needed, edit the owning crate first:
 
-- Runtime stream semantics/operators: `crates/dbsp-runtime/src/`
+- Runtime stream semantics and maintained columnar primitives: `crates/dbsp-runtime/src/`
 - Persistent storage format/keyspace/manifest/GC: `crates/dbsp-storage/src/storage/`
 - Circuit node definitions and expression/schema types: `crates/dbsp-circuit/src/circuit/`
 - DataFusion planning translation: `crates/dbsp-planner/src/planner/`
@@ -27,7 +27,7 @@ Do not add major runtime logic directly to `crates/dbsp/src/lib.rs`.
 `crates/dbsp/src/lib.rs` currently:
 
 - re-exports planner + circuit node/types (`CircuitPlan`, `DbspNodeKind`, expressions, schema/types),
-- re-exports runtime modules (`stream`, `operators`, `collections`, `handles`, etc.),
+- re-exports runtime modules (`stream`, `collections`, `handles`, and the maintained columnar count operator),
 - re-exports storage namespace via `dbsp_storage::storage`.
 
 When modifying exports, check downstream usage in:
@@ -66,7 +66,7 @@ For facade-only changes (re-exports/docs):
 
 For runtime/storage behavior changes:
 - `cargo test -p dbsp-runtime stream::tests::core::`
-- `cargo test -p dbsp-runtime operators::join::tests::`
+- `cargo test -p dbsp-runtime collections::columnar_indexed_zset::tests::`
 - `cargo test -p dbsp-storage storage::dictionary::tests::`
 
 For wider integration confidence:
@@ -78,16 +78,15 @@ Formatting/lints:
 - `cargo clippy --workspace -- -D warnings`
 
 ## Benchmarks
-The `dbsp` crate owns Criterion benches:
+The `dbsp` crate owns Criterion benches for the maintained handle and
+materialization paths:
 - `benches/delta_emission.rs`
-- `benches/incremental_join.rs`
 - `benches/materialization_metrics.rs`
 
 Useful commands:
 - `cargo bench -p dbsp --no-run`
-- `cargo bench -p dbsp --bench incremental_join`
-
-Benchmarks use in-memory object store + SlateDB and exercise handle materialization and incremental join paths.
+Benchmarks use in-memory object store + SlateDB and exercise maintained handle
+and materialization paths.
 
 ## Reference Context
 For semantic cross-checking, compare with Feldera when needed:

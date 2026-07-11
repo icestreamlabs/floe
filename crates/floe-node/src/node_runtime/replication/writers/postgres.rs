@@ -1,5 +1,6 @@
 use super::*;
 use floe_core::decimal::format_decimal128;
+use floe_core::postgres_types::{normalize_postgres_type, postgres_type_compatible};
 
 pub(in crate::node_runtime::replication) struct PostgresReplicationPipelineWriter {
     connection: String,
@@ -207,6 +208,8 @@ impl PostgresReplicationPipelineWriter {
 pub(in crate::node_runtime::replication) struct PostgresTargetColumnInfo {
     name: String,
     postgres_type: String,
+    numeric_precision: Option<i32>,
+    numeric_scale: Option<i32>,
     not_null: bool,
     has_default: bool,
     generated: bool,
@@ -223,10 +226,22 @@ impl PostgresTargetColumnInfo {
         Self {
             name: name.into(),
             postgres_type: postgres_type.into(),
+            numeric_precision: None,
+            numeric_scale: None,
             not_null,
             has_default,
             generated,
         }
+    }
+
+    pub(in crate::node_runtime::replication) fn with_numeric_shape(
+        mut self,
+        precision: Option<i32>,
+        scale: Option<i32>,
+    ) -> Self {
+        self.numeric_precision = precision;
+        self.numeric_scale = scale;
+        self
     }
 }
 
@@ -274,6 +289,14 @@ async fn load_postgres_target_table_info(
             SELECT
                 a.attname,
                 a.atttypid::regtype::text,
+                CASE
+                    WHEN a.atttypid = 'numeric'::regtype AND a.atttypmod >= 0
+                    THEN ((a.atttypmod - 4) >> 16) & 65535
+                END AS numeric_precision,
+                CASE
+                    WHEN a.atttypid = 'numeric'::regtype AND a.atttypmod >= 0
+                    THEN (a.atttypmod - 4) & 2047
+                END AS numeric_scale,
                 a.attnotnull,
                 d.adbin IS NOT NULL AS has_default,
                 a.attgenerated <> '' AS generated
@@ -297,10 +320,11 @@ async fn load_postgres_target_table_info(
             PostgresTargetColumnInfo::new(
                 row.get::<_, String>(0),
                 row.get::<_, String>(1),
-                row.get::<_, bool>(2),
-                row.get::<_, bool>(3),
                 row.get::<_, bool>(4),
+                row.get::<_, bool>(5),
+                row.get::<_, bool>(6),
             )
+            .with_numeric_shape(row.get(2), row.get(3))
         })
         .collect::<Vec<_>>();
 
@@ -348,7 +372,13 @@ pub(in crate::node_runtime::replication) fn validate_postgres_target_table_compa
             ));
         };
         anyhow::ensure!(
-            postgres_type_is_compatible(column.data_type(), &target_column.postgres_type),
+            postgres_type_compatible(
+                column.data_type(),
+                &target_column.postgres_type,
+                &target_column.postgres_type,
+                target_column.numeric_precision,
+                target_column.numeric_scale,
+            ),
             "replication pipeline Postgres target table '{table}' column '{}' has type '{}' but CDC schema expects {:?}; migrate the target column before resuming",
             column.name(),
             target_column.postgres_type,
@@ -382,44 +412,6 @@ pub(in crate::node_runtime::replication) fn validate_postgres_target_table_compa
         primary_key
     );
     Ok(())
-}
-
-fn postgres_type_is_compatible(data_type: &ColumnType, postgres_type: &str) -> bool {
-    let postgres_type = normalized_postgres_type(postgres_type);
-    match data_type {
-        ColumnType::Int64 => matches!(postgres_type.as_str(), "bigint" | "integer" | "smallint"),
-        ColumnType::Bool => matches!(postgres_type.as_str(), "boolean"),
-        ColumnType::Utf8 => matches!(
-            postgres_type.as_str(),
-            "text"
-                | "character varying"
-                | "character"
-                | "varchar"
-                | "bpchar"
-                | "name"
-                | "uuid"
-                | "json"
-                | "jsonb"
-                | "bytea"
-        ),
-        ColumnType::TimestampMillis => matches!(
-            postgres_type.as_str(),
-            "timestamp with time zone"
-                | "timestamp without time zone"
-                | "timestamptz"
-                | "timestamp"
-        ),
-        ColumnType::DateDays => matches!(postgres_type.as_str(), "date"),
-        ColumnType::Decimal128 { .. } | ColumnType::Numeric => {
-            matches!(postgres_type.as_str(), "numeric" | "decimal")
-        }
-    }
-}
-
-fn normalized_postgres_type(postgres_type: &str) -> String {
-    postgres_type
-        .trim_start_matches("pg_catalog.")
-        .to_ascii_lowercase()
 }
 
 pub(in crate::node_runtime::replication) fn parse_floe_json_record_value(
@@ -697,7 +689,7 @@ fn postgres_value_expr(
             format!("${param_idx}::numeric")
         }
         ColumnType::Utf8 => match target_column
-            .map(|column| normalized_postgres_type(&column.postgres_type))
+            .map(|column| normalize_postgres_type(&column.postgres_type))
             .as_deref()
         {
             Some("uuid") => format!("${param_idx}::uuid"),

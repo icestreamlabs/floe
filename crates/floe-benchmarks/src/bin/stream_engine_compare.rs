@@ -8,15 +8,13 @@ use serde_json::json;
 
 #[path = "stream_engine_compare/config.rs"]
 mod config;
-#[path = "harness_common/mod.rs"]
-mod harness_common;
 #[path = "stream_engine_compare/report.rs"]
 mod report;
 #[path = "stream_engine_compare/sql.rs"]
 mod sql;
 
 use config::{BenchQuery, Config, Engine};
-use harness_common::*;
+use floe_benchmarks::harness_common::*;
 use report::{
     EngineResult, capture_floe_metadata, capture_image_metadata, write_result, write_run_context,
     write_summary_header,

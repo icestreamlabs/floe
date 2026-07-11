@@ -1,4 +1,5 @@
 use super::*;
+pub(super) use floe_core::postgres_types::{postgres_column_type, postgres_type_compatible};
 
 pub(super) async fn postgres_replication_slot_plugin(
     client: &tokio_postgres::Client,
@@ -333,85 +334,4 @@ pub(super) async fn discover_primary_key(
         .into_iter()
         .map(|row| row.get::<_, String>(0))
         .collect())
-}
-
-pub(super) fn postgres_column_type(
-    udt_name: &str,
-    data_type: &str,
-    numeric_precision: Option<i32>,
-    numeric_scale: Option<i32>,
-) -> Result<ColumnType> {
-    let udt_name = udt_name.to_ascii_lowercase();
-    let data_type = data_type.to_ascii_lowercase();
-    match udt_name.as_str() {
-        "int8" | "int4" | "int2" => Ok(ColumnType::Int64),
-        "bool" => Ok(ColumnType::Bool),
-        "text" | "varchar" | "bpchar" | "name" | "uuid" | "json" | "jsonb" | "bytea" => {
-            Ok(ColumnType::Utf8)
-        }
-        "timestamp" | "timestamptz" => Ok(ColumnType::TimestampMillis),
-        "date" => Ok(ColumnType::DateDays),
-        "numeric" => decimal128_type_from_precision_scale(numeric_precision, numeric_scale)
-            .unwrap_or(Ok(ColumnType::Numeric)),
-        _ if matches!(
-            data_type.as_str(),
-            "timestamp without time zone" | "timestamp with time zone"
-        ) =>
-        {
-            Ok(ColumnType::TimestampMillis)
-        }
-        _ => bail!(
-            "unsupported Postgres CDC column type '{}' ({}) for schema discovery",
-            udt_name,
-            data_type
-        ),
-    }
-}
-
-pub(super) fn postgres_type_compatible(
-    expected: &ColumnType,
-    udt_name: &str,
-    data_type: &str,
-    numeric_precision: Option<i32>,
-    numeric_scale: Option<i32>,
-) -> bool {
-    let udt_name = udt_name.to_ascii_lowercase();
-    let data_type = data_type.to_ascii_lowercase();
-    match expected {
-        ColumnType::Int64 => matches!(udt_name.as_str(), "int8" | "int4" | "int2"),
-        ColumnType::Bool => udt_name == "bool",
-        ColumnType::Utf8 => matches!(
-            udt_name.as_str(),
-            "text" | "varchar" | "bpchar" | "name" | "uuid" | "json" | "jsonb" | "bytea"
-        ),
-        ColumnType::TimestampMillis => {
-            matches!(udt_name.as_str(), "timestamp" | "timestamptz")
-                || matches!(
-                    data_type.as_str(),
-                    "timestamp without time zone" | "timestamp with time zone"
-                )
-        }
-        ColumnType::DateDays => udt_name == "date" || data_type == "date",
-        ColumnType::Decimal128 { precision, scale } => {
-            (udt_name == "numeric" || matches!(data_type.as_str(), "numeric" | "decimal"))
-                && numeric_precision == Some(i32::from(*precision))
-                && numeric_scale == Some(i32::from(*scale))
-        }
-        ColumnType::Numeric => {
-            udt_name == "numeric" || matches!(data_type.as_str(), "numeric" | "decimal")
-        }
-    }
-}
-
-pub(super) fn decimal128_type_from_precision_scale(
-    precision: Option<i32>,
-    scale: Option<i32>,
-) -> Option<Result<ColumnType>> {
-    let (Some(precision), Some(scale)) = (precision, scale) else {
-        return None;
-    };
-    if !(1..=38).contains(&precision) || !(0..=precision).contains(&scale) {
-        return None;
-    }
-    Some(ColumnType::decimal128(precision as u8, scale as i8))
 }

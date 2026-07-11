@@ -27,8 +27,8 @@ use executor_task::{
 pub(super) use postgres_runtime::PostgresCdcRuntimePlanRequest;
 use postgres_runtime::{
     insert_catalog_source_definition, insert_replication_pipeline_definition,
-    insert_source_backed_table_definition, postgres_schema_evolution_policy_from_catalog,
-    validate_replication_pipelines, validate_source_backed_tables,
+    insert_source_backed_table_definition, validate_replication_pipelines,
+    validate_source_backed_tables,
 };
 pub(super) use postgres_runtime::{
     merge_catalog_source_connectors, postgres_cdc_runtime_plan,

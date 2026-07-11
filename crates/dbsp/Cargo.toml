@@ -12,8 +12,6 @@ dbsp-storage = { path = "../dbsp-storage" }
 [dev-dependencies]
 criterion = "0.5"
 object_store = { workspace = true }
-rand = "0.8"
-rkyv = { workspace = true }
 slatedb = { workspace = true }
 tokio = { workspace = true }
 
@@ -22,17 +20,5 @@ name = "delta_emission"
 harness = false
 
 [[bench]]
-name = "incremental_join"
-harness = false
-
-[[bench]]
-name = "incrementality_evidence"
-harness = false
-
-[[bench]]
 name = "materialization_metrics"
-harness = false
-
-[[bench]]
-name = "columnar_count_zset"
 harness = false

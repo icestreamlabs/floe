@@ -238,13 +238,10 @@ impl std::fmt::Debug for VectorizedExecutionRuntimeOptions {
 #[derive(Clone)]
 struct VectorizedSourceState {
     schema: SchemaRef,
-    provider: Arc<DynamicStateTableProvider>,
     query_provider: Option<Arc<DynamicStateTableProvider>>,
-    maintain_execution_state: bool,
     append_only: bool,
     alias_name: Option<String>,
     alias_schema: Option<SchemaRef>,
-    alias_provider: Option<Arc<DynamicStateTableProvider>>,
     query_alias_provider: Option<Arc<DynamicStateTableProvider>>,
     primary_key_columns: Vec<String>,
 }
@@ -405,6 +402,207 @@ impl IncrementalMaterializedViewState {
     }
 }
 
+async fn build_materialized_view_operator(
+    view_name: &str,
+    logical_plan: &LogicalPlan,
+    output_schema: &SchemaRef,
+    source_states: &HashMap<String, VectorizedSourceState>,
+    udfs: &[ScalarUDF],
+    ctx: &SessionContext,
+    options: &VectorizedExecutionRuntimeOptions,
+) -> Result<MaterializedViewOperator> {
+    macro_rules! finish_operator {
+        ($variant:ident, $label:literal, $build:expr) => {{
+            let state = $build.await.with_context(|| {
+                format!(
+                    "build SlateDB-backed columnar {} operator for {view_name}",
+                    $label
+                )
+            })?;
+            return Ok(MaterializedViewOperator::$variant(Box::new(state)));
+        }};
+    }
+
+    let state_table = || {
+        options.operator_state_table.as_ref().cloned().ok_or_else(|| {
+            anyhow!(
+                "materialized view '{view_name}' requires SlateDB-backed operator state for columnar DBSP execution"
+            )
+        })
+    };
+
+    if let Some(plan) = columnar_constant_plan_for_plan(logical_plan) {
+        finish_operator!(
+            Constant,
+            "constant",
+            build_columnar_constant_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                ctx,
+            )
+        );
+    }
+    if let Some(plan) = columnar_count_plan_for_plan(logical_plan, source_states, output_schema)? {
+        finish_operator!(
+            CountByKey,
+            "count",
+            build_columnar_count_materialized_view_state(state_table()?, view_name, plan)
+        );
+    }
+    if let Some(plan) =
+        columnar_grouped_count_plan_for_plan(logical_plan, source_states, output_schema)?
+    {
+        finish_operator!(
+            GroupedCount,
+            "grouped count",
+            build_columnar_grouped_count_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+    if let Some(plan) =
+        columnar_grouped_max_plan_for_plan(logical_plan, source_states, output_schema)?
+    {
+        finish_operator!(
+            GroupedMax,
+            "grouped max",
+            build_columnar_grouped_max_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+    if let Some(plan) =
+        columnar_grouped_stats_plan_for_plan(logical_plan, source_states, output_schema)?
+    {
+        finish_operator!(
+            GroupedStats,
+            "grouped stats",
+            build_columnar_grouped_stats_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+                options.publish_grouped_stats_arrow_snapshots,
+            )
+        );
+    }
+    if let Some(plan) = columnar_join_plan_for_plan(logical_plan, source_states)? {
+        finish_operator!(
+            Join,
+            "join",
+            build_columnar_join_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+    if let Some(plan) = columnar_topn_plan_for_plan(logical_plan, source_states)? {
+        finish_operator!(
+            TopN,
+            "topn",
+            build_columnar_topn_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+    if let Some(plan) = columnar_join_topn_plan_for_plan(logical_plan, source_states)? {
+        finish_operator!(
+            JoinTopN,
+            "join-topn",
+            build_columnar_join_topn_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+            )
+        );
+    }
+    if let Some(plan) = columnar_union_plan_for_plan(logical_plan, source_states)? {
+        finish_operator!(
+            Union,
+            "union",
+            build_columnar_union_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+    if let Some(plan) = columnar_stateless_plan_for_plan(logical_plan, source_states) {
+        finish_operator!(
+            Stateless,
+            "stateless",
+            build_columnar_stateless_materialized_view_state(
+                state_table()?,
+                view_name,
+                logical_plan,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+    if let Some(plan) =
+        columnar_union_grouped_count_plan_for_plan(logical_plan, source_states, output_schema)?
+    {
+        finish_operator!(
+            UnionGroupedCount,
+            "union grouped-count",
+            build_columnar_union_grouped_count_materialized_view_state(
+                state_table()?,
+                view_name,
+                output_schema,
+                plan,
+                source_states,
+                udfs,
+            )
+        );
+    }
+
+    let source_schemas = source_states
+        .iter()
+        .map(|(name, state)| format!("{name}: {:?}", state.schema.fields()))
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        view = view_name,
+        output_schema = ?output_schema.fields(),
+        sources = ?source_schemas,
+        plan = %logical_plan.display_indent(),
+        "materialized view did not match a SlateDB-backed columnar DBSP operator"
+    );
+    bail!(
+        "materialized view '{view_name}' requires a supported SlateDB-backed columnar DBSP operator"
+    )
+}
+
 pub struct VectorizedExecutionRuntime {
     sources: HashMap<String, VectorizedSourceState>,
     materialized_views: Vec<VectorizedMaterializedViewState>,
@@ -495,7 +693,7 @@ impl VectorizedExecutionRuntime {
             let alias_name = definition
                 .property(SOURCE_QUERY_ALIAS_PROPERTY)
                 .map(str::to_string);
-            let (alias_schema, alias_provider) = if let Some(alias) = alias_name.as_deref() {
+            let alias_schema = if let Some(alias) = alias_name.as_deref() {
                 let schema = camel_case_schema(definition);
                 let provider = Arc::new(dynamic_state_provider(
                     Arc::clone(&schema),
@@ -508,9 +706,9 @@ impl VectorizedExecutionRuntime {
                             definition.name()
                         )
                     })?;
-                (Some(schema), Some(provider))
+                Some(schema)
             } else {
-                (None, None)
+                None
             };
             let query_alias_provider = if options.maintains_query_alias_for(definition) {
                 alias_schema
@@ -528,13 +726,10 @@ impl VectorizedExecutionRuntime {
                 definition.name().to_string(),
                 VectorizedSourceState {
                     schema,
-                    provider,
                     query_provider,
-                    maintain_execution_state: false,
                     append_only,
                     alias_name,
                     alias_schema,
-                    alias_provider,
                     query_alias_provider,
                     primary_key_columns,
                 },
@@ -572,461 +767,16 @@ impl VectorizedExecutionRuntime {
                         .clone()
                 }
             };
-            let columnar_constant_plan = columnar_constant_plan_for_plan(&logical_plan);
-            let columnar_constant = match (
-                columnar_constant_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_constant_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &ctx,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar constant operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_count_plan = if columnar_constant.is_none() {
-                columnar_count_plan_for_plan(&logical_plan, &source_states, &mv.output_schema)?
-            } else {
-                None
-            };
-            let columnar_count = match (columnar_count_plan, options.operator_state_table.as_ref())
-            {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_count_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        plan,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar count operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_grouped_count_plan = if columnar_count.is_none() {
-                columnar_grouped_count_plan_for_plan(
-                    &logical_plan,
-                    &source_states,
-                    &mv.output_schema,
-                )?
-            } else {
-                None
-            };
-            let columnar_grouped_count = match (
-                columnar_grouped_count_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_grouped_count_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar grouped count operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_grouped_max_plan =
-                if columnar_count.is_none() && columnar_grouped_count.is_none() {
-                    columnar_grouped_max_plan_for_plan(
-                        &logical_plan,
-                        &source_states,
-                        &mv.output_schema,
-                    )?
-                } else {
-                    None
-                };
-            let columnar_grouped_max = match (
-                columnar_grouped_max_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_grouped_max_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar grouped max operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_grouped_stats_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-            {
-                columnar_grouped_stats_plan_for_plan(
-                    &logical_plan,
-                    &source_states,
-                    &mv.output_schema,
-                )?
-            } else {
-                None
-            };
-            let columnar_grouped_stats = match (
-                columnar_grouped_stats_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_grouped_stats_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                        options.publish_grouped_stats_arrow_snapshots,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar grouped stats operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_join_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-            {
-                columnar_join_plan_for_plan(&logical_plan, &source_states)?
-            } else {
-                None
-            };
-            let columnar_join = match (columnar_join_plan, options.operator_state_table.as_ref()) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_join_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar join operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_topn_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-            {
-                columnar_topn_plan_for_plan(&logical_plan, &source_states)?
-            } else {
-                None
-            };
-            let columnar_topn = match (columnar_topn_plan, options.operator_state_table.as_ref()) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_topn_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar topn operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_join_topn_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-                && columnar_topn.is_none()
-            {
-                columnar_join_topn_plan_for_plan(&logical_plan, &source_states)?
-            } else {
-                None
-            };
-            let columnar_join_topn = match (
-                columnar_join_topn_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_join_topn_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar join-topn operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_union_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-                && columnar_topn.is_none()
-                && columnar_join_topn.is_none()
-            {
-                columnar_union_plan_for_plan(&logical_plan, &source_states)?
-            } else {
-                None
-            };
-            let columnar_union = match (columnar_union_plan, options.operator_state_table.as_ref())
-            {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_union_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar union operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_stateless_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-                && columnar_topn.is_none()
-                && columnar_join_topn.is_none()
-                && columnar_union.is_none()
-            {
-                columnar_stateless_plan_for_plan(&logical_plan, &source_states)
-            } else {
-                None
-            };
-            let columnar_stateless = match (
-                columnar_stateless_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_stateless_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &logical_plan,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar stateless operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let columnar_union_grouped_count_plan = if columnar_count.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-                && columnar_topn.is_none()
-                && columnar_join_topn.is_none()
-                && columnar_union.is_none()
-                && columnar_stateless.is_none()
-            {
-                columnar_union_grouped_count_plan_for_plan(
-                    &logical_plan,
-                    &source_states,
-                    &mv.output_schema,
-                )?
-            } else {
-                None
-            };
-            let columnar_union_grouped_count = match (
-                columnar_union_grouped_count_plan,
-                options.operator_state_table.as_ref(),
-            ) {
-                (Some(plan), Some(table)) => Some(
-                    build_columnar_union_grouped_count_materialized_view_state(
-                        Arc::clone(table),
-                        &mv.view_name,
-                        &mv.output_schema,
-                        plan,
-                        &source_states,
-                        &udfs,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "build SlateDB-backed columnar union grouped-count operator for {}",
-                            mv.view_name
-                        )
-                    })?,
-                ),
-                (Some(_), None) => {
-                    bail!(
-                        "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
-                        mv.view_name
-                    );
-                }
-                _ => None,
-            };
-            let operator = if let Some(state) = columnar_constant {
-                MaterializedViewOperator::Constant(Box::new(state))
-            } else if let Some(state) = columnar_stateless {
-                MaterializedViewOperator::Stateless(Box::new(state))
-            } else if let Some(state) = columnar_grouped_count {
-                MaterializedViewOperator::GroupedCount(Box::new(state))
-            } else if let Some(state) = columnar_grouped_max {
-                MaterializedViewOperator::GroupedMax(Box::new(state))
-            } else if let Some(state) = columnar_grouped_stats {
-                MaterializedViewOperator::GroupedStats(Box::new(state))
-            } else if let Some(state) = columnar_join {
-                MaterializedViewOperator::Join(Box::new(state))
-            } else if let Some(state) = columnar_join_topn {
-                MaterializedViewOperator::JoinTopN(Box::new(state))
-            } else if let Some(state) = columnar_union_grouped_count {
-                MaterializedViewOperator::UnionGroupedCount(Box::new(state))
-            } else if let Some(state) = columnar_topn {
-                MaterializedViewOperator::TopN(Box::new(state))
-            } else if let Some(state) = columnar_union {
-                MaterializedViewOperator::Union(Box::new(state))
-            } else if let Some(state) = columnar_count {
-                MaterializedViewOperator::CountByKey(Box::new(state))
-            } else {
-                let source_schemas = source_states
-                    .iter()
-                    .map(|(name, state)| format!("{name}: {:?}", state.schema.fields()))
-                    .collect::<Vec<_>>();
-                tracing::debug!(
-                    view = %mv.view_name,
-                    output_schema = ?mv.output_schema.fields(),
-                    sources = ?source_schemas,
-                    plan = %&logical_plan.display_indent(),
-                    "materialized view did not match a SlateDB-backed columnar DBSP operator"
-                );
-                bail!(
-                    "materialized view '{}' requires a supported SlateDB-backed columnar DBSP operator",
-                    mv.view_name
-                );
-            };
+            let operator = build_materialized_view_operator(
+                &mv.view_name,
+                &logical_plan,
+                &mv.output_schema,
+                &source_states,
+                &udfs,
+                &ctx,
+                &options,
+            )
+            .await?;
             let previous_snapshot = operator.initial_snapshot();
             registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
             registry.register(mv.view_name.clone());
@@ -1163,24 +913,6 @@ impl VectorizedExecutionRuntime {
                 }
             }
             profile::record_since("source_delta.apply_unkeyed_query_state", phase_start);
-            let phase_start = profile::start();
-            if state.maintain_execution_state {
-                let next = apply_source_delta(
-                    &state.schema,
-                    &state.primary_key_columns,
-                    &state.provider,
-                    &delta,
-                )
-                .await
-                .with_context(|| format!("apply vectorized source delta for '{source_name}'"))?;
-                state.provider.set_batches(next.clone())?;
-                if let (Some(alias_schema), Some(alias_provider)) =
-                    (state.alias_schema.as_ref(), state.alias_provider.as_ref())
-                {
-                    alias_provider.set_batches(rename_batches(&next, alias_schema)?)?;
-                }
-            }
-            profile::record_since("source_delta.apply_unkeyed_execution_state", phase_start);
             Ok(())
         } else {
             let phase_start = profile::start();
@@ -1197,21 +929,6 @@ impl VectorizedExecutionRuntime {
                 query_provider.apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
             }
             profile::record_since("source_delta.apply_keyed_query_state", phase_start);
-            let phase_start = profile::start();
-            if state.maintain_execution_state {
-                state
-                    .provider
-                    .apply_keyed_delta(&update.touched_keys, positive_batches.clone())?;
-                if let (Some(alias_schema), Some(alias_provider)) =
-                    (state.alias_schema.as_ref(), state.alias_provider.as_ref())
-                {
-                    alias_provider.apply_keyed_delta(
-                        &update.touched_keys,
-                        rename_batches(&positive_batches, alias_schema)?,
-                    )?;
-                }
-            }
-            profile::record_since("source_delta.apply_keyed_execution_state", phase_start);
             let phase_start = profile::start();
             if let (Some(alias_schema), Some(alias_provider)) = (
                 state.alias_schema.as_ref(),
@@ -1355,17 +1072,8 @@ impl VectorizedExecutionRuntime {
         if execution_batches.is_empty() && query_batches.is_empty() {
             return Ok(());
         }
-        if state.maintain_execution_state {
-            state.provider.append_batches(execution_batches.clone())?;
-        }
         if let Some(query_provider) = state.query_provider.as_ref() {
             query_provider.append_batches(query_batches.clone())?;
-        }
-        if state.maintain_execution_state
-            && let (Some(alias_schema), Some(alias_provider)) =
-                (state.alias_schema.as_ref(), state.alias_provider.as_ref())
-        {
-            alias_provider.append_batches(rename_batches(&execution_batches, alias_schema)?)?;
         }
         if let (Some(alias_schema), Some(alias_provider)) = (
             state.alias_schema.as_ref(),

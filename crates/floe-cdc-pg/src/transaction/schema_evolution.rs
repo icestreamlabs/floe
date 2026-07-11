@@ -4,27 +4,11 @@ use anyhow::{Result, anyhow};
 use floe_cdc_core::{
     CdcChange, CdcRow, CdcSchemaVersionMap, CdcTableId, CdcTableSchema, UpstreamTableRef,
 };
+pub use floe_core::catalog::PostgresCdcSchemaEvolutionPolicy as PostgresSchemaEvolutionPolicy;
 
 use crate::PgOutputCdcChange;
 
 pub(super) const POSTGRES_SCHEMA_HISTORY_LIMIT: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostgresSchemaEvolutionPolicy {
-    FailFast,
-    IgnoreCompatible,
-    ApplyCompatibleAdditions,
-}
-
-impl PostgresSchemaEvolutionPolicy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::FailFast => "fail_fast",
-            Self::IgnoreCompatible => "ignore_compatible",
-            Self::ApplyCompatibleAdditions => "apply_compatible_additions",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresSchemaEvolutionOutcome {

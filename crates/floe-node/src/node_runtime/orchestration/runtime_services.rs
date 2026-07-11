@@ -49,9 +49,7 @@ pub(super) async fn start_runtime_services(
         if let Some(plan) = postgres_cdc_runtime_plan(PostgresCdcRuntimePlanRequest {
             connector_name: &connector.name,
             connection_string: connection,
-            schema_evolution_policy: postgres_schema_evolution_policy_from_catalog(
-                schema_evolution_policy,
-            ),
+            schema_evolution_policy,
             include_tables: include_tables.as_deref(),
             registry: config.source_registry,
             source_tables: config.source_backed_tables,

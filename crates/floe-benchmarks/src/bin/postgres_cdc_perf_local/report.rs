@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::{Config, DatasetPlan, LoadPlan, TargetKind};
-use crate::harness_common::*;
+use floe_benchmarks::harness_common::*;
 
 mod metrics;
 

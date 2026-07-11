@@ -19,30 +19,12 @@ pub use dbsp_storage::storage;
 pub use algebra::AbelianGroup;
 pub use collections::{OrderedBytes, ZSet};
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
-pub use metrics::{LogicalWorkCollector, LogicalWorkSnapshot};
+pub use metrics::LogicalWorkSnapshot;
 pub use operator_state_registry::{
     OperatorStateHandle, install_operator_state_restore, install_operator_state_restore_for_graph,
     snapshot_operator_states, snapshot_operator_states_for_graph,
 };
-pub use operators::aggregate::{AggregateOp, AggregateSpec};
 pub use operators::columnar_count::{ColumnarCountByKeyOp, SlateBackedColumnarCountByKeyOp};
-pub use operators::count_aggregate::{
-    CountAggregateOp, CountAggregateRow, CountAggregateSlotKind, CountAggregateSlotUpdate,
-    GroupedCountState,
-};
-pub use operators::distinct::DistinctOp;
-pub use operators::incremental_aggregate::{
-    AggregateValue, AggregateValueType, DistinctGroupKey, GroupedIncrementalAggregateState,
-    IncrementalAggregateIndexes, IncrementalAggregateOp, IncrementalAggregateRow,
-    IncrementalAggregateSlotKind, IncrementalAggregateSlotState, IncrementalAggregateSlotUpdate,
-};
-pub use operators::join::JoinOp;
-pub use operators::range_join::{RangeJoinBatchConfig, RangeJoinOp, RangeLookupMode};
-pub use operators::semijoin::{SemiJoinBatchConfig, SemiJoinMode, SemiJoinOp};
-pub use operators::top1::PartitionedTop1Op;
-pub use operators::topn::TopNOp;
-pub use operators::union::UnionOp;
-pub use operators::window::{WindowAggregateBatchConfig, WindowAggregateOp, WindowKey};
 pub use profile::{print_runtime_phase_profile, reset_runtime_phase_profile};
 pub use relation_state::RelationState;
 pub use stream::{

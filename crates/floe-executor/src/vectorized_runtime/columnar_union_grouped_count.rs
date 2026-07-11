@@ -284,13 +284,10 @@ fn derived_source_map(
         source_name.to_string(),
         VectorizedSourceState {
             schema: Arc::clone(schema),
-            provider: Arc::new(DynamicStateTableProvider::new(Arc::clone(schema))),
             query_provider: None,
-            maintain_execution_state: false,
             append_only: false,
             alias_name: None,
             alias_schema: None,
-            alias_provider: None,
             query_alias_provider: None,
             primary_key_columns: Vec::new(),
         },

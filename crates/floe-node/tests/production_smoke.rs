@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::Duration;
 
 #[path = "support/node_process.rs"]
 mod node_process;
@@ -327,15 +327,4 @@ async fn query_source_bid(pg_port: u16, auction: i64) -> Result<Option<SourceBid
         })
     })
     .transpose()
-}
-
-#[allow(dead_code)]
-fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
-    let run_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut path = std::env::temp_dir();
-    path.push(format!("{prefix}-{run_id}.{suffix}"));
-    path
 }

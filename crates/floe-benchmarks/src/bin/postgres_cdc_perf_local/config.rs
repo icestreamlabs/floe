@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use serde_json::json;
 
-use super::harness_common::*;
+use floe_benchmarks::harness_common::*;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum TargetKind {

@@ -482,6 +482,33 @@ fn postgres_target_compatibility_rejects_incompatible_required_columns() {
 }
 
 #[test]
+fn postgres_target_compatibility_rejects_narrow_decimal() {
+    let schema = CdcTableSchema::new(
+        CdcTableId::new("orders").unwrap(),
+        UpstreamTableRef::new("public", "orders").unwrap(),
+        vec![
+            CdcColumn::new("id", ColumnType::Int64, false).unwrap(),
+            CdcColumn::new("amount", ColumnType::decimal128(12, 2).unwrap(), false).unwrap(),
+        ],
+        CdcPrimaryKey::new(["id"]).unwrap(),
+    )
+    .unwrap();
+    let target = PostgresTargetTableInfo::new(
+        vec![
+            PostgresTargetColumnInfo::new("id", "bigint", true, false, false),
+            PostgresTargetColumnInfo::new("amount", "numeric", true, false, false)
+                .with_numeric_shape(Some(5), Some(2)),
+        ],
+        vec![vec!["id".to_string()]],
+    );
+
+    let error =
+        validate_postgres_target_table_compatibility(&schema, "public.orders_copy", &target)
+            .expect_err("narrow target decimal should fail");
+    assert!(format!("{error:#}").contains("has type 'numeric'"));
+}
+
+#[test]
 fn postgres_target_sql_casts_string_backed_native_types() {
     let schema = CdcTableSchema::new(
         CdcTableId::new("orders").unwrap(),

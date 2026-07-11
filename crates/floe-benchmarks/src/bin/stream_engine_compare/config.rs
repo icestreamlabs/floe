@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use super::harness_common::*;
+use floe_benchmarks::harness_common::*;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum Engine {

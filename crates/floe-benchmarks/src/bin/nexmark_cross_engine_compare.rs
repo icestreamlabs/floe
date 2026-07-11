@@ -1,22 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
+use floe_node_core::nexmark_queries::CANONICAL_NEXMARK_QUERY_IDS;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-const CANONICAL_NEXMARK_QUERY_IDS: &[&str] = &[
-    "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q12", "q13", "q14", "q15", "q16",
-    "q17", "q18", "q19", "q20", "q21", "q22",
-];
 const DEFAULT_FLOE_NEXMARK_BATCH_ROWS: u64 = 8_192;
 const DEFAULT_FLOE_KAFKA_POLL_MS: u64 = 1;
 const DEFAULT_FLOE_SOURCE_JOURNAL: &str = "auto";
@@ -27,8 +22,6 @@ const NEXMARK_BID_AUCTION_CARDINALITY: u64 = 10_000;
 mod commands;
 #[path = "nexmark_cross_engine_compare/fingerprints.rs"]
 mod fingerprints;
-#[path = "harness_common/mod.rs"]
-mod harness_common;
 #[path = "nexmark_cross_engine_compare/harness_engines.rs"]
 mod harness_engines;
 #[path = "nexmark_cross_engine_compare/harness_feldera_summary.rs"]
@@ -47,22 +40,8 @@ mod tests;
 
 use self::commands::*;
 use self::fingerprints::*;
-use self::harness_common::{
-    configure_process_group, terminate_child_process_group,
-    terminate_stale_floe_nodes_on_pgwire_port,
-};
 use self::queries::*;
-
-fn wait_before_retry(deadline: Instant, interval: Duration) -> bool {
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return false;
-    };
-    if remaining.is_zero() {
-        return false;
-    }
-    thread::park_timeout(interval.min(remaining));
-    deadline > Instant::now()
-}
+use floe_benchmarks::harness_common::*;
 
 fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;

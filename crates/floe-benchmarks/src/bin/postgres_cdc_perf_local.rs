@@ -10,14 +10,12 @@ use anyhow::{Context, Result, bail, ensure};
 mod config;
 #[path = "postgres_cdc_perf_local/datasets.rs"]
 mod datasets;
-#[path = "harness_common/mod.rs"]
-mod harness_common;
 #[path = "postgres_cdc_perf_local/report.rs"]
 mod report;
 
 use config::{BenchMode, Config, Dataset, TargetKind};
 use datasets::*;
-use harness_common::*;
+use floe_benchmarks::harness_common::*;
 use report::*;
 
 fn main() -> Result<()> {

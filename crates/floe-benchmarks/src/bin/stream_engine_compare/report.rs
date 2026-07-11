@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::{Config, Engine};
-use crate::harness_common::*;
+use floe_benchmarks::harness_common::*;
 
 pub(super) struct EngineResult<'a> {
     pub(super) engine: Engine,

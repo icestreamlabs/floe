@@ -42,9 +42,9 @@ Use focused tests during normal development; run full workspace tests before lar
 
 - DBSP stream/runtime core: `cargo test -p dbsp-runtime stream::tests::core::`
 - DBSP dictionary/storage: `cargo test -p dbsp-storage storage::dictionary::tests::`
-- DBSP operator join path: `cargo test -p dbsp-runtime operators::join::tests::`
+- DBSP columnar index path: `cargo test -p dbsp-runtime collections::columnar_indexed_zset::tests::`
 - Executor plan validation: `cargo test -p floe-executor --test plan_validation`
-- End-to-end node flows: `cargo test -p floe-node --test end_to_end_mv`
+- End-to-end node flows: `cargo test -p floe-node --test production_smoke`
 - Ignored integration tests (e.g., Kafka): `cargo test --workspace -- --ignored`
 
 ## Coding Style and Conventions

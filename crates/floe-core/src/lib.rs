@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod decimal;
 pub mod encoding;
+pub mod postgres_types;
 pub mod source;
 
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
