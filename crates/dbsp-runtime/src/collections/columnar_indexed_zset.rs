@@ -402,12 +402,9 @@ impl SlateBackedColumnarIndexedZSet {
 
         let phase_start = profile::start();
         let mut batches = inline_batches;
-        let mut segment_ids = refs_by_segment.keys().copied().collect::<Vec<_>>();
-        segment_ids.sort_unstable();
-        for segment_id in segment_ids {
-            let indices = refs_by_segment
-                .remove(&segment_id)
-                .expect("segment refs missing");
+        let mut segment_refs = refs_by_segment.into_iter().collect::<Vec<_>>();
+        segment_refs.sort_unstable_by_key(|(segment_id, _)| *segment_id);
+        for (segment_id, indices) in segment_refs {
             batches.extend(self.take_segment_rows(segment_id, indices).await?);
         }
         profile::record_since("columnar_index.lookup.take_segment_rows", phase_start);

@@ -1834,10 +1834,10 @@ fn decode_current_output_scalar(
             bytes, cursor,
         )?))),
         4 => {
-            let value = *read_bytes_at(bytes, cursor, 1, "join-topn current output bool")?
-                .first()
-                .expect("one bool byte");
-            Ok(Some(EncodedRowScalar::Bool(value != 0)))
+            let [value] = read_bytes_at(bytes, cursor, 1, "join-topn current output bool")? else {
+                bail!("join-topn current output bool has invalid width")
+            };
+            Ok(Some(EncodedRowScalar::Bool(*value != 0)))
         }
         5 => Ok(Some(EncodedRowScalar::DateDays(read_i32_be(
             bytes, cursor,
@@ -1996,12 +1996,9 @@ impl JoinTopNBestBidEvaluator {
             .map(|field| ScalarColumnBuilder::new(field.data_type(), best_by_partition.len()))
             .collect::<Result<Vec<_>>>()?;
 
-        let mut partition_keys = best_by_partition.keys().cloned().collect::<Vec<_>>();
-        partition_keys.sort();
-        for partition_key in partition_keys {
-            let best = best_by_partition
-                .get(&partition_key)
-                .expect("best bid missing for partition key");
+        let mut best_rows = best_by_partition.into_iter().collect::<Vec<_>>();
+        best_rows.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (_, best) in &best_rows {
             self.append_output_row(&mut builders, left_batches, right_batches, best)?;
         }
 
@@ -2108,16 +2105,13 @@ impl JoinTopNBestBidEvaluator {
         let mut row_count = 0usize;
 
         let compare_start = timing_start(timing_enabled);
-        let mut partition_keys = candidate_best.keys().cloned().collect::<Vec<_>>();
-        partition_keys.sort();
-        for partition_key in partition_keys {
-            if retracted_current.partition_keys.contains(&partition_key) {
+        let mut candidates = candidate_best.iter().collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (partition_key, candidate) in candidates {
+            if retracted_current.partition_keys.contains(partition_key) {
                 continue;
             }
-            let candidate = candidate_best
-                .get(&partition_key)
-                .expect("candidate best bid missing for partition key");
-            if let Some(previous) = previous_best.get(&partition_key) {
+            if let Some(previous) = previous_best.get(partition_key) {
                 if !candidate_orders_before_previous(candidate, previous) {
                     continue;
                 }
@@ -2357,7 +2351,7 @@ impl JoinTopNBestBidEvaluator {
             }
             let candidate = candidate_best
                 .get(partition_key)
-                .expect("candidate best bid missing for replacement key");
+                .ok_or_else(|| anyhow::anyhow!("join-topn replacement candidate is missing"))?;
             self.append_output_row(
                 &mut builders,
                 left_batches,

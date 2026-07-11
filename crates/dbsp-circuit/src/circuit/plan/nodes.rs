@@ -77,9 +77,8 @@ impl DbspValuesNode {
                 );
             }
             let mut typed_row = Vec::with_capacity(row.len());
-            for (idx, expr) in row.into_iter().enumerate() {
+            for (expr, field) in row.into_iter().zip(output_schema.fields()) {
                 let expression = DbspExpression::analyze(expr, empty_schema.clone())?;
-                let field = output_schema.field(idx).expect("schema index checked");
                 if expression.data_type() != &field.data_type {
                     bail!(
                         "VALUES column {} type mismatch: expected {}, found {}",
