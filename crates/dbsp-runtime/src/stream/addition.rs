@@ -80,7 +80,7 @@ where
                 left: a.clone(),
                 right: b.clone(),
             }),
-            StreamEvaluatorDescriptor::BuiltinBinary {
+            StreamEvaluatorDescriptor::Binary {
                 kind: "add",
                 left_namespace: a.namespace().to_string(),
                 right_namespace: b.namespace().to_string(),
@@ -99,7 +99,7 @@ where
             self.table.clone(),
             self.group.clone(),
             Arc::new(NegEvaluator { input: a.clone() }),
-            StreamEvaluatorDescriptor::BuiltinUnary {
+            StreamEvaluatorDescriptor::Unary {
                 kind: "neg",
                 input_namespace: a.namespace().to_string(),
             },

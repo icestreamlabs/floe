@@ -179,7 +179,7 @@ where
     ) -> Result<Self> {
         let stream = Self::evaluated_with_table(table, namespace, group, evaluator).await?;
         match descriptor {
-            StreamEvaluatorDescriptor::BuiltinUnary {
+            StreamEvaluatorDescriptor::Unary {
                 kind,
                 input_namespace,
             } => {
@@ -194,7 +194,7 @@ where
                     .put(&stream.core.evaluator_key, &encoded)
                     .await?;
             }
-            StreamEvaluatorDescriptor::BuiltinBinary {
+            StreamEvaluatorDescriptor::Binary {
                 kind,
                 left_namespace,
                 right_namespace,

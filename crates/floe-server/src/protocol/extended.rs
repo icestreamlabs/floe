@@ -42,10 +42,9 @@ pub(super) struct PreparedStatement {
     param_types: Vec<PgType>,
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum PreparedStatementKind {
-    Query { plan: LogicalPlan },
+    Query { plan: Box<LogicalPlan> },
     Management(ManagementStatement),
     Noop { tag: String },
 }
@@ -160,7 +159,9 @@ impl FloeExtendedQueryParser {
         let bound_param_types = infer_parameter_types(&inferred_parameter_types, parameter_types)?;
 
         Ok(PreparedStatement {
-            kind: PreparedStatementKind::Query { plan: logical_plan },
+            kind: PreparedStatementKind::Query {
+                plan: Box::new(logical_plan),
+            },
             result_fields: fields,
             referenced_views: deduped,
             param_types: bound_param_types,
@@ -222,6 +223,7 @@ impl FloeExtendedHandler {
             .map_err(|err| user_error(format!("DataFusion parameter inference error: {err}")))?;
         let param_values = deserialize_parameters(portal, &ordered_param_types(&inferred_types))?;
         let plan_with_values = plan
+            .as_ref()
             .clone()
             .replace_params_with_values(&param_values)
             .map_err(|err| user_error(format!("DataFusion parameter binding error: {err}")))?;

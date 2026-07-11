@@ -107,13 +107,12 @@ where
     async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T>;
 }
 
-#[allow(clippy::enum_variant_names)]
 pub(crate) enum StreamEvaluatorDescriptor {
-    BuiltinUnary {
+    Unary {
         kind: &'static str,
         input_namespace: String,
     },
-    BuiltinBinary {
+    Binary {
         kind: &'static str,
         left_namespace: String,
         right_namespace: String,
