@@ -519,10 +519,6 @@ where
             return Ok((Vec::new(), metrics));
         }
 
-        self.ensure_range_layout()
-            .await
-            .context("validate Arrow-index range layout")?;
-
         let full_range = self.range_bounds(&lower_bytes, &upper_bytes)?;
         let range_end = full_range.end;
         let mut scan_start = full_range.start;

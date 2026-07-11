@@ -420,11 +420,6 @@ impl DbspExpression {
         if values.is_null(0) {
             bail!("LIKE patterns must be UTF-8 strings");
         }
-        Self::validate_like_pattern(values.value(0))
-    }
-
-    fn validate_like_pattern(pattern: &str) -> Result<()> {
-        let _ = pattern;
         Ok(())
     }
 

@@ -555,10 +555,6 @@ where
         Ok((range_key_bytes, key_bytes, segment_id))
     }
 
-    pub(super) async fn ensure_range_layout(&self) -> Result<()> {
-        Ok(())
-    }
-
     pub(super) fn lookup_cache_for_key(&self, key_bytes: &[u8]) -> Result<Option<ValueWeightMap>> {
         let shard = shard_for_bytes(key_bytes, self.lookup_cache_shards.len());
         let guard = self.lookup_cache_shards[shard]
