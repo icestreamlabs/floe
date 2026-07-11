@@ -313,17 +313,17 @@ fn maps_sql_sink_runtime_options_to_runtime_config() {
         },
         true,
         Some(11),
-        SinkOptions::new(
-            Some(100),
-            Some(65_536),
-            Some(32),
-            Some(7),
-            Some(10),
-            Some(500),
-            Some("tx-out-orders".to_string()),
-            Some("floe-checkpoints".to_string()),
-            Some(2),
-        ),
+        SinkOptions {
+            batch_rows: Some(100),
+            batch_bytes: Some(65_536),
+            queue_capacity: Some(32),
+            retry_max_attempts: Some(7),
+            retry_base_ms: Some(10),
+            retry_max_backoff_ms: Some(500),
+            transactional_id: Some("tx-out-orders".to_string()),
+            checkpoint_topic: Some("floe-checkpoints".to_string()),
+            checkpoint_partition: Some(2),
+        },
     );
 
     let spec = sink_spec_from_sql(&definition).expect("map sink");

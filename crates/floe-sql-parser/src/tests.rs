@@ -708,18 +708,21 @@ fn parse_create_sink_statement_preserves_runtime_options() {
     let FloeStatement::CreateSink(definition) = stmt else {
         panic!("expected CREATE SINK statement");
     };
-    assert_eq!(definition.options().batch_rows(), Some(100));
-    assert_eq!(definition.options().batch_bytes(), Some(65_536));
-    assert_eq!(definition.options().queue_capacity(), Some(32));
-    assert_eq!(definition.options().retry_max_attempts(), Some(7));
-    assert_eq!(definition.options().retry_base_ms(), Some(10));
-    assert_eq!(definition.options().retry_max_backoff_ms(), Some(500));
-    assert_eq!(definition.options().transactional_id(), Some("tx-out-bid"));
+    assert_eq!(definition.options().batch_rows, Some(100));
+    assert_eq!(definition.options().batch_bytes, Some(65_536));
+    assert_eq!(definition.options().queue_capacity, Some(32));
+    assert_eq!(definition.options().retry_max_attempts, Some(7));
+    assert_eq!(definition.options().retry_base_ms, Some(10));
+    assert_eq!(definition.options().retry_max_backoff_ms, Some(500));
     assert_eq!(
-        definition.options().checkpoint_topic(),
+        definition.options().transactional_id.as_deref(),
+        Some("tx-out-bid")
+    );
+    assert_eq!(
+        definition.options().checkpoint_topic.as_deref(),
         Some("floe-checkpoints")
     );
-    assert_eq!(definition.options().checkpoint_partition(), Some(2));
+    assert_eq!(definition.options().checkpoint_partition, Some(2));
 }
 
 #[test]

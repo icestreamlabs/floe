@@ -514,15 +514,15 @@ pub struct SinkDefinition {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SinkOptions {
-    batch_rows: Option<usize>,
-    batch_bytes: Option<usize>,
-    queue_capacity: Option<usize>,
-    retry_max_attempts: Option<usize>,
-    retry_base_ms: Option<u64>,
-    retry_max_backoff_ms: Option<u64>,
-    transactional_id: Option<String>,
-    checkpoint_topic: Option<String>,
-    checkpoint_partition: Option<i32>,
+    pub batch_rows: Option<usize>,
+    pub batch_bytes: Option<usize>,
+    pub queue_capacity: Option<usize>,
+    pub retry_max_attempts: Option<usize>,
+    pub retry_base_ms: Option<u64>,
+    pub retry_max_backoff_ms: Option<u64>,
+    pub transactional_id: Option<String>,
+    pub checkpoint_topic: Option<String>,
+    pub checkpoint_partition: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,69 +635,6 @@ impl SinkDefinition {
 
     pub fn options(&self) -> &SinkOptions {
         &self.options
-    }
-}
-
-impl SinkOptions {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        batch_rows: Option<usize>,
-        batch_bytes: Option<usize>,
-        queue_capacity: Option<usize>,
-        retry_max_attempts: Option<usize>,
-        retry_base_ms: Option<u64>,
-        retry_max_backoff_ms: Option<u64>,
-        transactional_id: Option<String>,
-        checkpoint_topic: Option<String>,
-        checkpoint_partition: Option<i32>,
-    ) -> Self {
-        Self {
-            batch_rows,
-            batch_bytes,
-            queue_capacity,
-            retry_max_attempts,
-            retry_base_ms,
-            retry_max_backoff_ms,
-            transactional_id,
-            checkpoint_topic,
-            checkpoint_partition,
-        }
-    }
-
-    pub fn batch_rows(&self) -> Option<usize> {
-        self.batch_rows
-    }
-
-    pub fn batch_bytes(&self) -> Option<usize> {
-        self.batch_bytes
-    }
-
-    pub fn queue_capacity(&self) -> Option<usize> {
-        self.queue_capacity
-    }
-
-    pub fn retry_max_attempts(&self) -> Option<usize> {
-        self.retry_max_attempts
-    }
-
-    pub fn retry_base_ms(&self) -> Option<u64> {
-        self.retry_base_ms
-    }
-
-    pub fn retry_max_backoff_ms(&self) -> Option<u64> {
-        self.retry_max_backoff_ms
-    }
-
-    pub fn transactional_id(&self) -> Option<&str> {
-        self.transactional_id.as_deref()
-    }
-
-    pub fn checkpoint_topic(&self) -> Option<&str> {
-        self.checkpoint_topic.as_deref()
-    }
-
-    pub fn checkpoint_partition(&self) -> Option<i32> {
-        self.checkpoint_partition
     }
 }
 

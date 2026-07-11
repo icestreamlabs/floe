@@ -616,29 +616,34 @@ pub(super) fn parse_sink_statement(sql: &str) -> Result<SinkDefinition> {
     if checkpoint_partition.is_some_and(|partition| partition < 0) {
         return Err(anyhow!("option 'checkpoint_partition' must be >= 0"));
     }
-    let sink_options = SinkOptions::new(
-        option_any(&options, &["batch_rows", "batch.rows"])
+    let sink_options = SinkOptions {
+        batch_rows: option_any(&options, &["batch_rows", "batch.rows"])
             .map(|value| parse_positive_usize_option("batch_rows", value))
             .transpose()?,
-        option_any(&options, &["batch_bytes", "batch.bytes"])
+        batch_bytes: option_any(&options, &["batch_bytes", "batch.bytes"])
             .map(|value| parse_positive_usize_option("batch_bytes", value))
             .transpose()?,
-        option_any(&options, &["queue_capacity", "queue.capacity"])
+        queue_capacity: option_any(&options, &["queue_capacity", "queue.capacity"])
             .map(|value| parse_positive_usize_option("queue_capacity", value))
             .transpose()?,
-        option_any(&options, &["retry_max_attempts", "retry.max_attempts"])
+        retry_max_attempts: option_any(&options, &["retry_max_attempts", "retry.max_attempts"])
             .map(|value| parse_positive_usize_option("retry_max_attempts", value))
             .transpose()?,
-        option_any(&options, &["retry_base_ms", "retry.base_ms"])
+        retry_base_ms: option_any(&options, &["retry_base_ms", "retry.base_ms"])
             .map(|value| parse_positive_u64_option("retry_base_ms", value))
             .transpose()?,
-        option_any(&options, &["retry_max_backoff_ms", "retry.max_backoff_ms"])
-            .map(|value| parse_positive_u64_option("retry_max_backoff_ms", value))
-            .transpose()?,
-        option_any(&options, &["transactional_id", "transactional.id"]).map(ToString::to_string),
-        option_any(&options, &["checkpoint_topic", "checkpoint.topic"]).map(ToString::to_string),
+        retry_max_backoff_ms: option_any(
+            &options,
+            &["retry_max_backoff_ms", "retry.max_backoff_ms"],
+        )
+        .map(|value| parse_positive_u64_option("retry_max_backoff_ms", value))
+        .transpose()?,
+        transactional_id: option_any(&options, &["transactional_id", "transactional.id"])
+            .map(ToString::to_string),
+        checkpoint_topic: option_any(&options, &["checkpoint_topic", "checkpoint.topic"])
+            .map(ToString::to_string),
         checkpoint_partition,
-    );
+    };
 
     let connector = match connector.as_str() {
         "kafka" => {
