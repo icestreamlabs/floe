@@ -495,8 +495,10 @@ pub(super) fn extract_alias(expr: Expr) -> Result<(Expr, Option<String>), Planne
     }
 }
 
-// DataFusion still surfaces wildcard expressions through this enum shape.
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "DataFusion uses Wildcard for COUNT(*) until the variant is removed"
+)]
 fn is_wildcard_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Wildcard { .. })
 }
