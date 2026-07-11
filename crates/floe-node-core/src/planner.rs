@@ -62,21 +62,6 @@ pub async fn plan_materialized_views(
                     definition.name()
                 )
             })?;
-        let optimized = state.optimize(&plan).with_context(|| {
-            format!(
-                "failed to optimize logical plan for materialized view {}",
-                definition.name()
-            )
-        })?;
-        let plan = if logical_plan_uses_only_dbsp_supported_types(&optimized) {
-            optimized
-        } else {
-            tracing::debug!(
-                view = %definition.name(),
-                "falling back to unoptimized logical plan because optimized plan uses unsupported DBSP types"
-            );
-            plan
-        };
         plans.push(PlannedMaterializedView {
             definition: definition.clone(),
             logical_plan: plan,
@@ -113,33 +98,6 @@ fn register_nexmark_udfs(ctx: &SessionContext) {
     for udf in planner_udfs() {
         ctx.register_udf(udf);
     }
-}
-
-fn logical_plan_uses_only_dbsp_supported_types(plan: &LogicalPlan) -> bool {
-    logical_plan_node_supported(plan)
-        && plan
-            .inputs()
-            .into_iter()
-            .all(logical_plan_uses_only_dbsp_supported_types)
-}
-
-fn logical_plan_node_supported(plan: &LogicalPlan) -> bool {
-    plan.schema()
-        .fields()
-        .iter()
-        .all(|field| dbsp_supported_arrow_type(field.data_type()))
-}
-
-fn dbsp_supported_arrow_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int64
-            | DataType::Utf8
-            | DataType::Boolean
-            | DataType::Timestamp(TimeUnit::Millisecond, None)
-            | DataType::Date32
-            | DataType::Decimal128(_, _)
-    )
 }
 
 fn passthrough_window_udf(
@@ -834,19 +792,6 @@ mod tests {
             logical_plan.contains("orders"),
             "logical plan was: {logical_plan}"
         );
-    }
-
-    #[test]
-    fn supported_arrow_type_guard_covers_dbsp_scalar_types() {
-        assert!(dbsp_supported_arrow_type(&DataType::Int64));
-        assert!(dbsp_supported_arrow_type(&DataType::Utf8));
-        assert!(dbsp_supported_arrow_type(&DataType::Boolean));
-        assert!(dbsp_supported_arrow_type(&DataType::Timestamp(
-            TimeUnit::Millisecond,
-            None
-        )));
-        assert!(dbsp_supported_arrow_type(&DataType::Date32));
-        assert!(dbsp_supported_arrow_type(&DataType::Decimal128(38, 9)));
     }
 
     #[test]

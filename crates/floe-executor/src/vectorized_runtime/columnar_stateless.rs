@@ -18,7 +18,8 @@ use crate::vectorized_source_delta::unit_source_delta_batches;
 
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
-    build_incremental_materialized_view_state, collect_incremental_output, profile,
+    build_incremental_materialized_view_state_from_logical_plan, collect_incremental_output,
+    profile,
 };
 
 pub(super) struct ColumnarStatelessPlan {
@@ -51,7 +52,7 @@ pub(super) fn columnar_stateless_plan_for_plan(
 pub(super) async fn build_columnar_stateless_materialized_view_state(
     table: Arc<dyn KeyValueTable>,
     view_name: &str,
-    query: &str,
+    logical_plan: &LogicalPlan,
     output_schema: &SchemaRef,
     plan: ColumnarStatelessPlan,
     sources: &HashMap<String, VectorizedSourceState>,
@@ -80,11 +81,11 @@ pub(super) async fn build_columnar_stateless_materialized_view_state(
         source_schema: Arc::clone(&source.schema),
         operator_table: Arc::clone(&table),
         output_zset,
-        incremental: build_incremental_materialized_view_state(
-            query,
+        incremental: build_incremental_materialized_view_state_from_logical_plan(
             &plan.source_name,
             sources,
             udfs,
+            logical_plan,
         )
         .await
         .context("build stateless vectorized delta plan")?,
@@ -98,9 +99,9 @@ pub(super) async fn run_columnar_stateless_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_stateless.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::Stateless(columnar) = &mut mv.operator else {
+        unreachable!("stateless tick dispatched to non-stateless operator")
     };
 
     let plan_start = Instant::now();
@@ -162,7 +163,7 @@ pub(super) async fn run_columnar_stateless_materialized_view_tick(
             mode = "columnar_stateless",
             "SlateDB-backed stateless columnar DBSP materialized view empty tick completed"
         );
-        return Ok(true);
+        return Ok(());
     };
     handle.publish_columnar_version(
         version,
@@ -183,7 +184,7 @@ pub(super) async fn run_columnar_stateless_materialized_view_tick(
         mode = "columnar_stateless",
         "SlateDB-backed stateless columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 async fn stateless_output_delta_batches(

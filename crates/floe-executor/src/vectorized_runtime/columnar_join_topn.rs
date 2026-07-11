@@ -602,9 +602,9 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_join_topn.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::JoinTopN(columnar) = &mut mv.operator else {
+        unreachable!("join-topn tick dispatched to another operator")
     };
     let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let plan_start = timing_start(timing_enabled);
@@ -659,7 +659,7 @@ pub(super) async fn run_columnar_join_topn_materialized_view_tick(
         mode = "columnar_join_topn",
         "SlateDB-backed join-topn columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 pub(super) async fn run_columnar_join_topn_state_tick(

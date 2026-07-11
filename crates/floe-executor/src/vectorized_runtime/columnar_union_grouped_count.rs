@@ -125,9 +125,9 @@ pub(super) async fn run_columnar_union_grouped_count_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_union_grouped_count.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::UnionGroupedCount(columnar) = &mut mv.operator else {
+        unreachable!("union grouped-count tick dispatched to another operator")
     };
 
     let plan_start = Instant::now();
@@ -184,7 +184,7 @@ pub(super) async fn run_columnar_union_grouped_count_materialized_view_tick(
         mode = "columnar_union_grouped_count",
         "SlateDB-backed union grouped-count columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 fn rewrite_aggregate_over_union_count(

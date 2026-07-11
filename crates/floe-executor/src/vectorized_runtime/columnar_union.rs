@@ -360,9 +360,9 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_union.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::Union(columnar) = &mut mv.operator else {
+        unreachable!("union tick dispatched to non-union operator")
     };
     let plan_start = Instant::now();
     let tick = run_columnar_union_state_tick(
@@ -385,7 +385,7 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
         mode = "columnar_union",
         "SlateDB-backed union columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 pub(super) async fn run_columnar_union_state_tick(

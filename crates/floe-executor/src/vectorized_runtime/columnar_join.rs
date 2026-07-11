@@ -879,9 +879,9 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_join.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::Join(columnar) = &mut mv.operator else {
+        unreachable!("join tick dispatched to non-join operator")
     };
     let plan_start = Instant::now();
     let tick = Box::pin(run_columnar_join_state_tick_inner(
@@ -932,7 +932,7 @@ pub(super) async fn run_columnar_join_materialized_view_tick(
         mode = "columnar_join",
         "SlateDB-backed join columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 pub(super) async fn run_columnar_join_state_tick_delta_only(

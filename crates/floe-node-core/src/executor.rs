@@ -5,7 +5,6 @@ use floe_core::source::SourceDataType;
 use floe_executor::DbspPlanBuilder;
 use floe_executor::dbsp_plan::{
     CircuitPlan, DbspScalarType, Field, PlannerConfig, TableDescriptor, nexmark_config,
-    validate_dbsp_plan,
 };
 
 use crate::planner::PlannedMaterializedView;
@@ -64,7 +63,6 @@ pub fn available_sources_from_registry(
 
 pub fn build_dataflows(
     views: &[PlannedMaterializedView],
-    available_sources: &BTreeSet<String>,
     sources: &crate::source::SourceRegistry,
 ) -> Result<Vec<CircuitPlan>> {
     let planner = DbspPlanBuilder::new(planner_config_from_sources(sources)?);
@@ -74,8 +72,6 @@ pub fn build_dataflows(
             let plan = planner
                 .build(planned.logical_plan())
                 .with_context(|| format!("build DBSP plan for {}", planned.definition().name()))?;
-            validate_dbsp_plan(&plan, available_sources, planned.definition().name())
-                .context("validating query plan")?;
             Ok(plan)
         })
         .collect()
@@ -177,7 +173,6 @@ mod tests {
     async fn plans_projection_materialized_view() {
         let mut sources = SourceRegistry::new();
         sources.extend(generator::definitions().expect("generator definitions"));
-        let available_sources = available_sources_from_registry(&sources);
 
         let definition =
             parse_materialized_view("CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM person")
@@ -185,8 +180,7 @@ mod tests {
         let planned = plan_materialized_views(&sources, &[definition])
             .await
             .expect("plan mv");
-        let plans =
-            build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
+        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
         assert_eq!(plans.len(), 1);
         let plan = &plans[0];
         let root = plan.node(plan.root).expect("root node exists");
@@ -208,7 +202,6 @@ mod tests {
     async fn plans_filter_materialized_view() {
         let mut sources = SourceRegistry::new();
         sources.extend(generator::definitions().expect("generator definitions"));
-        let available_sources = available_sources_from_registry(&sources);
 
         let definition = parse_materialized_view(
             "CREATE MATERIALIZED VIEW mv AS SELECT * FROM bid WHERE bidder = 42",
@@ -217,8 +210,7 @@ mod tests {
         let planned = plan_materialized_views(&sources, &[definition])
             .await
             .expect("plan mv");
-        let plans =
-            build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
+        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
         assert_eq!(plans.len(), 1);
         let plan = &plans[0];
         assert!(
@@ -233,7 +225,6 @@ mod tests {
     async fn plans_simple_join_materialized_view() {
         let mut sources = SourceRegistry::new();
         sources.extend(generator::definitions().expect("generator definitions"));
-        let available_sources = available_sources_from_registry(&sources);
 
         let definition = parse_materialized_view(
             "CREATE MATERIALIZED VIEW mv AS SELECT b.auction, b.bidder, a.seller \
@@ -244,8 +235,7 @@ mod tests {
             .await
             .expect("plan mv");
 
-        let plans =
-            build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
+        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
         assert_eq!(plans.len(), 1);
         let plan = &plans[0];
         assert!(
@@ -260,7 +250,6 @@ mod tests {
     async fn q4_source_requirements_fall_back_for_ambiguous_join_filter() {
         let mut sources = SourceRegistry::new();
         sources.extend(generator::definitions().expect("generator definitions"));
-        let available_sources = available_sources_from_registry(&sources);
 
         let definition = parse_materialized_view(
             "CREATE MATERIALIZED VIEW mv AS \
@@ -275,8 +264,7 @@ mod tests {
             .await
             .expect("plan mv");
 
-        let plans =
-            build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
+        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
         let requirements = plan_source_requirements(&plans[0]).expect("source requirements");
         assert!(
             requirements.is_none(),
@@ -308,7 +296,6 @@ mod tests {
         auction.set_property("primary_key", "id");
         sources.register(bid);
         sources.register(auction);
-        let available_sources = available_sources_from_registry(&sources);
 
         let definition = parse_materialized_view(
             "CREATE MATERIALIZED VIEW mv AS SELECT b.auction, b.bidder, a.seller \
@@ -319,8 +306,7 @@ mod tests {
             .await
             .expect("plan mv");
 
-        let plans =
-            build_dataflows(&planned, &available_sources, &sources).expect("build dbsp plan");
+        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
         assert_eq!(plans.len(), 1);
         let plan = &plans[0];
         assert!(

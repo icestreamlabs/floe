@@ -1386,7 +1386,7 @@ async fn validate_generated_active_vectorized_runtime_case(
     let state_table = build_operator_state_table(&case.id).await?;
     let mv_plan = VectorizedMaterializedViewPlan::new(
         planned.definition().name().to_string(),
-        planned.definition().query().to_string(),
+        planned.logical_plan().clone(),
         output_schema,
     );
     let runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
@@ -1435,7 +1435,7 @@ async fn validate_active_vectorized_runtime_case(
     let state_table = build_operator_state_table(case.id).await?;
     let mv_plan = VectorizedMaterializedViewPlan::new(
         planned.definition().name().to_string(),
-        planned.definition().query().to_string(),
+        planned.logical_plan().clone(),
         output_schema,
     );
     let runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
@@ -1519,7 +1519,7 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
         let state_table = build_operator_state_table(query.id).await?;
         let mv_plan = VectorizedMaterializedViewPlan::new(
             planned.definition().name().to_string(),
-            planned.definition().query().to_string(),
+            planned.logical_plan().clone(),
             output_schema,
         );
         let runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(

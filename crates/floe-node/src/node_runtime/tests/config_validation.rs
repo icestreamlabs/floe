@@ -306,22 +306,6 @@ fn merge_sql_sinks_rejects_duplicate_names() {
 }
 
 #[test]
-fn validate_single_materialized_view_rejects_multiple_views() {
-    let views = vec![
-        MaterializedViewDefinition::new("mv_a", "SELECT 1", false),
-        MaterializedViewDefinition::new("mv_b", "SELECT 2", false),
-    ];
-
-    let err = validate_single_materialized_view(&views).expect_err("expected single-MV error");
-
-    assert!(
-        err.to_string()
-            .contains("at most one materialized view per process")
-    );
-    assert!(err.to_string().contains("mv_a, mv_b"));
-}
-
-#[test]
 fn runtime_failure_records_first_error_only() {
     let state = Arc::new(StdMutex::new(None::<String>));
     record_runtime_failure(&state, "first".to_string());

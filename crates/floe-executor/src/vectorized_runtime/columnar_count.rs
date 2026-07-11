@@ -107,9 +107,9 @@ pub(super) async fn run_columnar_count_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_count.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::CountByKey(columnar) = &mut mv.operator else {
+        unreachable!("count tick dispatched to non-count operator")
     };
 
     let plan_start = Instant::now();
@@ -163,7 +163,7 @@ pub(super) async fn run_columnar_count_materialized_view_tick(
         mode = "columnar_count_by_key",
         "SlateDB-backed columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 fn columnar_count_aggregate_for_plan(

@@ -381,7 +381,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let mut materialized_views: Vec<MaterializedViewDefinition> =
         materialized_view_map.into_values().collect();
     materialized_views.sort_by(|a, b| a.name().cmp(b.name()));
-    validate_single_materialized_view(&materialized_views)?;
     validate_materialized_views_do_not_query_raw_cdc_sources(
         &catalog_sources,
         &materialized_views,
@@ -403,11 +402,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(max_catchup_versions) = run_args.subscribe_max_catchup_versions {
         subscribe_execution_config.max_catchup_versions = max_catchup_versions;
     }
-    let circuit_plans = build_dataflows(
-        &planned_materialized_views,
-        &available_sources,
-        &source_registry,
-    )?;
+    let circuit_plans = build_dataflows(&planned_materialized_views, &source_registry)?;
     let mut all_required_sources: BTreeSet<String> = BTreeSet::new();
     let available_source_names: BTreeSet<String> = available_sources.iter().cloned().collect();
     let mut plan_required_sources: Vec<BTreeSet<String>> = Vec::with_capacity(circuit_plans.len());
@@ -556,7 +551,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             let arrow_schema = df_schema_to_arrow(mv.logical_plan().schema())?;
             Ok(VectorizedMaterializedViewPlan::new(
                 mv.definition().name().to_string(),
-                mv.definition().query().to_string(),
+                mv.logical_plan().clone(),
                 arrow_schema,
             ))
         })

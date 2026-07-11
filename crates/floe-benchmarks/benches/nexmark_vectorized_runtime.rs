@@ -21,8 +21,9 @@ use floe_executor::{
     VectorizedMaterializedViewPlan, print_columnar_phase_profile, reset_columnar_phase_profile,
 };
 use floe_node_core::generator;
-use floe_node_core::planner::planner_udfs;
+use floe_node_core::planner::{plan_materialized_views, planner_udfs};
 use floe_node_core::source::SourceRegistry;
+use floe_sql_parser::parse_materialized_view;
 use object_store::memory::InMemory;
 use slatedb::Db;
 use slatedb::WriteBatch;
@@ -981,15 +982,12 @@ async fn build_runtime_case(
     let definitions = generator::definitions()?;
     sources.extend(definitions.clone());
     let output_schema = (case.output_schema)();
+    let mv_plan = planned_runtime_case(&sources, case, output_schema).await?;
     let table = build_operator_state_table(case.id).await?;
     let registry = Arc::new(MaterializedViewRegistry::new());
     let execution = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
-            case.view_name,
-            case.query,
-            output_schema,
-        )],
+        vec![mv_plan],
         Arc::clone(&registry),
         planner_udfs(),
         VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
@@ -1037,6 +1035,7 @@ async fn build_q4_repeated_state_runtime_case(
     let definitions = generator::definitions()?;
     sources.extend(definitions.clone());
     let output_schema = (case.output_schema)();
+    let mv_plan = planned_runtime_case(&sources, case, output_schema).await?;
     let definitions_elapsed = definitions_start.elapsed();
     let table_start = Instant::now();
     let table = build_operator_state_table(case.id).await?;
@@ -1045,11 +1044,7 @@ async fn build_q4_repeated_state_runtime_case(
     let runtime_start = Instant::now();
     let execution = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
-            case.view_name,
-            case.query,
-            output_schema,
-        )],
+        vec![mv_plan],
         Arc::clone(&registry),
         planner_udfs(),
         VectorizedExecutionRuntimeOptions::default().with_operator_state_table(table),
@@ -1097,6 +1092,29 @@ async fn build_q4_repeated_state_runtime_case(
     }
 
     Ok((execution, registry, auction_batch, bid_batches))
+}
+
+async fn planned_runtime_case(
+    sources: &SourceRegistry,
+    case: &NexmarkRuntimeCase,
+    output_schema: SchemaRef,
+) -> Result<VectorizedMaterializedViewPlan> {
+    let definition = parse_materialized_view(&format!(
+        "CREATE MATERIALIZED VIEW {} AS {}",
+        case.view_name, case.query
+    ))?;
+    let planned = plan_materialized_views(sources, &[definition]).await?;
+    let logical_plan = planned
+        .into_iter()
+        .next()
+        .context("planner returned no materialized view")?
+        .logical_plan()
+        .clone();
+    Ok(VectorizedMaterializedViewPlan::new(
+        case.view_name,
+        logical_plan,
+        output_schema,
+    ))
 }
 
 async fn run_runtime_case(

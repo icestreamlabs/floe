@@ -457,9 +457,9 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_topn.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::TopN(columnar) = &mut mv.operator else {
+        unreachable!("topn tick dispatched to non-topn operator")
     };
     let plan_start = Instant::now();
 
@@ -515,7 +515,7 @@ pub(super) async fn run_columnar_topn_materialized_view_tick(
         mode = "columnar_topn",
         "SlateDB-backed topn columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 pub(super) async fn run_columnar_topn_state_tick(

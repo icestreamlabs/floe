@@ -107,9 +107,9 @@ pub(super) async fn run_columnar_constant_materialized_view_tick(
     registry: &MaterializedViewRegistry,
     mv: &mut VectorizedMaterializedViewState,
     version: i64,
-) -> Result<bool> {
-    let Some(columnar) = mv.columnar_constant.as_mut() else {
-        return Ok(false);
+) -> Result<()> {
+    let super::MaterializedViewOperator::Constant(columnar) = &mut mv.operator else {
+        unreachable!("constant tick dispatched to non-constant operator")
     };
 
     let plan_start = Instant::now();
@@ -164,7 +164,7 @@ pub(super) async fn run_columnar_constant_materialized_view_tick(
         mode = "columnar_constant",
         "SlateDB-backed constant columnar DBSP materialized view tick completed"
     );
-    Ok(true)
+    Ok(())
 }
 
 fn plan_contains_table_scan(plan: &LogicalPlan) -> bool {

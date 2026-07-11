@@ -12,6 +12,7 @@ use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
 use dbsp::storage::KeyValueTable;
+#[cfg(test)]
 use dbsp::{FloeAsofJoinNode, create_logical_plan_with_asof_preplanner};
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
@@ -98,29 +99,46 @@ use columnar_union_grouped_count::{
 #[derive(Debug, Clone)]
 pub struct VectorizedMaterializedViewPlan {
     view_name: String,
-    query: String,
+    #[cfg(not(test))]
+    logical_plan: LogicalPlan,
+    #[cfg(test)]
+    logical_plan: Option<LogicalPlan>,
+    #[cfg(test)]
+    query: Option<String>,
     output_schema: SchemaRef,
-    execution_policy: VectorizedMaterializedViewExecutionPolicy,
 }
 
 impl VectorizedMaterializedViewPlan {
     pub fn new(
+        view_name: impl Into<String>,
+        logical_plan: LogicalPlan,
+        output_schema: SchemaRef,
+    ) -> Self {
+        Self {
+            view_name: view_name.into(),
+            #[cfg(not(test))]
+            logical_plan,
+            #[cfg(test)]
+            logical_plan: Some(logical_plan),
+            #[cfg(test)]
+            query: None,
+            output_schema,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_sql(
         view_name: impl Into<String>,
         query: impl Into<String>,
         output_schema: SchemaRef,
     ) -> Self {
         Self {
             view_name: view_name.into(),
-            query: query.into(),
+            logical_plan: None,
+            query: Some(query.into()),
             output_schema,
-            execution_policy: VectorizedMaterializedViewExecutionPolicy::IncrementalOnly,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VectorizedMaterializedViewExecutionPolicy {
-    IncrementalOnly,
 }
 
 #[derive(Clone)]
@@ -232,19 +250,22 @@ struct VectorizedSourceState {
 struct VectorizedMaterializedViewState {
     view_name: String,
     output_schema: SchemaRef,
-    columnar_constant: Option<ColumnarConstantMaterializedViewState>,
     previous_snapshot: Vec<RecordBatch>,
-    columnar_stateless: Option<ColumnarStatelessMaterializedViewState>,
-    columnar_grouped_count: Option<ColumnarGroupedCountMaterializedViewState>,
-    columnar_grouped_max: Option<ColumnarGroupedMaxMaterializedViewState>,
-    columnar_grouped_stats: Option<ColumnarGroupedStatsMaterializedViewState>,
-    columnar_join: Option<ColumnarJoinMaterializedViewState>,
-    columnar_join_topn: Option<ColumnarJoinTopNMaterializedViewState>,
-    columnar_union_grouped_count: Option<ColumnarUnionGroupedCountMaterializedViewState>,
-    columnar_topn: Option<ColumnarTopNMaterializedViewState>,
-    columnar_union: Option<ColumnarUnionMaterializedViewState>,
-    columnar_count: Option<ColumnarCountMaterializedViewState>,
-    execution_mode: MaterializedViewExecutionMode,
+    operator: MaterializedViewOperator,
+}
+
+enum MaterializedViewOperator {
+    Constant(Box<ColumnarConstantMaterializedViewState>),
+    Stateless(Box<ColumnarStatelessMaterializedViewState>),
+    GroupedCount(Box<ColumnarGroupedCountMaterializedViewState>),
+    GroupedMax(Box<ColumnarGroupedMaxMaterializedViewState>),
+    GroupedStats(Box<ColumnarGroupedStatsMaterializedViewState>),
+    Join(Box<ColumnarJoinMaterializedViewState>),
+    JoinTopN(Box<ColumnarJoinTopNMaterializedViewState>),
+    UnionGroupedCount(Box<ColumnarUnionGroupedCountMaterializedViewState>),
+    TopN(Box<ColumnarTopNMaterializedViewState>),
+    Union(Box<ColumnarUnionMaterializedViewState>),
+    CountByKey(Box<ColumnarCountMaterializedViewState>),
 }
 
 struct IncrementalMaterializedViewState {
@@ -288,6 +309,41 @@ impl MaterializedViewExecutionMode {
     }
 }
 
+impl MaterializedViewOperator {
+    fn mode(&self) -> MaterializedViewExecutionMode {
+        match self {
+            Self::Constant(_) => MaterializedViewExecutionMode::ColumnarConstant,
+            Self::Stateless(_) => MaterializedViewExecutionMode::ColumnarStateless,
+            Self::GroupedCount(_) => MaterializedViewExecutionMode::ColumnarGroupedCount,
+            Self::GroupedMax(_) => MaterializedViewExecutionMode::ColumnarGroupedMax,
+            Self::GroupedStats(_) => MaterializedViewExecutionMode::ColumnarGroupedStats,
+            Self::Join(_) => MaterializedViewExecutionMode::ColumnarJoin,
+            Self::JoinTopN(_) => MaterializedViewExecutionMode::ColumnarJoinTopN,
+            Self::UnionGroupedCount(_) => MaterializedViewExecutionMode::ColumnarUnionGroupedCount,
+            Self::TopN(_) => MaterializedViewExecutionMode::ColumnarTopN,
+            Self::Union(_) => MaterializedViewExecutionMode::ColumnarUnion,
+            Self::CountByKey(_) => MaterializedViewExecutionMode::ColumnarCountByKey,
+        }
+    }
+
+    fn initial_snapshot(&self) -> Vec<RecordBatch> {
+        match self {
+            Self::Constant(state) => state.initial_snapshot(),
+            Self::Stateless(state) => state.initial_snapshot(),
+            Self::GroupedCount(state) => state.initial_snapshot(),
+            Self::GroupedMax(state) => state.initial_snapshot(),
+            Self::GroupedStats(state) => state.initial_snapshot(),
+            Self::Join(state) => state.initial_snapshot(),
+            Self::JoinTopN(state) => state.initial_snapshot(),
+            Self::UnionGroupedCount(state) => state.initial_snapshot(),
+            Self::TopN(state) => state.initial_snapshot(),
+            Self::Union(state) => state.initial_snapshot(),
+            Self::CountByKey(_) => Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Extension(extension) => extension
@@ -350,6 +406,7 @@ pub struct VectorizedExecutionRuntime {
 }
 
 impl VectorizedExecutionRuntime {
+    #[cfg(test)]
     pub async fn new(
         sources: &SourceRegistry,
         materialized_views: Vec<VectorizedMaterializedViewPlan>,
@@ -364,6 +421,7 @@ impl VectorizedExecutionRuntime {
         .await
     }
 
+    #[cfg(test)]
     pub async fn new_with_options(
         sources: &SourceRegistry,
         materialized_views: Vec<VectorizedMaterializedViewPlan>,
@@ -374,6 +432,7 @@ impl VectorizedExecutionRuntime {
             .await
     }
 
+    #[cfg(test)]
     pub async fn new_with_udfs(
         sources: &SourceRegistry,
         materialized_views: Vec<VectorizedMaterializedViewPlan>,
@@ -474,22 +533,36 @@ impl VectorizedExecutionRuntime {
         let mut mv_states = Vec::with_capacity(materialized_views.len());
         for mv in materialized_views {
             registry.set_schema(mv.view_name.clone(), Arc::clone(&mv.output_schema));
-            let state = ctx.state();
-            let asof_preplanned = create_logical_plan_with_asof_preplanner(&state, &mv.query)
-                .await
-                .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
-            let df = if plan_contains_asof_extension(&asof_preplanned) {
-                ctx.execute_logical_plan(asof_preplanned)
-                    .await
-                    .with_context(|| {
-                        format!("build vectorized ASOF DataFrame for {}", mv.view_name)
-                    })?
+            #[cfg(not(test))]
+            let logical_plan = mv.logical_plan.clone();
+            #[cfg(test)]
+            let logical_plan = if let Some(logical_plan) = mv.logical_plan.clone() {
+                logical_plan
             } else {
-                ctx.sql(&mv.query)
+                let query = mv.query.as_deref().ok_or_else(|| {
+                    anyhow!("materialized view '{}' has no logical plan", mv.view_name)
+                })?;
+                let state = ctx.state();
+                let asof_preplanned = create_logical_plan_with_asof_preplanner(&state, query)
                     .await
-                    .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
+                    .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
+                if plan_contains_asof_extension(&asof_preplanned) {
+                    ctx.execute_logical_plan(asof_preplanned)
+                        .await
+                        .with_context(|| {
+                            format!("build vectorized ASOF DataFrame for {}", mv.view_name)
+                        })?
+                        .logical_plan()
+                        .clone()
+                } else {
+                    ctx.sql(query)
+                        .await
+                        .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
+                        .logical_plan()
+                        .clone()
+                }
             };
-            let columnar_constant_plan = columnar_constant_plan_for_plan(df.logical_plan());
+            let columnar_constant_plan = columnar_constant_plan_for_plan(&logical_plan);
             let columnar_constant = match (
                 columnar_constant_plan,
                 options.operator_state_table.as_ref(),
@@ -510,10 +583,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -522,7 +592,7 @@ impl VectorizedExecutionRuntime {
                 _ => None,
             };
             let columnar_count_plan = if columnar_constant.is_none() {
-                columnar_count_plan_for_plan(df.logical_plan(), &source_states, &mv.output_schema)?
+                columnar_count_plan_for_plan(&logical_plan, &source_states, &mv.output_schema)?
             } else {
                 None
             };
@@ -542,10 +612,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -555,7 +622,7 @@ impl VectorizedExecutionRuntime {
             };
             let columnar_grouped_count_plan = if columnar_count.is_none() {
                 columnar_grouped_count_plan_for_plan(
-                    df.logical_plan(),
+                    &logical_plan,
                     &source_states,
                     &mv.output_schema,
                 )?
@@ -583,10 +650,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -597,7 +661,7 @@ impl VectorizedExecutionRuntime {
             let columnar_grouped_max_plan =
                 if columnar_count.is_none() && columnar_grouped_count.is_none() {
                     columnar_grouped_max_plan_for_plan(
-                        df.logical_plan(),
+                        &logical_plan,
                         &source_states,
                         &mv.output_schema,
                     )?
@@ -625,10 +689,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -641,7 +702,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_grouped_max.is_none()
             {
                 columnar_grouped_stats_plan_for_plan(
-                    df.logical_plan(),
+                    &logical_plan,
                     &source_states,
                     &mv.output_schema,
                 )?
@@ -670,10 +731,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -686,7 +744,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_grouped_max.is_none()
                 && columnar_grouped_stats.is_none()
             {
-                columnar_join_plan_for_plan(df.logical_plan(), &source_states)?
+                columnar_join_plan_for_plan(&logical_plan, &source_states)?
             } else {
                 None
             };
@@ -708,10 +766,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -725,7 +780,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_grouped_stats.is_none()
                 && columnar_join.is_none()
             {
-                columnar_topn_plan_for_plan(df.logical_plan(), &source_states)?
+                columnar_topn_plan_for_plan(&logical_plan, &source_states)?
             } else {
                 None
             };
@@ -747,10 +802,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -765,7 +817,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join.is_none()
                 && columnar_topn.is_none()
             {
-                columnar_join_topn_plan_for_plan(df.logical_plan(), &source_states)?
+                columnar_join_topn_plan_for_plan(&logical_plan, &source_states)?
             } else {
                 None
             };
@@ -790,10 +842,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -809,7 +858,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_topn.is_none()
                 && columnar_join_topn.is_none()
             {
-                columnar_union_plan_for_plan(df.logical_plan(), &source_states)?
+                columnar_union_plan_for_plan(&logical_plan, &source_states)?
             } else {
                 None
             };
@@ -832,10 +881,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -852,7 +898,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_join_topn.is_none()
                 && columnar_union.is_none()
             {
-                columnar_stateless_plan_for_plan(df.logical_plan(), &source_states)
+                columnar_stateless_plan_for_plan(&logical_plan, &source_states)
             } else {
                 None
             };
@@ -864,7 +910,7 @@ impl VectorizedExecutionRuntime {
                     build_columnar_stateless_materialized_view_state(
                         Arc::clone(table),
                         &mv.view_name,
-                        &mv.query,
+                        &logical_plan,
                         &mv.output_schema,
                         plan,
                         &source_states,
@@ -878,10 +924,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -900,7 +943,7 @@ impl VectorizedExecutionRuntime {
                 && columnar_stateless.is_none()
             {
                 columnar_union_grouped_count_plan_for_plan(
-                    df.logical_plan(),
+                    &logical_plan,
                     &source_states,
                     &mv.output_schema,
                 )?
@@ -928,10 +971,7 @@ impl VectorizedExecutionRuntime {
                         )
                     })?,
                 ),
-                (Some(_), None)
-                    if mv.execution_policy
-                        == VectorizedMaterializedViewExecutionPolicy::IncrementalOnly =>
-                {
+                (Some(_), None) => {
                     bail!(
                         "materialized view '{}' requires SlateDB-backed operator state for columnar DBSP execution",
                         mv.view_name
@@ -939,18 +979,29 @@ impl VectorizedExecutionRuntime {
                 }
                 _ => None,
             };
-            if columnar_count.is_none()
-                && columnar_constant.is_none()
-                && columnar_grouped_count.is_none()
-                && columnar_grouped_max.is_none()
-                && columnar_grouped_stats.is_none()
-                && columnar_join.is_none()
-                && columnar_topn.is_none()
-                && columnar_join_topn.is_none()
-                && columnar_union.is_none()
-                && columnar_stateless.is_none()
-                && columnar_union_grouped_count.is_none()
-            {
+            let operator = if let Some(state) = columnar_constant {
+                MaterializedViewOperator::Constant(Box::new(state))
+            } else if let Some(state) = columnar_stateless {
+                MaterializedViewOperator::Stateless(Box::new(state))
+            } else if let Some(state) = columnar_grouped_count {
+                MaterializedViewOperator::GroupedCount(Box::new(state))
+            } else if let Some(state) = columnar_grouped_max {
+                MaterializedViewOperator::GroupedMax(Box::new(state))
+            } else if let Some(state) = columnar_grouped_stats {
+                MaterializedViewOperator::GroupedStats(Box::new(state))
+            } else if let Some(state) = columnar_join {
+                MaterializedViewOperator::Join(Box::new(state))
+            } else if let Some(state) = columnar_join_topn {
+                MaterializedViewOperator::JoinTopN(Box::new(state))
+            } else if let Some(state) = columnar_union_grouped_count {
+                MaterializedViewOperator::UnionGroupedCount(Box::new(state))
+            } else if let Some(state) = columnar_topn {
+                MaterializedViewOperator::TopN(Box::new(state))
+            } else if let Some(state) = columnar_union {
+                MaterializedViewOperator::Union(Box::new(state))
+            } else if let Some(state) = columnar_count {
+                MaterializedViewOperator::CountByKey(Box::new(state))
+            } else {
                 let source_schemas = source_states
                     .iter()
                     .map(|(name, state)| format!("{name}: {:?}", state.schema.fields()))
@@ -959,106 +1010,20 @@ impl VectorizedExecutionRuntime {
                     view = %mv.view_name,
                     output_schema = ?mv.output_schema.fields(),
                     sources = ?source_schemas,
-                    plan = %df.logical_plan().display_indent(),
+                    plan = %&logical_plan.display_indent(),
                     "materialized view did not match a SlateDB-backed columnar DBSP operator"
                 );
                 bail!(
                     "materialized view '{}' requires a supported SlateDB-backed columnar DBSP operator",
                     mv.view_name
                 );
-            }
-            let execution_mode = if columnar_constant.is_some() {
-                MaterializedViewExecutionMode::ColumnarConstant
-            } else if columnar_stateless.is_some() {
-                MaterializedViewExecutionMode::ColumnarStateless
-            } else if columnar_grouped_count.is_some() {
-                MaterializedViewExecutionMode::ColumnarGroupedCount
-            } else if columnar_grouped_max.is_some() {
-                MaterializedViewExecutionMode::ColumnarGroupedMax
-            } else if columnar_grouped_stats.is_some() {
-                MaterializedViewExecutionMode::ColumnarGroupedStats
-            } else if columnar_join.is_some() {
-                MaterializedViewExecutionMode::ColumnarJoin
-            } else if columnar_join_topn.is_some() {
-                MaterializedViewExecutionMode::ColumnarJoinTopN
-            } else if columnar_union_grouped_count.is_some() {
-                MaterializedViewExecutionMode::ColumnarUnionGroupedCount
-            } else if columnar_topn.is_some() {
-                MaterializedViewExecutionMode::ColumnarTopN
-            } else if columnar_union.is_some() {
-                MaterializedViewExecutionMode::ColumnarUnion
-            } else if columnar_count.is_some() {
-                MaterializedViewExecutionMode::ColumnarCountByKey
-            } else {
-                bail!(
-                    "materialized view '{}' requires a supported SlateDB-backed columnar DBSP operator",
-                    mv.view_name
-                );
             };
+            let previous_snapshot = operator.initial_snapshot();
             mv_states.push(VectorizedMaterializedViewState {
                 view_name: mv.view_name,
                 output_schema: mv.output_schema,
-                previous_snapshot: columnar_constant
-                    .as_ref()
-                    .map(ColumnarConstantMaterializedViewState::initial_snapshot)
-                    .or_else(|| {
-                        columnar_stateless
-                            .as_ref()
-                            .map(ColumnarStatelessMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_grouped_count
-                            .as_ref()
-                            .map(ColumnarGroupedCountMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_grouped_max
-                            .as_ref()
-                            .map(ColumnarGroupedMaxMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_grouped_stats
-                            .as_ref()
-                            .map(ColumnarGroupedStatsMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_join
-                            .as_ref()
-                            .map(ColumnarJoinMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_join_topn
-                            .as_ref()
-                            .map(ColumnarJoinTopNMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_topn
-                            .as_ref()
-                            .map(ColumnarTopNMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_union
-                            .as_ref()
-                            .map(ColumnarUnionMaterializedViewState::initial_snapshot)
-                    })
-                    .or_else(|| {
-                        columnar_union_grouped_count
-                            .as_ref()
-                            .map(ColumnarUnionGroupedCountMaterializedViewState::initial_snapshot)
-                    })
-                    .unwrap_or_default(),
-                columnar_constant,
-                columnar_stateless,
-                columnar_grouped_count,
-                columnar_grouped_max,
-                columnar_grouped_stats,
-                columnar_join,
-                columnar_join_topn,
-                columnar_union_grouped_count,
-                columnar_topn,
-                columnar_union,
-                columnar_count,
-                execution_mode,
+                previous_snapshot,
+                operator,
             });
         }
         Ok(Self {
@@ -1094,35 +1059,30 @@ impl VectorizedExecutionRuntime {
     pub fn materialized_view_execution_modes(&self) -> Vec<(&str, &'static str)> {
         self.materialized_views
             .iter()
-            .map(|mv| (mv.view_name.as_str(), mv.execution_mode.as_str()))
+            .map(|mv| (mv.view_name.as_str(), mv.operator.mode().as_str()))
             .collect()
     }
 
-    pub fn append_source_batches_for_execution_and_query(
+    pub async fn append_source_batches_for_execution_and_query(
         &mut self,
         source_name: &str,
         execution_batches: Vec<RecordBatch>,
         query_batches: Vec<RecordBatch>,
-    ) -> std::future::Ready<Result<()>> {
-        // This path is synchronous; returning a ready future keeps existing async call sites
-        // without capturing the large runtime state in an async fn future.
-        let result = (|| {
-            if execution_batches.is_empty() && query_batches.is_empty() {
-                return Ok(());
+    ) -> Result<()> {
+        if execution_batches.is_empty() && query_batches.is_empty() {
+            return Ok(());
+        }
+        let state = self
+            .sources
+            .get(source_name)
+            .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
+            .clone();
+        for batch in execution_batches.iter().chain(query_batches.iter()) {
+            if batch.schema().as_ref() != state.schema.as_ref() {
+                bail!("source batch schema does not match source '{source_name}'");
             }
-            let state = self
-                .sources
-                .get(source_name)
-                .ok_or_else(|| anyhow!("unknown vectorized source '{source_name}'"))?
-                .clone();
-            for batch in execution_batches.iter().chain(query_batches.iter()) {
-                if batch.schema().as_ref() != state.schema.as_ref() {
-                    bail!("source batch schema does not match source '{source_name}'");
-                }
-            }
-            self.apply_insert_source_batches(source_name, &state, execution_batches, query_batches)
-        })();
-        std::future::ready(result)
+        }
+        self.apply_insert_source_batches(source_name, &state, execution_batches, query_batches)
     }
 
     pub async fn apply_weighted_source_delta(
@@ -1263,124 +1223,111 @@ impl VectorizedExecutionRuntime {
         let insert_batches = &self.current_insert_batches;
         let weighted_delta_batches = &self.current_weighted_delta_batches;
         for mv in &mut self.materialized_views {
-            if run_columnar_constant_materialized_view_tick(registry, mv, version).await? {
-                continue;
+            match mv.operator.mode() {
+                MaterializedViewExecutionMode::ColumnarConstant => {
+                    run_columnar_constant_materialized_view_tick(registry, mv, version).await?
+                }
+                MaterializedViewExecutionMode::ColumnarStateless => {
+                    run_columnar_stateless_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarCountByKey => {
+                    run_columnar_count_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarGroupedCount => {
+                    run_columnar_grouped_count_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarGroupedMax => {
+                    run_columnar_grouped_max_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarGroupedStats => {
+                    run_columnar_grouped_stats_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarJoin => {
+                    run_columnar_join_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarJoinTopN => {
+                    run_columnar_join_topn_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarTopN => {
+                    run_columnar_topn_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarUnion => {
+                    run_columnar_union_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
+                MaterializedViewExecutionMode::ColumnarUnionGroupedCount => {
+                    run_columnar_union_grouped_count_materialized_view_tick(
+                        registry,
+                        insert_batches,
+                        weighted_delta_batches,
+                        mv,
+                        version,
+                    )
+                    .await?
+                }
             }
-            if run_columnar_stateless_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_count_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_grouped_count_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_grouped_max_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_grouped_stats_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_join_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_join_topn_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_topn_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_union_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            if run_columnar_union_grouped_count_materialized_view_tick(
-                registry,
-                insert_batches,
-                weighted_delta_batches,
-                mv,
-                version,
-            )
-            .await?
-            {
-                continue;
-            }
-            bail!(
-                "materialized view '{}' has no SlateDB-backed columnar DBSP operator for execution mode {}",
-                mv.view_name,
-                mv.execution_mode.as_str()
-            );
         }
         self.current_insert_batches.clear();
         self.current_weighted_delta_batches.clear();
@@ -1431,26 +1378,6 @@ impl VectorizedExecutionRuntime {
         }
         Ok(())
     }
-}
-
-async fn build_incremental_materialized_view_state(
-    query: &str,
-    source_name: &str,
-    sources: &HashMap<String, VectorizedSourceState>,
-    udfs: &[ScalarUDF],
-) -> Result<IncrementalMaterializedViewState> {
-    let ctx = incremental_context_with_udfs(udfs);
-    let (source_provider, alias_schema, alias_provider) =
-        incremental_context_providers(&ctx, source_name, sources)?;
-    let df = ctx.sql(query).await?;
-    let plan = df.create_physical_plan().await?;
-    Ok(IncrementalMaterializedViewState {
-        ctx,
-        source_provider,
-        alias_schema,
-        alias_provider,
-        plan,
-    })
 }
 
 async fn build_incremental_materialized_view_state_from_logical_plan(

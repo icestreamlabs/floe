@@ -729,11 +729,10 @@ async fn assert_stateless_source_namespace_empty(table: &Arc<dyn KeyValueTable>,
 }
 
 fn assert_columnar_join_strategy(runtime: &VectorizedExecutionRuntime, expected: &str) {
-    let actual = runtime.materialized_views[0]
-        .columnar_join
-        .as_ref()
-        .map(|state| state.execution_strategy_name());
-    assert_eq!(actual, Some(expected));
+    let MaterializedViewOperator::Join(state) = &runtime.materialized_views[0].operator else {
+        panic!("materialized view is not a join operator");
+    };
+    assert_eq!(state.execution_strategy_name(), expected);
 }
 
 async fn assert_incremental_plan_rejected(
@@ -747,7 +746,7 @@ async fn assert_incremental_plan_rejected(
     let registry = Arc::new(MaterializedViewRegistry::new());
     let result = VectorizedExecutionRuntime::new_with_options(
         sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             view_name,
             query,
             output_schema,
@@ -1018,7 +1017,7 @@ async fn pruned_execution_batches_do_not_prune_query_provider() {
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders",
             Arc::clone(&output_schema),
@@ -1110,7 +1109,7 @@ async fn primary_key_cdc_delta_updates_filter_project_mv_incrementally() {
     ]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id, amount FROM orders WHERE amount >= 20",
             Arc::clone(&output_schema),
@@ -1214,7 +1213,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     let output_schema = Arc::clone(&schema);
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id * 2 AS id, note FROM orders WHERE id * 2 >= 4",
             Arc::clone(&output_schema),
@@ -1225,7 +1224,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarStateless
     );
 
@@ -1294,7 +1293,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id * 2 AS id, note FROM orders WHERE id * 2 >= 4",
             Arc::clone(&output_schema),
@@ -1305,7 +1304,7 @@ async fn filter_project_uses_slate_backed_columnar_stateless_operator_incrementa
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarStateless
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -1343,7 +1342,7 @@ async fn values_relation_uses_slate_backed_columnar_constant_operator() {
     let query = "SELECT id, note FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, note)";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_values",
             query,
             Arc::clone(&output_schema),
@@ -1354,7 +1353,7 @@ async fn values_relation_uses_slate_backed_columnar_constant_operator() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarConstant
     );
 
@@ -1384,7 +1383,7 @@ async fn values_relation_uses_slate_backed_columnar_constant_operator() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_values",
             query,
             Arc::clone(&output_schema),
@@ -1395,7 +1394,7 @@ async fn values_relation_uses_slate_backed_columnar_constant_operator() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarConstant
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -1428,7 +1427,7 @@ async fn empty_values_relation_persists_columnar_constant_state() {
     let query = "SELECT id, note FROM (VALUES (1, 'a'), (2, 'b')) AS t(id, note) WHERE id > 10";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_empty_values",
             query,
             Arc::clone(&output_schema),
@@ -1439,7 +1438,7 @@ async fn empty_values_relation_persists_columnar_constant_state() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarConstant
     );
 
@@ -1461,7 +1460,7 @@ async fn empty_values_relation_persists_columnar_constant_state() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_empty_values",
             query,
             Arc::clone(&output_schema),
@@ -1472,7 +1471,7 @@ async fn empty_values_relation_persists_columnar_constant_state() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarConstant
     );
     recovered.run_tick(2).await.expect("recovered tick");
@@ -1515,7 +1514,7 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
     let output_schema = Arc::clone(&schema);
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders ORDER BY id DESC",
             Arc::clone(&output_schema),
@@ -1526,7 +1525,7 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarStateless
     );
 
@@ -1581,7 +1580,7 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders ORDER BY id DESC",
             Arc::clone(&output_schema),
@@ -1592,7 +1591,7 @@ async fn sort_passthrough_uses_slate_backed_columnar_stateless_operator_incremen
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarStateless
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -1655,7 +1654,7 @@ async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_ids",
             "SELECT id FROM orders WHERE id <= 2 UNION ALL SELECT id FROM shipments WHERE id >= 2",
             Arc::clone(&output_schema),
@@ -1666,7 +1665,7 @@ async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
 
@@ -1727,7 +1726,7 @@ async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_ids",
             "SELECT id FROM orders WHERE id <= 2 UNION ALL SELECT id FROM shipments WHERE id >= 2",
             Arc::clone(&output_schema),
@@ -1738,7 +1737,7 @@ async fn union_all_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -1801,7 +1800,7 @@ async fn source_union_values_relation_uses_slate_backed_columnar_union_operator(
                  SELECT id FROM (VALUES (2), (4)) AS v(id)";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_values",
             query,
             Arc::clone(&output_schema),
@@ -1812,7 +1811,7 @@ async fn source_union_values_relation_uses_slate_backed_columnar_union_operator(
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
 
@@ -1863,7 +1862,7 @@ async fn source_union_values_relation_uses_slate_backed_columnar_union_operator(
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_values",
             query,
             Arc::clone(&output_schema),
@@ -1874,7 +1873,7 @@ async fn source_union_values_relation_uses_slate_backed_columnar_union_operator(
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -1932,7 +1931,7 @@ async fn union_distinct_uses_slate_backed_columnar_operator_incrementally() {
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_ids",
             "SELECT id FROM orders WHERE id <= 2 UNION SELECT id FROM shipments WHERE id >= 2",
             Arc::clone(&output_schema),
@@ -1943,7 +1942,7 @@ async fn union_distinct_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
 
@@ -1993,7 +1992,7 @@ async fn union_distinct_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_ids",
             "SELECT id FROM orders WHERE id <= 2 UNION SELECT id FROM shipments WHERE id >= 2",
             Arc::clone(&output_schema),
@@ -2004,7 +2003,7 @@ async fn union_distinct_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -2081,7 +2080,7 @@ async fn ordered_union_distinct_uses_slate_backed_columnar_operator_incrementall
     let query = "SELECT id FROM orders WHERE id <= 2 UNION SELECT id FROM shipments WHERE id >= 2 ORDER BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_ordered_union_ids",
             query,
             Arc::clone(&output_schema),
@@ -2092,7 +2091,7 @@ async fn ordered_union_distinct_uses_slate_backed_columnar_operator_incrementall
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
 
@@ -2144,7 +2143,7 @@ async fn ordered_union_distinct_uses_slate_backed_columnar_operator_incrementall
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_ordered_union_ids",
             query,
             Arc::clone(&output_schema),
@@ -2155,7 +2154,7 @@ async fn ordered_union_distinct_uses_slate_backed_columnar_operator_incrementall
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnion
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -2219,7 +2218,7 @@ async fn count_group_by_uses_slate_backed_columnar_operator_incrementally() {
     ]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_counts",
             "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
             Arc::clone(&output_schema),
@@ -2284,7 +2283,7 @@ async fn count_group_by_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_counts",
             "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
             Arc::clone(&output_schema),
@@ -2336,7 +2335,7 @@ async fn distinct_uses_slate_backed_grouped_count_state_incrementally() {
     let output_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_ids",
             "SELECT DISTINCT id FROM orders",
             Arc::clone(&output_schema),
@@ -2347,7 +2346,7 @@ async fn distinct_uses_slate_backed_grouped_count_state_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
 
@@ -2390,7 +2389,7 @@ async fn distinct_uses_slate_backed_grouped_count_state_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_ids",
             "SELECT DISTINCT id FROM orders",
             Arc::clone(&output_schema),
@@ -2401,7 +2400,7 @@ async fn distinct_uses_slate_backed_grouped_count_state_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -2485,7 +2484,7 @@ async fn ordered_distinct_uses_slate_backed_grouped_count_state_incrementally() 
     let query = "SELECT DISTINCT id FROM orders ORDER BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_ids_ordered",
             query,
             Arc::clone(&output_schema),
@@ -2496,7 +2495,7 @@ async fn ordered_distinct_uses_slate_backed_grouped_count_state_incrementally() 
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
 
@@ -2541,7 +2540,7 @@ async fn ordered_distinct_uses_slate_backed_grouped_count_state_incrementally() 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_ids_ordered",
             query,
             Arc::clone(&output_schema),
@@ -2552,7 +2551,7 @@ async fn ordered_distinct_uses_slate_backed_grouped_count_state_incrementally() 
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -2625,7 +2624,7 @@ async fn grouped_count_with_hidden_key_uses_slate_backed_columnar_operator_incre
     ]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_counts",
             "SELECT id, COUNT(*) AS count FROM orders GROUP BY id, ts",
             Arc::clone(&output_schema),
@@ -2636,7 +2635,7 @@ async fn grouped_count_with_hidden_key_uses_slate_backed_columnar_operator_incre
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
 
@@ -2678,7 +2677,7 @@ async fn grouped_count_with_hidden_key_uses_slate_backed_columnar_operator_incre
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_counts",
             "SELECT id, COUNT(*) AS count FROM orders GROUP BY id, ts",
             Arc::clone(&output_schema),
@@ -2689,7 +2688,7 @@ async fn grouped_count_with_hidden_key_uses_slate_backed_columnar_operator_incre
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -2768,7 +2767,7 @@ async fn append_only_hop_grouped_count_recovers_compact_state() {
     ]));
     let mut runtime = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_counts",
             r#"SELECT auction, COUNT(*) AS count FROM bids GROUP BY auction, HOP("dateTime", 1000, 3000)"#,
             Arc::clone(&output_schema),
@@ -2780,7 +2779,7 @@ async fn append_only_hop_grouped_count_recovers_compact_state() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
 
@@ -2801,7 +2800,7 @@ async fn append_only_hop_grouped_count_recovers_compact_state() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_udfs_and_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_counts",
             r#"SELECT auction, COUNT(*) AS count FROM bids GROUP BY auction, HOP("dateTime", 1000, 3000)"#,
             Arc::clone(&output_schema),
@@ -2888,7 +2887,7 @@ async fn grouped_count_supports_boolean_group_key_incrementally() {
     ]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_active_counts",
             "SELECT active, COUNT(*) AS count FROM events GROUP BY active",
             Arc::clone(&output_schema),
@@ -2899,7 +2898,7 @@ async fn grouped_count_supports_boolean_group_key_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedCount
     );
 
@@ -2975,7 +2974,7 @@ async fn grouped_max_with_hidden_key_uses_slate_backed_columnar_operator_increme
     )]));
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_max",
             "SELECT MAX(price) AS max_price FROM orders GROUP BY id, ts",
             Arc::clone(&output_schema),
@@ -2986,7 +2985,7 @@ async fn grouped_max_with_hidden_key_uses_slate_backed_columnar_operator_increme
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedMax
     );
 
@@ -3055,7 +3054,7 @@ async fn grouped_max_with_hidden_key_uses_slate_backed_columnar_operator_increme
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_max",
             "SELECT MAX(price) AS max_price FROM orders GROUP BY id, ts",
             Arc::clone(&output_schema),
@@ -3066,7 +3065,7 @@ async fn grouped_max_with_hidden_key_uses_slate_backed_columnar_operator_increme
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedMax
     );
     recovered.run_tick(4).await.expect("recovered tick");
@@ -3155,7 +3154,7 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3166,7 +3165,7 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -3207,7 +3206,7 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3218,7 +3217,7 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -3294,7 +3293,7 @@ async fn grouped_stats_can_publish_columnar_versions_without_arrow_snapshots() {
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3307,7 +3306,7 @@ async fn grouped_stats_can_publish_columnar_versions_without_arrow_snapshots() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -3399,7 +3398,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3412,7 +3411,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -3450,7 +3449,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3523,7 +3522,7 @@ async fn append_only_grouped_stats_recovers_distinct_presence_segments() {
         COUNT(DISTINCT bidder) AS distinct_bidders FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3543,7 +3542,7 @@ async fn append_only_grouped_stats_recovers_distinct_presence_segments() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3610,7 +3609,7 @@ async fn append_only_grouped_stats_rejects_negative_source_delta() {
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -3684,7 +3683,7 @@ async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let query = "SELECT id, SUM(amount) AS total FROM orders GROUP BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -3695,7 +3694,7 @@ async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -3738,7 +3737,7 @@ async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -3749,7 +3748,7 @@ async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -3831,7 +3830,7 @@ async fn ordered_sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
         ORDER BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals_ordered",
             query,
             Arc::clone(&output_schema),
@@ -3842,7 +3841,7 @@ async fn ordered_sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -3887,7 +3886,7 @@ async fn ordered_sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals_ordered",
             query,
             Arc::clone(&output_schema),
@@ -3898,7 +3897,7 @@ async fn ordered_sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -3978,7 +3977,7 @@ async fn having_grouped_stats_uses_slate_backed_post_aggregate_filter_incrementa
         FROM orders GROUP BY id HAVING SUM(amount) >= 20";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_large_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -3989,7 +3988,7 @@ async fn having_grouped_stats_uses_slate_backed_post_aggregate_filter_incrementa
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4031,7 +4030,7 @@ async fn having_grouped_stats_uses_slate_backed_post_aggregate_filter_incrementa
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_large_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -4042,7 +4041,7 @@ async fn having_grouped_stats_uses_slate_backed_post_aggregate_filter_incrementa
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -4119,7 +4118,7 @@ async fn final_aggregate_projection_uses_slate_backed_grouped_stats_incrementall
     let query = "SELECT id, SUM(amount) + 1 AS adjusted_total FROM orders GROUP BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_adjusted_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -4130,7 +4129,7 @@ async fn final_aggregate_projection_uses_slate_backed_grouped_stats_incrementall
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4175,7 +4174,7 @@ async fn final_aggregate_projection_uses_slate_backed_grouped_stats_incrementall
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_adjusted_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -4186,7 +4185,7 @@ async fn final_aggregate_projection_uses_slate_backed_grouped_stats_incrementall
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -4269,7 +4268,7 @@ async fn aggregate_subquery_having_projection_uses_slate_backed_grouped_stats_in
     ) a WHERE amount_count > 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -4280,7 +4279,7 @@ async fn aggregate_subquery_having_projection_uses_slate_backed_grouped_stats_in
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4320,7 +4319,7 @@ async fn aggregate_subquery_having_projection_uses_slate_backed_grouped_stats_in
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -4331,7 +4330,7 @@ async fn aggregate_subquery_having_projection_uses_slate_backed_grouped_stats_in
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -4406,7 +4405,7 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
     let query = "SELECT COUNT(*) AS total FROM orders";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_count",
             query,
             Arc::clone(&output_schema),
@@ -4417,7 +4416,7 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4454,7 +4453,7 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_count",
             query,
             Arc::clone(&output_schema),
@@ -4465,7 +4464,7 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -4537,7 +4536,7 @@ async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     let query = "SELECT SUM(amount) AS total FROM orders";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_sum",
             query,
             Arc::clone(&output_schema),
@@ -4548,7 +4547,7 @@ async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4585,7 +4584,7 @@ async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_sum",
             query,
             Arc::clone(&output_schema),
@@ -4596,7 +4595,7 @@ async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -4694,7 +4693,7 @@ async fn grouped_stats_supports_distinct_counts_and_string_max_incrementally() {
         FROM events GROUP BY channel, day";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_event_stats",
             query,
             Arc::clone(&output_schema),
@@ -4705,7 +4704,7 @@ async fn grouped_stats_supports_distinct_counts_and_string_max_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4771,7 +4770,7 @@ async fn grouped_stats_supports_distinct_counts_and_string_max_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_event_stats",
             query,
             Arc::clone(&output_schema),
@@ -4879,7 +4878,7 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
     let query = "SELECT COUNT(DISTINCT channel) AS distinct_channels FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_distinct_channels",
             query,
             Arc::clone(&output_schema),
@@ -4890,7 +4889,7 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -4932,7 +4931,7 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_distinct_channels",
             query,
             Arc::clone(&output_schema),
@@ -4943,7 +4942,7 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -5018,7 +5017,7 @@ async fn grouped_stats_supports_timestamp_min_max_incrementally() {
     let query = "SELECT MIN(event_time) AS first_ts, MAX(event_time) AS last_ts FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_event_bounds",
             query,
             Arc::clone(&output_schema),
@@ -5029,7 +5028,7 @@ async fn grouped_stats_supports_timestamp_min_max_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -5069,7 +5068,7 @@ async fn grouped_stats_supports_timestamp_min_max_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_event_bounds",
             query,
             Arc::clone(&output_schema),
@@ -5080,7 +5079,7 @@ async fn grouped_stats_supports_timestamp_min_max_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -5154,7 +5153,7 @@ async fn grouped_stats_supports_date_min_max_incrementally() {
     let query = "SELECT MIN(event_day) AS first_day, MAX(event_day) AS last_day FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_event_days",
             query,
             Arc::clone(&output_schema),
@@ -5165,7 +5164,7 @@ async fn grouped_stats_supports_date_min_max_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -5236,7 +5235,7 @@ async fn grouped_stats_supports_timestamp_distinct_count_incrementally() {
     let query = "SELECT COUNT(DISTINCT event_time) AS distinct_times FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_distinct_times",
             query,
             Arc::clone(&output_schema),
@@ -5247,7 +5246,7 @@ async fn grouped_stats_supports_timestamp_distinct_count_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -5286,7 +5285,7 @@ async fn grouped_stats_supports_timestamp_distinct_count_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_distinct_times",
             query,
             Arc::clone(&output_schema),
@@ -5297,7 +5296,7 @@ async fn grouped_stats_supports_timestamp_distinct_count_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -5370,7 +5369,7 @@ async fn grouped_stats_supports_boolean_distinct_count_incrementally() {
     let query = "SELECT COUNT(DISTINCT active) AS distinct_flags FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_distinct_flags",
             query,
             Arc::clone(&output_schema),
@@ -5381,7 +5380,7 @@ async fn grouped_stats_supports_boolean_distinct_count_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -5455,7 +5454,7 @@ async fn grouped_stats_supports_decimal_stats_incrementally() {
     let query = "SELECT SUM(amount) AS total_amount, MIN(amount) AS min_amount, MAX(amount) AS max_amount, COUNT(DISTINCT amount) AS distinct_amounts FROM payments";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_payment_stats",
             query,
             Arc::clone(&output_schema),
@@ -5466,7 +5465,7 @@ async fn grouped_stats_supports_decimal_stats_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -5512,7 +5511,7 @@ async fn grouped_stats_supports_decimal_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_payment_stats",
             query,
             Arc::clone(&output_schema),
@@ -5523,7 +5522,7 @@ async fn grouped_stats_supports_decimal_stats_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -5627,7 +5626,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
         WHERE c.region = 'west'";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -5638,7 +5637,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoin
     );
     assert_columnar_join_strategy(&runtime, "incremental_inner");
@@ -5697,7 +5696,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -5708,7 +5707,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoin
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -5855,7 +5854,7 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
         ORDER BY order_id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_ordered_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -5866,7 +5865,7 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoin
     );
     assert_columnar_join_strategy(&runtime, "incremental_inner");
@@ -5927,7 +5926,7 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_ordered_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -5938,7 +5937,7 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoin
     );
     assert_columnar_join_strategy(&recovered, "incremental_inner");
@@ -6054,7 +6053,7 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
         ON o.customer_id = c.id AND o.amount = c.amount";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_customer_amount_orders",
             query,
             Arc::clone(&output_schema),
@@ -6065,7 +6064,7 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoin
     );
     assert_columnar_join_strategy(&runtime, "incremental_inner");
@@ -6134,7 +6133,7 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_customer_amount_orders",
             query,
             Arc::clone(&output_schema),
@@ -6145,7 +6144,7 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoin
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -6284,7 +6283,7 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
         WHERE rownum <= 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_bid",
             query,
             Arc::clone(&output_schema),
@@ -6295,7 +6294,7 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoinTopN
     );
 
@@ -6362,7 +6361,7 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_bid",
             query,
             Arc::clone(&output_schema),
@@ -6373,7 +6372,7 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoinTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -6522,7 +6521,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
         WHERE rownum <= 1 GROUP BY seller";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_q6",
             query,
             Arc::clone(&output_schema),
@@ -6533,7 +6532,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -6591,7 +6590,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_q6",
             query,
             Arc::clone(&output_schema),
@@ -6602,7 +6601,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -6763,7 +6762,7 @@ async fn cdc_q9_shape_uses_incremental_join_topn_semantics() {
         WHERE rownum <= 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_cdc_q9",
             query,
             Arc::clone(&output_schema),
@@ -6774,7 +6773,7 @@ async fn cdc_q9_shape_uses_incremental_join_topn_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarJoinTopN
     );
 
@@ -6954,7 +6953,7 @@ async fn cdc_q6_shape_uses_incremental_top_bid_grouped_avg_semantics() {
         WHERE rownum <= 1 GROUP BY seller";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_cdc_q6",
             query,
             Arc::clone(&output_schema),
@@ -6965,7 +6964,7 @@ async fn cdc_q6_shape_uses_incremental_top_bid_grouped_avg_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -7272,7 +7271,7 @@ async fn cdc_q6_generated_mutations_match_query_provider_semantics() {
         WHERE rownum <= 1 GROUP BY seller";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_cdc_q6_generated",
             query,
             Arc::clone(&output_schema),
@@ -7285,7 +7284,7 @@ async fn cdc_q6_generated_mutations_match_query_provider_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -7489,7 +7488,7 @@ async fn topn_over_join_avg_uses_grouped_stats_input_semantics() {
         ORDER BY avg_price DESC LIMIT 2) s";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_avg_bid",
             query,
             Arc::clone(&output_schema),
@@ -7500,7 +7499,7 @@ async fn topn_over_join_avg_uses_grouped_stats_input_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -7555,7 +7554,7 @@ async fn topn_over_join_avg_uses_grouped_stats_input_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_avg_bid",
             query,
             Arc::clone(&output_schema),
@@ -7566,7 +7565,7 @@ async fn topn_over_join_avg_uses_grouped_stats_input_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -7667,7 +7666,7 @@ async fn global_aggregate_over_join_avg_topn_uses_grouped_stats_topn_input_seman
         ORDER BY avg_price DESC LIMIT 2) s";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_avg_total",
             query,
             Arc::clone(&output_schema),
@@ -7678,7 +7677,7 @@ async fn global_aggregate_over_join_avg_topn_uses_grouped_stats_topn_input_seman
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -7730,7 +7729,7 @@ async fn global_aggregate_over_join_avg_topn_uses_grouped_stats_topn_input_seman
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_avg_total",
             query,
             Arc::clone(&output_schema),
@@ -7741,7 +7740,7 @@ async fn global_aggregate_over_join_avg_topn_uses_grouped_stats_topn_input_seman
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -7820,7 +7819,7 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
     let query = "SELECT auction, bidder, price FROM bids ORDER BY price DESC LIMIT 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -7831,7 +7830,7 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -7873,7 +7872,7 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -7884,7 +7883,7 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -7970,7 +7969,7 @@ async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally(
     let query = "SELECT auction FROM bids ORDER BY price DESC LIMIT 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_hidden_sort_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -7981,7 +7980,7 @@ async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally(
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -8020,7 +8019,7 @@ async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally(
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_hidden_sort_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -8031,7 +8030,7 @@ async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally(
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -8116,12 +8115,12 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_filtered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_filtered_partitioned_topn",
                 partitioned_query,
                 Arc::clone(&output_schema),
@@ -8133,11 +8132,11 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     assert_eq!(
-        runtime.materialized_views[1].execution_mode,
+        runtime.materialized_views[1].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -8213,12 +8212,12 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_filtered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_filtered_partitioned_topn",
                 partitioned_query,
                 Arc::clone(&output_schema),
@@ -8230,11 +8229,11 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     assert_eq!(
-        recovered.materialized_views[1].execution_mode,
+        recovered.materialized_views[1].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -8358,12 +8357,12 @@ async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_ordered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_ordered_row_number_topn",
                 row_number_query,
                 Arc::clone(&output_schema),
@@ -8375,11 +8374,11 @@ async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     assert_eq!(
-        runtime.materialized_views[1].execution_mode,
+        runtime.materialized_views[1].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -8442,12 +8441,12 @@ async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_ordered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_ordered_row_number_topn",
                 row_number_query,
                 Arc::clone(&output_schema),
@@ -8459,11 +8458,11 @@ async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     assert_eq!(
-        recovered.materialized_views[1].execution_mode,
+        recovered.materialized_views[1].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -8540,7 +8539,7 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
         WHERE rank_number <= 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_global_ranked_bids",
             query,
             Arc::clone(&output_schema),
@@ -8551,7 +8550,7 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -8593,7 +8592,7 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_global_ranked_bids",
             query,
             Arc::clone(&output_schema),
@@ -8604,7 +8603,7 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -8701,12 +8700,12 @@ async fn row_number_predicate_variants_use_slate_backed_columnar_operator_increm
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_reversed_ranked_bids",
                 reversed_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::new(
+            VectorizedMaterializedViewPlan::from_sql(
                 "mv_second_ranked_bids",
                 equality_query,
                 Arc::clone(&output_schema),
@@ -8721,7 +8720,7 @@ async fn row_number_predicate_variants_use_slate_backed_columnar_operator_increm
         runtime
             .materialized_views
             .iter()
-            .all(|mv| mv.execution_mode == MaterializedViewExecutionMode::ColumnarTopN)
+            .all(|mv| mv.operator.mode() == MaterializedViewExecutionMode::ColumnarTopN)
     );
 
     runtime
@@ -8814,7 +8813,7 @@ async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() 
     let query = "SELECT auction, bidder, price FROM bids ORDER BY price DESC LIMIT 2 OFFSET 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_offset_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -8825,7 +8824,7 @@ async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() 
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -8867,7 +8866,7 @@ async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_offset_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -8878,7 +8877,7 @@ async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() 
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -8966,7 +8965,7 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
         FROM bids) ranked WHERE rank_number <= 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -8977,7 +8976,7 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -9025,7 +9024,7 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -9036,7 +9035,7 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -9138,7 +9137,7 @@ async fn under_limit_topn_projection_uses_weighted_source_delta_semantics() {
         FROM bids) ranked WHERE rank_number <= 10";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_under_limit_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -9149,7 +9148,7 @@ async fn under_limit_topn_projection_uses_weighted_source_delta_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -9223,7 +9222,7 @@ async fn count_group_by_requires_slate_backed_operator_state_table() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_counts",
             "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
             Arc::clone(&output_schema),
@@ -9260,7 +9259,7 @@ async fn filter_project_requires_slate_backed_operator_state_table() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders WHERE amount > 10",
             Arc::clone(&output_schema),
@@ -9295,7 +9294,7 @@ async fn source_query_tables_are_not_maintained_by_default() {
 
     let runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders",
             Arc::clone(&output_schema),
@@ -9420,7 +9419,7 @@ async fn sum_group_by_requires_slate_backed_operator_state_table() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals",
             "SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
             Arc::clone(&output_schema),
@@ -9475,7 +9474,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
         LIMIT 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_auction_totals",
             query,
             Arc::clone(&output_schema),
@@ -9486,7 +9485,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
 
@@ -9535,7 +9534,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_top_auction_totals",
             query,
             Arc::clone(&output_schema),
@@ -9546,7 +9545,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarTopN
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -9645,7 +9644,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
         GROUP BY a.category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_category_bid_counts",
             query,
             Arc::clone(&output_schema),
@@ -9656,7 +9655,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -9713,7 +9712,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_category_bid_counts",
             query,
             Arc::clone(&output_schema),
@@ -9724,7 +9723,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -9849,7 +9848,7 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
         GROUP BY a.id, a.category) per_auction GROUP BY category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_q4_avg_price",
             query,
             Arc::clone(&output_schema),
@@ -9860,7 +9859,7 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -9917,7 +9916,7 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_q4_avg_price",
             query,
             Arc::clone(&output_schema),
@@ -9928,7 +9927,7 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
     recovered.run_tick(4).await.expect("recovered tick");
@@ -10067,7 +10066,7 @@ async fn q4_nexmark_shape_uses_incremental_grouped_stats_composition_semantics()
         GROUP BY a.id, a.category) per_auction GROUP BY category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_q4_nexmark",
             query,
             Arc::clone(&output_schema),
@@ -10078,7 +10077,7 @@ async fn q4_nexmark_shape_uses_incremental_grouped_stats_composition_semantics()
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -10253,7 +10252,7 @@ async fn q4_nexmark_generated_batches_use_incremental_grouped_stats_semantics() 
         GROUP BY a.id, a.category) per_auction GROUP BY category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_q4_generated",
             query,
             Arc::clone(&output_schema),
@@ -10264,7 +10263,7 @@ async fn q4_nexmark_generated_batches_use_incremental_grouped_stats_semantics() 
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarGroupedStats
     );
 
@@ -10363,7 +10362,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
         GROUP BY key";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_key_counts",
             query,
             Arc::clone(&output_schema),
@@ -10374,7 +10373,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     .await
     .expect("runtime");
     assert_eq!(
-        runtime.materialized_views[0].execution_mode,
+        runtime.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnionGroupedCount
     );
 
@@ -10430,7 +10429,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_union_key_counts",
             query,
             Arc::clone(&output_schema),
@@ -10441,7 +10440,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     .await
     .expect("recovered runtime");
     assert_eq!(
-        recovered.materialized_views[0].execution_mode,
+        recovered.materialized_views[0].operator.mode(),
         MaterializedViewExecutionMode::ColumnarUnionGroupedCount
     );
     recovered.run_tick(3).await.expect("recovered tick");
@@ -10509,7 +10508,7 @@ async fn unsupported_incremental_plan_without_state_table_is_rejected() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::new(
+        vec![VectorizedMaterializedViewPlan::from_sql(
             "mv_order_totals",
             "SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
             Arc::clone(&output_schema),
