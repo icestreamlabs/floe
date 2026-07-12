@@ -2163,6 +2163,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

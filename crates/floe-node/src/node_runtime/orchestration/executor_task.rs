@@ -626,6 +626,7 @@ pub(super) fn spawn_executor_task(context: ExecutorTaskContext) -> JoinHandle<()
                                     start_offset: range.start_offset,
                                     end_offset: range.end_offset,
                                     row_count: range.row_count,
+                                    checksum_algorithm: range.checksum_algorithm,
                                     checksum: range.checksum,
                                 }
                             }),

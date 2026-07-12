@@ -26,6 +26,7 @@ tokio = { workspace = true, features = ["sync", "net", "rt", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 prometheus = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 arrow-schema = { workspace = true }

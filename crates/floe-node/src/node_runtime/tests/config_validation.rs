@@ -221,6 +221,8 @@ fn kafka_arrow_batch(
             start_offset: 0,
             end_offset: i64::try_from(rows.saturating_sub(1)).unwrap(),
             row_count: u64::try_from(rows).unwrap(),
+            checksum_algorithm:
+                floe_executor::source_journal::KafkaSourceJournalChecksumAlgorithm::Xxh3,
             checksum: 42,
         })
         .into_iter()

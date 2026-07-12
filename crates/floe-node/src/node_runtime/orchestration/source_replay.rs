@@ -243,9 +243,9 @@ async fn replay_kafka_source_journal_entry_as_arrow(
         let mut builder =
             SourceArrowBatchBuilder::new(definition.clone(), replayed.events.len().max(1));
         let mut row_count = 0u64;
-        let mut checksum = kafka_source_journal_initial_checksum();
+        let mut checksum = KafkaSourceJournalChecksum::new(range.checksum_algorithm);
         let mut raw_row_count = 0u64;
-        let mut raw_checksum = kafka_source_journal_initial_checksum();
+        let mut raw_checksum = KafkaSourceJournalChecksum::new(range.checksum_algorithm);
         for raw_payload in &replayed.raw_payloads {
             if raw_payload.topic.as_ref() != range.topic.as_str()
                 || raw_payload.partition != range.partition
@@ -254,8 +254,7 @@ async fn replay_kafka_source_journal_entry_as_arrow(
             {
                 continue;
             }
-            update_kafka_source_journal_checksum_parts(
-                &mut raw_checksum,
+            raw_checksum.update_parts(
                 raw_payload.offset,
                 &[
                     entry.source.as_bytes(),
@@ -298,12 +297,14 @@ async fn replay_kafka_source_journal_entry_as_arrow(
                 ));
             }
             let checksum_bytes = kafka_source_journal_event_checksum_bytes(&event);
-            update_kafka_source_journal_checksum(&mut checksum, offset, &checksum_bytes);
+            checksum.update(offset, &checksum_bytes);
             builder
                 .append_event(&event)
                 .with_context(|| format!("decode replayed kafka event for '{}'", entry.source))?;
             row_count = row_count.saturating_add(1);
         }
+        let checksum = checksum.finish();
+        let raw_checksum = raw_checksum.finish();
         let event_checksum_matches = row_count == range.row_count && checksum == range.checksum;
         let raw_checksum_matches =
             raw_row_count == range.row_count && raw_checksum == range.checksum;

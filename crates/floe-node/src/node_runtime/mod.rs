@@ -44,9 +44,8 @@ use floe_executor::checkpoint::{
     CheckpointManager, KafkaCheckpointOffset, MaterializedViewTickVersion, SinkCursor, TickCommit,
 };
 use floe_executor::source_journal::{
-    KafkaSourceJournal, KafkaSourceJournalRange, VectorizedSourceBatchJournal,
-    append_vectorized_entry_to_batch, kafka_source_journal_initial_checksum,
-    update_kafka_source_journal_checksum, update_kafka_source_journal_checksum_parts,
+    KafkaSourceJournal, KafkaSourceJournalChecksum, KafkaSourceJournalRange,
+    VectorizedSourceBatchJournal, append_vectorized_entry_to_batch,
 };
 use floe_executor::{
     DbspMaintenance, FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,

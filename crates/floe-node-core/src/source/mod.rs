@@ -50,6 +50,7 @@ pub struct KafkaArrowIngestJournalRange {
     pub start_offset: i64,
     pub end_offset: i64,
     pub row_count: u64,
+    pub checksum_algorithm: floe_executor::source_journal::KafkaSourceJournalChecksumAlgorithm,
     pub checksum: u64,
 }
 

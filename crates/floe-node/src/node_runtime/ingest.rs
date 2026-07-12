@@ -182,14 +182,13 @@ pub(super) fn event_kafka_offset(
     }
 }
 
-#[derive(Debug, Clone)]
 pub(super) struct KafkaSourceJournalRangeAccumulator {
     topic: Arc<str>,
     partition: i32,
     start_offset: i64,
     end_offset: i64,
     row_count: u64,
-    checksum: u64,
+    checksum: KafkaSourceJournalChecksum,
 }
 
 impl KafkaSourceJournalRangeAccumulator {
@@ -200,7 +199,7 @@ impl KafkaSourceJournalRangeAccumulator {
             start_offset: offset,
             end_offset: offset,
             row_count: 0,
-            checksum: kafka_source_journal_initial_checksum(),
+            checksum: KafkaSourceJournalChecksum::current(),
         }
     }
 
@@ -209,18 +208,15 @@ impl KafkaSourceJournalRangeAccumulator {
         self.end_offset = self.end_offset.max(offset);
         self.row_count = self.row_count.saturating_add(1);
         let checksum_bytes = kafka_source_journal_event_checksum_bytes(event);
-        update_kafka_source_journal_checksum(&mut self.checksum, offset, &checksum_bytes);
+        self.checksum.update(offset, &checksum_bytes);
     }
 
     fn observe_raw_payload(&mut self, offset: i64, source: &str, payload: &[u8]) {
         self.start_offset = self.start_offset.min(offset);
         self.end_offset = self.end_offset.max(offset);
         self.row_count = self.row_count.saturating_add(1);
-        update_kafka_source_journal_checksum_parts(
-            &mut self.checksum,
-            offset,
-            &[source.as_bytes(), &[0], payload],
-        );
+        self.checksum
+            .update_parts(offset, &[source.as_bytes(), &[0], payload]);
     }
 
     pub(super) fn into_range(self) -> KafkaSourceJournalRange {
@@ -230,7 +226,8 @@ impl KafkaSourceJournalRangeAccumulator {
             start_offset: self.start_offset,
             end_offset: self.end_offset,
             row_count: self.row_count,
-            checksum: self.checksum,
+            checksum_algorithm: self.checksum.algorithm(),
+            checksum: self.checksum.finish(),
         }
     }
 }

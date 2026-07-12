@@ -19,9 +19,7 @@ use crate::source::{
     KafkaArrowIngestRecord, KafkaRawIngestBatch, KafkaRawIngestRecord,
 };
 use floe_core::source::{AppendIngestEvent, SourceDefinition};
-use floe_executor::source_journal::{
-    kafka_source_journal_initial_checksum, update_kafka_source_journal_checksum_parts,
-};
+use floe_executor::source_journal::KafkaSourceJournalChecksum;
 use floe_executor::{SourceArrowBatchBuilder, SourceArrowBatchMode};
 
 const KAFKA_CONNECTOR_TICK_LOG_EVERY: u64 = 32;
@@ -592,7 +590,7 @@ struct KafkaArrowJournalAccumulator {
     start_offset: i64,
     end_offset: i64,
     row_count: u64,
-    checksum: u64,
+    checksum: KafkaSourceJournalChecksum,
 }
 
 impl KafkaArrowJournalAccumulator {
@@ -603,7 +601,7 @@ impl KafkaArrowJournalAccumulator {
             start_offset: offset,
             end_offset: offset,
             row_count: 0,
-            checksum: kafka_source_journal_initial_checksum(),
+            checksum: KafkaSourceJournalChecksum::current(),
         }
     }
 
@@ -611,11 +609,8 @@ impl KafkaArrowJournalAccumulator {
         self.start_offset = self.start_offset.min(offset);
         self.end_offset = self.end_offset.max(offset);
         self.row_count = self.row_count.saturating_add(1);
-        update_kafka_source_journal_checksum_parts(
-            &mut self.checksum,
-            offset,
-            &[source.as_bytes(), &[0], payload],
-        );
+        self.checksum
+            .update_parts(offset, &[source.as_bytes(), &[0], payload]);
     }
 
     fn into_range(self) -> KafkaArrowIngestJournalRange {
@@ -625,7 +620,8 @@ impl KafkaArrowJournalAccumulator {
             start_offset: self.start_offset,
             end_offset: self.end_offset,
             row_count: self.row_count,
-            checksum: self.checksum,
+            checksum_algorithm: self.checksum.algorithm(),
+            checksum: self.checksum.finish(),
         }
     }
 }

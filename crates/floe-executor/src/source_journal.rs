@@ -9,8 +9,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use dbsp::storage::{KeyValueTable, prefix_bounds};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
+use xxhash_rust::xxh3::Xxh3;
 
 const KAFKA_SOURCE_JOURNAL_PREFIX: &str = "kafka_source_journal";
+const KAFKA_SOURCE_JOURNAL_V2_MAGIC: &[u8] = b"FLOE_KAFKA_SOURCE_JOURNAL_V2";
 const VECTORIZED_SOURCE_BATCH_JOURNAL_PREFIX: &str = "vectorized_source_journal";
 const VECTORIZED_SOURCE_BATCH_JOURNAL_ARROW_MAGIC: &[u8] = b"FLOE_VECTORIZED_SOURCE_BATCH_ARROW_V1";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -31,7 +33,97 @@ pub struct KafkaSourceJournalRange {
     pub start_offset: i64,
     pub end_offset: i64,
     pub row_count: u64,
+    pub checksum_algorithm: KafkaSourceJournalChecksumAlgorithm,
     pub checksum: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KafkaSourceJournalChecksumAlgorithm {
+    Fnv1a64,
+    Xxh3,
+}
+
+impl KafkaSourceJournalChecksumAlgorithm {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Fnv1a64 => 1,
+            Self::Xxh3 => 2,
+        }
+    }
+
+    fn decode(encoded: u8) -> Result<Self> {
+        match encoded {
+            1 => Ok(Self::Fnv1a64),
+            2 => Ok(Self::Xxh3),
+            other => bail!("unsupported kafka source journal checksum algorithm {other}"),
+        }
+    }
+}
+
+pub struct KafkaSourceJournalChecksum {
+    state: KafkaSourceJournalChecksumState,
+}
+
+enum KafkaSourceJournalChecksumState {
+    Fnv1a64(u64),
+    Xxh3(Box<Xxh3>),
+}
+
+impl KafkaSourceJournalChecksum {
+    pub fn new(algorithm: KafkaSourceJournalChecksumAlgorithm) -> Self {
+        let state = match algorithm {
+            KafkaSourceJournalChecksumAlgorithm::Fnv1a64 => {
+                KafkaSourceJournalChecksumState::Fnv1a64(FNV_OFFSET_BASIS)
+            }
+            KafkaSourceJournalChecksumAlgorithm::Xxh3 => {
+                KafkaSourceJournalChecksumState::Xxh3(Box::default())
+            }
+        };
+        Self { state }
+    }
+
+    pub fn current() -> Self {
+        Self::new(KafkaSourceJournalChecksumAlgorithm::Xxh3)
+    }
+
+    pub fn algorithm(&self) -> KafkaSourceJournalChecksumAlgorithm {
+        match &self.state {
+            KafkaSourceJournalChecksumState::Fnv1a64(_) => {
+                KafkaSourceJournalChecksumAlgorithm::Fnv1a64
+            }
+            KafkaSourceJournalChecksumState::Xxh3(_) => KafkaSourceJournalChecksumAlgorithm::Xxh3,
+        }
+    }
+
+    pub fn update(&mut self, offset: i64, row: &[u8]) {
+        self.update_parts(offset, &[row]);
+    }
+
+    pub fn update_parts(&mut self, offset: i64, row_parts: &[&[u8]]) {
+        let row_len = row_parts
+            .iter()
+            .map(|part| part.len())
+            .fold(0usize, usize::saturating_add);
+        self.update_bytes(&offset.to_le_bytes());
+        self.update_bytes(&(u64::try_from(row_len).unwrap_or(u64::MAX)).to_le_bytes());
+        for part in row_parts {
+            self.update_bytes(part);
+        }
+    }
+
+    pub fn finish(&self) -> u64 {
+        match &self.state {
+            KafkaSourceJournalChecksumState::Fnv1a64(checksum) => *checksum,
+            KafkaSourceJournalChecksumState::Xxh3(checksum) => checksum.digest(),
+        }
+    }
+
+    fn update_bytes(&mut self, bytes: &[u8]) {
+        match &mut self.state {
+            KafkaSourceJournalChecksumState::Fnv1a64(checksum) => update_fnv64(checksum, bytes),
+            KafkaSourceJournalChecksumState::Xxh3(checksum) => checksum.update(bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,33 +324,6 @@ pub fn append_vectorized_entry_to_batch(
     Ok(encoded_len)
 }
 
-pub fn kafka_source_journal_initial_checksum() -> u64 {
-    FNV_OFFSET_BASIS
-}
-
-pub fn update_kafka_source_journal_checksum(checksum: &mut u64, offset: i64, row: &[u8]) {
-    update_kafka_source_journal_checksum_parts(checksum, offset, &[row]);
-}
-
-pub fn update_kafka_source_journal_checksum_parts(
-    checksum: &mut u64,
-    offset: i64,
-    row_parts: &[&[u8]],
-) {
-    update_fnv64(checksum, &offset.to_le_bytes());
-    let row_len = row_parts
-        .iter()
-        .map(|part| part.len())
-        .fold(0usize, usize::saturating_add);
-    update_fnv64(
-        checksum,
-        &(u64::try_from(row_len).unwrap_or(u64::MAX)).to_le_bytes(),
-    );
-    for part in row_parts {
-        update_fnv64(checksum, part);
-    }
-}
-
 fn vectorized_entry_prefix() -> Vec<u8> {
     format!("{VECTORIZED_SOURCE_BATCH_JOURNAL_PREFIX}/entries/").into_bytes()
 }
@@ -398,12 +463,15 @@ fn encode_kafka_entry(
     let count =
         u32::try_from(ranges.len()).context("too many ranges in kafka source journal metadata")?;
     let mut encoded = Vec::with_capacity(
-        8 + 4
+        KAFKA_SOURCE_JOURNAL_V2_MAGIC.len()
+            + 8
+            + 4
             + ranges
                 .iter()
-                .map(|range| 4 + range.topic.len() + 4 + 8 + 8 + 8 + 8)
+                .map(|range| 4 + range.topic.len() + 4 + 8 + 8 + 8 + 1 + 8)
                 .sum::<usize>(),
     );
+    encoded.extend_from_slice(KAFKA_SOURCE_JOURNAL_V2_MAGIC);
     encoded.extend_from_slice(&max_event_time_ms.unwrap_or(-1).to_le_bytes());
     encoded.extend_from_slice(&count.to_le_bytes());
     for range in ranges {
@@ -423,16 +491,27 @@ fn encode_kafka_entry(
         encoded.extend_from_slice(&range.start_offset.to_le_bytes());
         encoded.extend_from_slice(&range.end_offset.to_le_bytes());
         encoded.extend_from_slice(&range.row_count.to_le_bytes());
+        encoded.push(range.checksum_algorithm.encode());
         encoded.extend_from_slice(&range.checksum.to_le_bytes());
     }
     Ok(encoded)
 }
 
 fn decode_kafka_entry(value: &[u8]) -> Result<(Option<i64>, Vec<KafkaSourceJournalRange>)> {
-    if value.len() < 12 {
+    let is_v2 = value.starts_with(KAFKA_SOURCE_JOURNAL_V2_MAGIC);
+    let minimum_len = if is_v2 {
+        KAFKA_SOURCE_JOURNAL_V2_MAGIC.len() + 12
+    } else {
+        12
+    };
+    if value.len() < minimum_len {
         bail!("kafka source journal entry missing header");
     }
-    let mut cursor = 0usize;
+    let mut cursor = if is_v2 {
+        KAFKA_SOURCE_JOURNAL_V2_MAGIC.len()
+    } else {
+        0
+    };
     let max_event_time_ms = i64::from_le_bytes(read_fixed::<8>(
         value,
         &mut cursor,
@@ -481,6 +560,17 @@ fn decode_kafka_entry(value: &[u8]) -> Result<(Option<i64>, Vec<KafkaSourceJourn
             &mut cursor,
             "kafka source journal row count",
         )?);
+        let checksum_algorithm = if is_v2 {
+            KafkaSourceJournalChecksumAlgorithm::decode(
+                read_fixed::<1>(
+                    value,
+                    &mut cursor,
+                    "kafka source journal checksum algorithm",
+                )?[0],
+            )?
+        } else {
+            KafkaSourceJournalChecksumAlgorithm::Fnv1a64
+        };
         let checksum = u64::from_le_bytes(read_fixed::<8>(
             value,
             &mut cursor,
@@ -497,6 +587,7 @@ fn decode_kafka_entry(value: &[u8]) -> Result<(Option<i64>, Vec<KafkaSourceJourn
             start_offset,
             end_offset,
             row_count,
+            checksum_algorithm,
             checksum,
         });
     }
@@ -536,9 +627,10 @@ mod tests {
     async fn kafka_source_journal_roundtrips_metadata_entries() {
         let table = test_table("kafka-source-journal-roundtrip").await;
         let journal = KafkaSourceJournal::new(table);
-        let mut checksum = kafka_source_journal_initial_checksum();
-        update_kafka_source_journal_checksum(&mut checksum, 42, b"row-a");
-        update_kafka_source_journal_checksum(&mut checksum, 43, b"row-b");
+        let mut checksum = KafkaSourceJournalChecksum::current();
+        checksum.update(42, b"row-a");
+        checksum.update(43, b"row-b");
+        let checksum = checksum.finish();
         journal
             .append(
                 "nexmark_bid",
@@ -550,6 +642,7 @@ mod tests {
                     start_offset: 42,
                     end_offset: 43,
                     row_count: 2,
+                    checksum_algorithm: KafkaSourceJournalChecksumAlgorithm::Xxh3,
                     checksum,
                 }],
             )
@@ -573,8 +666,36 @@ mod tests {
                 start_offset: 42,
                 end_offset: 43,
                 row_count: 2,
+                checksum_algorithm: KafkaSourceJournalChecksumAlgorithm::Xxh3,
                 checksum,
             }]
         );
+    }
+
+    #[test]
+    fn kafka_source_journal_decodes_legacy_fnv_entries() {
+        let mut checksum =
+            KafkaSourceJournalChecksum::new(KafkaSourceJournalChecksumAlgorithm::Fnv1a64);
+        checksum.update(42, b"row-a");
+
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&123_i64.to_le_bytes());
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&7_u32.to_le_bytes());
+        encoded.extend_from_slice(b"nexmark");
+        encoded.extend_from_slice(&0_i32.to_le_bytes());
+        encoded.extend_from_slice(&42_i64.to_le_bytes());
+        encoded.extend_from_slice(&42_i64.to_le_bytes());
+        encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(&checksum.finish().to_le_bytes());
+
+        let (max_event_time_ms, ranges) = decode_kafka_entry(&encoded).expect("decode legacy");
+        assert_eq!(max_event_time_ms, Some(123));
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].checksum_algorithm,
+            KafkaSourceJournalChecksumAlgorithm::Fnv1a64
+        );
+        assert_eq!(ranges[0].checksum, checksum.finish());
     }
 }
