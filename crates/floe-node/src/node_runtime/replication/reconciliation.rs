@@ -22,7 +22,7 @@ pub(super) async fn observe_postgres_table_for_reconciliation(
     options: ReplicationPipelineReconciliationOptions,
     role: &str,
 ) -> anyhow::Result<ReplicationPipelineReconciliationObservation> {
-    let quoted_table = writers::quote_postgres_qualified_name(table)?;
+    let quoted_table = crate::postgres_sql::quote_postgres_qualified_name(table)?;
     let (client, connection_task) = tokio_postgres::connect(connection, tokio_postgres::NoTls)
         .await
         .with_context(|| format!("connect Postgres {role} for CDC reconciliation"))?;

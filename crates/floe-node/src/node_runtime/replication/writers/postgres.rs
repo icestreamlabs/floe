@@ -1,4 +1,5 @@
 use super::*;
+use crate::postgres_sql::{quote_postgres_ident, quote_postgres_qualified_name};
 use floe_core::decimal::format_decimal128;
 use floe_core::postgres_types::{normalize_postgres_type, postgres_type_compatible};
 
@@ -700,21 +701,4 @@ fn postgres_value_expr(
         },
         ColumnType::Int64 | ColumnType::Bool => format!("${param_idx}"),
     }
-}
-
-pub(in crate::node_runtime::replication) fn quote_postgres_qualified_name(
-    name: &str,
-) -> anyhow::Result<String> {
-    let parts = name
-        .split('.')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(quote_postgres_ident)
-        .collect::<Vec<_>>();
-    anyhow::ensure!(!parts.is_empty(), "Postgres target table cannot be empty");
-    Ok(parts.join("."))
-}
-
-fn quote_postgres_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }

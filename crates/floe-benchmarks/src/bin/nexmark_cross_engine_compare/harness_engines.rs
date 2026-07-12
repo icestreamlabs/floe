@@ -259,7 +259,7 @@ impl Harness {
                 target,
                 artifact_dir,
                 "expected_result",
-                expected_query_text,
+                &expected_query_text,
                 &artifact_dir.join("expected_result.stderr.log"),
             )?;
             verify_result_content_hash(engine, query_id, &observed, &expected, artifact_dir)?;
@@ -384,7 +384,7 @@ impl Harness {
                 &pipeline,
                 artifact_dir,
                 "expected_result",
-                expected_query_text,
+                &expected_query_text,
             )?;
             verify_result_content_hash(
                 Engine::Feldera,

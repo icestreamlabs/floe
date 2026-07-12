@@ -12,26 +12,22 @@ dbsp = { path = "../dbsp" }
 floe-sql-parser = { path = "../floe-sql-parser" }
 arrow-ipc = "57.1.0"
 anyhow = { workspace = true }
-async-recursion = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 datafusion = { workspace = true }
+datafusion-sql = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlparser = { workspace = true }
 slatedb = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "rt", "io-util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 prometheus = { workspace = true }
-regex = "1.11"
 
 [dev-dependencies]
-criterion = "0.5"
 arrow-schema = { workspace = true }
 nexmark = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
-proptest = "1.5"
-serial_test = "3"

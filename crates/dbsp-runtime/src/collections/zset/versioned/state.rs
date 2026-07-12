@@ -162,16 +162,6 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn manifest_prefix_bytes(&self) -> &[u8] {
-        &self.manifest_prefix
-    }
-
-    #[cfg(test)]
-    pub(crate) fn segment_prefix_bytes(&self) -> &[u8] {
-        &self.segment_prefix
-    }
-
-    #[cfg(test)]
     pub(crate) fn intent_key_bytes(&self) -> &[u8] {
         &self.intent_key
     }

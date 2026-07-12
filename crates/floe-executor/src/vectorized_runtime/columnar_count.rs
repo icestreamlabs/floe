@@ -10,7 +10,7 @@ use datafusion::common::ScalarValue;
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use dbsp::SlateBackedColumnarCountByKeyOp;
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarI64ZSet, SlateBackedColumnarI64ZSet};
 use dbsp::storage::KeyValueTable;
 
@@ -48,7 +48,8 @@ pub(super) fn columnar_count_plan_for_plan(
         return Ok(None);
     }
 
-    let Expr::Column(group_column) = strip_alias(&aggregate.group_expr[0]) else {
+    let Expr::Column(group_column) = super::columnar_utils::strip_alias(&aggregate.group_expr[0])
+    else {
         return Ok(None);
     };
     if !is_count_star_expr(&aggregate.aggr_expr[0]) {
@@ -202,9 +203,13 @@ fn projection_preserves_count_order(projection: &Projection, aggregate: &Aggrega
 
     let aggregate_key_name = aggregate.schema.field(0).name();
     let aggregate_count_name = aggregate.schema.field(1).name();
-    expr_refers_to_column(strip_alias(&projection.expr[0]), aggregate_key_name)
-        && (expr_refers_to_column(strip_alias(&projection.expr[1]), aggregate_count_name)
-            || is_count_star_expr(&projection.expr[1]))
+    expr_refers_to_column(
+        super::columnar_utils::strip_alias(&projection.expr[0]),
+        aggregate_key_name,
+    ) && (expr_refers_to_column(
+        super::columnar_utils::strip_alias(&projection.expr[1]),
+        aggregate_count_name,
+    ) || is_count_star_expr(&projection.expr[1]))
 }
 
 fn output_schema_is_supported(output_schema: &SchemaRef) -> bool {
@@ -216,7 +221,7 @@ fn output_schema_is_supported(output_schema: &SchemaRef) -> bool {
 }
 
 fn is_count_star_expr(expr: &Expr) -> bool {
-    let Expr::AggregateFunction(aggregate) = strip_alias(expr) else {
+    let Expr::AggregateFunction(aggregate) = super::columnar_utils::strip_alias(expr) else {
         return false;
     };
     let params = &aggregate.params;
@@ -229,13 +234,6 @@ fn is_count_star_expr(expr: &Expr) -> bool {
             params.args.as_slice(),
             [Expr::Literal(ScalarValue::Int64(Some(1)), _)]
         )
-}
-
-fn strip_alias(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Alias(alias) => strip_alias(alias.expr.as_ref()),
-        _ => expr,
-    }
 }
 
 fn expr_refers_to_column(expr: &Expr, name: &str) -> bool {

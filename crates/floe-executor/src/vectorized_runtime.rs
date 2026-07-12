@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::{FloeAsofJoinNode, create_logical_plan_with_asof_preplanner};
 use anyhow::{Context, Result, anyhow, bail};
 use datafusion::arrow::array::{ArrayRef, Int64Array};
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
@@ -11,9 +13,8 @@ use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::collect;
+use dbsp::collections::SlateBackedColumnarZSet;
 use dbsp::storage::KeyValueTable;
-#[cfg(test)]
-use dbsp::{FloeAsofJoinNode, create_logical_plan_with_asof_preplanner};
 use floe_core::source::{SourceDefinition, SourceRegistry};
 
 use crate::delta_consolidation::add_weight_column_to_batches;
@@ -43,6 +44,7 @@ mod columnar_stateless;
 mod columnar_topn;
 mod columnar_union;
 mod columnar_union_grouped_count;
+mod columnar_utils;
 mod profile;
 mod source_state;
 
@@ -100,12 +102,7 @@ use columnar_union_grouped_count::{
 #[derive(Debug, Clone)]
 pub struct VectorizedMaterializedViewPlan {
     view_name: String,
-    #[cfg(not(test))]
     logical_plan: LogicalPlan,
-    #[cfg(test)]
-    logical_plan: Option<LogicalPlan>,
-    #[cfg(test)]
-    query: Option<String>,
     output_schema: SchemaRef,
 }
 
@@ -117,17 +114,21 @@ impl VectorizedMaterializedViewPlan {
     ) -> Self {
         Self {
             view_name: view_name.into(),
-            #[cfg(not(test))]
             logical_plan,
-            #[cfg(test)]
-            logical_plan: Some(logical_plan),
-            #[cfg(test)]
-            query: None,
             output_schema,
         }
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+struct SqlMaterializedViewPlan {
+    view_name: String,
+    query: String,
+    output_schema: SchemaRef,
+}
+
+#[cfg(test)]
+impl SqlMaterializedViewPlan {
     fn from_sql(
         view_name: impl Into<String>,
         query: impl Into<String>,
@@ -135,8 +136,7 @@ impl VectorizedMaterializedViewPlan {
     ) -> Self {
         Self {
             view_name: view_name.into(),
-            logical_plan: None,
-            query: Some(query.into()),
+            query: query.into(),
             output_schema,
         }
     }
@@ -267,6 +267,32 @@ enum MaterializedViewOperator {
     CountByKey(Box<ColumnarCountMaterializedViewState>),
 }
 
+/// A compiled child node in the incremental operator graph.
+///
+/// Parent operators consume this single typed edge instead of maintaining one
+/// optional field and dispatch path for every supported child composition.
+enum IncrementalInputOperator {
+    Source(Box<SlateBackedColumnarZSet>),
+    Join(Box<ColumnarJoinMaterializedViewState>),
+    JoinTopN(Box<ColumnarJoinTopNMaterializedViewState>),
+    GroupedMax(Box<ColumnarGroupedMaxMaterializedViewState>),
+    GroupedStats(Box<ColumnarGroupedStatsMaterializedViewState>),
+    TopN(Box<ColumnarTopNMaterializedViewState>),
+}
+
+impl IncrementalInputOperator {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Source(_) => "source",
+            Self::Join(_) => "join",
+            Self::JoinTopN(_) => "join_topn",
+            Self::GroupedMax(_) => "grouped_max",
+            Self::GroupedStats(_) => "grouped_stats",
+            Self::TopN(_) => "topn",
+        }
+    }
+}
+
 struct IncrementalMaterializedViewState {
     ctx: SessionContext,
     source_provider: Arc<DynamicStateTableProvider>,
@@ -380,6 +406,57 @@ fn plan_contains_asof_extension(plan: &LogicalPlan) -> bool {
             .any(|input| plan_contains_asof_extension(input.as_ref())),
         _ => false,
     }
+}
+
+#[cfg(test)]
+async fn plan_test_materialized_views(
+    sources: &SourceRegistry,
+    materialized_views: Vec<SqlMaterializedViewPlan>,
+    udfs: &[ScalarUDF],
+) -> Result<Vec<VectorizedMaterializedViewPlan>> {
+    let ctx = SessionContext::new();
+    for udf in udfs.iter().cloned() {
+        ctx.register_udf(udf);
+    }
+    for definition in sources.definitions() {
+        let schema = definition.to_arrow_schema();
+        let key_indices = source_key_indices(&schema, &source_primary_key_columns(definition))?;
+        let provider = dynamic_state_provider(Arc::clone(&schema), key_indices.as_deref())?;
+        ctx.register_table(definition.name(), Arc::new(provider))?;
+        if let Some(alias) = definition.property(SOURCE_QUERY_ALIAS_PROPERTY) {
+            let alias_schema = camel_case_schema(definition);
+            let provider =
+                dynamic_state_provider(Arc::clone(&alias_schema), key_indices.as_deref())?;
+            ctx.register_table(alias, Arc::new(provider))?;
+        }
+    }
+
+    let mut plans = Vec::with_capacity(materialized_views.len());
+    for mv in materialized_views {
+        let state = ctx.state();
+        let asof_preplanned = create_logical_plan_with_asof_preplanner(&state, &mv.query)
+            .await
+            .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
+        let logical_plan = if plan_contains_asof_extension(&asof_preplanned) {
+            ctx.execute_logical_plan(asof_preplanned)
+                .await
+                .with_context(|| format!("build vectorized ASOF DataFrame for {}", mv.view_name))?
+                .logical_plan()
+                .clone()
+        } else {
+            ctx.sql(&mv.query)
+                .await
+                .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
+                .logical_plan()
+                .clone()
+        };
+        plans.push(VectorizedMaterializedViewPlan::new(
+            mv.view_name,
+            logical_plan,
+            mv.output_schema,
+        ));
+    }
+    Ok(plans)
 }
 
 impl IncrementalMaterializedViewState {
@@ -613,9 +690,9 @@ pub struct VectorizedExecutionRuntime {
 
 impl VectorizedExecutionRuntime {
     #[cfg(test)]
-    pub async fn new(
+    async fn new(
         sources: &SourceRegistry,
-        materialized_views: Vec<VectorizedMaterializedViewPlan>,
+        materialized_views: Vec<SqlMaterializedViewPlan>,
         registry: Arc<MaterializedViewRegistry>,
     ) -> Result<Self> {
         Self::new_with_options(
@@ -628,31 +705,26 @@ impl VectorizedExecutionRuntime {
     }
 
     #[cfg(test)]
-    pub async fn new_with_options(
+    async fn new_with_options(
         sources: &SourceRegistry,
-        materialized_views: Vec<VectorizedMaterializedViewPlan>,
+        materialized_views: Vec<SqlMaterializedViewPlan>,
         registry: Arc<MaterializedViewRegistry>,
         options: VectorizedExecutionRuntimeOptions,
     ) -> Result<Self> {
-        Self::new_with_udfs_and_options(sources, materialized_views, registry, Vec::new(), options)
-            .await
+        let plans = plan_test_materialized_views(sources, materialized_views, &[]).await?;
+        Self::new_with_udfs_and_options(sources, plans, registry, Vec::new(), options).await
     }
 
     #[cfg(test)]
-    pub async fn new_with_udfs(
+    async fn new_from_sql_with_udfs_and_options(
         sources: &SourceRegistry,
-        materialized_views: Vec<VectorizedMaterializedViewPlan>,
+        materialized_views: Vec<SqlMaterializedViewPlan>,
         registry: Arc<MaterializedViewRegistry>,
         udfs: Vec<ScalarUDF>,
+        options: VectorizedExecutionRuntimeOptions,
     ) -> Result<Self> {
-        Self::new_with_udfs_and_options(
-            sources,
-            materialized_views,
-            registry,
-            udfs,
-            VectorizedExecutionRuntimeOptions::default(),
-        )
-        .await
+        let plans = plan_test_materialized_views(sources, materialized_views, &udfs).await?;
+        Self::new_with_udfs_and_options(sources, plans, registry, udfs, options).await
     }
 
     pub async fn new_with_udfs_and_options(
@@ -738,35 +810,7 @@ impl VectorizedExecutionRuntime {
 
         let mut mv_states = Vec::with_capacity(materialized_views.len());
         for mv in materialized_views {
-            #[cfg(not(test))]
             let logical_plan = mv.logical_plan.clone();
-            #[cfg(test)]
-            let logical_plan = if let Some(logical_plan) = mv.logical_plan.clone() {
-                logical_plan
-            } else {
-                let query = mv.query.as_deref().ok_or_else(|| {
-                    anyhow!("materialized view '{}' has no logical plan", mv.view_name)
-                })?;
-                let state = ctx.state();
-                let asof_preplanned = create_logical_plan_with_asof_preplanner(&state, query)
-                    .await
-                    .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?;
-                if plan_contains_asof_extension(&asof_preplanned) {
-                    ctx.execute_logical_plan(asof_preplanned)
-                        .await
-                        .with_context(|| {
-                            format!("build vectorized ASOF DataFrame for {}", mv.view_name)
-                        })?
-                        .logical_plan()
-                        .clone()
-                } else {
-                    ctx.sql(query)
-                        .await
-                        .with_context(|| format!("plan vectorized SQL for {}", mv.view_name))?
-                        .logical_plan()
-                        .clone()
-                }
-            };
             let operator = build_materialized_view_operator(
                 &mv.view_name,
                 &logical_plan,

@@ -6,7 +6,7 @@ use datafusion::arrow::array::{Array, BooleanArray, BooleanBuilder, Int64Array};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::WEIGHT_COLUMN_NAME;
 
 use crate::delta_consolidation::{DeltaConsolidator, add_weight_column_to_batches};
 use crate::scalar_array_builder::ScalarColumnBuilder;

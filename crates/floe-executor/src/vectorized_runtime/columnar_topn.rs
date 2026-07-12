@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,7 +10,7 @@ use datafusion::arrow::array::{
     StringArray, TimestampMillisecondArray, UInt32Array, UInt64Array,
 };
 use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
@@ -19,12 +19,12 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::expr::WindowFunction;
-use datafusion::logical_expr::logical_plan::{Filter, Limit, Sort, TableScan, Window};
+use datafusion::logical_expr::logical_plan::{Filter, Limit, Sort, Window};
 use datafusion::logical_expr::{
     Expr, LogicalPlan, LogicalPlanBuilder, Operator, ScalarUDF, WindowFunctionDefinition,
 };
 use datafusion::physical_plan::collect;
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
@@ -38,7 +38,7 @@ use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegis
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
-use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
+use crate::vectorized_runtime::source_state::rename_batches;
 
 use super::columnar_grouped_stats::{
     ColumnarGroupedStatsMaterializedViewState, ColumnarGroupedStatsPlan,
@@ -85,8 +85,7 @@ pub(super) struct ColumnarTopNMaterializedViewState {
     operator_table: Arc<dyn KeyValueTable>,
     input_name: String,
     source_schema: SchemaRef,
-    input_zset: Option<SlateBackedColumnarZSet>,
-    grouped_stats: Option<Box<ColumnarGroupedStatsMaterializedViewState>>,
+    input: super::IncrementalInputOperator,
     output_zset: SlateBackedColumnarZSet,
     evaluator: TopNEvaluator,
     partition_indices: Vec<usize>,
@@ -262,7 +261,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
         .await
         .context("load topn output snapshot")?;
     let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
-    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
+    let initial_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&initial_output)?;
     match plan.input {
         ColumnarTopNInputPlan::Source { source_name } => {
             let source = sources
@@ -296,7 +295,8 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 .materialize_columnar()
                 .await
                 .context("load topn input snapshot")?;
-            let source_snapshot = snapshot_batches_from_zset(&input_snapshot_zset)?;
+            let source_snapshot =
+                crate::columnar_snapshot::columnar_zset_snapshot(&input_snapshot_zset)?;
             let source_index = if partition_indices.is_empty() {
                 None
             } else {
@@ -344,8 +344,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 operator_table: Arc::clone(&table),
                 input_name: source_name,
                 source_schema: Arc::clone(&source.schema),
-                input_zset: Some(input_zset),
-                grouped_stats: None,
+                input: super::IncrementalInputOperator::Source(Box::new(input_zset)),
                 output_zset,
                 evaluator,
                 partition_indices,
@@ -406,8 +405,7 @@ pub(super) async fn build_columnar_topn_materialized_view_state_in_namespace(
                 operator_table: Arc::clone(&table),
                 input_name,
                 source_schema: schema,
-                input_zset: None,
-                grouped_stats: Some(grouped_stats),
+                input: super::IncrementalInputOperator::GroupedStats(grouped_stats),
                 output_zset,
                 evaluator,
                 partition_indices,
@@ -552,9 +550,6 @@ async fn run_columnar_topn_state_tick_inner(
         .context("prepare SlateDB-backed topn input tick")?;
     let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("topn.prepare_input", phase_start);
-    if columnar.input_zset.is_none() && columnar.grouped_stats.is_none() {
-        bail!("topn requires a source zset or incremental derived input");
-    }
     let input_changed = input_tick.input_changed;
     let persisted_input_delta = input_tick.delta;
     let phase_start = profile::start();
@@ -851,7 +846,7 @@ async fn run_columnar_topn_append_only_source_state_tick(
     previous_snapshot: &[RecordBatch],
     input_changed: bool,
 ) -> Result<Option<ColumnarTopNTick>> {
-    if columnar.input_zset.is_none()
+    if !matches!(columnar.input, super::IncrementalInputOperator::Source(_))
         || !schemas_match_by_position(&columnar.source_schema, output_schema)
     {
         return Ok(None);
@@ -950,8 +945,10 @@ async fn run_columnar_topn_append_only_source_state_tick(
     }
 
     let phase_start = profile::start();
-    let mut candidate_batches =
-        rewrap_record_batches_with_schema(&previous_output_for_keys, &columnar.source_schema)?;
+    let mut candidate_batches = super::columnar_utils::rewrap_record_batches_with_schema(
+        &previous_output_for_keys,
+        &columnar.source_schema,
+    )?;
     candidate_batches.extend(delta_value_batches);
     profile::record_since("topn.append_only_candidate_batches", phase_start);
 
@@ -2631,115 +2628,92 @@ async fn prepare_topn_input_tick(
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<TopNInputTick> {
     let total_start = profile::start();
-    if columnar.grouped_stats.is_some() {
-        return prepare_grouped_stats_topn_input_tick(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-    let phase_start = profile::start();
-    let append_only_source_delta = weighted_delta_batches
-        .get(columnar.input_name.as_str())
-        .is_none()
-        && insert_batches
-            .get(columnar.input_name.as_str())
-            .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() > 0));
-    let input_delta = source_input_delta(columnar, insert_batches, weighted_delta_batches)?;
-    profile::record_since("topn.source_input_delta", phase_start);
-    let input_zset = columnar
-        .input_zset
-        .as_mut()
-        .context("topn source input zset missing")?;
-    let phase_start = profile::start();
-    let delta = persisted_source_delta(input_zset, input_delta).await?;
-    profile::record_since("topn.persist_source_delta", phase_start);
-    let input_changed = !delta.batches().is_empty();
-    profile::record_since("topn.prepare_input_total", total_start);
-    Ok(TopNInputTick {
-        delta,
-        input_changed,
-        next_source_snapshot: None,
-        append_only_source_delta,
-    })
-}
-
-async fn prepare_grouped_stats_topn_input_tick(
-    columnar: &mut ColumnarTopNMaterializedViewState,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-) -> Result<TopNInputTick> {
-    let Some(grouped_stats) = columnar.grouped_stats.as_mut() else {
-        return Ok(TopNInputTick {
-            delta: ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?,
-            input_changed: false,
-            next_source_snapshot: None,
-            append_only_source_delta: false,
-        });
-    };
-    let tick = run_columnar_grouped_stats_state_tick(
-        grouped_stats.as_mut(),
-        insert_batches,
-        weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.source_snapshot,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "evaluate topn grouped-stats input '{}'",
-            columnar.input_name
-        )
-    })?;
-    let input_changed = !tick.delta.batches().is_empty();
-    if tick.input_changed && !input_changed {
-        columnar.source_snapshot = tick.next_snapshot;
-        return Ok(TopNInputTick {
-            delta: tick.delta,
-            input_changed: false,
-            next_source_snapshot: None,
-            append_only_source_delta: false,
-        });
-    }
-    Ok(TopNInputTick {
-        delta: tick.delta,
-        input_changed,
-        next_source_snapshot: input_changed.then_some(tick.next_snapshot),
-        append_only_source_delta: false,
-    })
-}
-
-fn source_input_delta(
-    columnar: &ColumnarTopNMaterializedViewState,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-) -> Result<ColumnarZSet> {
-    if let Some(weighted_batches) = weighted_delta_batches.get(columnar.input_name.as_str()) {
-        ColumnarZSet::try_new_weighted(
-            Arc::clone(&columnar.source_schema),
-            weighted_batches.clone(),
-        )
-        .with_context(|| {
-            format!(
-                "build weighted topn input delta for '{}'",
-                columnar.input_name
+    match &mut columnar.input {
+        super::IncrementalInputOperator::Source(input_zset) => {
+            let phase_start = profile::start();
+            let append_only_source_delta = weighted_delta_batches
+                .get(columnar.input_name.as_str())
+                .is_none()
+                && insert_batches
+                    .get(columnar.input_name.as_str())
+                    .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() > 0));
+            let input_delta = if let Some(weighted_batches) =
+                weighted_delta_batches.get(columnar.input_name.as_str())
+            {
+                ColumnarZSet::try_new_weighted(
+                    Arc::clone(&columnar.source_schema),
+                    weighted_batches.clone(),
+                )
+                .with_context(|| {
+                    format!(
+                        "build weighted topn input delta for '{}'",
+                        columnar.input_name
+                    )
+                })?
+            } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
+                ColumnarZSet::from_value_batches(
+                    Arc::clone(&columnar.source_schema),
+                    source_batches.clone(),
+                    1,
+                )
+                .with_context(|| {
+                    format!(
+                        "build insert topn input delta for '{}'",
+                        columnar.input_name
+                    )
+                })?
+            } else {
+                ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
+            };
+            profile::record_since("topn.source_input_delta", phase_start);
+            let phase_start = profile::start();
+            let delta = persisted_source_delta(input_zset, input_delta).await?;
+            profile::record_since("topn.persist_source_delta", phase_start);
+            let input_changed = !delta.batches().is_empty();
+            profile::record_since("topn.prepare_input_total", total_start);
+            Ok(TopNInputTick {
+                delta,
+                input_changed,
+                next_source_snapshot: None,
+                append_only_source_delta,
+            })
+        }
+        super::IncrementalInputOperator::GroupedStats(grouped_stats) => {
+            let tick = run_columnar_grouped_stats_state_tick(
+                grouped_stats,
+                insert_batches,
+                weighted_delta_batches,
+                &columnar.source_schema,
+                &columnar.source_snapshot,
             )
-        })
-    } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
-        ColumnarZSet::from_value_batches(
-            Arc::clone(&columnar.source_schema),
-            source_batches.clone(),
-            1,
-        )
-        .with_context(|| {
-            format!(
-                "build insert topn input delta for '{}'",
-                columnar.input_name
-            )
-        })
-    } else {
-        ColumnarZSet::empty(Arc::clone(&columnar.source_schema))
+            .await
+            .with_context(|| {
+                format!(
+                    "evaluate topn grouped-stats input '{}'",
+                    columnar.input_name
+                )
+            })?;
+            let input_changed = !tick.delta.batches().is_empty();
+            if tick.input_changed && !input_changed {
+                columnar.source_snapshot = tick.next_snapshot;
+                return Ok(TopNInputTick {
+                    delta: tick.delta,
+                    input_changed: false,
+                    next_source_snapshot: None,
+                    append_only_source_delta: false,
+                });
+            }
+            Ok(TopNInputTick {
+                delta: tick.delta,
+                input_changed,
+                next_source_snapshot: input_changed.then_some(tick.next_snapshot),
+                append_only_source_delta: false,
+            })
+        }
+        unsupported => bail!(
+            "topn received unsupported compiled input operator '{}'",
+            unsupported.kind()
+        ),
     }
 }
 
@@ -2839,7 +2813,7 @@ fn direct_projection_indices_for_exprs(
         .iter()
         .enumerate()
         .map(|(output_idx, expr)| {
-            let Expr::Column(column) = strip_alias(expr) else {
+            let Expr::Column(column) = super::columnar_utils::strip_alias(expr) else {
                 return None;
             };
             let input_idx = input_schema.index_of(&column.name).ok()?;
@@ -3099,36 +3073,6 @@ fn unit_positive_delta_value_batches(
         output.push(RecordBatch::try_new(Arc::clone(value_schema), columns)?);
     }
     Ok(Some(output))
-}
-
-fn rewrap_record_batches_with_schema(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    batches
-        .iter()
-        .map(|batch| {
-            if batch.num_columns() != schema.fields().len() {
-                bail!(
-                    "topn append-only candidate batch width {} does not match schema width {}",
-                    batch.num_columns(),
-                    schema.fields().len()
-                );
-            }
-            for (idx, field) in schema.fields().iter().enumerate() {
-                let actual_type = batch.column(idx).data_type();
-                if actual_type != field.data_type() {
-                    bail!(
-                        "topn append-only candidate column {} type {:?} does not match expected {:?}",
-                        idx,
-                        actual_type,
-                        field.data_type()
-                    );
-                }
-            }
-            RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec()).map_err(Into::into)
-        })
-        .collect()
 }
 
 impl TopNEvaluator {
@@ -3417,27 +3361,6 @@ fn partition_column_index_for_schema(schema: &SchemaRef, column: &str) -> Result
         .with_context(|| format!("topn partition column '{column}' missing from input schema"))
 }
 
-fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::Projection(projection) => derived_relation_name(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => derived_relation_name(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.to_string()),
-        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            derived_relation_name(sort.input.as_ref())
-        }
-        _ => None,
-    }
-}
-
-fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> SchemaRef {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
-        .collect::<Vec<_>>();
-    Arc::new(Schema::new(fields))
-}
-
 fn rebind_topn_logical_plan(
     logical_plan: LogicalPlan,
     provider_by_table: &HashMap<String, Arc<dyn TableProvider>>,
@@ -3615,9 +3538,9 @@ fn grouped_stats_topn_input_for_plan(
     let Some(input) = global_topn_input_plan(plan) else {
         return Ok(None);
     };
-    let input_name =
-        derived_relation_name(input).unwrap_or_else(|| "__floe_topn_grouped_stats_input".into());
-    let schema = df_schema_to_arrow(input.schema());
+    let input_name = super::columnar_utils::derived_relation_name(input)
+        .unwrap_or_else(|| "__floe_topn_grouped_stats_input".into());
+    let schema = super::columnar_utils::df_schema_to_arrow(input.schema())?;
     let Some(grouped_stats) = columnar_grouped_stats_plan_for_plan(input, sources, &schema)? else {
         return Ok(None);
     };
@@ -3914,7 +3837,7 @@ fn row_number_window_function(expr: &Expr) -> Option<(String, &WindowFunction)> 
 }
 
 fn partition_column_name(expr: &Expr) -> Option<String> {
-    match strip_alias(expr) {
+    match super::columnar_utils::strip_alias(expr) {
         Expr::Column(column) => Some(column.name.clone()),
         _ => None,
     }
@@ -3928,65 +3851,16 @@ fn projection_expr_matches_rank(expr: &Expr, rank_column: &str) -> bool {
     }
 }
 
-fn strip_alias(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Alias(alias) => strip_alias(alias.expr.as_ref()),
-        _ => expr,
-    }
-}
-
 fn single_source_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Option<String> {
-    let sources = source_set_for_plan(plan, sources);
+    let sources = super::columnar_utils::source_set_for_plan(plan, sources);
     if sources.len() == 1 {
         sources.into_iter().next()
     } else {
         None
     }
-}
-
-fn source_set_for_plan(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    collect_sources(plan, sources, &mut out);
-    out
-}
-
-fn collect_sources(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-    out: &mut BTreeSet<String>,
-) {
-    match plan {
-        LogicalPlan::TableScan(scan) => {
-            if let Some(source_name) = table_scan_source(scan, sources) {
-                out.insert(source_name);
-            }
-        }
-        LogicalPlan::Projection(projection) => {
-            collect_sources(projection.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
-        LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
-        LogicalPlan::Aggregate(aggregate) => {
-            collect_sources(aggregate.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
-        LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
-        LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
-        _ => {}
-    }
-}
-
-fn table_scan_source(
-    scan: &TableScan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> Option<String> {
-    resolve_source_table(scan.table_name.table().to_string(), sources)
 }
 
 fn contains_unsupported_topn_wrapper(plan: &LogicalPlan) -> bool {
@@ -4020,47 +3894,4 @@ fn contains_aggregate(plan: &LogicalPlan) -> bool {
         LogicalPlan::Sort(sort) => contains_aggregate(sort.input.as_ref()),
         _ => false,
     }
-}
-
-fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
-    let weight_idx = zset.weighted_schema().index_of(WEIGHT_COLUMN_NAME)?;
-    let mut batches = zset
-        .batches()
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| -> Result<RecordBatch> {
-            let weights = batch
-                .column(weight_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-            let mut indices = Vec::new();
-            for row_idx in 0..weights.len() {
-                if weights.is_null(row_idx) {
-                    bail!("materialized columnar zset weight cannot be NULL");
-                }
-                let weight = weights.value(row_idx);
-                if weight < 0 {
-                    bail!("materialized columnar zset contains negative weight");
-                }
-                let row_idx =
-                    u32::try_from(row_idx).context("columnar zset batch exceeds u32 rows")?;
-                for _ in 0..weight {
-                    indices.push(row_idx);
-                }
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .take(zset.value_column_count())
-                .map(|column| take(column.as_ref(), &indices, None))
-                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-            Ok(RecordBatch::try_new(zset.value_schema(), columns)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(zset.value_schema()));
-    }
-    Ok(batches)
 }

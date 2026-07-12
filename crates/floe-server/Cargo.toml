@@ -25,5 +25,3 @@ slatedb = { workspace = true, features = ["aws"] }
 arrow-schema = { workspace = true }
 arrow-buffer = "57.1.0"
 arrow-data = "57.1.0"
-dbsp = { path = "../dbsp" }
-slatedb = { workspace = true }

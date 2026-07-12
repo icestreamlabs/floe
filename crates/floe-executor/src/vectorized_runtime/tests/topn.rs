@@ -32,7 +32,7 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
     let query = "SELECT auction, bidder, price FROM bids ORDER BY price DESC LIMIT 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -85,7 +85,7 @@ async fn global_topn_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -181,7 +181,7 @@ async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally(
     let query = "SELECT auction FROM bids ORDER BY price DESC LIMIT 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_hidden_sort_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -231,7 +231,7 @@ async fn hidden_sort_key_topn_uses_slate_backed_columnar_operator_incrementally(
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_hidden_sort_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -327,12 +327,12 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_filtered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_filtered_partitioned_topn",
                 partitioned_query,
                 Arc::clone(&output_schema),
@@ -424,12 +424,12 @@ async fn filtered_topn_wrappers_use_slate_backed_columnar_operator_incrementally
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_filtered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_filtered_partitioned_topn",
                 partitioned_query,
                 Arc::clone(&output_schema),
@@ -569,12 +569,12 @@ async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_ordered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_ordered_row_number_topn",
                 row_number_query,
                 Arc::clone(&output_schema),
@@ -653,12 +653,12 @@ async fn ordered_topn_wrappers_use_slate_backed_columnar_operator_semantics() {
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_ordered_global_topn",
                 global_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_ordered_row_number_topn",
                 row_number_query,
                 Arc::clone(&output_schema),
@@ -751,7 +751,7 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
         WHERE rank_number <= 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_global_ranked_bids",
             query,
             Arc::clone(&output_schema),
@@ -804,7 +804,7 @@ async fn global_row_number_topn_uses_slate_backed_columnar_operator_incrementall
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_global_ranked_bids",
             query,
             Arc::clone(&output_schema),
@@ -912,12 +912,12 @@ async fn row_number_predicate_variants_use_slate_backed_columnar_operator_increm
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
         vec![
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_reversed_ranked_bids",
                 reversed_query,
                 Arc::clone(&output_schema),
             ),
-            VectorizedMaterializedViewPlan::from_sql(
+            SqlMaterializedViewPlan::from_sql(
                 "mv_second_ranked_bids",
                 equality_query,
                 Arc::clone(&output_schema),
@@ -1030,7 +1030,7 @@ async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() 
     let query = "SELECT auction, bidder, price FROM bids ORDER BY price DESC LIMIT 2 OFFSET 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_offset_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -1083,7 +1083,7 @@ async fn global_topn_offset_uses_slate_backed_columnar_operator_incrementally() 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_offset_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -1182,7 +1182,7 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
         FROM bids) ranked WHERE rank_number <= 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -1241,7 +1241,7 @@ async fn topn_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -1354,7 +1354,7 @@ async fn under_limit_topn_projection_uses_weighted_source_delta_semantics() {
         FROM bids) ranked WHERE rank_number <= 10";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_under_limit_top_bids",
             query,
             Arc::clone(&output_schema),
@@ -1439,7 +1439,7 @@ async fn count_group_by_requires_slate_backed_operator_state_table() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_counts",
             "SELECT id, COUNT(*) AS count FROM orders GROUP BY id",
             Arc::clone(&output_schema),
@@ -1476,7 +1476,7 @@ async fn filter_project_requires_slate_backed_operator_state_table() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders WHERE amount > 10",
             Arc::clone(&output_schema),
@@ -1511,7 +1511,7 @@ async fn source_query_tables_are_not_maintained_by_default() {
 
     let runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_orders",
             "SELECT id FROM orders",
             Arc::clone(&output_schema),
@@ -1637,7 +1637,7 @@ async fn sum_group_by_requires_slate_backed_operator_state_table() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals",
             "SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
             Arc::clone(&output_schema),

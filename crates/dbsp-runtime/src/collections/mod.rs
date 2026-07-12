@@ -11,4 +11,4 @@ pub use columnar_zset::{
     SlateBackedColumnarZSet,
 };
 pub use indexed_batch_zset::{ApplyDeltaMetrics, LookupMetrics, OrderedBytes, RangeKey};
-pub use zset::{CompactionPolicy, VersionChainStats, ZSet};
+pub use zset::{CompactionPolicy, VersionChainStats};

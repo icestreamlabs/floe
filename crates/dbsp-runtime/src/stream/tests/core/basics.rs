@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::algebra::AbelianGroup;
 use crate::stream::core::stream::Stream;
 use crate::stream::tests::common::{IntegerGroup, build_db};
-use crate::stream::util::{set_default_at_in_place, set_default_in_place};
 use slatedb::WriteBatch;
 
 #[tokio::test]
@@ -125,8 +124,8 @@ async fn set_default_preserves_later_scheduled_tail() {
         .await
         .expect("build stream");
 
-    set_default_in_place(&mut stream, 5);
-    set_default_at_in_place(&stream, 2, 0);
+    stream.set_default_in_place(5);
+    stream.set_default_at_in_place(2, 0);
     stream.advance_to(1).await.expect("advance to t1");
 
     assert_eq!(stream.default_value(), 0);

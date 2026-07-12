@@ -402,20 +402,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     if let Some(max_catchup_versions) = run_args.subscribe_max_catchup_versions {
         subscribe_execution_config.max_catchup_versions = max_catchup_versions;
     }
-    let circuit_plans = build_dataflows(&planned_materialized_views, &source_registry)?;
+    let dataflows = analyze_dataflows(&planned_materialized_views, &source_registry)?;
     let mut all_required_sources: BTreeSet<String> = BTreeSet::new();
-    let available_source_names: BTreeSet<String> = available_sources.iter().cloned().collect();
-    let mut plan_required_sources: Vec<BTreeSet<String>> = Vec::with_capacity(circuit_plans.len());
-    for (mv_idx, plan) in circuit_plans.iter().enumerate() {
-        let view_name = planned_materialized_views[mv_idx]
-            .definition()
-            .name()
-            .to_string();
-        let ValidatedPlan {
-            required_sources, ..
-        } = validate_dbsp_plan(plan, &available_source_names, &view_name)?;
-        all_required_sources.extend(required_sources.iter().cloned());
-        plan_required_sources.push(required_sources);
+    for dataflow in &dataflows {
+        all_required_sources.extend(dataflow.required_sources.iter().cloned());
     }
     all_required_sources.extend(durable_table_source_names.iter().cloned());
     let source_journal_mode = config
@@ -484,7 +474,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             source_count = all_required_sources.len(),
             materialized_view_count = materialized_views.len(),
             sink_count = sink_specs.len(),
-            circuit_plan_count = circuit_plans.len(),
+            dataflow_count = dataflows.len(),
             "dry-run validation succeeded"
         );
         return Ok(());
@@ -526,16 +516,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let vectorized_source_batch_journal =
         VectorizedSourceBatchJournal::new(checkpoint_manager.store().table());
     let kafka_source_journal = KafkaSourceJournal::new(checkpoint_manager.store().table());
-    if circuit_plans.is_empty() {
-        tracing::warn!("DBSP planning produced no circuit plans.");
+    if dataflows.is_empty() {
+        tracing::warn!("no materialized-view dataflows were planned");
     } else {
         tracing::info!(
-            circuit_plans = circuit_plans.len(),
-            "DBSP planning produced circuit plans"
+            dataflows = dataflows.len(),
+            "materialized-view dataflows analyzed"
         );
-        for plan in &circuit_plans {
-            tracing::debug!(root = plan.root, "circuit plan root node");
-        }
     }
 
     let mv_registry = Arc::new(MaterializedViewRegistry::new_with_retention(
@@ -711,8 +698,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let required_columns_by_source_id = required_column_masks_by_source_id(
         &definitions,
         &all_required_sources,
-        &circuit_plans,
-        &plan_required_sources,
+        &dataflows,
         &source_journal_required_sources,
     )?;
     let runtime_services = start_runtime_services(RuntimeServicesConfig {

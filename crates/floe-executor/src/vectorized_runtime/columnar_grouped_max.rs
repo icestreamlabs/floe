@@ -3,11 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, UInt32Array};
-use datafusion::arrow::compute::take;
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, Int64Builder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::provider_as_source;
@@ -15,14 +13,14 @@ use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
 use datafusion::physical_plan::{ExecutionPlan, collect};
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
 use slatedb::config::ScanOptions;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
-use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
@@ -38,9 +36,8 @@ use super::columnar_join::{
 use super::profile;
 use super::{
     IncrementalMaterializedViewState, VectorizedMaterializedViewState, VectorizedSourceState,
-    apply_weighted_snapshot_delta, build_incremental_materialized_view_state_from_logical_plan,
-    collect_incremental_output, direct_project_record_batches, direct_projection_indices,
-    normalize_batches,
+    build_incremental_materialized_view_state_from_logical_plan, collect_incremental_output,
+    direct_project_record_batches, direct_projection_indices, normalize_batches,
 };
 
 const APPEND_ONLY_GROUPED_MAX_STREAMING_ROW_LIMIT: usize = 8_192;
@@ -79,8 +76,7 @@ pub(super) struct ColumnarGroupedMaxMaterializedViewState {
     input_name: String,
     append_only_input: bool,
     source_schema: SchemaRef,
-    input_zset: Option<SlateBackedColumnarZSet>,
-    join: Option<Box<ColumnarJoinMaterializedViewState>>,
+    input: super::IncrementalInputOperator,
     input_snapshot: Vec<RecordBatch>,
     output_zset: SlateBackedColumnarZSet,
     max_state: SlateGroupedMaxState,
@@ -90,6 +86,8 @@ pub(super) struct ColumnarGroupedMaxMaterializedViewState {
     group_schema: SchemaRef,
     output_mapping: Vec<usize>,
     max_idx: usize,
+    operator_table: Arc<dyn KeyValueTable>,
+    row_count: i64,
     initial_snapshot: Vec<RecordBatch>,
 }
 
@@ -148,8 +146,7 @@ struct PendingMaxDelta {
 
 pub(super) struct ColumnarGroupedMaxTick {
     pub(super) delta: ColumnarZSet,
-    pub(super) next_snapshot: Vec<RecordBatch>,
-    pub(super) input_changed: bool,
+    row_count_delta: i64,
 }
 
 pub(super) fn columnar_grouped_max_plan_for_plan(
@@ -175,7 +172,7 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
     };
 
     let max_idx = aggregate.group_expr.len();
-    let aggregate_schema = df_schema_to_arrow(&aggregate.schema)?;
+    let aggregate_schema = super::columnar_utils::df_schema_to_arrow(&aggregate.schema)?;
     if aggregate_schema.fields().len() != max_idx + 1
         || aggregate_schema.field(max_idx).data_type() != &DataType::Int64
     {
@@ -199,47 +196,48 @@ pub(super) fn columnar_grouped_max_plan_for_plan(
 
     let mut projection_expr = aggregate.group_expr.clone();
     projection_expr.push(max_value_expr);
-    let (input, append_only_input, value_projection) =
-        if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
-            let append_only_input = sources
-                .get(&source_name)
-                .is_some_and(|source| source.append_only);
-            let projection_input = aggregate.input.as_ref().clone();
-            let value_projection = Projection::try_new(projection_expr, Arc::new(projection_input))
-                .context("build grouped-max value projection")?;
-            (
-                ColumnarGroupedMaxInputPlan::Source { source_name },
-                append_only_input,
-                value_projection,
-            )
-        } else {
-            let projected_join = Projection::try_new(
-                projection_expr.clone(),
-                Arc::new(aggregate.input.as_ref().clone()),
-            )
-            .context("build grouped-max projected join input")?;
-            let projected_join_plan = LogicalPlan::Projection(projected_join.clone());
-            let Some(join) = columnar_join_plan_for_plan(&projected_join_plan, sources)? else {
-                return Ok(None);
-            };
-            let append_only_input = columnar_join_plan_sources_append_only(&join, sources);
-            let projection_schema = df_schema_to_arrow(&projected_join.schema)?;
-            let projection_input_schema = derived_projection_input_schema(&projection_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_max_join_input".to_string());
-            (
-                ColumnarGroupedMaxInputPlan::Join {
-                    input_name,
-                    source_schema: Arc::clone(&projection_schema),
-                    projection_input_schema,
-                    plan: Box::new(join),
-                    preprojected: true,
-                },
-                append_only_input,
-                projected_join,
-            )
+    let (input, append_only_input, value_projection) = if let Some(source_name) =
+        incremental_source_for_plan(aggregate.input.as_ref(), sources)
+    {
+        let append_only_input = sources
+            .get(&source_name)
+            .is_some_and(|source| source.append_only);
+        let projection_input = aggregate.input.as_ref().clone();
+        let value_projection = Projection::try_new(projection_expr, Arc::new(projection_input))
+            .context("build grouped-max value projection")?;
+        (
+            ColumnarGroupedMaxInputPlan::Source { source_name },
+            append_only_input,
+            value_projection,
+        )
+    } else {
+        let projected_join = Projection::try_new(
+            projection_expr.clone(),
+            Arc::new(aggregate.input.as_ref().clone()),
+        )
+        .context("build grouped-max projected join input")?;
+        let projected_join_plan = LogicalPlan::Projection(projected_join.clone());
+        let Some(join) = columnar_join_plan_for_plan(&projected_join_plan, sources)? else {
+            return Ok(None);
         };
-    let projection_schema = df_schema_to_arrow(&value_projection.schema)?;
+        let append_only_input = columnar_join_plan_sources_append_only(&join, sources);
+        let projection_schema = super::columnar_utils::df_schema_to_arrow(&projected_join.schema)?;
+        let projection_input_schema = derived_projection_input_schema(&projection_schema);
+        let input_name = super::columnar_utils::derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_max_join_input".to_string());
+        (
+            ColumnarGroupedMaxInputPlan::Join {
+                input_name,
+                source_schema: Arc::clone(&projection_schema),
+                projection_input_schema,
+                plan: Box::new(join),
+                preprojected: true,
+            },
+            append_only_input,
+            projected_join,
+        )
+    };
+    let projection_schema = super::columnar_utils::df_schema_to_arrow(&value_projection.schema)?;
     if projection_schema.fields().len() != max_idx + 1
         || projection_schema.field(max_idx).data_type() != &DataType::Int64
     {
@@ -302,98 +300,95 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
     )
     .await
     .context("initialize SlateDB-backed grouped-max output zset")?;
-    let initial_snapshot = snapshot_batches_from_zset(
-        &output_zset
-            .materialize_columnar()
+    let initial_output = output_zset
+        .materialize_columnar()
+        .await
+        .context("load grouped-max output snapshot")?;
+    let row_count = columnar_zset_weight_sum(&initial_output)?;
+    let initial_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&initial_output)?;
+    let (input_name, source_schema, input, input_snapshot, projection_delta) = match plan.input {
+        ColumnarGroupedMaxInputPlan::Source { source_name } => {
+            let source = sources
+                .get(&source_name)
+                .ok_or_else(|| anyhow::anyhow!("unknown vectorized source '{}'", source_name))?;
+            let input_namespace = format!("{mv_namespace}/columnar/grouped_max/input");
+            let input_zset = Box::pin(SlateBackedColumnarZSet::new(
+                Arc::clone(&table),
+                input_namespace,
+                Arc::clone(&source.schema),
+            ))
             .await
-            .context("load grouped-max output snapshot")?,
-    )?;
-    let (input_name, source_schema, input_zset, join, input_snapshot, projection_delta) =
-        match plan.input {
-            ColumnarGroupedMaxInputPlan::Source { source_name } => {
-                let source = sources.get(&source_name).ok_or_else(|| {
-                    anyhow::anyhow!("unknown vectorized source '{}'", source_name)
-                })?;
-                let input_namespace = format!("{mv_namespace}/columnar/grouped_max/input");
-                let input_zset = Box::pin(SlateBackedColumnarZSet::new(
-                    Arc::clone(&table),
-                    input_namespace,
-                    Arc::clone(&source.schema),
-                ))
-                .await
-                .context("initialize SlateDB-backed grouped-max input zset")?;
-                let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
-                    &source_name,
-                    sources,
-                    udfs,
-                    &LogicalPlan::Projection(plan.projection.clone()),
+            .context("initialize SlateDB-backed grouped-max input zset")?;
+            let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
+                &source_name,
+                sources,
+                udfs,
+                &LogicalPlan::Projection(plan.projection.clone()),
+            )
+            .await
+            .context("build grouped-max vectorized value projection delta plan")?;
+            (
+                source_name,
+                Arc::clone(&source.schema),
+                super::IncrementalInputOperator::Source(Box::new(input_zset)),
+                Vec::new(),
+                GroupedMaxProjectionState::Source(projection_delta),
+            )
+        }
+        ColumnarGroupedMaxInputPlan::Join {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: join_plan,
+            preprojected,
+        } => {
+            let join_namespace = format!("{mv_namespace}/columnar/grouped_max/join_input");
+            let join = Box::pin(build_boxed_join_grouped_max_input_state(
+                Arc::clone(&table),
+                join_namespace,
+                &source_schema,
+                *join_plan,
+                sources,
+                udfs,
+            ))
+            .await
+            .with_context(|| {
+                format!(
+                    "build SlateDB-backed grouped-max join input for '{}'",
+                    input_name
                 )
-                .await
-                .context("build grouped-max vectorized value projection delta plan")?;
-                (
-                    source_name,
-                    Arc::clone(&source.schema),
-                    Some(input_zset),
-                    None,
-                    Vec::new(),
-                    GroupedMaxProjectionState::Source(projection_delta),
+            })?;
+            let input_snapshot = join.initial_snapshot();
+            let projection_delta = if preprojected {
+                GroupedMaxProjectionState::Direct(
+                    (0..plan.projection_schema.fields().len()).collect(),
                 )
-            }
-            ColumnarGroupedMaxInputPlan::Join {
+            } else {
+                GroupedMaxProjectionState::Derived(
+                    build_derived_projection_state(
+                        LogicalPlan::Projection(plan.projection.clone()),
+                        &input_name,
+                        &projection_input_schema,
+                        udfs,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "build grouped-max derived projection delta plan for '{}'",
+                            input_name
+                        )
+                    })?,
+                )
+            };
+            (
                 input_name,
                 source_schema,
-                projection_input_schema,
-                plan: join_plan,
-                preprojected,
-            } => {
-                let join_namespace = format!("{mv_namespace}/columnar/grouped_max/join_input");
-                let join = Box::pin(build_boxed_join_grouped_max_input_state(
-                    Arc::clone(&table),
-                    join_namespace,
-                    &source_schema,
-                    *join_plan,
-                    sources,
-                    udfs,
-                ))
-                .await
-                .with_context(|| {
-                    format!(
-                        "build SlateDB-backed grouped-max join input for '{}'",
-                        input_name
-                    )
-                })?;
-                let input_snapshot = join.initial_snapshot();
-                let projection_delta = if preprojected {
-                    GroupedMaxProjectionState::Direct(
-                        (0..plan.projection_schema.fields().len()).collect(),
-                    )
-                } else {
-                    GroupedMaxProjectionState::Derived(
-                        build_derived_projection_state(
-                            LogicalPlan::Projection(plan.projection.clone()),
-                            &input_name,
-                            &projection_input_schema,
-                            udfs,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "build grouped-max derived projection delta plan for '{}'",
-                                input_name
-                            )
-                        })?,
-                    )
-                };
-                (
-                    input_name,
-                    source_schema,
-                    None,
-                    Some(join),
-                    input_snapshot,
-                    projection_delta,
-                )
-            }
-        };
+                super::IncrementalInputOperator::Join(join),
+                input_snapshot,
+                projection_delta,
+            )
+        }
+    };
 
     let assume_empty_state = output_zset.current_handle().is_none();
 
@@ -411,17 +406,23 @@ pub(super) async fn build_columnar_grouped_max_materialized_view_state_in_namesp
         input_name,
         append_only_input: plan.append_only_input,
         source_schema,
-        input_zset,
-        join,
+        input,
         input_snapshot,
         output_zset,
-        max_state: SlateGroupedMaxState::new(table, &state_namespace, assume_empty_state).await?,
+        max_state: SlateGroupedMaxState::new(
+            Arc::clone(&table),
+            &state_namespace,
+            assume_empty_state,
+        )
+        .await?,
         value_index,
         projection_delta,
         projection_schema: plan.projection_schema,
         group_schema: plan.group_schema,
         output_mapping: plan.output_mapping,
         max_idx: plan.max_idx,
+        operator_table: table,
+        row_count,
         initial_snapshot,
     })
 }
@@ -500,25 +501,45 @@ pub(super) async fn run_columnar_grouped_max_materialized_view_tick(
     };
 
     let plan_start = Instant::now();
-    let tick = run_columnar_grouped_max_state_tick(
-        columnar,
-        insert_batches,
-        weighted_delta_batches,
-        &mv.output_schema,
-        &mv.previous_snapshot,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "evaluate Slate-backed grouped-max columnar snapshot delta for '{}'",
-            mv.view_name
-        )
-    })?;
+    let tick =
+        run_columnar_grouped_max_state_tick(columnar, insert_batches, weighted_delta_batches)
+            .await
+            .with_context(|| {
+                format!(
+                    "evaluate Slate-backed grouped-max columnar snapshot delta for '{}'",
+                    mv.view_name
+                )
+            })?;
 
     let delta_batches = tick.delta.batches().to_vec();
+    columnar.row_count = columnar.row_count.saturating_add(tick.row_count_delta);
+    if columnar.row_count < 0 {
+        bail!(
+            "grouped-max materialized view '{}' row count became negative",
+            mv.view_name
+        );
+    }
+    let snapshot_rows =
+        usize::try_from(columnar.row_count).context("grouped-max row count exceeds usize")?;
     let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = tick.next_snapshot;
+    if let Some(zset_handle) = columnar.output_zset.current_handle() {
+        handle.publish_columnar_version(
+            version,
+            zset_handle,
+            ColumnarMaterializedViewStorage::new(
+                Arc::clone(&columnar.operator_table),
+                Arc::clone(&mv.output_schema),
+            ),
+            snapshot_rows,
+            delta_batches,
+        );
+    } else {
+        handle.publish_arrow_version(
+            version,
+            vec![RecordBatch::new_empty(Arc::clone(&mv.output_schema))],
+            delta_batches,
+        );
+    }
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -533,15 +554,11 @@ pub(super) async fn run_columnar_grouped_max_state_tick(
     columnar: &mut ColumnarGroupedMaxMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedMaxTick> {
     run_columnar_grouped_max_state_tick_inner(
         columnar,
         insert_batches,
         weighted_delta_batches,
-        output_schema,
-        previous_snapshot,
         true,
     )
     .await
@@ -551,15 +568,11 @@ pub(super) async fn run_columnar_grouped_max_state_tick_delta_only(
     columnar: &mut ColumnarGroupedMaxMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarGroupedMaxTick> {
     run_columnar_grouped_max_state_tick_inner(
         columnar,
         insert_batches,
         weighted_delta_batches,
-        output_schema,
-        previous_snapshot,
         false,
     )
     .await
@@ -569,9 +582,7 @@ async fn run_columnar_grouped_max_state_tick_inner(
     columnar: &mut ColumnarGroupedMaxMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
-    maintain_output_snapshot: bool,
+    persist_output: bool,
 ) -> Result<ColumnarGroupedMaxTick> {
     let total_start = profile::start();
     let phase_start = profile::start();
@@ -580,7 +591,6 @@ async fn run_columnar_grouped_max_state_tick_inner(
         prepare_grouped_max_input_delta(columnar, insert_batches, weighted_delta_batches).await?;
     let prepare_ms = prepare_start.elapsed().as_millis() as u64;
     profile::record_since("grouped_max.prepare_input", phase_start);
-    let input_changed = !persisted_input_delta.batches().is_empty();
     let streaming_start = Instant::now();
     let streaming_output =
         grouped_max_append_only_streaming_delta(columnar, persisted_input_delta.batches()).await?;
@@ -638,7 +648,7 @@ async fn run_columnar_grouped_max_state_tick_inner(
         .map(RecordBatch::num_rows)
         .sum::<usize>();
     let mut output_create_ms = 0_u64;
-    if maintain_output_snapshot {
+    if persist_output {
         let phase_start = profile::start();
         let output_create_start = Instant::now();
         columnar
@@ -655,24 +665,8 @@ async fn run_columnar_grouped_max_state_tick_inner(
         profile::record_since("grouped_max.output_create_version", phase_start);
     }
     let persisted_output_delta = output_delta;
-
-    let mut output_snapshot_ms = 0_u64;
-    let next_snapshot = if maintain_output_snapshot {
-        let phase_start = profile::start();
-        let output_snapshot_start = Instant::now();
-        let next_snapshot = apply_weighted_snapshot_delta(
-            output_schema,
-            previous_snapshot,
-            persisted_output_delta.batches().to_vec(),
-        )
-        .await
-        .context("apply Slate-backed grouped-max columnar snapshot delta")?;
-        output_snapshot_ms = output_snapshot_start.elapsed().as_millis() as u64;
-        profile::record_since("grouped_max.output_snapshot_delta", phase_start);
-        next_snapshot
-    } else {
-        Vec::new()
-    };
+    let row_count_delta = columnar_zset_weight_sum(&persisted_output_delta)
+        .context("compute grouped-max output row-count delta")?;
 
     tracing::debug!(
         input = %columnar.input_name,
@@ -685,16 +679,14 @@ async fn run_columnar_grouped_max_state_tick_inner(
         apply_ms,
         build_output_ms,
         output_create_ms,
-        output_snapshot_ms,
-        maintain_output_snapshot,
+        persist_output,
         "grouped-max state tick phase timings"
     );
 
     profile::record_since("grouped_max.total", total_start);
     Ok(ColumnarGroupedMaxTick {
         delta: persisted_output_delta,
-        next_snapshot,
-        input_changed,
+        row_count_delta,
     })
 }
 
@@ -703,93 +695,74 @@ async fn prepare_grouped_max_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    if columnar.join.is_some() {
-        return prepare_join_grouped_max_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-
-    let input_delta =
-        if let Some(weighted_batches) = weighted_delta_batches.get(columnar.input_name.as_str()) {
-            ColumnarZSet::try_new_weighted(
-                Arc::clone(&columnar.source_schema),
-                weighted_batches.clone(),
-            )
+    match &mut columnar.input {
+        super::IncrementalInputOperator::Source(input_zset) => {
+            let input_delta = if let Some(weighted_batches) =
+                weighted_delta_batches.get(columnar.input_name.as_str())
+            {
+                ColumnarZSet::try_new_weighted(
+                    Arc::clone(&columnar.source_schema),
+                    weighted_batches.clone(),
+                )
+                .with_context(|| {
+                    format!(
+                        "build weighted grouped-max input delta for '{}'",
+                        columnar.input_name
+                    )
+                })?
+            } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
+                ColumnarZSet::from_value_batches(
+                    Arc::clone(&columnar.source_schema),
+                    source_batches.clone(),
+                    1,
+                )
+                .with_context(|| {
+                    format!(
+                        "build insert grouped-max input delta for '{}'",
+                        columnar.input_name
+                    )
+                })?
+            } else {
+                ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
+            };
+            if let Some(handle) = input_zset.create_version(&input_delta, None).await? {
+                input_zset.read_delta(&handle).await
+            } else {
+                Ok(input_delta)
+            }
+        }
+        super::IncrementalInputOperator::Join(join) => {
+            let join_start = Instant::now();
+            let tick = Box::pin(run_columnar_join_state_tick_delta_only(
+                join,
+                insert_batches,
+                weighted_delta_batches,
+                &columnar.source_schema,
+                &columnar.input_snapshot,
+            ))
+            .await
             .with_context(|| {
                 format!(
-                    "build weighted grouped-max input delta for '{}'",
+                    "evaluate grouped-max nested join input '{}'",
                     columnar.input_name
                 )
-            })?
-        } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
-            ColumnarZSet::from_value_batches(
-                Arc::clone(&columnar.source_schema),
-                source_batches.clone(),
-                1,
-            )
-            .with_context(|| {
-                format!(
-                    "build insert grouped-max input delta for '{}'",
-                    columnar.input_name
-                )
-            })?
-        } else {
-            ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
-        };
-
-    let input_zset = columnar
-        .input_zset
-        .as_mut()
-        .context("grouped-max source input zset missing")?;
-    if let Some(handle) = input_zset.create_version(&input_delta, None).await? {
-        input_zset.read_delta(&handle).await
-    } else {
-        Ok(input_delta)
+            })?;
+            tracing::debug!(
+                input = %columnar.input_name,
+                join_ms = join_start.elapsed().as_millis() as u64,
+                delta_rows = tick.delta.batches().iter().map(RecordBatch::num_rows).sum::<usize>(),
+                "grouped-max nested join input prepared"
+            );
+            if tick.input_changed && !tick.next_snapshot.is_empty() {
+                columnar.input_snapshot = tick.next_snapshot;
+            }
+            Ok(tick.delta)
+        }
+        unsupported => bail!(
+            "grouped-max received unsupported compiled input operator '{}'",
+            unsupported.kind()
+        ),
     }
-}
-
-async fn prepare_join_grouped_max_input_delta(
-    columnar: &mut ColumnarGroupedMaxMaterializedViewState,
-    insert_batches: &HashMap<String, Vec<RecordBatch>>,
-    weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-) -> Result<ColumnarZSet> {
-    let join = columnar
-        .join
-        .as_mut()
-        .context("grouped-max nested join state missing")?;
-    let join_start = Instant::now();
-    let tick = Box::pin(run_columnar_join_state_tick_delta_only(
-        join.as_mut(),
-        insert_batches,
-        weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.input_snapshot,
-    ))
-    .await
-    .with_context(|| {
-        format!(
-            "evaluate grouped-max nested join input '{}'",
-            columnar.input_name
-        )
-    })?;
-    tracing::debug!(
-        input = %columnar.input_name,
-        join_ms = join_start.elapsed().as_millis() as u64,
-        delta_rows = tick
-            .delta
-            .batches()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        "grouped-max nested join input prepared"
-    );
-    if tick.input_changed && !tick.next_snapshot.is_empty() {
-        columnar.input_snapshot = tick.next_snapshot;
-    }
-    Ok(tick.delta)
 }
 
 async fn grouped_max_append_only_streaming_delta(
@@ -834,7 +807,7 @@ async fn grouped_max_append_only_streaming_delta(
         columnar.output_zset.value_schema(),
         &columnar.output_mapping,
     )?;
-    let converter = row_converter_for_schema(&columnar.group_schema)?;
+    let converter = super::columnar_utils::row_converter_for_schema(&columnar.group_schema)?;
     let mut current_maxes = HashMap::<Vec<u8>, Option<i64>>::with_capacity(input_row_count);
     let mut max_updates = Vec::new();
     let mut bounds_update = None;
@@ -991,8 +964,10 @@ async fn collect_grouped_max_projection_output(
                     "grouped-max",
                 );
             }
-            let provider_batches =
-                rewrap_record_batches_with_schema(source_batches, &derived.input_schema)?;
+            let provider_batches = super::columnar_utils::rewrap_record_batches_with_schema(
+                source_batches,
+                &derived.input_schema,
+            )?;
             derived.provider.set_batches(provider_batches)?;
             let collected = collect(Arc::clone(&derived.plan), derived.ctx.task_ctx()).await;
             derived.provider.set_batches(Vec::new())?;
@@ -1013,7 +988,7 @@ fn add_projected_value_batches_to_pending(
     if batches.is_empty() {
         return Ok(());
     }
-    let converter = row_converter_for_schema(&columnar.group_schema)?;
+    let converter = super::columnar_utils::row_converter_for_schema(&columnar.group_schema)?;
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
@@ -1402,7 +1377,7 @@ fn max_by_group_from_projected_value_zset(
     group_schema: &SchemaRef,
 ) -> Result<HashMap<Vec<u8>, i64>> {
     let mut counts = HashMap::<Vec<u8>, HashMap<i64, i64>>::new();
-    let converter = row_converter_for_schema(group_schema)?;
+    let converter = super::columnar_utils::row_converter_for_schema(group_schema)?;
     for batch in zset.batches() {
         if batch.num_rows() == 0 {
             continue;
@@ -1802,7 +1777,13 @@ fn output_mapping_for_projection(
             projection
                 .expr
                 .iter()
-                .map(|expr| output_expr_source_idx(strip_alias(expr), aggregate_schema, max_idx))
+                .map(|expr| {
+                    output_expr_source_idx(
+                        super::columnar_utils::strip_alias(expr),
+                        aggregate_schema,
+                        max_idx,
+                    )
+                })
                 .collect()
         }
         None => {
@@ -1832,7 +1813,7 @@ fn output_expr_source_idx(
 }
 
 fn max_value_expr(expr: &Expr) -> Option<Expr> {
-    let Expr::AggregateFunction(aggregate) = strip_alias(expr) else {
+    let Expr::AggregateFunction(aggregate) = super::columnar_utils::strip_alias(expr) else {
         return None;
     };
     let params = &aggregate.params;
@@ -1850,13 +1831,6 @@ fn max_value_expr(expr: &Expr) -> Option<Expr> {
     Some(expr.clone())
 }
 
-fn strip_alias(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Alias(alias) => strip_alias(alias.expr.as_ref()),
-        _ => expr,
-    }
-}
-
 fn derived_projection_input_schema(source_schema: &SchemaRef) -> SchemaRef {
     let fields = source_schema
         .fields()
@@ -1871,109 +1845,6 @@ fn derived_projection_input_schema(source_schema: &SchemaRef) -> SchemaRef {
         })
         .collect::<Vec<_>>();
     Arc::new(Schema::new(fields))
-}
-
-fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::Projection(projection) => derived_relation_name(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => derived_relation_name(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.to_string()),
-        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            derived_relation_name(sort.input.as_ref())
-        }
-        _ => None,
-    }
-}
-
-fn rewrap_record_batches_with_schema(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    batches
-        .iter()
-        .map(|batch| {
-            if batch.num_columns() != schema.fields().len() {
-                bail!(
-                    "grouped-max derived input batch width {} does not match schema width {}",
-                    batch.num_columns(),
-                    schema.fields().len()
-                );
-            }
-            for (idx, field) in schema.fields().iter().enumerate() {
-                let actual_type = batch.column(idx).data_type();
-                if actual_type != field.data_type() {
-                    bail!(
-                        "grouped-max derived input column {} type {:?} does not match expected {:?}",
-                        idx,
-                        actual_type,
-                        field.data_type()
-                    );
-                }
-            }
-            RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec()).map_err(Into::into)
-        })
-        .collect()
-}
-
-fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> Result<SchemaRef> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Schema::new(fields)))
-}
-
-fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| SortField::new(field.data_type().clone()))
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).context("build grouped-max Arrow row converter")
-}
-
-fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
-    let weight_idx = zset.weighted_schema().index_of(WEIGHT_COLUMN_NAME)?;
-    let mut batches = zset
-        .batches()
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| -> Result<RecordBatch> {
-            let weights = batch
-                .column(weight_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-            let mut indices = Vec::new();
-            for row_idx in 0..weights.len() {
-                if weights.is_null(row_idx) {
-                    bail!("materialized columnar zset weight cannot be NULL");
-                }
-                let weight = weights.value(row_idx);
-                if weight < 0 {
-                    bail!("materialized columnar zset contains negative weight");
-                }
-                let row_idx =
-                    u32::try_from(row_idx).context("columnar zset batch exceeds u32 rows")?;
-                for _ in 0..weight {
-                    indices.push(row_idx);
-                }
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .take(zset.value_column_count())
-                .map(|column| take(column.as_ref(), &indices, None))
-                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-            Ok(RecordBatch::try_new(zset.value_schema(), columns)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(zset.value_schema()));
-    }
-    Ok(batches)
 }
 
 fn merge_group_key_bounds_update(update: &mut Option<GroupKeyBoundsUpdate>, group_key: &[u8]) {

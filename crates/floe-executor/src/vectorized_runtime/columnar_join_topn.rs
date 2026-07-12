@@ -12,9 +12,8 @@ use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::logical_plan::{Filter, Join, TableScan, Window};
+use datafusion::logical_expr::logical_plan::{Filter, Join, Window};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarIndexedZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
@@ -26,7 +25,6 @@ use crate::encoding::EncodedRowScalar;
 use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
-use crate::vectorized_runtime::source_state::resolve_source_table;
 
 use super::{
     VectorizedMaterializedViewState, VectorizedSourceState, apply_keyed_source_snapshot_delta,
@@ -285,7 +283,8 @@ pub(super) fn partitioned_join_top1_value_input_for_plan(
     let [window_expr] = window.window_expr.as_slice() else {
         return Ok(None);
     };
-    let Expr::WindowFunction(window_function) = strip_alias(window_expr) else {
+    let Expr::WindowFunction(window_function) = super::columnar_utils::strip_alias(window_expr)
+    else {
         return Ok(None);
     };
     let [first_order, ..] = window_function.params.order_by.as_slice() else {
@@ -330,7 +329,7 @@ fn partitioned_best_bid_join_topn_plan_for_plan(
     if left_source == right_source {
         return Ok(None);
     }
-    let all_sources = source_set_for_plan(plan, sources);
+    let all_sources = super::columnar_utils::source_set_for_plan(plan, sources);
     if all_sources.len() != 2
         || !all_sources.contains(&left_source)
         || !all_sources.contains(&right_source)
@@ -492,7 +491,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         .await
         .context("load join-topn output snapshot")?;
     let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
-    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
+    let initial_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&initial_output)?;
     let left_snapshot_zset = left_zset
         .materialize_columnar()
         .await
@@ -502,7 +501,7 @@ pub(super) async fn build_columnar_join_topn_materialized_view_state_in_namespac
         .await
         .context("load join-topn right input snapshot")?;
     let left_index_namespace = format!("{left_namespace}/index");
-    let left_snapshot = snapshot_batches_from_zset(&left_snapshot_zset)?;
+    let left_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&left_snapshot_zset)?;
     let append_only_left_snapshot = if left_source.append_only
         && record_batch_row_count(&left_snapshot) <= APPEND_ONLY_LEFT_SNAPSHOT_ROW_LIMIT
     {
@@ -1039,7 +1038,7 @@ fn apply_append_only_left_snapshot_delta(
     if delta.is_empty() {
         return Ok(true);
     }
-    let mut delta_batches = snapshot_batches_from_zset(delta)?;
+    let mut delta_batches = crate::columnar_snapshot::columnar_zset_snapshot(delta)?;
     let delta_rows = record_batch_row_count(&delta_batches);
     if delta_rows == 0 {
         return Ok(true);
@@ -3341,12 +3340,12 @@ fn left_partition_columns_by_join_key(
 ) -> Option<Vec<String>> {
     let mut accepted = None;
     for expr in &window.window_expr {
-        let Expr::WindowFunction(window) = strip_alias(expr) else {
+        let Expr::WindowFunction(window) = super::columnar_utils::strip_alias(expr) else {
             return None;
         };
         let mut columns = Vec::with_capacity(window.params.partition_by.len());
         for partition_expr in &window.params.partition_by {
-            let Expr::Column(column) = strip_alias(partition_expr) else {
+            let Expr::Column(column) = super::columnar_utils::strip_alias(partition_expr) else {
                 return None;
             };
             if join_column_side(
@@ -3373,13 +3372,6 @@ fn left_partition_columns_by_join_key(
     accepted
 }
 
-fn strip_alias(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Alias(alias) => strip_alias(alias.expr.as_ref()),
-        _ => expr,
-    }
-}
-
 fn contains_aggregate(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Aggregate(_) => true,
@@ -3400,55 +3392,12 @@ fn single_source_for_plan(
     plan: &LogicalPlan,
     sources: &HashMap<String, VectorizedSourceState>,
 ) -> Option<String> {
-    let sources = source_set_for_plan(plan, sources);
+    let sources = super::columnar_utils::source_set_for_plan(plan, sources);
     if sources.len() == 1 {
         sources.into_iter().next()
     } else {
         None
     }
-}
-
-fn source_set_for_plan(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    collect_sources(plan, sources, &mut out);
-    out
-}
-
-fn collect_sources(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-    out: &mut BTreeSet<String>,
-) {
-    match plan {
-        LogicalPlan::TableScan(scan) => {
-            if let Some(source_name) = table_scan_source(scan, sources) {
-                out.insert(source_name);
-            }
-        }
-        LogicalPlan::Projection(projection) => {
-            collect_sources(projection.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
-        LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
-        LogicalPlan::Sort(sort) => collect_sources(sort.input.as_ref(), sources, out),
-        LogicalPlan::Limit(limit) => collect_sources(limit.input.as_ref(), sources, out),
-        LogicalPlan::Window(window) => collect_sources(window.input.as_ref(), sources, out),
-        LogicalPlan::Join(join) => {
-            collect_sources(join.left.as_ref(), sources, out);
-            collect_sources(join.right.as_ref(), sources, out);
-        }
-        _ => {}
-    }
-}
-
-fn table_scan_source(
-    scan: &TableScan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> Option<String> {
-    resolve_source_table(scan.table_name.table().to_string(), sources)
 }
 
 fn contains_unsupported_join_topn_wrapper(plan: &LogicalPlan) -> bool {
@@ -3472,47 +3421,4 @@ fn contains_unsupported_join_topn_wrapper(plan: &LogicalPlan) -> bool {
         LogicalPlan::TableScan(_) => false,
         _ => true,
     }
-}
-
-fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
-    let weight_idx = zset.weighted_schema().index_of(WEIGHT_COLUMN_NAME)?;
-    let mut batches = zset
-        .batches()
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| -> Result<RecordBatch> {
-            let weights = batch
-                .column(weight_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-            let mut indices = Vec::new();
-            for row_idx in 0..weights.len() {
-                if weights.is_null(row_idx) {
-                    bail!("materialized columnar zset weight cannot be NULL");
-                }
-                let weight = weights.value(row_idx);
-                if weight < 0 {
-                    bail!("materialized columnar zset contains negative weight");
-                }
-                let row_idx =
-                    u32::try_from(row_idx).context("columnar zset batch exceeds u32 rows")?;
-                for _ in 0..weight {
-                    indices.push(row_idx);
-                }
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .take(zset.value_column_count())
-                .map(|column| take(column.as_ref(), &indices, None))
-                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-            Ok(RecordBatch::try_new(zset.value_schema(), columns)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(zset.value_schema()));
-    }
-    Ok(batches)
 }

@@ -12,7 +12,7 @@ use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::common::{Result as DFResult, internal_err};
 use datafusion::error::DataFusionError;
 
-use dbsp::circuit::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
+use dbsp::{KEY_COLUMN_NAME, WEIGHT_COLUMN_NAME};
 
 use crate::scalar_array_builder::ScalarColumnBuilder;
 

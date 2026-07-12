@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -33,11 +31,13 @@ pub(crate) const JOIN_AUCTION_ROW_COUNT: usize = 10_000;
 const DEFAULT_SAMPLE_ROW_COUNT: usize = 20;
 const CHECKSUM_MOD: i128 = 2_305_843_009_213_693_951;
 const BASE_TS_MS: i64 = 1_700_000_000_000;
+#[allow(dead_code)]
 const DAY_UTC: &str = "2023-11-14";
 const DEFAULT_NO_SINK_END_COUNT_SETTLE_MS: u64 = 0;
 const DEFAULT_NO_SINK_END_COUNT_POLL_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum FieldKind {
     Int64,
     String,
@@ -57,6 +57,7 @@ impl FieldSpec {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) const fn string(name: &'static str) -> Self {
         Self {
             name,
@@ -75,6 +76,7 @@ pub(crate) fn int64(value: i64) -> ExpectedValue {
     ExpectedValue::Int64(value)
 }
 
+#[allow(dead_code)]
 pub(crate) fn string(value: impl Into<String>) -> ExpectedValue {
     ExpectedValue::String(value.into())
 }
@@ -212,6 +214,7 @@ struct NodeSpawnConfig<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum SampleSelection {
     FirstN(usize),
     EvenlySpaced(usize),
@@ -235,6 +238,7 @@ pub(crate) struct MillionQuerySpec {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum MillionDatasetKind {
     BidOnly {
         project: fn(&BidInput) -> Option<ExpectedRow>,
@@ -246,6 +250,7 @@ pub(crate) enum MillionDatasetKind {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum SinkMode {
     WithKafkaSink,
     NoSink,
@@ -284,6 +289,7 @@ pub(crate) struct BidInput {
     pub(crate) bidder: i64,
     pub(crate) price: i64,
     pub(crate) channel: &'static str,
+    #[allow(dead_code)]
     pub(crate) dir1: String,
     pub(crate) url: String,
     pub(crate) date_time_ms: i64,
@@ -391,14 +397,17 @@ impl AuctionInput {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_redpanda_kafka_million_test(spec: MillionQuerySpec) -> Result<()> {
     run_redpanda_kafka_million_test_impl(spec, SinkMode::WithKafkaSink, None).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_redpanda_kafka_million_no_sink_test(spec: MillionQuerySpec) -> Result<()> {
     run_redpanda_kafka_million_test_impl(spec, SinkMode::NoSink, None).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_redpanda_kafka_million_no_sink_test_with_verify_mode(
     spec: MillionQuerySpec,
     verify_mode: NoSinkVerifyMode,
@@ -420,6 +429,7 @@ use process_rows::*;
 use run_impl::*;
 use verify::*;
 
+#[allow(dead_code)]
 pub(crate) fn day_string() -> &'static str {
     process_rows::day_string()
 }

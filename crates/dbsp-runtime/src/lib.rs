@@ -11,13 +11,12 @@ mod metrics;
 pub mod operator_state_registry;
 pub mod operators;
 mod profile;
-pub mod relation_state;
 pub mod stream;
 
 pub use dbsp_storage::storage;
 
 pub use algebra::AbelianGroup;
-pub use collections::{OrderedBytes, ZSet};
+pub use collections::OrderedBytes;
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use metrics::LogicalWorkSnapshot;
 pub use operator_state_registry::{
@@ -26,7 +25,9 @@ pub use operator_state_registry::{
 };
 pub use operators::columnar_count::{ColumnarCountByKeyOp, SlateBackedColumnarCountByKeyOp};
 pub use profile::{print_runtime_phase_profile, reset_runtime_phase_profile};
-pub use relation_state::RelationState;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };
+
+pub const KEY_COLUMN_NAME: &str = "__key";
+pub const WEIGHT_COLUMN_NAME: &str = "__weight";

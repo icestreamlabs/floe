@@ -2,12 +2,12 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DFSchemaRef, Result as DataFusionResult, ScalarValue, plan_err};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     Expr, Extension, JoinType, LogicalPlan, UserDefinedLogicalNodeCore,
 };
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{DFSchemaRef, Result as DataFusionResult, ScalarValue, plan_err};
 use datafusion_sql::parser::Statement as DFStatement;
 use sqlparser::ast::{
     BinaryOperator as SqlBinaryOperator, Expr as SqlExpr, JoinConstraint, JoinOperator,
@@ -89,15 +89,14 @@ impl UserDefinedLogicalNodeCore for FloeAsofJoinNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        let mut exprs = Vec::with_capacity(self.on.len() * 2 + usize::from(self.filter.is_some()));
+        let mut expressions =
+            Vec::with_capacity(self.on.len() * 2 + usize::from(self.filter.is_some()));
         for (left, right) in &self.on {
-            exprs.push(left.clone());
-            exprs.push(right.clone());
+            expressions.push(left.clone());
+            expressions.push(right.clone());
         }
-        if let Some(filter) = &self.filter {
-            exprs.push(filter.clone());
-        }
-        exprs
+        expressions.extend(self.filter.iter().cloned());
+        expressions
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -115,40 +114,43 @@ impl UserDefinedLogicalNodeCore for FloeAsofJoinNode {
 
     fn with_exprs_and_inputs(
         &self,
-        exprs: Vec<Expr>,
+        expressions: Vec<Expr>,
         inputs: Vec<LogicalPlan>,
     ) -> DataFusionResult<Self> {
         if inputs.len() != 2 {
             return plan_err!("Floe ASOF logical node requires exactly two inputs");
         }
         let expected = self.on.len() * 2 + usize::from(self.filter.is_some());
-        if exprs.len() != expected {
+        if expressions.len() != expected {
             return plan_err!(
                 "Floe ASOF logical node expected {expected} expressions, got {}",
-                exprs.len()
+                expressions.len()
             );
         }
-
-        let mut iter = exprs.into_iter();
+        let mut expressions = expressions.into_iter();
         let mut on = Vec::with_capacity(self.on.len());
         for _ in 0..self.on.len() {
-            let Some(left) = iter.next() else {
-                return plan_err!("Floe ASOF logical node missing left ON expression");
-            };
-            let Some(right) = iter.next() else {
-                return plan_err!("Floe ASOF logical node missing right ON expression");
-            };
+            let left = expressions.next().ok_or_else(|| {
+                datafusion::common::DataFusionError::Plan(
+                    "ASOF join missing left ON expression".into(),
+                )
+            })?;
+            let right = expressions.next().ok_or_else(|| {
+                datafusion::common::DataFusionError::Plan(
+                    "ASOF join missing right ON expression".into(),
+                )
+            })?;
             on.push((left, right));
         }
         let filter = if self.filter.is_some() {
-            let Some(filter) = iter.next() else {
-                return plan_err!("Floe ASOF logical node missing filter expression");
-            };
-            Some(filter)
+            Some(expressions.next().ok_or_else(|| {
+                datafusion::common::DataFusionError::Plan(
+                    "ASOF join missing filter expression".into(),
+                )
+            })?)
         } else {
             None
         };
-
         Ok(Self {
             left: Arc::new(inputs[0].clone()),
             right: Arc::new(inputs[1].clone()),
@@ -167,11 +169,10 @@ pub async fn create_logical_plan_with_asof_preplanner(
     let dialect = state.config_options().sql_parser.dialect;
     let mut statement = state.sql_to_statement(sql, &dialect)?;
     let asof_count = rewrite_asof_joins(&mut statement)?;
-    if asof_count == 0 {
-        return state.statement_to_plan(statement).await;
-    }
-
     let plan = state.statement_to_plan(statement).await?;
+    if asof_count == 0 {
+        return Ok(plan);
+    }
     install_asof_extension_nodes(plan, asof_count)
 }
 
@@ -205,7 +206,6 @@ fn install_asof_extension_nodes(
         }
         other => Ok(Transformed::no(other)),
     })?;
-
     if converted_count != expected_count {
         return plan_err!(
             "expected to convert {expected_count} ASOF join(s), converted {converted_count}"
@@ -229,25 +229,20 @@ fn rewrite_sql_statement(statement: &mut SqlStatement) -> DataFusionResult<usize
 }
 
 fn rewrite_query(query: &mut Box<SqlQuery>) -> DataFusionResult<usize> {
-    let mut count = 0usize;
+    let mut count = 0;
     if let Some(with) = &mut query.with {
         for cte in &mut with.cte_tables {
             count += rewrite_query(&mut cte.query)?;
         }
     }
-    count += rewrite_set_expr(&mut query.body)?;
-    Ok(count)
+    Ok(count + rewrite_set_expr(&mut query.body)?)
 }
 
 fn rewrite_set_expr(set_expr: &mut Box<SetExpr>) -> DataFusionResult<usize> {
     match set_expr.as_mut() {
-        SetExpr::Select(select) => {
-            let mut count = 0usize;
-            for table in &mut select.from {
-                count += rewrite_table_with_joins(table)?;
-            }
-            Ok(count)
-        }
+        SetExpr::Select(select) => select.from.iter_mut().try_fold(0, |count, table| {
+            Ok(count + rewrite_table_with_joins(table)?)
+        }),
         SetExpr::Query(query) => rewrite_query(query),
         SetExpr::SetOperation { left, right, .. } => {
             Ok(rewrite_set_expr(left)? + rewrite_set_expr(right)?)
@@ -267,7 +262,6 @@ fn rewrite_table_with_joins(table: &mut TableWithJoins) -> DataFusionResult<usiz
         else {
             continue;
         };
-
         let marker = marker_expr(count);
         let combined = match constraint.clone() {
             JoinConstraint::On(on) => and_expr(and_expr(on, match_condition.clone()), marker),
@@ -313,18 +307,15 @@ fn strip_asof_marker(expr: Expr) -> (Option<Expr>, bool) {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(expr, &mut conjuncts);
     let mut had_marker = false;
-    let residuals = conjuncts
-        .into_iter()
-        .filter(|expr| {
-            if is_asof_marker(expr) {
-                had_marker = true;
-                false
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>();
-    (combine_conjuncts(residuals), had_marker)
+    conjuncts.retain(|expr| {
+        if is_asof_marker(expr) {
+            had_marker = true;
+            false
+        } else {
+            true
+        }
+    });
+    (combine_conjuncts(conjuncts), had_marker)
 }
 
 fn flatten_conjuncts(expr: Expr, out: &mut Vec<Expr>) {
@@ -338,9 +329,9 @@ fn flatten_conjuncts(expr: Expr, out: &mut Vec<Expr>) {
 }
 
 fn combine_conjuncts(conjuncts: Vec<Expr>) -> Option<Expr> {
-    let mut iter = conjuncts.into_iter();
-    let first = iter.next()?;
-    Some(iter.fold(first, |left, right| {
+    let mut conjuncts = conjuncts.into_iter();
+    let first = conjuncts.next()?;
+    Some(conjuncts.fold(first, |left, right| {
         Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
             left: Box::new(left),
             op: datafusion::logical_expr::Operator::And,
@@ -356,13 +347,10 @@ fn is_asof_marker(expr: &Expr) -> bool {
     if binary.op != datafusion::logical_expr::Operator::Eq {
         return false;
     }
-    let Some(left) = marker_literal(binary.left.as_ref()) else {
-        return false;
-    };
-    let Some(right) = marker_literal(binary.right.as_ref()) else {
-        return false;
-    };
-    left == right
+    matches!(
+        (marker_literal(binary.left.as_ref()), marker_literal(binary.right.as_ref())),
+        (Some(left), Some(right)) if left == right
+    )
 }
 
 fn marker_literal(expr: &Expr) -> Option<&str> {
@@ -371,7 +359,7 @@ fn marker_literal(expr: &Expr) -> Option<&str> {
         | Expr::Literal(ScalarValue::LargeUtf8(Some(value)), _)
             if value.starts_with(ASOF_MARKER_PREFIX) =>
         {
-            Some(value.as_str())
+            Some(value)
         }
         _ => None,
     }

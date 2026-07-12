@@ -16,7 +16,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
 };
 use datafusion::prelude::SessionContext;
-use dbsp_planner::create_logical_plan_with_asof_preplanner;
+use floe_executor::create_logical_plan_with_asof_preplanner;
 use floe_sql_parser::MaterializedViewDefinition;
 use regex::Regex;
 

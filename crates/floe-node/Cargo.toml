@@ -36,7 +36,6 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
-serde_yaml = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 rdkafka = { workspace = true }
@@ -47,13 +46,8 @@ mimalloc = { version = "0.1", optional = true, default-features = false }
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
-slatedb = { workspace = true }
-floe-storage = { path = "../floe-storage" }
-arrow-schema = { workspace = true }
-arrow-array = "57.1.0"
 arrow-buffer = "57.1.0"
 arrow-data = "57.1.0"
 tempfile = "3.10"
-serde_json = { workspace = true }
 tower = "0.5"
 serial_test = "3"

@@ -33,7 +33,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
         LIMIT 2";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_auction_totals",
             query,
             Arc::clone(&output_schema),
@@ -93,7 +93,7 @@ async fn aggregate_topn_uses_slate_backed_columnar_topn_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_auction_totals",
             query,
             Arc::clone(&output_schema),
@@ -203,7 +203,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
         GROUP BY a.category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_category_bid_counts",
             query,
             Arc::clone(&output_schema),
@@ -271,7 +271,7 @@ async fn join_aggregate_uses_slate_backed_columnar_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_category_bid_counts",
             query,
             Arc::clone(&output_schema),
@@ -407,7 +407,7 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
         GROUP BY a.id, a.category) per_auction GROUP BY category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_q4_avg_price",
             query,
             Arc::clone(&output_schema),
@@ -475,7 +475,7 @@ async fn q4_uses_incremental_grouped_stats_composition_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_q4_avg_price",
             query,
             Arc::clone(&output_schema),
@@ -625,7 +625,7 @@ async fn q4_nexmark_shape_uses_incremental_grouped_stats_composition_semantics()
         GROUP BY a.id, a.category) per_auction GROUP BY category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_q4_nexmark",
             query,
             Arc::clone(&output_schema),
@@ -811,7 +811,7 @@ async fn q4_nexmark_generated_batches_use_incremental_grouped_stats_semantics() 
         GROUP BY a.id, a.category) per_auction GROUP BY category";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_q4_generated",
             query,
             Arc::clone(&output_schema),
@@ -921,7 +921,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
         GROUP BY key";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_union_key_counts",
             query,
             Arc::clone(&output_schema),
@@ -988,7 +988,7 @@ async fn union_aggregate_uses_slate_backed_columnar_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_union_key_counts",
             query,
             Arc::clone(&output_schema),
@@ -1067,7 +1067,7 @@ async fn unsupported_incremental_plan_without_state_table_is_rejected() {
 
     let result = VectorizedExecutionRuntime::new(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals",
             "SELECT id, SUM(amount) AS total FROM orders GROUP BY id",
             Arc::clone(&output_schema),

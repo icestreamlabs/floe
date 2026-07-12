@@ -216,6 +216,7 @@ pub(super) fn read_log_tail(path: &Path, max_lines: usize) -> Result<String> {
     Ok(lines[start..].join("\n"))
 }
 
+#[allow(dead_code)]
 pub(super) fn day_string() -> &'static str {
     DAY_UTC
 }

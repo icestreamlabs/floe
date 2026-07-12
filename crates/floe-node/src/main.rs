@@ -3,6 +3,7 @@ mod cli;
 mod http_ingest;
 mod metrics;
 mod node_runtime;
+mod postgres_sql;
 mod runtime_failure;
 mod sinks;
 

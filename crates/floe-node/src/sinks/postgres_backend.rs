@@ -6,6 +6,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::task::JoinHandle;
 
 use super::*;
+use crate::postgres_sql::{quote_postgres_ident, quote_postgres_qualified_name};
 
 const POSTGRES_COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const POSTGRES_INSERT_STAGE_TABLE: &str = "floe_sink_stage_rows";
@@ -792,21 +793,6 @@ fn postgres_target_column_ref(alias: &str, column_name: &str) -> String {
 
 fn stage_column_name(idx: usize) -> String {
     format!("c{idx}")
-}
-
-fn quote_postgres_qualified_name(name: &str) -> Result<String> {
-    let parts = name
-        .split('.')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(quote_postgres_ident)
-        .collect::<Vec<_>>();
-    ensure!(!parts.is_empty(), "Postgres sink table cannot be empty");
-    Ok(parts.join("."))
-}
-
-fn quote_postgres_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[cfg(test)]

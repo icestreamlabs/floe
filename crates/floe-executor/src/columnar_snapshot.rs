@@ -106,6 +106,10 @@ pub(crate) fn columnar_zset_to_arrow_snapshot(
     Ok(output)
 }
 
+pub(crate) fn columnar_zset_snapshot(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
+    columnar_zset_to_arrow_snapshot(zset, zset.value_schema(), None)
+}
+
 fn snapshot_output_builders(schema: &SchemaRef) -> Result<Vec<ScalarColumnBuilder>> {
     schema
         .fields()

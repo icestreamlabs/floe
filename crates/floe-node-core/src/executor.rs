@@ -1,17 +1,12 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use floe_core::source::SourceDataType;
-use floe_executor::DbspPlanBuilder;
-use floe_executor::dbsp_plan::{
-    CircuitPlan, DbspScalarType, Field, PlannerConfig, TableDescriptor,
-};
+use anyhow::{Result, anyhow};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::optimizer::optimize_projections::OptimizeProjections;
+use datafusion::optimizer::{Optimizer, OptimizerContext};
 
 use crate::planner::PlannedMaterializedView;
-use crate::planner::to_camel_case;
-use crate::source::SourceDefinition;
-
-const SOURCE_PRIMARY_KEY_PROPERTY: &str = "primary_key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamCompactionConfig {
@@ -44,6 +39,19 @@ impl Default for StreamGcConfig {
         }
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSourceRequirements {
+    pub source_name: String,
+    pub required_columns: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataflowAnalysis {
+    pub required_sources: BTreeSet<String>,
+    pub source_requirements: Vec<PlanSourceRequirements>,
+}
+
 pub fn available_sources_from_registry(
     registry: &crate::source::SourceRegistry,
 ) -> BTreeSet<String> {
@@ -51,8 +59,7 @@ pub fn available_sources_from_registry(
         .definitions()
         .iter()
         .flat_map(|definition| {
-            let mut names = Vec::with_capacity(2);
-            names.push(definition.name().to_string());
+            let mut names = vec![definition.name().to_string()];
             if let Some(alias) = definition.property("query_alias") {
                 names.push(alias.to_string());
             }
@@ -61,217 +68,92 @@ pub fn available_sources_from_registry(
         .collect()
 }
 
-pub fn build_dataflows(
+pub fn analyze_dataflows(
     views: &[PlannedMaterializedView],
     sources: &crate::source::SourceRegistry,
-) -> Result<Vec<CircuitPlan>> {
-    let planner = DbspPlanBuilder::new(planner_config_from_sources(sources)?);
+) -> Result<Vec<DataflowAnalysis>> {
     views
         .iter()
-        .map(|planned| {
-            let plan = planner
-                .build(planned.logical_plan())
-                .with_context(|| format!("build DBSP plan for {}", planned.definition().name()))?;
-            Ok(plan)
-        })
+        .map(|view| analyze_logical_plan(view.logical_plan(), sources))
         .collect()
 }
 
-pub fn planner_config_from_sources(
-    registry: &crate::source::SourceRegistry,
-) -> Result<PlannerConfig> {
-    let mut config = PlannerConfig::new();
-    for definition in registry.definitions() {
-        config.register_owned_table(table_descriptor_from_source(
-            definition,
-            definition.name().to_string(),
-            false,
-        )?);
-        if let Some(short_name) = definition.property("query_alias") {
-            config.register_owned_table(table_descriptor_from_source(
-                definition,
-                short_name.to_string(),
-                true,
-            )?);
+pub fn analyze_logical_plan(
+    plan: &LogicalPlan,
+    sources: &crate::source::SourceRegistry,
+) -> Result<DataflowAnalysis> {
+    let mut source_names = HashMap::new();
+    for definition in sources.definitions() {
+        source_names.insert(definition.name().to_string(), definition.name().to_string());
+        if let Some(alias) = definition.property("query_alias") {
+            source_names.insert(alias.to_string(), definition.name().to_string());
         }
     }
-    Ok(config)
+
+    let mut required_columns = BTreeMap::<String, BTreeSet<usize>>::new();
+    let requirement_plan = Optimizer::with_rules(vec![Arc::new(OptimizeProjections::new())])
+        .optimize(
+            plan.clone(),
+            &OptimizerContext::new().with_skip_failing_rules(false),
+            |_, _| {},
+        )?;
+    collect_scan_requirements(
+        &requirement_plan,
+        sources,
+        &source_names,
+        &mut required_columns,
+    )?;
+    let required_sources = required_columns.keys().cloned().collect();
+    let source_requirements = required_columns
+        .into_iter()
+        .map(|(source_name, required_columns)| PlanSourceRequirements {
+            source_name,
+            required_columns: required_columns.into_iter().collect(),
+        })
+        .collect();
+    Ok(DataflowAnalysis {
+        required_sources,
+        source_requirements,
+    })
 }
 
-fn table_descriptor_from_source(
-    definition: &SourceDefinition,
-    name: String,
-    camel_case_columns: bool,
-) -> Result<TableDescriptor> {
-    let fields = definition
-        .columns()
-        .iter()
-        .map(|column| {
-            let name = if camel_case_columns {
-                to_camel_case(column.name())
-            } else {
-                column.name().to_string()
-            };
-            Field::new(
-                name,
-                source_type_to_dbsp(column.data_type()),
-                column.nullable(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let primary_key = definition
-        .property(SOURCE_PRIMARY_KEY_PROPERTY)
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|column| !column.is_empty())
-                .map(|column| {
-                    if camel_case_columns {
-                        to_camel_case(column)
-                    } else {
-                        column.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    TableDescriptor::try_new_dynamic(name, fields, &primary_key)
-}
-
-fn source_type_to_dbsp(data_type: &SourceDataType) -> DbspScalarType {
-    match data_type {
-        SourceDataType::Int64 => DbspScalarType::Int64,
-        SourceDataType::Bool => DbspScalarType::Bool,
-        SourceDataType::Utf8 => DbspScalarType::Utf8,
-        SourceDataType::TimestampMillis => DbspScalarType::TimestampMillis,
-        SourceDataType::DateDays => DbspScalarType::DateDays,
-        SourceDataType::Decimal128 { precision, scale } => DbspScalarType::Decimal128 {
-            precision: *precision,
-            scale: *scale,
-        },
-        SourceDataType::Numeric => DbspScalarType::Utf8,
+fn collect_scan_requirements(
+    plan: &LogicalPlan,
+    sources: &crate::source::SourceRegistry,
+    source_names: &HashMap<String, String>,
+    required_columns: &mut BTreeMap<String, BTreeSet<usize>>,
+) -> Result<()> {
+    if let LogicalPlan::TableScan(scan) = plan {
+        let scan_name = scan.table_name.table();
+        let source_name = source_names
+            .get(scan_name)
+            .ok_or_else(|| anyhow!("logical plan referenced unknown source '{scan_name}'"))?;
+        let definition = sources
+            .get(source_name)
+            .ok_or_else(|| anyhow!("source registry lost definition '{source_name}'"))?;
+        let columns = required_columns.entry(source_name.clone()).or_default();
+        if let Some(projection) = &scan.projection {
+            columns.extend(projection.iter().copied());
+        } else {
+            columns.extend(0..definition.columns().len());
+        }
     }
+    for input in plan.inputs() {
+        collect_scan_requirements(input, sources, source_names, required_columns)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition};
+    use floe_core::source::{SourceColumn, SourceDataType, SourceDefinition, SourceRegistry};
     use floe_sql_parser::parse_materialized_view;
 
     use super::*;
-    use crate::generator;
     use crate::planner::plan_materialized_views;
-    use crate::source::SourceRegistry;
-    use floe_executor::dbsp_plan::DbspNodeKind;
-    use floe_executor::plan_source_requirements;
 
     #[tokio::test]
-    async fn plans_projection_materialized_view() {
-        let mut sources = SourceRegistry::new();
-        sources.extend(generator::definitions().expect("generator definitions"));
-
-        let definition =
-            parse_materialized_view("CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM person")
-                .expect("parse mv");
-        let planned = plan_materialized_views(&sources, &[definition])
-            .await
-            .expect("plan mv");
-        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
-        assert_eq!(plans.len(), 1);
-        let plan = &plans[0];
-        let root = plan.node(plan.root).expect("root node exists");
-        match &root.kind {
-            DbspNodeKind::Project(project) => {
-                assert_eq!(project.expressions().len(), 2);
-            }
-            other => panic!("expected project root node, found {other:?}"),
-        }
-        assert!(
-            plan.nodes()
-                .iter()
-                .any(|node| matches!(node.kind, DbspNodeKind::Source(_))),
-            "expected plan to contain a source node"
-        );
-    }
-
-    #[tokio::test]
-    async fn plans_filter_materialized_view() {
-        let mut sources = SourceRegistry::new();
-        sources.extend(generator::definitions().expect("generator definitions"));
-
-        let definition = parse_materialized_view(
-            "CREATE MATERIALIZED VIEW mv AS SELECT * FROM bid WHERE bidder = 42",
-        )
-        .expect("parse mv");
-        let planned = plan_materialized_views(&sources, &[definition])
-            .await
-            .expect("plan mv");
-        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
-        assert_eq!(plans.len(), 1);
-        let plan = &plans[0];
-        assert!(
-            plan.nodes()
-                .iter()
-                .any(|node| matches!(node.kind, DbspNodeKind::Select(_))),
-            "expected plan to contain a select node"
-        );
-    }
-
-    #[tokio::test]
-    async fn plans_simple_join_materialized_view() {
-        let mut sources = SourceRegistry::new();
-        sources.extend(generator::definitions().expect("generator definitions"));
-
-        let definition = parse_materialized_view(
-            "CREATE MATERIALIZED VIEW mv AS SELECT b.auction, b.bidder, a.seller \
-             FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id",
-        )
-        .expect("parse mv");
-        let planned = plan_materialized_views(&sources, &[definition])
-            .await
-            .expect("plan mv");
-
-        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
-        assert_eq!(plans.len(), 1);
-        let plan = &plans[0];
-        assert!(
-            plan.nodes()
-                .iter()
-                .any(|node| matches!(node.kind, DbspNodeKind::Join(_))),
-            "expected plan to contain a join node"
-        );
-    }
-
-    #[tokio::test]
-    async fn q4_source_requirements_fall_back_for_ambiguous_join_filter() {
-        let mut sources = SourceRegistry::new();
-        sources.extend(generator::definitions().expect("generator definitions"));
-
-        let definition = parse_materialized_view(
-            "CREATE MATERIALIZED VIEW mv AS \
-             SELECT category, CAST(AVG(max) AS BIGINT) AS avg_price \
-             FROM (SELECT MAX(b.price) AS max, a.category \
-             FROM nexmark_auction a JOIN nexmark_bid b ON a.id = b.auction \
-             WHERE b.date_time BETWEEN a.date_time AND a.expires \
-             GROUP BY a.id, a.category) per_auction GROUP BY category",
-        )
-        .expect("parse mv");
-        let planned = plan_materialized_views(&sources, &[definition])
-            .await
-            .expect("plan mv");
-
-        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
-        let requirements = plan_source_requirements(&plans[0]).expect("source requirements");
-        assert!(
-            requirements.is_none(),
-            "ambiguous pushed join filters should use full-width execution batches"
-        );
-    }
-
-    #[tokio::test]
-    async fn plans_join_over_dynamic_source_registry_schemas() {
-        let mut sources = SourceRegistry::new();
+    async fn dataflow_analysis_uses_table_scan_projection_and_resolves_alias() {
         let mut bid = SourceDefinition::new(
             "nexmark_bid",
             vec![
@@ -281,36 +163,52 @@ mod tests {
             ],
         )
         .expect("bid source");
-        bid.set_property("primary_key", "auction");
-        let mut auction = SourceDefinition::new(
-            "nexmark_auction",
-            vec![
-                SourceColumn::new_nullable("id", SourceDataType::Int64, false),
-                SourceColumn::new_nullable("seller", SourceDataType::Int64, false),
-            ],
-        )
-        .expect("auction source");
-        auction.set_property("primary_key", "id");
+        bid.set_property("query_alias", "bid");
+        let mut sources = SourceRegistry::new();
         sources.register(bid);
-        sources.register(auction);
-
         let definition = parse_materialized_view(
-            "CREATE MATERIALIZED VIEW mv AS SELECT b.auction, b.bidder, a.seller \
-             FROM nexmark_bid AS b JOIN nexmark_auction AS a ON b.auction = a.id",
+            "CREATE MATERIALIZED VIEW mv AS SELECT auction, price FROM bid WHERE bidder = 42",
         )
-        .expect("parse mv");
+        .expect("parse materialized view");
         let planned = plan_materialized_views(&sources, &[definition])
             .await
-            .expect("plan mv");
+            .expect("plan materialized view");
+        let analyses = analyze_dataflows(&planned, &sources).expect("analyze dataflow");
+        assert_eq!(
+            analyses[0].required_sources,
+            BTreeSet::from(["nexmark_bid".into()])
+        );
+        assert_eq!(
+            analyses[0].source_requirements[0].required_columns,
+            vec![0, 1, 2]
+        );
+    }
 
-        let plans = build_dataflows(&planned, &sources).expect("build dbsp plan");
-        assert_eq!(plans.len(), 1);
-        let plan = &plans[0];
-        assert!(
-            plan.nodes()
-                .iter()
-                .any(|node| matches!(node.kind, DbspNodeKind::Join(_))),
-            "expected plan to contain a join node"
+    #[tokio::test]
+    async fn dataflow_analysis_does_not_require_unused_source_columns() {
+        let mut bid = SourceDefinition::new(
+            "nexmark_bid",
+            vec![
+                SourceColumn::new_nullable("auction", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("bidder", SourceDataType::Int64, false),
+                SourceColumn::new_nullable("price", SourceDataType::Int64, false),
+            ],
+        )
+        .expect("bid source");
+        bid.set_property("query_alias", "bid");
+        let mut sources = SourceRegistry::new();
+        sources.register(bid);
+        let definition = parse_materialized_view(
+            "CREATE MATERIALIZED VIEW mv AS SELECT auction FROM bid WHERE price > 42",
+        )
+        .expect("parse materialized view");
+        let planned = plan_materialized_views(&sources, &[definition])
+            .await
+            .expect("plan materialized view");
+        let analyses = analyze_dataflows(&planned, &sources).expect("analyze dataflow");
+        assert_eq!(
+            analyses[0].source_requirements[0].required_columns,
+            vec![0, 2]
         );
     }
 }

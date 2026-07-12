@@ -12,7 +12,7 @@ use datafusion::logical_expr::expr_fn::SimpleScalarUDF;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionImplementation, ScalarUDF, Signature, TypeSignature, Volatility,
 };
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::WEIGHT_COLUMN_NAME;
 use dbsp::storage::{KeyValueTable, SlateTable, keyspace};
 use floe_core::source::{
     AppendIngestEvent, SourceColumn, SourceDataType, SourceDefinition, SourceRegistry,
@@ -771,7 +771,7 @@ async fn assert_incremental_plan_rejected(
     let registry = Arc::new(MaterializedViewRegistry::new());
     let result = VectorizedExecutionRuntime::new_with_options(
         sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             view_name,
             query,
             output_schema,

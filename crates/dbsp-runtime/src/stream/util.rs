@@ -2,7 +2,6 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -12,7 +11,6 @@ use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
 use rkyv::bytecheck::CheckBytes;
 
-use crate::algebra::AbelianGroup;
 use crate::collections::zset::VersionedZSet;
 use crate::handles::{ZSetHandle, ZSetHandleView};
 use crate::storage::KeyValueTable;
@@ -20,8 +18,6 @@ use crate::storage::dictionary::Dictionary;
 use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 
 use super::core::stream::Stream;
-
-pub(crate) static DERIVED_NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const DELTA_NAMESPACE_SUFFIX: &str = "/delta";
 const TRANSIENT_ZSET_BATCH_REGISTRY_MAX_ENTRIES: usize = 512;
@@ -236,30 +232,6 @@ where
     Ok(values)
 }
 
-pub(crate) fn next_derived_namespace(prefix: &str) -> String {
-    let id = DERIVED_NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}{}", prefix, id)
-}
-
-pub(crate) async fn build_derived_stream<T>(
-    table: Arc<dyn KeyValueTable>,
-    group: Arc<dyn AbelianGroup<T>>,
-    prefix: &str,
-) -> Result<Stream<T>>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    let namespace = next_derived_namespace(prefix);
-    Stream::with_table(table, namespace, group).await
-}
-
 // Use this for operators that require the full integrated ZSet snapshot.
 pub async fn materialize_zset_handle<K>(
     table: Arc<dyn KeyValueTable>,
@@ -432,63 +404,6 @@ where
 
     deltas.retain(|(_, delta)| *delta != 0);
     deltas
-}
-
-pub(crate) fn set_default_in_place<T>(stream: &mut Stream<T>, value: T)
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    stream.set_default_in_place(value);
-}
-
-#[cfg(test)]
-pub(crate) fn set_default_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    stream.set_default_at_in_place(timestamp, value);
-}
-
-pub(crate) fn push_value_in_place<T>(stream: &mut Stream<T>, value: T)
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    stream.push_value_in_place(value);
-}
-
-pub(crate) fn set_value_at_in_place<T>(stream: &Stream<T>, timestamp: i64, value: T)
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    stream.set_value_at_in_place(timestamp, value);
 }
 
 #[cfg(test)]

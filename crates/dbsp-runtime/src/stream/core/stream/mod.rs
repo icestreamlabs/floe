@@ -1,11 +1,6 @@
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use anyhow::Result;
-use async_trait::async_trait;
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -85,52 +80,9 @@ where
     data_prefix: Vec<u8>,
     default_prefix: Vec<u8>,
     state_key: Vec<u8>,
-    evaluator_key: Vec<u8>,
     group: Arc<dyn AbelianGroup<T>>,
-    evaluator: Option<Arc<dyn StreamEvaluator<T>>>,
     state: RwLock<StreamState<T>>,
     frontier_tx: watch::Sender<i64>,
-}
-
-#[async_trait]
-pub(crate) trait StreamEvaluator<T>: Send + Sync
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    async fn value_at(&self, timestamp: i64, group: Arc<dyn AbelianGroup<T>>) -> Result<T>;
-}
-
-pub(crate) enum StreamEvaluatorDescriptor {
-    Unary {
-        kind: &'static str,
-        input_namespace: String,
-    },
-    Binary {
-        kind: &'static str,
-        left_namespace: String,
-        right_namespace: String,
-    },
-}
-
-static STREAM_EVALUATOR_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn stream_evaluator_registry_guard()
--> MutexGuard<'static, HashMap<String, Arc<dyn Any + Send + Sync>>> {
-    match STREAM_EVALUATOR_REGISTRY.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            tracing::warn!("stream evaluator registry lock was poisoned; recovering inner state");
-            poisoned.into_inner()
-        }
-    }
 }
 
 fn read_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockReadGuard<'a, T> {
@@ -151,37 +103,6 @@ fn write_lock<'a, T>(lock: &'a RwLock<T>, label: &str) -> RwLockWriteGuard<'a, T
             poisoned.into_inner()
         }
     }
-}
-
-fn register_stream_evaluator<T>(namespace: &str, evaluator: Arc<dyn StreamEvaluator<T>>)
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    let erased: Arc<dyn Any + Send + Sync> = Arc::new(evaluator);
-    stream_evaluator_registry_guard().insert(namespace.to_string(), erased);
-}
-
-fn registered_stream_evaluator<T>(namespace: &str) -> Option<Arc<dyn StreamEvaluator<T>>>
-where
-    T: Archive
-        + Clone
-        + PartialEq
-        + Send
-        + Sync
-        + 'static
-        + for<'a> RkyvSerialize<RkyvSerializer<'a>>,
-    T::Archived: RkyvDeserialize<T, RkyvDeserializer> + for<'a> CheckBytes<RkyvValidator<'a>>,
-{
-    let erased = stream_evaluator_registry_guard().get(namespace).cloned()?;
-    let typed = Arc::downcast::<Arc<dyn StreamEvaluator<T>>>(erased).ok()?;
-    Some(typed.as_ref().clone())
 }
 
 struct StreamState<T>
@@ -247,17 +168,5 @@ where
 
     fn notify_committed_frontier(&self, ts: i64) {
         let _ = self.core.frontier_tx.send(ts);
-    }
-
-    pub(crate) fn derived_value_at(
-        &self,
-        timestamp: i64,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<T>>> + Send + '_>> {
-        Box::pin(async move {
-            let Some(evaluator) = self.core.evaluator.clone() else {
-                return Ok(None);
-            };
-            evaluator.value_at(timestamp, self.group()).await.map(Some)
-        })
     }
 }

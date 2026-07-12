@@ -3,8 +3,7 @@ use super::*;
 pub(super) fn required_column_masks_by_source_id(
     definitions: &[SourceDefinition],
     all_required_sources: &BTreeSet<String>,
-    circuit_plans: &[CircuitPlan],
-    plan_required_sources: &[BTreeSet<String>],
+    dataflows: &[DataflowAnalysis],
     full_width_sources: &BTreeSet<String>,
 ) -> anyhow::Result<Vec<Option<Arc<[bool]>>>> {
     let source_id_by_name = definitions
@@ -27,17 +26,9 @@ pub(super) fn required_column_masks_by_source_id(
         })
         .collect::<Vec<_>>();
 
-    for (plan, required_sources) in circuit_plans.iter().zip(plan_required_sources) {
-        let Some(requirements) = plan_source_requirements(plan)? else {
-            mark_required_sources_full_width(
-                &source_id_by_name,
-                &mut force_all_columns,
-                required_sources,
-            );
-            continue;
-        };
+    for dataflow in dataflows {
         let mut exact_sources = HashSet::new();
-        for requirement in requirements {
+        for requirement in &dataflow.source_requirements {
             exact_sources.insert(requirement.source_name.clone());
             let Some(source_id) = source_id_by_name.get(&requirement.source_name).copied() else {
                 return Err(anyhow!(
@@ -48,7 +39,7 @@ pub(super) fn required_column_masks_by_source_id(
             let Some(mask) = masks[source_id].as_mut() else {
                 continue;
             };
-            for column_idx in requirement.required_columns {
+            for &column_idx in &requirement.required_columns {
                 let Some(required) = mask.get_mut(column_idx) else {
                     return Err(anyhow!(
                         "plan required column {column_idx} outside source '{}' schema",
@@ -58,7 +49,8 @@ pub(super) fn required_column_masks_by_source_id(
                 *required = true;
             }
         }
-        let missing_exact_sources = required_sources
+        let missing_exact_sources = dataflow
+            .required_sources
             .iter()
             .filter(|source| !exact_sources.contains(source.as_str()))
             .cloned()

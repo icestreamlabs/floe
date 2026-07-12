@@ -13,10 +13,7 @@ use datafusion::common::DFSchemaRef;
 use dbsp::collections::CompactionPolicy;
 use dbsp::storage::gc::{GcPolicy, GcService};
 use dbsp::storage::{KeyValueTable, SlateTable};
-use dbsp::{
-    CircuitPlan, CompactionSchedulerConfig, print_runtime_phase_profile,
-    reset_runtime_phase_profile,
-};
+use dbsp::{CompactionSchedulerConfig, print_runtime_phase_profile, reset_runtime_phase_profile};
 use floe_cdc::CdcTableStore;
 use floe_cdc_core::{
     CdcColumn, CdcPrimaryKey, CdcSourceId, CdcTableId, CdcTableSchema, ChangeBatch,
@@ -53,10 +50,9 @@ use floe_executor::source_journal::{
 };
 use floe_executor::{
     DbspMaintenance, FloeQueryContext, MaterializedViewRegistry, MaterializedViewTableProvider,
-    SourceArrowBatchBuilder, SourceArrowBatchMode, SubscribeExecutionConfig, ValidatedPlan,
+    SourceArrowBatchBuilder, SourceArrowBatchMode, SubscribeExecutionConfig,
     VectorizedExecutionRuntime, VectorizedExecutionRuntimeOptions, VectorizedMaterializedViewPlan,
-    plan_source_requirements, print_columnar_phase_profile, reset_columnar_phase_profile,
-    validate_dbsp_plan,
+    print_columnar_phase_profile, reset_columnar_phase_profile,
 };
 use floe_node_core::cdc_delta_encoder::CdcArrowDeltaBatch;
 use floe_node_core::connector::{ConnectorContext, run_connector};
@@ -309,7 +305,8 @@ impl QueuedAppendIngestItem {
 
 use crate::http_ingest::{HttpAdminConfig, HttpIngestConfig, HttpIngestHealth};
 use floe_node_core::executor::{
-    StreamCompactionConfig, StreamGcConfig, available_sources_from_registry, build_dataflows,
+    DataflowAnalysis, StreamCompactionConfig, StreamGcConfig, analyze_dataflows,
+    available_sources_from_registry,
 };
 use floe_node_core::source as core_source;
 use floe_node_core::source::SourceRegistry;

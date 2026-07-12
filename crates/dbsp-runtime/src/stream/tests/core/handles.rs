@@ -3,45 +3,7 @@ use std::sync::Arc;
 use crate::storage::dictionary::Dictionary;
 use crate::storage::{KeyValueTable, SlateTable};
 use crate::stream::tests::common::build_db;
-use crate::stream::{StreamCursor, StreamRetention, ZSetStream};
-
-#[tokio::test]
-async fn stream_cursor_tracks_new_versions() {
-    let db = build_db().await;
-    let table: Arc<dyn KeyValueTable> = Arc::new(SlateTable::new(Arc::clone(&db)));
-    let dict = Arc::new(
-        Dictionary::<Vec<u8>>::with_table(table.clone(), "cursor_stream", None)
-            .await
-            .expect("dictionary"),
-    );
-    let mut zset = ZSetStream::new(
-        dict,
-        table,
-        "cursor_stream".to_string(),
-        StreamRetention::KeepLast { keep_last: 1 },
-    )
-    .await
-    .expect("create zset stream");
-    let stream = zset.handle_stream();
-    let mut cursor = StreamCursor::new(stream.stream());
-
-    let (ts0, handle0) = cursor.snapshot().await.expect("snapshot ts0");
-    assert_eq!(ts0, 0);
-    assert_eq!(handle0.version, 0);
-
-    zset.add_delta(vec![1], 1);
-    let h1 = zset.flush().await.expect("flush first version");
-    assert_eq!(h1.version, 1);
-    let (ts1, handle1) = cursor.next().await.expect("cursor ts1");
-    assert_eq!(ts1, 1);
-    assert_eq!(handle1.version, 1);
-
-    zset.add_delta(vec![2], 1);
-    zset.flush().await.expect("flush second version");
-    let (ts2, handle2) = cursor.next().await.expect("cursor ts2");
-    assert_eq!(ts2, 2);
-    assert_eq!(handle2.version, 2);
-}
+use crate::stream::{StreamRetention, ZSetStream};
 
 #[tokio::test]
 async fn handle_stream_clones_observe_frontier_advances() {

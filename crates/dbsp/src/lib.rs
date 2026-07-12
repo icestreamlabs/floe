@@ -1,53 +1,19 @@
-//! Floe DBSP facade.
-//!
-//! Root-level exports focus on operational execution types, handle/Z-set
-//! streams, planner types, and maintained runtime operator implementations.
-
-pub mod circuit {
-    pub use dbsp_circuit::circuit::*;
-    pub use dbsp_planner::{
-        CircuitNode, CircuitPlan, CircuitPlanner, FloeAsofJoinNode, OptimizerDiagnostics,
-        OptimizerRuleDiagnostics, OptimizerStageDiagnostics, PlannerConfig, PlannerError,
-        create_logical_plan_with_asof_preplanner,
-    };
-
-    pub mod planner {
-        pub use dbsp_planner::{
-            CircuitNode, CircuitPlan, CircuitPlanner, FloeAsofJoinNode, OptimizerDiagnostics,
-            OptimizerRuleDiagnostics, OptimizerStageDiagnostics, PlannerConfig, PlannerError,
-            create_logical_plan_with_asof_preplanner,
-        };
-    }
-}
+//! Floe's facade over the operational DBSP runtime and storage primitives.
 
 pub use dbsp_runtime::{
-    algebra, collections, handles, operator_state_registry, operators, relation_state, stream,
+    KEY_COLUMN_NAME, LogicalWorkSnapshot, WEIGHT_COLUMN_NAME, algebra, collections, handles,
+    operator_state_registry, operators, print_runtime_phase_profile, reset_runtime_phase_profile,
+    stream,
 };
 pub use dbsp_storage::storage;
 
 pub use algebra::AbelianGroup;
-pub use circuit::{
-    CircuitNode, CircuitPlan, CircuitPlanner, DbspAggregateFunction, DbspAggregateNode,
-    DbspAsofJoinSpec, DbspDistinctNode, DbspEmptyNode, DbspExpression, DbspJoinNode, DbspJoinType,
-    DbspNodeKind, DbspOneRowNode, DbspPredicate, DbspProjectNode, DbspRangeJoinSpec,
-    DbspScalarType, DbspSelectNode, DbspSinkNode, DbspSourceNode, DbspTopNNode, DbspUnionNode,
-    DbspValuesNode, DbspWindowAggregateNode, DbspWindowPolicy, DbspWindowSpec, Field, FieldRef,
-    FloeAsofJoinNode, OptimizerDiagnostics, OptimizerRuleDiagnostics, OptimizerStageDiagnostics,
-    OrderExpr, PlannerConfig, PlannerError, PrimaryKey, ProjectItem, RowSchema, TableDescriptor,
-    create_logical_plan_with_asof_preplanner, nexmark_auction_alias_table, nexmark_auction_table,
-    nexmark_bid_alias_table, nexmark_bid_table, nexmark_person_alias_table, nexmark_person_table,
-};
-pub use collections::ZSet;
-pub use dbsp_runtime::{
-    LogicalWorkSnapshot, print_runtime_phase_profile, reset_runtime_phase_profile,
-};
 pub use handles::{StreamHandle, ZSetHandle, ZSetHandleView};
 pub use operator_state_registry::{
     OperatorStateHandle, install_operator_state_restore, install_operator_state_restore_for_graph,
     snapshot_operator_states, snapshot_operator_states_for_graph,
 };
 pub use operators::columnar_count::{ColumnarCountByKeyOp, SlateBackedColumnarCountByKeyOp};
-pub use relation_state::RelationState;
 pub use stream::{
     CompactionSchedulerConfig, DeltaHandleStream, SnapshotHandleStream, StreamRetention, ZSetStream,
 };

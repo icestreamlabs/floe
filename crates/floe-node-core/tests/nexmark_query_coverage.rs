@@ -14,7 +14,7 @@ use object_store::memory::InMemory;
 use serde::Serialize;
 use slatedb::Db;
 
-use floe_executor::dbsp_plan::{DbspPlanBuilder, nexmark_config, validate_dbsp_plan};
+use floe_node_core::executor::analyze_logical_plan;
 use floe_node_core::generator;
 use floe_node_core::nexmark_queries::{CANONICAL_NEXMARK_QUERY_IDS, canonical_nexmark_queries};
 use floe_node_core::planner::{plan_materialized_views, planner_udfs};
@@ -24,8 +24,7 @@ use floe_sql_parser::parse_materialized_view;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct QueryCoverage {
     logical_planner: bool,
-    circuit_planner: bool,
-    runtime_validation: bool,
+    dataflow_analysis: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -60,7 +59,6 @@ struct GeneratedPlanRuntimeCase {
 #[derive(Debug, Clone)]
 enum GeneratedRuntimeCaseResult {
     RuntimeMode(String),
-    PlanningUnsupported,
     RuntimeUnsupported,
 }
 
@@ -279,7 +277,7 @@ const GENERATED_PLAN_INPUTS: &[(&str, &str)] = &[
     ),
 ];
 
-fn generated_dbsp_runtime_plan_cases() -> Vec<GeneratedPlanRuntimeCase> {
+fn generated_runtime_plan_cases() -> Vec<GeneratedPlanRuntimeCase> {
     let mut cases = Vec::new();
     for (input_id, input_sql) in GENERATED_PLAN_INPUTS {
         cases.push(GeneratedPlanRuntimeCase {
@@ -450,15 +448,9 @@ async fn guards_nexmark_query_coverage_regressions() {
                 result.error.as_deref().unwrap_or("no diagnostic provided")
             ));
         }
-        if !current.circuit_planner {
+        if !current.dataflow_analysis {
             failures.push(format!(
-                "{query}: circuit planner failed ({})",
-                result.error.as_deref().unwrap_or("no diagnostic provided")
-            ));
-        }
-        if !current.runtime_validation {
-            failures.push(format!(
-                "{query}: runtime validation failed ({})",
+                "{query}: dataflow analysis failed ({})",
                 result.error.as_deref().unwrap_or("no diagnostic provided")
             ));
         }
@@ -489,13 +481,30 @@ async fn guards_active_vectorized_runtime_nexmark_columnar_subset() {
         }
     }
 
-    let expected_supported = [
-        "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q12", "q13", "q14", "q15",
-        "q16", "q17", "q18", "q19", "q20", "q21", "q22",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    for query in expected_supported {
+    let expected_modes = BTreeMap::from([
+        ("q0", "columnar_stateless"),
+        ("q1", "columnar_stateless"),
+        ("q2", "columnar_stateless"),
+        ("q3", "columnar_join"),
+        ("q4", "columnar_grouped_stats"),
+        ("q5", "columnar_grouped_count"),
+        ("q6", "columnar_grouped_stats"),
+        ("q7", "columnar_grouped_max"),
+        ("q8", "columnar_grouped_count"),
+        ("q9", "columnar_join_topn"),
+        ("q12", "columnar_grouped_count"),
+        ("q13", "columnar_join"),
+        ("q14", "columnar_stateless"),
+        ("q15", "columnar_grouped_stats"),
+        ("q16", "columnar_grouped_stats"),
+        ("q17", "columnar_grouped_stats"),
+        ("q18", "columnar_topn"),
+        ("q19", "columnar_topn"),
+        ("q20", "columnar_join"),
+        ("q21", "columnar_stateless"),
+        ("q22", "columnar_stateless"),
+    ]);
+    for (query, expected_mode) in expected_modes {
         let result = actual
             .get(query)
             .unwrap_or_else(|| panic!("coverage did not evaluate {query}"));
@@ -504,14 +513,19 @@ async fn guards_active_vectorized_runtime_nexmark_columnar_subset() {
             "{query}: active vectorized runtime rejected supported columnar stateless plan ({})",
             result.error.as_deref().unwrap_or("no diagnostic provided")
         );
+        assert_eq!(
+            result.coverage.execution_mode.as_deref(),
+            Some(expected_mode),
+            "{query}: active runtime execution mode changed"
+        );
     }
 }
 
 #[test]
-fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions() {
+fn guards_generated_active_vectorized_runtime_compositions() {
     run_current_thread_coverage_test_on_explicit_stack(
         "generated-vectorized-runtime-coverage",
-        guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inner(),
+        guards_generated_active_vectorized_runtime_compositions_inner(),
     );
 }
 
@@ -534,13 +548,11 @@ where
         .expect("coverage thread panicked");
 }
 
-async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inner() {
+async fn guards_generated_active_vectorized_runtime_compositions_inner() {
     let mut registry = SourceRegistry::new();
     registry.extend(generator::definitions().expect("load nexmark source definitions"));
-    let planner = DbspPlanBuilder::new(nexmark_config().expect("load nexmark planner config"));
-    let available_sources = available_nexmark_sources();
 
-    let cases = generated_dbsp_runtime_plan_cases();
+    let cases = generated_runtime_plan_cases();
     let case_count = cases.len();
     let unique_case_ids = cases
         .iter()
@@ -553,23 +565,12 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inne
     );
 
     let mut failures = Vec::new();
-    let mut planning_unsupported_count = 0usize;
     let mut runtime_unsupported_count = 0usize;
     let mut execution_modes = BTreeMap::new();
     for case in cases {
-        match validate_generated_active_vectorized_runtime_case(
-            &registry,
-            &planner,
-            &available_sources,
-            &case,
-        )
-        .await
-        {
+        match validate_generated_active_vectorized_runtime_case(&registry, &case).await {
             Ok(GeneratedRuntimeCaseResult::RuntimeMode(execution_mode)) => {
                 execution_modes.insert(case.id, execution_mode);
-            }
-            Ok(GeneratedRuntimeCaseResult::PlanningUnsupported) => {
-                planning_unsupported_count = planning_unsupported_count.saturating_add(1);
             }
             Ok(GeneratedRuntimeCaseResult::RuntimeUnsupported) => {
                 runtime_unsupported_count = runtime_unsupported_count.saturating_add(1);
@@ -581,24 +582,34 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inne
     }
 
     eprintln!(
-        "generated runtime coverage: {} supported, {} planning-unsupported, {} runtime-unsupported",
+        "generated runtime coverage: {} supported, {} runtime-unsupported, fingerprint={:#018x}",
         execution_modes.len(),
-        planning_unsupported_count,
         runtime_unsupported_count,
+        execution_mode_fingerprint(&execution_modes),
     );
     assert_eq!(
-        execution_modes.len()
-            + planning_unsupported_count
-            + runtime_unsupported_count
-            + failures.len(),
+        execution_modes.len() + runtime_unsupported_count + failures.len(),
         case_count,
         "generated coverage must classify every case"
     );
+    assert_eq!(
+        execution_modes.len(),
+        164,
+        "generated supported case set changed"
+    );
+    assert_eq!(
+        runtime_unsupported_count, 1161,
+        "generated unsupported case set changed"
+    );
+    assert_eq!(
+        execution_mode_fingerprint(&execution_modes),
+        0x0a2f6ae7ff1cabb4,
+        "generated supported case IDs or execution modes changed; inspect the printed map before accepting the new snapshot"
+    );
     assert!(
         execution_modes.len() >= 150,
-        "generated coverage unexpectedly shrank: {} DBSP-valid cases, {} DBSP-unsupported cases",
+        "generated coverage unexpectedly shrank: {} supported cases",
         execution_modes.len(),
-        planning_unsupported_count
     );
     let covered_modes = execution_modes
         .values()
@@ -622,19 +633,31 @@ async fn guards_generated_active_vectorized_runtime_dbsp_valid_compositions_inne
 
     if !failures.is_empty() {
         panic!(
-            "active vectorized runtime rejected generated DBSP-valid plan shape(s):\n{}",
+            "active vectorized runtime failed to classify generated plan shape(s):\n{}",
             failures.join("\n")
         );
     }
 }
 
+fn execution_mode_fingerprint(execution_modes: &BTreeMap<String, String>) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for (case_id, mode) in execution_modes {
+        for byte in case_id
+            .bytes()
+            .chain([b'='])
+            .chain(mode.bytes())
+            .chain([b'\n'])
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
 async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
     let mut registry = SourceRegistry::new();
     registry.extend(generator::definitions()?);
-
-    let available_sources = available_nexmark_sources();
-
-    let planner = DbspPlanBuilder::new(nexmark_config()?);
 
     let mut out = BTreeMap::new();
     for query in canonical_nexmark_queries() {
@@ -649,8 +672,7 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
                     QueryCoverageResult {
                         coverage: QueryCoverage {
                             logical_planner: false,
-                            circuit_planner: false,
-                            runtime_validation: false,
+                            dataflow_analysis: false,
                         },
                         error: Some(format!("SQL parse failed: {err}")),
                     },
@@ -667,8 +689,7 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
                     QueryCoverageResult {
                         coverage: QueryCoverage {
                             logical_planner: false,
-                            circuit_planner: false,
-                            runtime_validation: false,
+                            dataflow_analysis: false,
                         },
                         error: Some(format!("logical planning failed: {err}")),
                     },
@@ -678,33 +699,14 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
         };
 
         let logical_plan = logical[0].logical_plan();
-        let circuit = match planner.build(logical_plan) {
-            Ok(plan) => plan,
-            Err(err) => {
-                out.insert(
-                    query.id.to_string(),
-                    QueryCoverageResult {
-                        coverage: QueryCoverage {
-                            logical_planner: true,
-                            circuit_planner: false,
-                            runtime_validation: false,
-                        },
-                        error: Some(format!("circuit planning failed: {err}")),
-                    },
-                );
-                continue;
-            }
-        };
-
-        match validate_dbsp_plan(&circuit, &available_sources, query.id) {
+        match analyze_logical_plan(logical_plan, &registry) {
             Ok(_) => {
                 out.insert(
                     query.id.to_string(),
                     QueryCoverageResult {
                         coverage: QueryCoverage {
                             logical_planner: true,
-                            circuit_planner: true,
-                            runtime_validation: true,
+                            dataflow_analysis: true,
                         },
                         error: None,
                     },
@@ -716,10 +718,9 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
                     QueryCoverageResult {
                         coverage: QueryCoverage {
                             logical_planner: true,
-                            circuit_planner: true,
-                            runtime_validation: false,
+                            dataflow_analysis: false,
                         },
-                        error: Some(format!("runtime validation failed: {err}")),
+                        error: Some(format!("dataflow analysis failed: {err}")),
                     },
                 );
             }
@@ -731,8 +732,6 @@ async fn collect_coverage() -> Result<BTreeMap<String, QueryCoverageResult>> {
 
 async fn validate_generated_active_vectorized_runtime_case(
     registry: &SourceRegistry,
-    planner: &DbspPlanBuilder,
-    available_sources: &BTreeSet<String>,
     case: &GeneratedPlanRuntimeCase,
 ) -> Result<GeneratedRuntimeCaseResult> {
     let definition = parse_materialized_view(&format!(
@@ -746,18 +745,6 @@ async fn validate_generated_active_vectorized_runtime_case(
     let planned = logical
         .first()
         .with_context(|| format!("logical planner produced no MV plan for {}", case.id))?;
-    let circuit = match planner.build(planned.logical_plan()) {
-        Ok(plan) => plan,
-        Err(err) => {
-            tracing::debug!(case = %case.id, error = %err, "generated case is unsupported by DBSP planning");
-            return Ok(GeneratedRuntimeCaseResult::PlanningUnsupported);
-        }
-    };
-    if let Err(err) = validate_dbsp_plan(&circuit, available_sources, &case.id) {
-        tracing::debug!(case = %case.id, error = %err, "generated case is unsupported by DBSP validation");
-        return Ok(GeneratedRuntimeCaseResult::PlanningUnsupported);
-    }
-
     let output_schema = df_schema_to_arrow(planned.logical_plan().schema())
         .with_context(|| format!("Arrow schema conversion failed for {}", case.id))?;
     let state_table = build_operator_state_table(&case.id).await?;
@@ -899,20 +886,6 @@ async fn collect_active_runtime_coverage() -> Result<BTreeMap<String, ActiveRunt
     }
 
     Ok(out)
-}
-
-fn available_nexmark_sources() -> BTreeSet<String> {
-    [
-        "nexmark_person",
-        "person",
-        "nexmark_auction",
-        "auction",
-        "nexmark_bid",
-        "bid",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 async fn build_operator_state_table(name: &str) -> Result<Arc<dyn KeyValueTable>> {

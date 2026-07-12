@@ -8,12 +8,10 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int64Array, Int64Builder,
-    StringArray, TimestampMillisecondArray, UInt32Array,
+    StringArray, TimestampMillisecondArray,
 };
-use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, ScalarValue};
@@ -23,7 +21,6 @@ use datafusion::functions_aggregate::expr_fn::max;
 use datafusion::logical_expr::logical_plan::{Aggregate, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::physical_plan::{ExecutionPlan, collect};
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace, prefix_bounds};
 use slatedb::WriteBatch;
@@ -146,12 +143,7 @@ pub(super) struct ColumnarGroupedStatsMaterializedViewState {
     input_name: String,
     append_only_input: bool,
     source_schema: SchemaRef,
-    input_zset: Option<SlateBackedColumnarZSet>,
-    join: Option<Box<ColumnarJoinMaterializedViewState>>,
-    join_topn: Option<Box<ColumnarJoinTopNMaterializedViewState>>,
-    grouped_max: Option<Box<ColumnarGroupedMaxMaterializedViewState>>,
-    grouped_stats: Option<Box<ColumnarGroupedStatsMaterializedViewState>>,
-    topn: Option<Box<ColumnarTopNMaterializedViewState>>,
+    input: super::IncrementalInputOperator,
     input_snapshot: Vec<RecordBatch>,
     output_zset: SlateBackedColumnarZSet,
     stats_state: SlateGroupedStatsState,
@@ -455,94 +447,95 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
     }
 
     let group_count = aggregate.group_expr.len();
-    let aggregate_schema = df_schema_to_arrow(&aggregate.schema)?;
+    let aggregate_schema = super::columnar_utils::df_schema_to_arrow(&aggregate.schema)?;
     if aggregate_schema.fields().len() != group_count + aggregate.aggr_expr.len() {
         return Ok(None);
     }
-    let input =
-        if let Some(source_name) = incremental_source_for_plan(aggregate.input.as_ref(), sources) {
-            ColumnarGroupedStatsInputPlan::Source { source_name }
-        } else if let Some((grouped_max, source_schema)) =
-            grouped_stats_top1_value_grouped_max_input_for_aggregate(aggregate, sources)?
-        {
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            ColumnarGroupedStatsInputPlan::GroupedMax {
-                input_name: "__floe_grouped_stats_top1_value_grouped_max_input".to_string(),
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(grouped_max),
-            }
-        } else if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(
-            aggregate.input.as_ref(),
-            sources,
-            &df_schema_to_arrow(aggregate.input.schema())?,
-        )? {
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_grouped_max_input".to_string());
-            ColumnarGroupedStatsInputPlan::GroupedMax {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(grouped_max),
-            }
-        } else if let Some(grouped_stats) = columnar_grouped_stats_plan_for_plan(
-            aggregate.input.as_ref(),
-            sources,
-            &df_schema_to_arrow(aggregate.input.schema())?,
-        )? {
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_grouped_stats_input".to_string());
-            ColumnarGroupedStatsInputPlan::GroupedStats {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(grouped_stats),
-            }
-        } else if let Some(join) = columnar_join_plan_for_plan(aggregate.input.as_ref(), sources)? {
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_join_input".to_string());
-            ColumnarGroupedStatsInputPlan::Join {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(join),
-            }
-        } else if let Some(join_topn) =
-            columnar_join_topn_plan_for_plan(aggregate.input.as_ref(), sources)?
-        {
-            if join_topn.is_partitioned_best_bid() {
-                return Ok(None);
-            }
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_join_topn_input".to_string());
-            ColumnarGroupedStatsInputPlan::JoinTopN {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(join_topn),
-            }
-        } else if let Some(topn) = columnar_topn_plan_for_plan(aggregate.input.as_ref(), sources)? {
-            let source_schema = df_schema_to_arrow(aggregate.input.schema())?;
-            let projection_input_schema = derived_projection_input_schema(&source_schema);
-            let input_name = derived_relation_name(aggregate.input.as_ref())
-                .unwrap_or_else(|| "__floe_grouped_stats_topn_input".to_string());
-            ColumnarGroupedStatsInputPlan::TopN {
-                input_name,
-                source_schema,
-                projection_input_schema,
-                plan: Box::new(topn),
-            }
-        } else {
+    let input = if let Some(source_name) =
+        incremental_source_for_plan(aggregate.input.as_ref(), sources)
+    {
+        ColumnarGroupedStatsInputPlan::Source { source_name }
+    } else if let Some((grouped_max, source_schema)) =
+        grouped_stats_top1_value_grouped_max_input_for_aggregate(aggregate, sources)?
+    {
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        ColumnarGroupedStatsInputPlan::GroupedMax {
+            input_name: "__floe_grouped_stats_top1_value_grouped_max_input".to_string(),
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(grouped_max),
+        }
+    } else if let Some(grouped_max) = columnar_grouped_max_plan_for_plan(
+        aggregate.input.as_ref(),
+        sources,
+        &super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?,
+    )? {
+        let source_schema = super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?;
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        let input_name = super::columnar_utils::derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_stats_grouped_max_input".to_string());
+        ColumnarGroupedStatsInputPlan::GroupedMax {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(grouped_max),
+        }
+    } else if let Some(grouped_stats) = columnar_grouped_stats_plan_for_plan(
+        aggregate.input.as_ref(),
+        sources,
+        &super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?,
+    )? {
+        let source_schema = super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?;
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        let input_name = super::columnar_utils::derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_stats_grouped_stats_input".to_string());
+        ColumnarGroupedStatsInputPlan::GroupedStats {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(grouped_stats),
+        }
+    } else if let Some(join) = columnar_join_plan_for_plan(aggregate.input.as_ref(), sources)? {
+        let source_schema = super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?;
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        let input_name = super::columnar_utils::derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_stats_join_input".to_string());
+        ColumnarGroupedStatsInputPlan::Join {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(join),
+        }
+    } else if let Some(join_topn) =
+        columnar_join_topn_plan_for_plan(aggregate.input.as_ref(), sources)?
+    {
+        if join_topn.is_partitioned_best_bid() {
             return Ok(None);
-        };
+        }
+        let source_schema = super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?;
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        let input_name = super::columnar_utils::derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_stats_join_topn_input".to_string());
+        ColumnarGroupedStatsInputPlan::JoinTopN {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(join_topn),
+        }
+    } else if let Some(topn) = columnar_topn_plan_for_plan(aggregate.input.as_ref(), sources)? {
+        let source_schema = super::columnar_utils::df_schema_to_arrow(aggregate.input.schema())?;
+        let projection_input_schema = derived_projection_input_schema(&source_schema);
+        let input_name = super::columnar_utils::derived_relation_name(aggregate.input.as_ref())
+            .unwrap_or_else(|| "__floe_grouped_stats_topn_input".to_string());
+        ColumnarGroupedStatsInputPlan::TopN {
+            input_name,
+            source_schema,
+            projection_input_schema,
+            plan: Box::new(topn),
+        }
+    } else {
+        return Ok(None);
+    };
     let append_only_input = grouped_stats_input_is_append_only(&input, sources);
 
     let mut projection_expr = aggregate.group_expr.clone();
@@ -602,7 +595,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
         }
     }
     if let Some(post_plan) = post_aggregate_plan.as_ref() {
-        let post_schema = df_schema_to_arrow(post_plan.schema())?;
+        let post_schema = super::columnar_utils::df_schema_to_arrow(post_plan.schema())?;
         if post_schema.fields().len() != output_schema.fields().len() {
             return Ok(None);
         }
@@ -655,7 +648,7 @@ pub(super) fn columnar_grouped_stats_plan_for_plan(
 
     let projection_plan = Projection::try_new(projection_expr, Arc::new(projection_input))
         .context("build grouped-stats value projection")?;
-    let projection_schema = df_schema_to_arrow(&projection_plan.schema)?;
+    let projection_schema = super::columnar_utils::df_schema_to_arrow(&projection_plan.schema)?;
     for spec in &mut specs {
         if let (Some(value_idx), Some(value_type)) = (spec.value_idx, spec.value_type) {
             let actual_type = projection_schema.field(value_idx).data_type();
@@ -794,20 +787,9 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         .await
         .context("load grouped-stats output snapshot")?;
     let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
-    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
+    let initial_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&initial_output)?;
     let append_only_input = plan.append_only_input;
-    let (
-        input_name,
-        source_schema,
-        input_zset,
-        join,
-        join_topn,
-        grouped_max,
-        grouped_stats,
-        topn,
-        input_snapshot,
-        projection_delta,
-    ) = match plan.input {
+    let (input_name, source_schema, input, input_snapshot, projection_delta) = match plan.input {
         ColumnarGroupedStatsInputPlan::Source { source_name } => {
             let source = sources
                 .get(&source_name)
@@ -831,12 +813,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 source_name,
                 Arc::clone(&source.schema),
-                Some(input_zset),
-                None,
-                None,
-                None,
-                None,
-                None,
+                super::IncrementalInputOperator::Source(Box::new(input_zset)),
                 Vec::new(),
                 GroupedStatsProjectionState::Source(projection_delta),
             )
@@ -880,12 +857,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
-                Some(join),
-                None,
-                None,
-                None,
-                None,
+                super::IncrementalInputOperator::Join(join),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -929,12 +901,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
-                None,
-                Some(join_topn),
-                None,
-                None,
-                None,
+                super::IncrementalInputOperator::JoinTopN(join_topn),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -979,12 +946,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
-                None,
-                None,
-                Some(grouped_max),
-                None,
-                None,
+                super::IncrementalInputOperator::GroupedMax(grouped_max),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -1029,12 +991,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
-                None,
-                None,
-                None,
-                Some(grouped_stats),
-                None,
+                super::IncrementalInputOperator::GroupedStats(grouped_stats),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -1078,12 +1035,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
             (
                 input_name,
                 source_schema,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(topn),
+                super::IncrementalInputOperator::TopN(topn),
                 input_snapshot,
                 GroupedStatsProjectionState::Derived(projection_delta),
             )
@@ -1113,12 +1065,7 @@ pub(super) async fn build_columnar_grouped_stats_materialized_view_state_in_name
         input_name,
         append_only_input,
         source_schema,
-        input_zset,
-        join,
-        join_topn,
-        grouped_max,
-        grouped_stats,
-        topn,
+        input,
         input_snapshot,
         stats_state: SlateGroupedStatsState::new(
             table,
@@ -1522,114 +1469,118 @@ async fn prepare_grouped_stats_input_delta(
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    if columnar.join.is_some() {
-        return prepare_join_grouped_stats_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-    if columnar.join_topn.is_some() {
-        return prepare_join_topn_grouped_stats_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-    if columnar.grouped_max.is_some() {
-        return prepare_grouped_max_grouped_stats_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-    if columnar.grouped_stats.is_some() {
-        return prepare_grouped_stats_grouped_stats_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-    if columnar.topn.is_some() {
-        return prepare_topn_grouped_stats_input_delta(
-            columnar,
-            insert_batches,
-            weighted_delta_batches,
-        )
-        .await;
-    }
-
-    let input_delta =
-        if let Some(weighted_batches) = weighted_delta_batches.get(columnar.input_name.as_str()) {
-            ColumnarZSet::try_new_weighted(
-                Arc::clone(&columnar.source_schema),
-                weighted_batches.clone(),
-            )
-            .with_context(|| {
-                format!(
-                    "build weighted grouped-stats input delta for '{}'",
-                    columnar.input_name
+    match &mut columnar.input {
+        super::IncrementalInputOperator::Source(input_zset) => {
+            let input_delta = if let Some(weighted_batches) =
+                weighted_delta_batches.get(columnar.input_name.as_str())
+            {
+                ColumnarZSet::try_new_weighted(
+                    Arc::clone(&columnar.source_schema),
+                    weighted_batches.clone(),
                 )
-            })?
-        } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
-            ColumnarZSet::from_value_batches(
-                Arc::clone(&columnar.source_schema),
-                source_batches.clone(),
-                1,
-            )
-            .with_context(|| {
-                format!(
-                    "build insert grouped-stats input delta for '{}'",
-                    columnar.input_name
+                .with_context(|| {
+                    format!(
+                        "build weighted grouped-stats input delta for '{}'",
+                        columnar.input_name
+                    )
+                })?
+            } else if let Some(source_batches) = insert_batches.get(columnar.input_name.as_str()) {
+                ColumnarZSet::from_value_batches(
+                    Arc::clone(&columnar.source_schema),
+                    source_batches.clone(),
+                    1,
                 )
-            })?
-        } else {
-            ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
-        };
-
-    if columnar.append_only_input {
-        return Ok(input_delta);
-    }
-
-    let input_zset = columnar
-        .input_zset
-        .as_mut()
-        .context("grouped-stats source input zset missing")?;
-    if let Some(handle) = input_zset.create_version(&input_delta, None).await? {
-        input_zset.read_delta(&handle).await
-    } else {
-        Ok(input_delta)
+                .with_context(|| {
+                    format!(
+                        "build insert grouped-stats input delta for '{}'",
+                        columnar.input_name
+                    )
+                })?
+            } else {
+                ColumnarZSet::empty(Arc::clone(&columnar.source_schema))?
+            };
+            if columnar.append_only_input {
+                return Ok(input_delta);
+            }
+            if let Some(handle) = input_zset.create_version(&input_delta, None).await? {
+                input_zset.read_delta(&handle).await
+            } else {
+                Ok(input_delta)
+            }
+        }
+        super::IncrementalInputOperator::Join(join) => {
+            prepare_join_grouped_stats_input_delta(
+                join,
+                &columnar.input_name,
+                &columnar.source_schema,
+                &mut columnar.input_snapshot,
+                insert_batches,
+                weighted_delta_batches,
+            )
+            .await
+        }
+        super::IncrementalInputOperator::JoinTopN(join_topn) => {
+            prepare_join_topn_grouped_stats_input_delta(
+                join_topn,
+                &columnar.input_name,
+                &columnar.source_schema,
+                insert_batches,
+                weighted_delta_batches,
+            )
+            .await
+        }
+        super::IncrementalInputOperator::GroupedMax(grouped_max) => {
+            prepare_grouped_max_grouped_stats_input_delta(
+                grouped_max,
+                &columnar.input_name,
+                insert_batches,
+                weighted_delta_batches,
+            )
+            .await
+        }
+        super::IncrementalInputOperator::GroupedStats(grouped_stats) => {
+            prepare_grouped_stats_grouped_stats_input_delta(
+                grouped_stats,
+                &columnar.input_name,
+                &columnar.source_schema,
+                &mut columnar.input_snapshot,
+                insert_batches,
+                weighted_delta_batches,
+            )
+            .await
+        }
+        super::IncrementalInputOperator::TopN(topn) => {
+            prepare_topn_grouped_stats_input_delta(
+                topn,
+                &columnar.input_name,
+                &columnar.source_schema,
+                &mut columnar.input_snapshot,
+                insert_batches,
+                weighted_delta_batches,
+            )
+            .await
+        }
     }
 }
 
 async fn prepare_join_grouped_stats_input_delta(
-    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    join: &mut ColumnarJoinMaterializedViewState,
+    input_name: &str,
+    source_schema: &SchemaRef,
+    input_snapshot: &mut Vec<RecordBatch>,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let join = columnar
-        .join
-        .as_mut()
-        .context("grouped-stats nested join state missing")?;
     let join_start = Instant::now();
     let tick = Box::pin(run_columnar_join_state_tick_delta_only(
-        join.as_mut(),
+        join,
         insert_batches,
         weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.input_snapshot,
+        source_schema,
+        input_snapshot,
     ))
     .await
-    .with_context(|| {
-        format!(
-            "evaluate grouped-stats nested join input '{}'",
-            columnar.input_name
-        )
-    })?;
+    .with_context(|| format!("evaluate grouped-stats nested join input '{}'", input_name))?;
     tracing::debug!(
         join_ms = join_start.elapsed().as_millis() as u64,
         delta_rows = tick
@@ -1641,119 +1592,102 @@ async fn prepare_join_grouped_stats_input_delta(
         "grouped-stats nested join input prepared"
     );
     if tick.input_changed && !tick.next_snapshot.is_empty() {
-        columnar.input_snapshot = tick.next_snapshot;
+        *input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)
 }
 
 async fn prepare_join_topn_grouped_stats_input_delta(
-    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    join_topn: &mut ColumnarJoinTopNMaterializedViewState,
+    input_name: &str,
+    source_schema: &SchemaRef,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let join_topn = columnar
-        .join_topn
-        .as_mut()
-        .context("grouped-stats nested join-topn state missing")?;
     let tick = Box::pin(run_columnar_join_topn_state_tick(
-        join_topn.as_mut(),
+        join_topn,
         insert_batches,
         weighted_delta_batches,
-        &columnar.source_schema,
+        source_schema,
     ))
     .await
     .with_context(|| {
         format!(
             "evaluate grouped-stats nested join-topn input '{}'",
-            columnar.input_name
+            input_name
         )
     })?;
     Ok(tick.delta)
 }
 
 async fn prepare_grouped_max_grouped_stats_input_delta(
-    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    grouped_max: &mut ColumnarGroupedMaxMaterializedViewState,
+    input_name: &str,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let grouped_max = columnar
-        .grouped_max
-        .as_mut()
-        .context("grouped-stats nested grouped-max state missing")?;
     let tick = Box::pin(run_columnar_grouped_max_state_tick_delta_only(
-        grouped_max.as_mut(),
+        grouped_max,
         insert_batches,
         weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.input_snapshot,
     ))
     .await
     .with_context(|| {
         format!(
             "evaluate grouped-stats nested grouped-max input '{}'",
-            columnar.input_name
+            input_name
         )
     })?;
-    if tick.input_changed && !tick.next_snapshot.is_empty() {
-        columnar.input_snapshot = tick.next_snapshot;
-    }
     Ok(tick.delta)
 }
 
 async fn prepare_grouped_stats_grouped_stats_input_delta(
-    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    grouped_stats: &mut ColumnarGroupedStatsMaterializedViewState,
+    input_name: &str,
+    source_schema: &SchemaRef,
+    input_snapshot: &mut Vec<RecordBatch>,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let grouped_stats = columnar
-        .grouped_stats
-        .as_mut()
-        .context("grouped-stats nested grouped-stats state missing")?;
     let tick = Box::pin(run_columnar_grouped_stats_state_tick(
-        grouped_stats.as_mut(),
+        grouped_stats,
         insert_batches,
         weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.input_snapshot,
+        source_schema,
+        input_snapshot,
     ))
     .await
     .with_context(|| {
         format!(
             "evaluate grouped-stats nested grouped-stats input '{}'",
-            columnar.input_name
+            input_name
         )
     })?;
     if tick.input_changed {
-        columnar.input_snapshot = tick.next_snapshot;
+        *input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)
 }
 
 async fn prepare_topn_grouped_stats_input_delta(
-    columnar: &mut ColumnarGroupedStatsMaterializedViewState,
+    topn: &mut ColumnarTopNMaterializedViewState,
+    input_name: &str,
+    source_schema: &SchemaRef,
+    input_snapshot: &mut Vec<RecordBatch>,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
 ) -> Result<ColumnarZSet> {
-    let topn = columnar
-        .topn
-        .as_mut()
-        .context("grouped-stats nested topn state missing")?;
     let tick = Box::pin(run_columnar_topn_state_tick(
-        topn.as_mut(),
+        topn,
         insert_batches,
         weighted_delta_batches,
-        &columnar.source_schema,
-        &columnar.input_snapshot,
+        source_schema,
+        input_snapshot,
     ))
     .await
-    .with_context(|| {
-        format!(
-            "evaluate grouped-stats nested topn input '{}'",
-            columnar.input_name
-        )
-    })?;
+    .with_context(|| format!("evaluate grouped-stats nested topn input '{}'", input_name))?;
     if tick.input_changed {
-        columnar.input_snapshot = tick.next_snapshot;
+        *input_snapshot = tick.next_snapshot;
     }
     Ok(tick.delta)
 }
@@ -1934,7 +1868,9 @@ async fn grouped_stats_append_only_direct_count_compact_delta(
             let converter = if columnar.group_count == 0 {
                 None
             } else {
-                Some(row_converter_for_schema(&columnar.group_schema)?)
+                Some(super::columnar_utils::row_converter_for_schema(
+                    &columnar.group_schema,
+                )?)
             };
 
             for batch in &positive_output {
@@ -2091,7 +2027,9 @@ async fn grouped_stats_append_only_streaming_direct_count_compact_delta(
             let converter = if columnar.group_count == 0 {
                 None
             } else {
-                Some(row_converter_for_schema(&columnar.group_schema)?)
+                Some(super::columnar_utils::row_converter_for_schema(
+                    &columnar.group_schema,
+                )?)
             };
 
             for batch in positive_output {
@@ -2195,8 +2133,10 @@ async fn collect_grouped_stats_projection_output(
                     "grouped-stats",
                 );
             }
-            let provider_batches =
-                rewrap_record_batches_with_schema(source_batches, &derived.input_schema)?;
+            let provider_batches = super::columnar_utils::rewrap_record_batches_with_schema(
+                source_batches,
+                &derived.input_schema,
+            )?;
             derived.provider.set_batches(provider_batches)?;
             let collected = collect(Arc::clone(&derived.plan), derived.ctx.task_ctx()).await;
             derived.provider.set_batches(Vec::new())?;
@@ -2223,7 +2163,9 @@ fn add_projected_stats_batches_to_pending(
     let converter = if columnar.group_count == 0 {
         None
     } else {
-        Some(row_converter_for_schema(&columnar.group_schema)?)
+        Some(super::columnar_utils::row_converter_for_schema(
+            &columnar.group_schema,
+        )?)
     };
     for batch in batches {
         if batch.num_rows() == 0 {
@@ -2286,7 +2228,9 @@ fn add_projected_compact_stats_batches_to_pending(
     let converter = if columnar.group_count == 0 {
         None
     } else {
-        Some(row_converter_for_schema(&columnar.group_schema)?)
+        Some(super::columnar_utils::row_converter_for_schema(
+            &columnar.group_schema,
+        )?)
     };
     for batch in batches {
         if batch.num_rows() == 0 {
@@ -7048,7 +6992,8 @@ fn grouped_stats_top1_value_grouped_max_input_for_aggregate(
     let synthetic_grouped_max_plan = LogicalPlanBuilder::from(grouped_max_aggregate)
         .project(projected_exprs)?
         .build()?;
-    let source_schema = df_schema_to_arrow(synthetic_grouped_max_plan.schema())?;
+    let source_schema =
+        super::columnar_utils::df_schema_to_arrow(synthetic_grouped_max_plan.schema())?;
     let Some(grouped_max) =
         columnar_grouped_max_plan_for_plan(&synthetic_grouped_max_plan, sources, &source_schema)?
     else {
@@ -7058,7 +7003,7 @@ fn grouped_stats_top1_value_grouped_max_input_for_aggregate(
 }
 
 fn avg_value_expr_for_top1_value_rewrite(expr: &Expr) -> Option<&Expr> {
-    let Expr::AggregateFunction(aggregate) = strip_alias(expr) else {
+    let Expr::AggregateFunction(aggregate) = super::columnar_utils::strip_alias(expr) else {
         return None;
     };
     let params = &aggregate.params;
@@ -7081,10 +7026,9 @@ fn projection_expr_index_or_push(
     expr: &Expr,
     alias_prefix: &str,
 ) -> usize {
-    if let Some(idx) = projection_expr
-        .iter()
-        .position(|existing| strip_alias(existing) == strip_alias(expr))
-    {
+    if let Some(idx) = projection_expr.iter().position(|existing| {
+        super::columnar_utils::strip_alias(existing) == super::columnar_utils::strip_alias(expr)
+    }) {
         return idx;
     }
     let idx = projection_expr.len();
@@ -7109,14 +7053,14 @@ fn assign_shared_minmax_value_count_indices(specs: &mut [AggregateSpec]) {
 }
 
 fn aggregate_input_column_index(aggregate: &Aggregate, expr: &Expr) -> Option<usize> {
-    let Expr::Column(column) = strip_alias(expr) else {
+    let Expr::Column(column) = super::columnar_utils::strip_alias(expr) else {
         return None;
     };
     aggregate.input.schema().index_of_column(column).ok()
 }
 
 fn column_exprs_match(left: &Expr, right: &Expr) -> bool {
-    strip_alias(left) == strip_alias(right)
+    super::columnar_utils::strip_alias(left) == super::columnar_utils::strip_alias(right)
         || match (column_expr_name(left), column_expr_name(right)) {
             (Some(left), Some(right)) => left == right,
             _ => false,
@@ -7124,7 +7068,7 @@ fn column_exprs_match(left: &Expr, right: &Expr) -> bool {
 }
 
 fn column_expr_name(expr: &Expr) -> Option<&str> {
-    match strip_alias(expr) {
+    match super::columnar_utils::strip_alias(expr) {
         Expr::Column(column) => Some(column.name.as_str()),
         _ => None,
     }
@@ -7135,7 +7079,7 @@ fn aggregate_spec_for_expr(
     output_type: &DataType,
     projection_expr: &mut Vec<Expr>,
 ) -> Option<AggregateSpec> {
-    let Expr::AggregateFunction(aggregate) = strip_alias(expr) else {
+    let Expr::AggregateFunction(aggregate) = super::columnar_utils::strip_alias(expr) else {
         return None;
     };
     let params = &aggregate.params;
@@ -7411,48 +7355,6 @@ fn scan_plan_for_derived_input(input_name: &str, schema: &SchemaRef) -> Result<L
     .map_err(Into::into)
 }
 
-fn derived_relation_name(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::Projection(projection) => derived_relation_name(projection.input.as_ref()),
-        LogicalPlan::Filter(filter) => derived_relation_name(filter.input.as_ref()),
-        LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.to_string()),
-        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            derived_relation_name(sort.input.as_ref())
-        }
-        _ => None,
-    }
-}
-
-fn rewrap_record_batches_with_schema(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    batches
-        .iter()
-        .map(|batch| {
-            if batch.num_columns() != schema.fields().len() {
-                bail!(
-                    "grouped-stats derived input batch width {} does not match schema width {}",
-                    batch.num_columns(),
-                    schema.fields().len()
-                );
-            }
-            for (idx, field) in schema.fields().iter().enumerate() {
-                let actual_type = batch.column(idx).data_type();
-                if actual_type != field.data_type() {
-                    bail!(
-                        "grouped-stats derived input column {} type {:?} does not match expected {:?}",
-                        idx,
-                        actual_type,
-                        field.data_type()
-                    );
-                }
-            }
-            RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec()).map_err(Into::into)
-        })
-        .collect()
-}
-
 fn unqualify_post_aggregate_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
     Ok(match plan {
         LogicalPlan::Projection(mut projection) => {
@@ -7587,7 +7489,12 @@ fn output_mapping_for_projection(
             projection
                 .expr
                 .iter()
-                .map(|expr| output_expr_source_idx(strip_alias(expr), aggregate_schema))
+                .map(|expr| {
+                    output_expr_source_idx(
+                        super::columnar_utils::strip_alias(expr),
+                        aggregate_schema,
+                    )
+                })
                 .collect()
         }
         None => {
@@ -7644,11 +7551,14 @@ fn output_expr_source_idx(
             .fields()
             .iter()
             .position(|field| field.name() == &column.name),
-        Expr::Cast(cast) => {
-            output_expr_source_idx(strip_alias(cast.expr.as_ref()), aggregate_schema)
-        }
+        Expr::Cast(cast) => output_expr_source_idx(
+            super::columnar_utils::strip_alias(cast.expr.as_ref()),
+            aggregate_schema,
+        ),
         _ => {
-            let expr_name = strip_alias(expr).schema_name().to_string();
+            let expr_name = super::columnar_utils::strip_alias(expr)
+                .schema_name()
+                .to_string();
             aggregate_schema
                 .fields()
                 .iter()
@@ -7659,74 +7569,6 @@ fn output_expr_source_idx(
 
 fn is_count_star_args(args: &[Expr]) -> bool {
     matches!(args, [Expr::Literal(ScalarValue::Int64(Some(1)), _)])
-}
-
-fn strip_alias(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Alias(alias) => strip_alias(alias.expr.as_ref()),
-        _ => expr,
-    }
-}
-
-fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> Result<SchemaRef> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Schema::new(fields)))
-}
-
-fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| SortField::new(field.data_type().clone()))
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).context("build grouped-stats Arrow row converter")
-}
-
-fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
-    let weight_idx = zset.weighted_schema().index_of(WEIGHT_COLUMN_NAME)?;
-    let mut batches = zset
-        .batches()
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| -> Result<RecordBatch> {
-            let weights = batch
-                .column(weight_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-            let mut indices = Vec::new();
-            for row_idx in 0..weights.len() {
-                if weights.is_null(row_idx) {
-                    bail!("materialized columnar zset weight cannot be NULL");
-                }
-                let weight = weights.value(row_idx);
-                if weight < 0 {
-                    bail!("materialized columnar zset contains negative weight");
-                }
-                let row_idx =
-                    u32::try_from(row_idx).context("columnar zset batch exceeds u32 rows")?;
-                for _ in 0..weight {
-                    indices.push(row_idx);
-                }
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .take(zset.value_column_count())
-                .map(|column| take(column.as_ref(), &indices, None))
-                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-            Ok(RecordBatch::try_new(zset.value_schema(), columns)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(zset.value_schema()));
-    }
-    Ok(batches)
 }
 
 fn minmax_value(kind: AggregateKind, left: i64, right: i64) -> i64 {

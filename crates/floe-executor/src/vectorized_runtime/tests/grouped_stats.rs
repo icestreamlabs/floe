@@ -41,7 +41,7 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -93,7 +93,7 @@ async fn grouped_stats_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -179,7 +179,7 @@ async fn grouped_stats_can_publish_columnar_versions_without_arrow_snapshots() {
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -284,7 +284,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -335,7 +335,7 @@ async fn append_only_grouped_stats_recovers_from_dense_compact_state_snapshot() 
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -408,7 +408,7 @@ async fn append_only_grouped_stats_recovers_distinct_presence_segments() {
         COUNT(DISTINCT bidder) AS distinct_bidders FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -428,7 +428,7 @@ async fn append_only_grouped_stats_recovers_distinct_presence_segments() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -495,7 +495,7 @@ async fn append_only_grouped_stats_rejects_negative_source_delta() {
         FROM bids GROUP BY auction";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_bid_stats",
             query,
             Arc::clone(&output_schema),
@@ -569,7 +569,7 @@ async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let query = "SELECT id, SUM(amount) AS total FROM orders GROUP BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -623,7 +623,7 @@ async fn sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -716,7 +716,7 @@ async fn ordered_sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
         ORDER BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals_ordered",
             query,
             Arc::clone(&output_schema),
@@ -772,7 +772,7 @@ async fn ordered_sum_group_by_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals_ordered",
             query,
             Arc::clone(&output_schema),
@@ -863,7 +863,7 @@ async fn having_grouped_stats_uses_slate_backed_post_aggregate_filter_incrementa
         FROM orders GROUP BY id HAVING SUM(amount) >= 20";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_large_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -916,7 +916,7 @@ async fn having_grouped_stats_uses_slate_backed_post_aggregate_filter_incrementa
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_large_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -1004,7 +1004,7 @@ async fn final_aggregate_projection_uses_slate_backed_grouped_stats_incrementall
     let query = "SELECT id, SUM(amount) + 1 AS adjusted_total FROM orders GROUP BY id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_adjusted_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -1060,7 +1060,7 @@ async fn final_aggregate_projection_uses_slate_backed_grouped_stats_incrementall
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_adjusted_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -1154,7 +1154,7 @@ async fn aggregate_subquery_having_projection_uses_slate_backed_grouped_stats_in
     ) a WHERE amount_count > 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -1205,7 +1205,7 @@ async fn aggregate_subquery_having_projection_uses_slate_backed_grouped_stats_in
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_totals",
             query,
             Arc::clone(&output_schema),
@@ -1291,7 +1291,7 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
     let query = "SELECT COUNT(*) AS total FROM orders";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_count",
             query,
             Arc::clone(&output_schema),
@@ -1339,7 +1339,7 @@ async fn global_count_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_count",
             query,
             Arc::clone(&output_schema),
@@ -1422,7 +1422,7 @@ async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     let query = "SELECT SUM(amount) AS total FROM orders";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_sum",
             query,
             Arc::clone(&output_schema),
@@ -1470,7 +1470,7 @@ async fn global_sum_uses_slate_backed_grouped_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_order_sum",
             query,
             Arc::clone(&output_schema),
@@ -1579,7 +1579,7 @@ async fn grouped_stats_supports_distinct_counts_and_string_max_incrementally() {
         FROM events GROUP BY channel, day";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_event_stats",
             query,
             Arc::clone(&output_schema),
@@ -1656,7 +1656,7 @@ async fn grouped_stats_supports_distinct_counts_and_string_max_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_event_stats",
             query,
             Arc::clone(&output_schema),
@@ -1764,7 +1764,7 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
     let query = "SELECT COUNT(DISTINCT channel) AS distinct_channels FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_distinct_channels",
             query,
             Arc::clone(&output_schema),
@@ -1817,7 +1817,7 @@ async fn grouped_stats_supports_string_distinct_count_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_distinct_channels",
             query,
             Arc::clone(&output_schema),
@@ -1903,7 +1903,7 @@ async fn grouped_stats_supports_timestamp_min_max_incrementally() {
     let query = "SELECT MIN(event_time) AS first_ts, MAX(event_time) AS last_ts FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_event_bounds",
             query,
             Arc::clone(&output_schema),
@@ -1954,7 +1954,7 @@ async fn grouped_stats_supports_timestamp_min_max_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_event_bounds",
             query,
             Arc::clone(&output_schema),
@@ -2039,7 +2039,7 @@ async fn grouped_stats_supports_date_min_max_incrementally() {
     let query = "SELECT MIN(event_day) AS first_day, MAX(event_day) AS last_day FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_event_days",
             query,
             Arc::clone(&output_schema),
@@ -2121,7 +2121,7 @@ async fn grouped_stats_supports_timestamp_distinct_count_incrementally() {
     let query = "SELECT COUNT(DISTINCT event_time) AS distinct_times FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_distinct_times",
             query,
             Arc::clone(&output_schema),
@@ -2171,7 +2171,7 @@ async fn grouped_stats_supports_timestamp_distinct_count_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_distinct_times",
             query,
             Arc::clone(&output_schema),
@@ -2255,7 +2255,7 @@ async fn grouped_stats_supports_boolean_distinct_count_incrementally() {
     let query = "SELECT COUNT(DISTINCT active) AS distinct_flags FROM events";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_distinct_flags",
             query,
             Arc::clone(&output_schema),
@@ -2340,7 +2340,7 @@ async fn grouped_stats_supports_decimal_stats_incrementally() {
     let query = "SELECT SUM(amount) AS total_amount, MIN(amount) AS min_amount, MAX(amount) AS max_amount, COUNT(DISTINCT amount) AS distinct_amounts FROM payments";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_payment_stats",
             query,
             Arc::clone(&output_schema),
@@ -2397,7 +2397,7 @@ async fn grouped_stats_supports_decimal_stats_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_payment_stats",
             query,
             Arc::clone(&output_schema),

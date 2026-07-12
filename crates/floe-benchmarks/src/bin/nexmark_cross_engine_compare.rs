@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
-use floe_node_core::nexmark_queries::CANONICAL_NEXMARK_QUERY_IDS;
+use floe_node_core::nexmark_queries::{
+    CANONICAL_NEXMARK_QUERY_IDS, NexmarkSqlDialect, nexmark_query_sql,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 

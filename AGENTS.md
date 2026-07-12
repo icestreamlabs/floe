@@ -1,13 +1,13 @@
 # Repository Guidelines
 
 ## About
-Floe is a single-node streaming SQL database built around a DBSP runtime, DataFusion planning, and SlateDB-backed state.
+Floe is a single-node streaming SQL database built around a DBSP runtime, DataFusion logical planning, and SlateDB-backed state.
 
 Feldera is a similar streaming SQL database with a reference DBSP implementation.
 Local reference repo: `/home/jlerche/programming_projects/github.com/feldera/feldera`.
 
 ## Workspace Layout
-Floe is a Rust **workspace** (not a single binary crate). The workspace currently contains 13 crates under `crates/`.
+Floe is a Rust **workspace** (not a single binary crate). The workspace currently contains 15 crates under `crates/`.
 
 - Default member: `crates/floe-node`.
 - Running `cargo run` from repo root targets `floe-node` by default.
@@ -21,11 +21,9 @@ Floe is a Rust **workspace** (not a single binary crate). The workspace currentl
 - `crates/floe-storage`: Floe-level catalog/state persistence.
 - `crates/floe-core`: shared domain types (catalog/source/row abstractions).
 - `crates/floe-sql-parser`: parser for Floe SQL statements.
-- `crates/dbsp`: DBSP facade crate re-exporting planner/circuit/runtime/storage APIs.
+- `crates/dbsp`: DBSP facade crate re-exporting operational runtime/storage APIs.
 - `crates/dbsp-runtime`: stream runtime, operators, handle-based ZSet mechanics.
 - `crates/dbsp-storage`: DBSP storage primitives (dictionary, manifests, segments, GC).
-- `crates/dbsp-circuit`: DBSP logical plan/circuit types.
-- `crates/dbsp-planner`: DataFusion -> DBSP circuit translation.
 - `crates/floe-benchmarks`: benchmark binaries and Criterion benches.
 
 ## Build, Run, and Test Commands
@@ -43,7 +41,7 @@ Use focused tests during normal development; run full workspace tests before lar
 - DBSP stream/runtime core: `cargo test -p dbsp-runtime stream::tests::core::`
 - DBSP dictionary/storage: `cargo test -p dbsp-storage storage::dictionary::tests::`
 - DBSP columnar index path: `cargo test -p dbsp-runtime collections::columnar_indexed_zset::tests::`
-- Executor plan validation: `cargo test -p floe-executor --test plan_validation`
+- Executor plan/runtime coverage: `cargo test -p floe-node-core --test nexmark_query_coverage`
 - End-to-end node flows: `cargo test -p floe-node --test production_smoke`
 - Ignored integration tests (e.g., Kafka): `cargo test --workspace -- --ignored`
 

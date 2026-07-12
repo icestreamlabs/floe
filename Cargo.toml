@@ -14,8 +14,6 @@ members = [
     "crates/dbsp",
     "crates/dbsp-runtime",
     "crates/dbsp-storage",
-    "crates/dbsp-circuit",
-    "crates/dbsp-planner",
     "crates/floe-sql-parser",
 ]
 default-members = ["crates/floe-node"]

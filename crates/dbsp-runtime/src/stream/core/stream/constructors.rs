@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rkyv::Archive;
 use rkyv::Deserialize as RkyvDeserialize;
 use rkyv::Serialize as RkyvSerialize;
@@ -14,10 +14,7 @@ use crate::storage::encoding::{RkyvDeserializer, RkyvSerializer, RkyvValidator};
 use crate::storage::keyspace::{self, namespace_prefix};
 use crate::storage::{KeyValueTable, SlateTable};
 
-use super::{
-    Stream, StreamCore, StreamEvaluator, StreamEvaluatorDescriptor, StreamState,
-    register_stream_evaluator, registered_stream_evaluator,
-};
+use super::{Stream, StreamCore, StreamState};
 
 impl<T> Stream<T>
 where
@@ -56,9 +53,6 @@ where
         let mut state_key = base.clone();
         state_key.extend_from_slice(b"meta/state");
 
-        let mut evaluator_key = base.clone();
-        evaluator_key.extend_from_slice(b"meta/evaluator");
-
         let initial_default = group.identity().await?;
         let state = StreamState::new(initial_default.clone());
         let (frontier_tx, frontier_rx) = watch::channel(state.logical_timestamp);
@@ -68,9 +62,7 @@ where
             data_prefix,
             default_prefix,
             state_key,
-            evaluator_key,
             group,
-            evaluator: None,
             state: std::sync::RwLock::new(state),
             frontier_tx,
         });
@@ -79,26 +71,6 @@ where
         let mut needs_initial_flush = false;
 
         stream.core.clear_intent().await?;
-        if let Some(evaluator_bytes) = stream.table().get_bytes(&stream.core.evaluator_key).await? {
-            let evaluator = if let Some(evaluator) = stream
-                .rebuild_builtin_evaluator(evaluator_bytes.as_ref())
-                .await?
-            {
-                Some(evaluator)
-            } else {
-                registered_stream_evaluator::<T>(&namespace)
-            };
-            let Some(evaluator) = evaluator else {
-                bail!(
-                    "cannot reopen evaluator-derived stream `{namespace}` without its in-memory DBSP evaluator graph"
-                );
-            };
-            let Some(core) = Arc::get_mut(&mut stream.core) else {
-                bail!("new stream unexpectedly shared its core before evaluator install");
-            };
-            core.evaluator = Some(evaluator);
-        }
-
         if let Some(bytes) = stream.table().get_bytes(&stream.core.state_key).await? {
             let (timestamp, max_known_timestamp, identity, default, last_default_ts) =
                 encoding::decode::<(i64, i64, bool, T, i64)>(bytes.as_ref())
@@ -148,125 +120,6 @@ where
         }
 
         Ok(stream)
-    }
-
-    pub(crate) async fn evaluated_with_table(
-        table: Arc<dyn KeyValueTable>,
-        namespace: impl Into<String>,
-        group: Arc<dyn AbelianGroup<T>>,
-        evaluator: Arc<dyn StreamEvaluator<T>>,
-    ) -> Result<Self> {
-        let namespace = namespace.into();
-        register_stream_evaluator(&namespace, evaluator.clone());
-        let mut stream = Self::with_table(table, namespace, group).await?;
-        let Some(core) = Arc::get_mut(&mut stream.core) else {
-            bail!("new evaluated stream unexpectedly shared its core before evaluator install");
-        };
-        core.evaluator = Some(evaluator);
-        stream
-            .table()
-            .put(&stream.core.evaluator_key, b"ephemeral")
-            .await?;
-        Ok(stream)
-    }
-
-    pub(crate) async fn evaluated_with_table_and_descriptor(
-        table: Arc<dyn KeyValueTable>,
-        namespace: impl Into<String>,
-        group: Arc<dyn AbelianGroup<T>>,
-        evaluator: Arc<dyn StreamEvaluator<T>>,
-        descriptor: StreamEvaluatorDescriptor,
-    ) -> Result<Self> {
-        let stream = Self::evaluated_with_table(table, namespace, group, evaluator).await?;
-        match descriptor {
-            StreamEvaluatorDescriptor::Unary {
-                kind,
-                input_namespace,
-            } => {
-                let encoded = encoding::encode(&(
-                    "builtin-unary".to_string(),
-                    kind.to_string(),
-                    input_namespace,
-                ))
-                .context("encode stream evaluator descriptor")?;
-                stream
-                    .table()
-                    .put(&stream.core.evaluator_key, &encoded)
-                    .await?;
-            }
-            StreamEvaluatorDescriptor::Binary {
-                kind,
-                left_namespace,
-                right_namespace,
-            } => {
-                let encoded = encoding::encode(&(
-                    "builtin-binary".to_string(),
-                    kind.to_string(),
-                    left_namespace,
-                    right_namespace,
-                ))
-                .context("encode stream evaluator descriptor")?;
-                stream
-                    .table()
-                    .put(&stream.core.evaluator_key, &encoded)
-                    .await?;
-            }
-        }
-        Ok(stream)
-    }
-
-    async fn rebuild_builtin_evaluator(
-        &self,
-        evaluator_bytes: &[u8],
-    ) -> Result<Option<Arc<dyn StreamEvaluator<T>>>> {
-        if let Ok((family, kind, input_namespace)) =
-            encoding::decode::<(String, String, String)>(evaluator_bytes)
-            && family == "builtin-unary"
-        {
-            let input = Box::pin(Stream::with_table(
-                self.table(),
-                input_namespace.clone(),
-                self.group(),
-            ))
-            .await
-            .with_context(|| {
-                format!("rebuild {kind} evaluator input stream `{input_namespace}`")
-            })?;
-            return Ok(Some(crate::stream::addition::builtin_addition_evaluator(
-                kind,
-                Some(input),
-                None,
-            )?));
-        }
-
-        if let Ok((family, kind, left_namespace, right_namespace)) =
-            encoding::decode::<(String, String, String, String)>(evaluator_bytes)
-            && family == "builtin-binary"
-        {
-            let left = Box::pin(Stream::with_table(
-                self.table(),
-                left_namespace.clone(),
-                self.group(),
-            ))
-            .await
-            .with_context(|| format!("rebuild {kind} evaluator left stream `{left_namespace}`"))?;
-            let right = Box::pin(Stream::with_table(
-                self.table(),
-                right_namespace.clone(),
-                self.group(),
-            ))
-            .await
-            .with_context(|| {
-                format!("rebuild {kind} evaluator right stream `{right_namespace}`")
-            })?;
-            return Ok(Some(crate::stream::addition::builtin_addition_evaluator(
-                kind,
-                Some(left),
-                Some(right),
-            )?));
-        }
-
-        Ok(None)
     }
 
     pub async fn open_at(

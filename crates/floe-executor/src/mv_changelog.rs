@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, ensure};
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::WEIGHT_COLUMN_NAME;
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

@@ -5,18 +5,14 @@ use std::time::Instant;
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::array::{
-    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, TimestampMillisecondArray,
-    UInt32Array, UInt64Array,
+    Array, ArrayBuilder, ArrayRef, Int64Array, Int64Builder, TimestampMillisecondArray, UInt64Array,
 };
-use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::functions_aggregate::count::count_all;
 use datafusion::logical_expr::logical_plan::{Aggregate, Distinct, Projection};
 use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF};
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
@@ -171,7 +167,7 @@ pub(super) fn columnar_grouped_count_plan_for_plan(
     }
 
     let count_idx = aggregate.group_expr.len();
-    let aggregate_schema = df_schema_to_arrow(&aggregate.schema)?;
+    let aggregate_schema = super::columnar_utils::df_schema_to_arrow(&aggregate.schema)?;
     if aggregate_schema.fields().len() != count_idx + 1
         || aggregate_schema.field(count_idx).data_type() != &DataType::Int64
     {
@@ -321,7 +317,7 @@ pub(super) async fn build_columnar_grouped_count_materialized_view_state_in_name
         .await
         .context("load grouped-count output snapshot")?;
     let initial_row_count = columnar_zset_weight_sum(&initial_output)?;
-    let initial_snapshot = snapshot_batches_from_zset(&initial_output)?;
+    let initial_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&initial_output)?;
     let (aggregate_delta, hop_group_projection_delta) =
         if let Some(hop_group_projection) = plan.hop_group_projection.as_ref() {
             let projection_delta = build_incremental_materialized_view_state_from_logical_plan(
@@ -1014,7 +1010,7 @@ fn add_aggregate_batches_to_pending(
     if batches.is_empty() {
         return Ok(());
     }
-    let converter = row_converter_for_schema(&columnar.group_schema)?;
+    let converter = super::columnar_utils::row_converter_for_schema(&columnar.group_schema)?;
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
@@ -1804,8 +1800,8 @@ fn hop_group_projection_for_aggregate(
 
     let projection = Projection::try_new(projection_expr, Arc::clone(&aggregate.input))
         .context("build grouped-count HOP group projection")?;
-    let projection_schema = df_schema_to_arrow(&projection.schema)?;
-    let aggregate_schema = df_schema_to_arrow(&aggregate.schema)?;
+    let projection_schema = super::columnar_utils::df_schema_to_arrow(&projection.schema)?;
+    let aggregate_schema = super::columnar_utils::df_schema_to_arrow(&aggregate.schema)?;
     for (idx, projected) in projection_schema.fields().iter().enumerate() {
         let expected = aggregate_schema.field(idx);
         if projected.data_type() != expected.data_type() {
@@ -1821,7 +1817,7 @@ fn hop_group_projection_for_aggregate(
 }
 
 fn fixed_window_group_expr(expr: &Expr) -> Result<Option<(Expr, i64, i64)>> {
-    let Expr::ScalarFunction(function) = strip_alias(expr) else {
+    let Expr::ScalarFunction(function) = super::columnar_utils::strip_alias(expr) else {
         return Ok(None);
     };
     if function.name().eq_ignore_ascii_case("tumble") {
@@ -1849,7 +1845,7 @@ fn fixed_window_group_expr(expr: &Expr) -> Result<Option<(Expr, i64, i64)>> {
 }
 
 fn literal_i64(expr: &Expr) -> Result<i64> {
-    match strip_alias(expr) {
+    match super::columnar_utils::strip_alias(expr) {
         Expr::Literal(ScalarValue::Int64(Some(value)), _) => Ok(*value),
         other => bail!("expected Int64 literal, found {other:?}"),
     }
@@ -1870,7 +1866,13 @@ fn output_mapping_for_projection(
             projection
                 .expr
                 .iter()
-                .map(|expr| output_expr_source_idx(strip_alias(expr), aggregate_schema, count_idx))
+                .map(|expr| {
+                    output_expr_source_idx(
+                        super::columnar_utils::strip_alias(expr),
+                        aggregate_schema,
+                        count_idx,
+                    )
+                })
                 .collect()
         }
         None => {
@@ -1914,7 +1916,7 @@ fn output_expr_source_idx(
 }
 
 fn is_count_star_expr(expr: &Expr) -> bool {
-    let Expr::AggregateFunction(aggregate) = strip_alias(expr) else {
+    let Expr::AggregateFunction(aggregate) = super::columnar_utils::strip_alias(expr) else {
         return false;
     };
     let params = &aggregate.params;
@@ -1927,74 +1929,6 @@ fn is_count_star_expr(expr: &Expr) -> bool {
             params.args.as_slice(),
             [Expr::Literal(ScalarValue::Int64(Some(1)), _)]
         )
-}
-
-fn strip_alias(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Alias(alias) => strip_alias(alias.expr.as_ref()),
-        _ => expr,
-    }
-}
-
-fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> Result<SchemaRef> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Schema::new(fields)))
-}
-
-fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| SortField::new(field.data_type().clone()))
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).context("build grouped-count Arrow row converter")
-}
-
-fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
-    let weight_idx = zset.weighted_schema().index_of(WEIGHT_COLUMN_NAME)?;
-    let mut batches = zset
-        .batches()
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| -> Result<RecordBatch> {
-            let weights = batch
-                .column(weight_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-            let mut indices = Vec::new();
-            for row_idx in 0..weights.len() {
-                if weights.is_null(row_idx) {
-                    bail!("materialized columnar zset weight cannot be NULL");
-                }
-                let weight = weights.value(row_idx);
-                if weight < 0 {
-                    bail!("materialized columnar zset contains negative weight");
-                }
-                let row_idx =
-                    u32::try_from(row_idx).context("columnar zset batch exceeds u32 rows")?;
-                for _ in 0..weight {
-                    indices.push(row_idx);
-                }
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .take(zset.value_column_count())
-                .map(|column| take(column.as_ref(), &indices, None))
-                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-            Ok(RecordBatch::try_new(zset.value_schema(), columns)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(zset.value_schema()));
-    }
-    Ok(batches)
 }
 
 async fn read_count_sequence(table: &dyn KeyValueTable, key: &[u8]) -> Result<u64> {

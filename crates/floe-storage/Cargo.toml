@@ -15,6 +15,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 slatedb = { workspace = true }
 tokio = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3.10"

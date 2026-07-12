@@ -10,7 +10,6 @@ floe-cdc-pg = { path = "../floe-cdc-pg" }
 floe-core = { path = "../floe-core" }
 floe-executor = { path = "../floe-executor" }
 floe-sql-parser = { path = "../floe-sql-parser" }
-dbsp-planner = { path = "../dbsp-planner" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

@@ -3,35 +3,31 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
-use datafusion::arrow::compute::take;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::context::{SessionConfig, SessionContext};
-use datafusion::logical_expr::logical_plan::{Distinct, TableScan};
+use datafusion::logical_expr::logical_plan::Distinct;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, ScalarUDF};
 use datafusion::physical_plan::collect;
-use dbsp::circuit::WEIGHT_COLUMN_NAME;
+use dbsp::WEIGHT_COLUMN_NAME;
 use dbsp::collections::{ColumnarZSet, SlateBackedColumnarZSet};
 use dbsp::storage::{KeyValueTable, keyspace};
 use slatedb::WriteBatch;
 
+use crate::columnar_snapshot::columnar_zset_weight_sum;
 use crate::delta_consolidation::{add_weight_column_to_batches, weighted_snapshot_schema};
-use crate::mv::registry::MaterializedViewRegistry;
+use crate::mv::registry::{ColumnarMaterializedViewStorage, MaterializedViewRegistry};
 use crate::namespaces;
 use crate::scalar_array_builder::ScalarColumnBuilder;
 use crate::table_provider::DynamicStateTableProvider;
-use crate::vectorized_runtime::source_state::{rename_batches, resolve_source_table};
+use crate::vectorized_runtime::source_state::rename_batches;
 use crate::vectorized_source_delta::unit_source_delta_batches;
 
-use super::{
-    VectorizedMaterializedViewState, VectorizedSourceState, apply_weighted_snapshot_delta,
-    normalize_batches,
-};
+use super::{VectorizedMaterializedViewState, VectorizedSourceState, normalize_batches};
 
 pub(super) struct ColumnarUnionPlan {
     logical_plan: LogicalPlan,
@@ -44,6 +40,8 @@ pub(super) struct ColumnarUnionMaterializedViewState {
     output_zset: SlateBackedColumnarZSet,
     evaluator: UnionDeltaEvaluator,
     distinct_state: Option<SlateUnionDistinctState>,
+    operator_table: Arc<dyn KeyValueTable>,
+    row_count: i64,
     initial_snapshot: Vec<RecordBatch>,
 }
 
@@ -70,7 +68,7 @@ struct ColumnarUnionConstantState {
 
 pub(super) struct ColumnarUnionTick {
     pub(super) delta: ColumnarZSet,
-    pub(super) next_snapshot: Vec<RecordBatch>,
+    row_count_delta: i64,
 }
 
 struct ColumnarUnionInputPlan {
@@ -199,12 +197,12 @@ pub(super) async fn build_columnar_union_materialized_view_state_in_namespace(
     )
     .await
     .context("initialize SlateDB-backed union output zset")?;
-    let initial_snapshot = snapshot_batches_from_zset(
-        &output_zset
-            .materialize_columnar()
-            .await
-            .context("load union output snapshot")?,
-    )?;
+    let initial_output = output_zset
+        .materialize_columnar()
+        .await
+        .context("load union output snapshot")?;
+    let row_count = columnar_zset_weight_sum(&initial_output)?;
+    let initial_snapshot = crate::columnar_snapshot::columnar_zset_snapshot(&initial_output)?;
     let output_initialized = output_zset.current_handle().is_some();
 
     let evaluator = UnionDeltaEvaluator::build(logical_plan, sources, udfs, output_schema, &inputs)
@@ -237,7 +235,9 @@ pub(super) async fn build_columnar_union_materialized_view_state_in_namespace(
         output_zset,
         evaluator,
         distinct_state: distinct
-            .then(|| SlateUnionDistinctState::new(table, &distinct_state_namespace)),
+            .then(|| SlateUnionDistinctState::new(Arc::clone(&table), &distinct_state_namespace)),
+        operator_table: table,
+        row_count,
         initial_snapshot,
     })
 }
@@ -308,7 +308,7 @@ async fn build_union_input_state(
                 || output_initialized;
             let has_persisted_input = input_zset.current_handle().is_some();
             let persisted_snapshot = if has_persisted_input {
-                snapshot_batches_from_zset(
+                crate::columnar_snapshot::columnar_zset_snapshot(
                     &input_zset
                         .materialize_columnar()
                         .await
@@ -377,19 +377,38 @@ pub(super) async fn run_columnar_union_materialized_view_tick(
         unreachable!("union tick dispatched to non-union operator")
     };
     let plan_start = Instant::now();
-    let tick = run_columnar_union_state_tick(
-        columnar,
-        insert_batches,
-        weighted_delta_batches,
-        &mv.output_schema,
-        &mv.previous_snapshot,
-    )
-    .await?;
+    let tick =
+        run_columnar_union_state_tick(columnar, insert_batches, weighted_delta_batches).await?;
 
     let delta_batches = tick.delta.batches().to_vec();
+    columnar.row_count = columnar.row_count.saturating_add(tick.row_count_delta);
+    if columnar.row_count < 0 {
+        bail!(
+            "union materialized view '{}' row count became negative",
+            mv.view_name
+        );
+    }
+    let snapshot_rows =
+        usize::try_from(columnar.row_count).context("union row count exceeds usize")?;
     let handle = registry.register(mv.view_name.clone());
-    handle.publish_arrow_version(version, tick.next_snapshot.clone(), delta_batches);
-    mv.previous_snapshot = tick.next_snapshot;
+    if let Some(zset_handle) = columnar.output_zset.current_handle() {
+        handle.publish_columnar_version(
+            version,
+            zset_handle,
+            ColumnarMaterializedViewStorage::new(
+                Arc::clone(&columnar.operator_table),
+                Arc::clone(&mv.output_schema),
+            ),
+            snapshot_rows,
+            delta_batches,
+        );
+    } else {
+        handle.publish_arrow_version(
+            version,
+            vec![RecordBatch::new_empty(Arc::clone(&mv.output_schema))],
+            delta_batches,
+        );
+    }
     tracing::debug!(
         view = %mv.view_name,
         version,
@@ -404,8 +423,6 @@ pub(super) async fn run_columnar_union_state_tick(
     columnar: &mut ColumnarUnionMaterializedViewState,
     insert_batches: &HashMap<String, Vec<RecordBatch>>,
     weighted_delta_batches: &HashMap<String, Vec<RecordBatch>>,
-    output_schema: &SchemaRef,
-    previous_snapshot: &[RecordBatch],
 ) -> Result<ColumnarUnionTick> {
     let (output_delta, _input_changed) =
         prepare_union_delta_tick(columnar, insert_batches, weighted_delta_batches).await?;
@@ -425,18 +442,15 @@ pub(super) async fn run_columnar_union_state_tick(
         output_delta
     };
 
-    let delta_batches = persisted_output_delta.batches().to_vec();
-    let next_snapshot =
-        apply_weighted_snapshot_delta(output_schema, previous_snapshot, delta_batches.clone())
-            .await
-            .context("apply Slate-backed union columnar snapshot delta")?;
+    let row_count_delta = columnar_zset_weight_sum(&persisted_output_delta)
+        .context("compute union output row-count delta")?;
 
     for source in &mut columnar.sources {
         mark_union_constant_initialized(source).await?;
     }
     Ok(ColumnarUnionTick {
         delta: persisted_output_delta,
-        next_snapshot,
+        row_count_delta,
     })
 }
 
@@ -523,7 +537,7 @@ fn union_distinct_pending_delta(
     if batches.is_empty() {
         return Ok(pending);
     }
-    let converter = row_converter_for_schema(output_schema)?;
+    let converter = super::columnar_utils::row_converter_for_schema(output_schema)?;
     let value_column_count = output_schema.fields().len();
     for batch in batches {
         if batch.num_rows() == 0 {
@@ -1176,7 +1190,7 @@ fn push_union_input_plan(
         *constant_idx += 1;
         inputs.push(ColumnarUnionInputPlan {
             input_name,
-            schema: df_schema_to_arrow(plan.schema()),
+            schema: super::columnar_utils::df_schema_to_arrow(plan.schema())?,
             kind: ColumnarUnionInputPlanKind::Constant {
                 logical_plan: Box::new(plan.clone()),
             },
@@ -1186,7 +1200,7 @@ fn push_union_input_plan(
     if contains_union(plan) {
         return collect_union_input_plans(plan, sources, seen_sources, inputs, constant_idx);
     }
-    let mut input_sources = source_set_for_plan(plan, sources).into_iter();
+    let mut input_sources = super::columnar_utils::source_set_for_plan(plan, sources).into_iter();
     let Some(source_name) = input_sources.next() else {
         bail!("columnar union input must reference exactly one source");
     };
@@ -1223,111 +1237,6 @@ fn plan_contains_table_scan(plan: &LogicalPlan) -> bool {
         }
     });
     found
-}
-
-fn df_schema_to_arrow(schema: &datafusion::common::DFSchemaRef) -> SchemaRef {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
-        .collect::<Vec<_>>();
-    Arc::new(Schema::new(fields))
-}
-
-fn source_set_for_plan(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    collect_sources(plan, sources, &mut out);
-    out
-}
-
-fn collect_sources(
-    plan: &LogicalPlan,
-    sources: &HashMap<String, VectorizedSourceState>,
-    out: &mut BTreeSet<String>,
-) {
-    match plan {
-        LogicalPlan::TableScan(scan) => {
-            if let Some(source_name) = table_scan_source(scan, sources) {
-                out.insert(source_name);
-            }
-        }
-        LogicalPlan::Projection(projection) => {
-            collect_sources(projection.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Filter(filter) => collect_sources(filter.input.as_ref(), sources, out),
-        LogicalPlan::SubqueryAlias(alias) => collect_sources(alias.input.as_ref(), sources, out),
-        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
-            collect_sources(sort.input.as_ref(), sources, out)
-        }
-        LogicalPlan::Union(union) => {
-            for input in &union.inputs {
-                collect_sources(input.as_ref(), sources, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn table_scan_source(
-    scan: &TableScan,
-    sources: &HashMap<String, VectorizedSourceState>,
-) -> Option<String> {
-    resolve_source_table(scan.table_name.table().to_string(), sources)
-}
-
-fn snapshot_batches_from_zset(zset: &ColumnarZSet) -> Result<Vec<RecordBatch>> {
-    let weight_idx = zset.weighted_schema().index_of(WEIGHT_COLUMN_NAME)?;
-    let mut batches = zset
-        .batches()
-        .iter()
-        .filter(|batch| batch.num_rows() > 0)
-        .map(|batch| -> Result<RecordBatch> {
-            let weights = batch
-                .column(weight_idx)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("columnar zset weight column must be Int64"))?;
-            let mut indices = Vec::new();
-            for row_idx in 0..weights.len() {
-                if weights.is_null(row_idx) {
-                    bail!("materialized columnar zset weight cannot be NULL");
-                }
-                let weight = weights.value(row_idx);
-                if weight < 0 {
-                    bail!("materialized columnar zset contains negative weight");
-                }
-                let row_idx =
-                    u32::try_from(row_idx).context("columnar zset batch exceeds u32 rows")?;
-                for _ in 0..weight {
-                    indices.push(row_idx);
-                }
-            }
-            let indices = UInt32Array::from(indices);
-            let columns = batch
-                .columns()
-                .iter()
-                .take(zset.value_column_count())
-                .map(|column| take(column.as_ref(), &indices, None))
-                .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-            Ok(RecordBatch::try_new(zset.value_schema(), columns)?)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(zset.value_schema()));
-    }
-    Ok(batches)
-}
-
-fn row_converter_for_schema(schema: &SchemaRef) -> Result<RowConverter> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| SortField::new(field.data_type().clone()))
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).context("build union distinct Arrow row converter")
 }
 
 fn decode_i64(bytes: &[u8]) -> Result<i64> {

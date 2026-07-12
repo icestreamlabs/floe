@@ -76,10 +76,6 @@ where
                 .insert(timestamp, value.clone());
             return Ok(value);
         }
-        if let Some(value) = self.derived_value_at(timestamp).await? {
-            self.set_value_at_in_place(timestamp, value.clone());
-            return Ok(value);
-        }
         Ok(default_value)
     }
 
@@ -108,10 +104,6 @@ where
             if current >= timestamp {
                 break;
             }
-            if let Some(value) = self.derived_value_at(current + 1).await? {
-                self.push_value_in_place(value);
-                continue;
-            }
             let default = {
                 let state = self.read_state();
                 state.default_at(current + 1)
@@ -133,20 +125,6 @@ where
         state.pending_state = true;
     }
 
-    pub(crate) fn push_value_in_place(&self, value: T) {
-        let mut state = self.write_state();
-        let next_timestamp = state.logical_timestamp + 1;
-        let default_at_next = state.default_at(next_timestamp);
-        if value != default_at_next {
-            state.pending_data.insert(next_timestamp, value.clone());
-            state.data_cache.insert(next_timestamp, value);
-            state.identity = false;
-        }
-        state.logical_timestamp = next_timestamp;
-        state.max_known_timestamp = state.max_known_timestamp.max(next_timestamp);
-        state.pending_state = true;
-    }
-
     #[cfg(test)]
     pub(crate) fn set_default_at_in_place(&self, timestamp: i64, value: T) {
         let mut state = self.write_state();
@@ -154,21 +132,6 @@ where
         if timestamp >= state.last_default_ts {
             state.default = value;
             state.last_default_ts = timestamp;
-        }
-        state.max_known_timestamp = state.max_known_timestamp.max(timestamp);
-        state.pending_state = true;
-    }
-
-    pub(crate) fn set_value_at_in_place(&self, timestamp: i64, value: T) {
-        let mut state = self.write_state();
-        let default_at_timestamp = state.default_at(timestamp);
-        if value != default_at_timestamp {
-            state.pending_data.insert(timestamp, value.clone());
-            state.data_cache.insert(timestamp, value);
-            state.identity = false;
-        } else {
-            state.pending_data.remove(&timestamp);
-            state.data_cache.remove(&timestamp);
         }
         state.max_known_timestamp = state.max_known_timestamp.max(timestamp);
         state.pending_state = true;

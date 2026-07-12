@@ -52,7 +52,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
         WHERE c.region = 'west'";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -124,7 +124,7 @@ async fn join_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -281,7 +281,7 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
         ORDER BY order_id";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_ordered_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -355,7 +355,7 @@ async fn ordered_join_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_ordered_west_orders",
             query,
             Arc::clone(&output_schema),
@@ -482,7 +482,7 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
         ON o.customer_id = c.id AND o.amount = c.amount";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_customer_amount_orders",
             query,
             Arc::clone(&output_schema),
@@ -564,7 +564,7 @@ async fn multi_column_join_uses_slate_backed_columnar_operator_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_customer_amount_orders",
             query,
             Arc::clone(&output_schema),
@@ -714,7 +714,7 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
         WHERE rownum <= 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_bid",
             query,
             Arc::clone(&output_schema),
@@ -792,7 +792,7 @@ async fn join_topn_uses_slate_backed_columnar_operator_incrementally() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_bid",
             query,
             Arc::clone(&output_schema),
@@ -951,7 +951,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
         WHERE rownum <= 1 GROUP BY seller";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_q6",
             query,
             Arc::clone(&output_schema),
@@ -1020,7 +1020,7 @@ async fn q6_shape_uses_grouped_stats_over_grouped_max_join_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_q6",
             query,
             Arc::clone(&output_schema),
@@ -1192,7 +1192,7 @@ async fn cdc_q9_shape_uses_incremental_join_topn_semantics() {
         WHERE rownum <= 1";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_cdc_q9",
             query,
             Arc::clone(&output_schema),
@@ -1383,7 +1383,7 @@ async fn cdc_q6_shape_uses_incremental_top_bid_grouped_avg_semantics() {
         WHERE rownum <= 1 GROUP BY seller";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_cdc_q6",
             query,
             Arc::clone(&output_schema),
@@ -1701,7 +1701,7 @@ async fn cdc_q6_generated_mutations_match_query_provider_semantics() {
         WHERE rownum <= 1 GROUP BY seller";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_cdc_q6_generated",
             query,
             Arc::clone(&output_schema),
@@ -1918,7 +1918,7 @@ async fn topn_over_join_avg_uses_grouped_stats_input_semantics() {
         ORDER BY avg_price DESC LIMIT 2) s";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_avg_bid",
             query,
             Arc::clone(&output_schema),
@@ -1984,7 +1984,7 @@ async fn topn_over_join_avg_uses_grouped_stats_input_semantics() {
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_avg_bid",
             query,
             Arc::clone(&output_schema),
@@ -2096,7 +2096,7 @@ async fn global_aggregate_over_join_avg_topn_uses_grouped_stats_topn_input_seman
         ORDER BY avg_price DESC LIMIT 2) s";
     let mut runtime = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_avg_total",
             query,
             Arc::clone(&output_schema),
@@ -2159,7 +2159,7 @@ async fn global_aggregate_over_join_avg_topn_uses_grouped_stats_topn_input_seman
     let recovery_registry = Arc::new(MaterializedViewRegistry::new());
     let mut recovered = VectorizedExecutionRuntime::new_with_options(
         &sources,
-        vec![VectorizedMaterializedViewPlan::from_sql(
+        vec![SqlMaterializedViewPlan::from_sql(
             "mv_top_avg_total",
             query,
             Arc::clone(&output_schema),
